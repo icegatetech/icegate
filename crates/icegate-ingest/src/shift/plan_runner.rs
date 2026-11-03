@@ -396,6 +396,7 @@ where
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use arrow::datatypes::SchemaRef;
     use async_trait::async_trait;
     use iceberg::spec::DataFile;
     use icegate_queue::ExtractedValue;
@@ -488,12 +489,23 @@ mod tests {
 
     #[async_trait]
     impl Storage for FakeStorage {
+        type Target = SchemaRef;
+
         async fn get_last_offset(&self, _cancel_token: &CancellationToken) -> IngestResult<Option<u64>> {
             panic!("get_last_offset is not expected in plan runner tests");
         }
 
+        async fn load_write_target(&self, _cancel_token: &CancellationToken) -> IngestResult<SchemaRef> {
+            Err(crate::error::IngestError::NotImplemented(
+                "the plan runner does not read the table schema".to_string(),
+            ))
+        }
+
+        async fn evict_cached_table(&self) {}
+
         async fn write_record_batches(
             &self,
+            _target: SchemaRef,
             _batches: BoxRecordBatchStream,
             _cancel_token: &CancellationToken,
         ) -> IngestResult<WrittenDataFiles> {
@@ -581,6 +593,8 @@ mod tests {
 
     #[async_trait]
     impl Storage for FakeDependency {
+        type Target = SchemaRef;
+
         async fn get_last_offset(&self, cancel_token: &CancellationToken) -> IngestResult<Option<u64>> {
             if self.apply_behavior(cancel_token) {
                 return Err(crate::error::IngestError::Shift(
@@ -590,8 +604,17 @@ mod tests {
             Ok(self.committed_offset())
         }
 
+        async fn load_write_target(&self, _cancel_token: &CancellationToken) -> IngestResult<SchemaRef> {
+            Err(crate::error::IngestError::NotImplemented(
+                "the plan runner does not read the table schema".to_string(),
+            ))
+        }
+
+        async fn evict_cached_table(&self) {}
+
         async fn write_record_batches(
             &self,
+            _target: SchemaRef,
             _batches: BoxRecordBatchStream,
             _cancel_token: &CancellationToken,
         ) -> IngestResult<WrittenDataFiles> {

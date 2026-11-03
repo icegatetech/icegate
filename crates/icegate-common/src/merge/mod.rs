@@ -26,11 +26,14 @@ use crate::{error::Result, iceberg_write::CommonRecordBatchStream, merge::sort_k
 pub mod cluster;
 /// The k-way sort-merge engine ([`RowGroupsMerger`]).
 pub mod merger;
+/// The merge source that delivers inputs in the table's current schema ([`SchemaTransitionMergeSource`]).
+pub mod schema_transition_source;
 /// Sort-key descriptors, the per-batch comparison cache, and row-group
 /// boundary key types.
 pub mod sort_key;
 
 pub use merger::{RowGroupsMerger, SortedBatchMergerConfig};
+pub use schema_transition_source::SchemaTransitionMergeSource;
 
 /// One already-sorted mergeable input: a WAL row group, or an Iceberg data
 /// file.

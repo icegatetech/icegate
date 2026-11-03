@@ -1,11 +1,10 @@
 # Table migration and snapshot retention
 
 `migrate create` creates the six IceGate tables from the schema module and stamps
-their properties; `migrate upgrade` reports schema drift. Neither rewrites a table
-in place, except that both append new optional columns to `prices`. Both exit
-when done. What each command does with an existing
-table is documented on [`operations.rs`](operations.rs); what a policy field
-means, on the field in [`config.rs`](config.rs).
+their properties; `migrate upgrade` reports schema drift. Both exit when done.
+What each command does with an existing table is documented on
+[`operations.rs`](operations.rs); what a policy field means, on the field in
+[`config.rs`](config.rs).
 
 This file covers what no single field can state: where snapshot expiration
 actually runs, and what an operator inherits by turning it on.
@@ -38,9 +37,9 @@ Shifter writes and left off `prices`
 
 ## What the operator inherits
 
-- **The policy is written once, at creation.** `migrate create` skips a table
-  that already exists, properties included, and `migrate upgrade` does not touch
-  properties either. Changing the config re-stamps nothing; there is no backfill
+- **The policy is written once, at creation.** Neither `migrate create` nor
+  `migrate upgrade` re-stamps the properties of an existing table. Changing the
+  config re-stamps nothing; there is no backfill
   command. A table created before this policy existed keeps its history forever.
 - **A live table is turned off on the table.** Setting
   `history.expire.enabled=false` on the table itself is what stops expiration.

@@ -12,7 +12,7 @@ use std::{
 use arrow::{
     array::{Array, ArrayRef, MapArray, StringArray, StructArray, TimestampMicrosecondArray, new_null_array},
     buffer::OffsetBuffer,
-    datatypes::{DataType, Schema},
+    datatypes::{DataType, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
 use async_trait::async_trait;
@@ -44,7 +44,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    iceberg_storage::{BoxRecordBatchStream, IcebergStorage, Storage, WrittenDataFiles},
+    iceberg_storage::{BoxRecordBatchStream, CachedTable, IcebergStorage, Storage, WriteTarget, WrittenDataFiles},
     plan_runner::{PLAN_FIELD_BOUNDARY_RANGE, PLAN_FIELD_TENANT_ID, PLAN_FIELD_TIMESTAMP_RANGE},
     timeout::TimeoutEstimator,
 };
@@ -216,8 +216,18 @@ impl RecordingStorage {
     }
 }
 
+/// A storage double's write target is the table schema alone: the double writes no parquet, so it
+/// needs no table to write into.
+impl WriteTarget for SchemaRef {
+    fn arrow_schema(&self) -> &SchemaRef {
+        self
+    }
+}
+
 #[async_trait]
 impl Storage for RecordingStorage {
+    type Target = SchemaRef;
+
     async fn get_last_offset(&self, _cancel_token: &CancellationToken) -> Result<Option<u64>> {
         let read_count = self.last_offset_reads.fetch_add(1, Ordering::SeqCst) + 1;
         if self.fault == StorageFault::CommitLastOffsetRead && read_count > 1 {
@@ -228,8 +238,16 @@ impl Storage for RecordingStorage {
         Ok(*self.committed_offset.lock().await)
     }
 
+    /// The fixture batches carry the canonical logs schema, so it is the table schema here.
+    async fn load_write_target(&self, _cancel_token: &CancellationToken) -> Result<SchemaRef> {
+        Ok(crate::transform::logs_arrow_schema()?)
+    }
+
+    async fn evict_cached_table(&self) {}
+
     async fn write_record_batches(
         &self,
+        _target: SchemaRef,
         batches: BoxRecordBatchStream,
         _cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
@@ -324,16 +342,27 @@ impl IcebergStorageWithHistory {
 
 #[async_trait]
 impl Storage for IcebergStorageWithHistory {
+    type Target = CachedTable;
+
     async fn get_last_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>> {
         self.inner.get_last_offset(cancel_token).await
     }
 
+    async fn load_write_target(&self, cancel_token: &CancellationToken) -> Result<CachedTable> {
+        self.inner.load_write_target(cancel_token).await
+    }
+
+    async fn evict_cached_table(&self) {
+        self.inner.evict_cached_table().await;
+    }
+
     async fn write_record_batches(
         &self,
+        target: CachedTable,
         batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
-        let written = self.inner.write_record_batches(batches, cancel_token).await?;
+        let written = self.inner.write_record_batches(target, batches, cancel_token).await?;
         self.written_data_files.lock().await.extend(written.data_files.iter().cloned());
         Ok(written)
     }

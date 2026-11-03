@@ -2,6 +2,8 @@
 
 use std::{error::Error, io};
 
+use icegate_common::schema_transition::SchemaTransitionError;
+
 /// Result type alias for ingest operations.
 pub type Result<T> = std::result::Result<T, IngestError>;
 
@@ -51,6 +53,11 @@ pub enum IngestError {
     /// Shift queue-read operation error.
     #[error("shift queue read error: {0}")]
     ShiftQueueRead(String),
+
+    /// A WAL batch cannot take the table's current schema. Kept typed so the
+    /// Shifter can tell a stale cached table from an unsupported schema.
+    #[error("schema transition error: {0}")]
+    SchemaTransition(SchemaTransitionError),
 
     /// Operation cancelled.
     #[error("operation cancelled")]
@@ -102,7 +109,11 @@ impl From<icegate_common::error::CommonError> for IngestError {
             // but the conversion must stay exhaustive). WAL-offset resolution
             // runs on the shift path (resuming after a compaction snapshot), so
             // a failure there is a shift error too.
-            CommonError::Write(msg) | CommonError::CompactRead(msg) | CommonError::WalOffset(msg) => Self::Shift(msg),
+            CommonError::Write(msg)
+            | CommonError::CompactRead(msg)
+            | CommonError::WalOffset(msg)
+            | CommonError::BatchSchemaMismatch(msg) => Self::Shift(msg),
+            CommonError::SchemaTransition(e) => Self::SchemaTransition(e),
         }
     }
 }
@@ -116,9 +127,15 @@ impl IngestError {
             Self::Queue(err) => err.is_retryable(),
             Self::Other(err) => is_retryable_error_chain(err.as_ref()),
             Self::Multiple(errors) => errors.iter().all(Self::is_retryable),
-            // Backpressure signals: shed now, let the client retry.
-            Self::QueueFull | Self::AckTimeout => true,
-            Self::Decode(_)
+            // Backpressure signals: shed now, let the client retry. A batch
+            // newer than the cached table is resolved by reloading it.
+            Self::QueueFull
+            | Self::AckTimeout
+            | Self::SchemaTransition(SchemaTransitionError::ColumnNotInTable { .. }) => true,
+            Self::SchemaTransition(
+                SchemaTransitionError::RequiredColumnMissing { .. } | SchemaTransitionError::ColumnTypeChanged { .. },
+            )
+            | Self::Decode(_)
             | Self::Validation(_)
             | Self::NotImplemented(_)
             | Self::Config(_)

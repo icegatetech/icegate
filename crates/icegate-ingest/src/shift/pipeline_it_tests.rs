@@ -21,31 +21,41 @@ use std::{
 };
 
 use arrow::array::{Array, FixedSizeBinaryArray, Float64Array, ListArray, RecordBatch, StringArray, StructArray};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use iceberg::{
     Catalog, NamespaceIdent, TableCreation, TableIdent,
-    spec::{PartitionSpec, Schema, SortOrder},
+    arrow::schema_to_arrow_schema,
+    spec::{PartitionSpec, PrimitiveType, Schema, SortOrder, Type},
     table::Table,
+    transaction::{AddColumn, ApplyTransactionAction, Transaction},
 };
 use icegate_common::{
-    ICEGATE_NAMESPACE, LOGS_TABLE, LOGS_TOPIC, OPERATIONS_TABLE, OPERATIONS_TOPIC,
+    ICEGATE_NAMESPACE, LOGS_TABLE, LOGS_TOPIC, METRICS_TABLE, METRICS_TOPIC, OPERATIONS_TABLE, OPERATIONS_TOPIC,
+    SPANS_TABLE, SPANS_TOPIC,
     catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle},
     list_data_files_with_stats,
     parquet_encoding::{
-        LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS, OPERATIONS_BLOOM_COLUMNS, OPERATIONS_COLUMN_ENCODINGS,
+        LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS, METRICS_BLOOM_COLUMNS, METRICS_COLUMN_ENCODINGS,
+        OPERATIONS_BLOOM_COLUMNS, OPERATIONS_COLUMN_ENCODINGS, SPANS_BLOOM_COLUMNS, SPANS_COLUMN_ENCODINGS,
     },
     parquet_writer::ColumnEncoding,
     resolve_committed_offset,
     schema::{
-        logs_partition_spec, logs_schema, logs_sort_order, operations_partition_spec, operations_schema,
-        operations_sort_order,
+        logs_partition_spec, logs_schema, logs_sort_order, metrics_partition_spec, metrics_schema, metrics_sort_order,
+        operations_partition_spec, operations_schema, operations_sort_order, spans_partition_spec, spans_schema,
+        spans_sort_order,
     },
     testing::{S3TestContainer, create_s3_bucket, create_s3_object_store},
 };
 use icegate_queue::{ParquetQueueReader, PreparedWalRowGroup, QueueConfig, QueueWriter, WriteRequest, channel};
 use opentelemetry_proto::tonic::{
-    collector::trace::v1::ExportTraceServiceRequest,
+    collector::{
+        logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest,
+        trace::v1::ExportTraceServiceRequest,
+    },
     common::v1::{AnyValue, KeyValue, any_value::Value},
+    logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+    metrics::v1::{Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point},
     trace::v1::{
         ResourceSpans, ScopeSpans, Span,
         span::{Event, Link},
@@ -56,14 +66,18 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    CURRENT_PLANNER_PARTITION_SPEC, ShiftConfig, ShiftJobSpec, Shifter,
+    CURRENT_PLANNER_PARTITION_SPEC, IcebergStorage, ShiftConfig, ShiftJobSpec, Shifter,
     config::JobsStorageConfig,
+    iceberg_storage::WriteTarget,
     test_utils::{expected_row_bodies, log_sort_key_cmp, read_parquet_output_rows, two_tenant_ingest_batches},
 };
 use crate::{
     infra::metrics::ShiftMetrics,
-    transform::{operations_to_record_batch, test_support::test_tenant},
-    wal::{SortColumnsDescriptor, sort_logs, sort_operations},
+    transform::{
+        logs_to_record_batch, metrics_to_record_batch, operations_to_record_batch, spans_to_record_batch,
+        test_support::test_tenant,
+    },
+    wal::{SortColumnsDescriptor, sort_logs, sort_metrics, sort_operations, sort_spans},
 };
 
 /// Bucket the test provisions for the WAL, the catalog, the table data, and the job state.
@@ -85,7 +99,7 @@ struct CommittedFile {
 }
 
 /// Object storage, plus the credentials every component in this test authenticates with.
-struct ObjectStorage {
+pub(super) struct ObjectStorage {
     _container: S3TestContainer,
     endpoint: String,
     access_key: String,
@@ -93,7 +107,7 @@ struct ObjectStorage {
 }
 
 /// Start object storage and create the bucket the run works in.
-async fn start_object_storage() -> ObjectStorage {
+pub(super) async fn start_object_storage() -> ObjectStorage {
     let container = S3TestContainer::start().await.expect("start object storage");
     create_s3_bucket(container.endpoint(), BUCKET_NAME)
         .await
@@ -112,7 +126,7 @@ async fn start_object_storage() -> ObjectStorage {
 /// The writer runs with the production bloom-filter and encoding lists the caller passes for
 /// `topic`, so the segments a shift task reads back are encoded the way the ingest binary encodes
 /// them.
-async fn write_wal_segments(
+pub(super) async fn write_wal_segments(
     storage: &ObjectStorage,
     base_path: &str,
     topic: &str,
@@ -155,7 +169,7 @@ async fn write_wal_segments(
 }
 
 /// Build the S3-backed catalog the ingest binary builds, with the IceGate namespace created.
-async fn build_catalog(storage: &ObjectStorage, catalog_prefix: &str) -> Arc<dyn Catalog> {
+pub(super) async fn build_catalog(storage: &ObjectStorage, catalog_prefix: &str) -> Arc<dyn Catalog> {
     let catalog_config = CatalogConfig {
         backend: CatalogBackend::S3 {
             warehouse: catalog_prefix.to_string(),
@@ -182,7 +196,7 @@ async fn build_catalog(storage: &ObjectStorage, catalog_prefix: &str) -> Arc<dyn
 
 /// Create `table` in the IceGate namespace with the schema, partition spec, and sort order the
 /// schema module defines for it.
-async fn create_table(
+pub(super) async fn create_table(
     catalog: &Arc<dyn Catalog>,
     table: &str,
     schema: Schema,
@@ -217,7 +231,7 @@ async fn create_logs_table(storage: &ObjectStorage, catalog_prefix: &str) -> (Ar
 
 /// The shift configuration the run uses: production defaults, with the job state pointed at this
 /// run's own prefix in the bucket and a poll interval short enough to keep the test brief.
-fn shift_config(storage: &ObjectStorage, jobs_prefix: &str) -> ShiftConfig {
+pub(super) fn shift_config(storage: &ObjectStorage, jobs_prefix: &str) -> ShiftConfig {
     let mut config = ShiftConfig::default();
     config.jobsmanager.worker_count = 4;
     config.jobsmanager.poll_interval_ms = 50;
@@ -416,7 +430,7 @@ fn traced_span(span_id: [u8; 8], attributes: Vec<KeyValue>) -> Span {
 /// One trace in which an LLM span is evaluated inline — through an `OpenInference` attribute
 /// array and an OTEL `GenAI` result event — and again post hoc by an evaluator span linked to
 /// it, beside an LLM span nothing evaluates.
-fn evaluated_traces_request() -> ExportTraceServiceRequest {
+pub(super) fn evaluated_traces_request() -> ExportTraceServiceRequest {
     let mut evaluated = traced_span(
         EVALUATED_SPAN_ID,
         vec![
@@ -463,7 +477,7 @@ fn evaluated_traces_request() -> ExportTraceServiceRequest {
 
 /// One evaluation result as a query engine reads it back from the table.
 #[derive(Debug, PartialEq)]
-struct StoredEvaluation {
+pub(super) struct StoredEvaluation {
     name: String,
     score_value: Option<f64>,
     score_label: Option<String>,
@@ -475,7 +489,7 @@ struct StoredEvaluation {
 
 /// Decode every row of `batch` into its span id and its `evaluations` list, each field
 /// addressed by name.
-fn decode_evaluations(batch: &RecordBatch) -> Vec<(Vec<u8>, Option<Vec<StoredEvaluation>>)> {
+pub(super) fn decode_evaluations(batch: &RecordBatch) -> Vec<(Vec<u8>, Option<Vec<StoredEvaluation>>)> {
     let span_ids = batch
         .column_by_name("span_id")
         .expect("span_id column")
@@ -532,6 +546,51 @@ fn decode_evaluations(batch: &RecordBatch) -> Vec<(Vec<u8>, Option<Vec<StoredEva
             (span_ids.value(row).to_vec(), results)
         })
         .collect()
+}
+
+/// The rows [`decode_evaluations`] reads back from the table after [`evaluated_traces_request`] is
+/// shifted into it, in span id order.
+pub(super) fn expected_stored_evaluations() -> Vec<(Vec<u8>, Option<Vec<StoredEvaluation>>)> {
+    let evaluated_trace = Some(EVALUATED_TRACE_ID.to_vec());
+    let evaluated_span = Some(EVALUATED_SPAN_ID.to_vec());
+    vec![
+        (
+            EVALUATED_SPAN_ID.to_vec(),
+            Some(vec![
+                StoredEvaluation {
+                    name: "hallucination".to_string(),
+                    score_value: Some(1.0),
+                    score_label: None,
+                    annotator_kind: Some("LLM".to_string()),
+                    target_scope: "span".to_string(),
+                    target_trace_id: evaluated_trace.clone(),
+                    target_span_id: evaluated_span.clone(),
+                },
+                StoredEvaluation {
+                    name: "Relevance".to_string(),
+                    score_value: Some(0.9),
+                    score_label: Some("relevant".to_string()),
+                    annotator_kind: None,
+                    target_scope: "span".to_string(),
+                    target_trace_id: evaluated_trace.clone(),
+                    target_span_id: evaluated_span.clone(),
+                },
+            ]),
+        ),
+        (
+            CARRIER_SPAN_ID.to_vec(),
+            Some(vec![StoredEvaluation {
+                name: "groundedness".to_string(),
+                score_value: None,
+                score_label: Some("grounded".to_string()),
+                annotator_kind: None,
+                target_scope: "span".to_string(),
+                target_trace_id: evaluated_trace,
+                target_span_id: evaluated_span,
+            }]),
+        ),
+        (PLAIN_SPAN_ID.to_vec(), None),
+    ]
 }
 
 /// Evaluation results survive the whole ingest path: the OTLP transform, the WAL the production
@@ -607,48 +666,229 @@ async fn evaluation_results_reach_iceberg_through_the_production_shifter() {
     }
     rows.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let evaluated_trace = Some(EVALUATED_TRACE_ID.to_vec());
-    let evaluated_span = Some(EVALUATED_SPAN_ID.to_vec());
     assert_eq!(
         rows,
-        vec![
-            (
-                EVALUATED_SPAN_ID.to_vec(),
-                Some(vec![
-                    StoredEvaluation {
-                        name: "hallucination".to_string(),
-                        score_value: Some(1.0),
-                        score_label: None,
-                        annotator_kind: Some("LLM".to_string()),
-                        target_scope: "span".to_string(),
-                        target_trace_id: evaluated_trace.clone(),
-                        target_span_id: evaluated_span.clone(),
-                    },
-                    StoredEvaluation {
-                        name: "Relevance".to_string(),
-                        score_value: Some(0.9),
-                        score_label: Some("relevant".to_string()),
-                        annotator_kind: None,
-                        target_scope: "span".to_string(),
-                        target_trace_id: evaluated_trace.clone(),
-                        target_span_id: evaluated_span.clone(),
-                    },
-                ]),
-            ),
-            (
-                CARRIER_SPAN_ID.to_vec(),
-                Some(vec![StoredEvaluation {
-                    name: "groundedness".to_string(),
-                    score_value: None,
-                    score_label: Some("grounded".to_string()),
-                    annotator_kind: None,
-                    target_scope: "span".to_string(),
-                    target_trace_id: evaluated_trace,
-                    target_span_id: evaluated_span,
-                }]),
-            ),
-            (PLAIN_SPAN_ID.to_vec(), None),
-        ],
+        expected_stored_evaluations(),
         "every row must keep exactly the results it was ingested with"
     );
+}
+
+/// A minimal OTLP logs request: one record, enough for the logs transform to emit a row.
+fn single_record_logs_request() -> ExportLogsServiceRequest {
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: Some(AnyValue {
+                        value: Some(Value::StringValue("hello".to_string())),
+                    }),
+                    ..LogRecord::default()
+                }],
+                ..ScopeLogs::default()
+            }],
+            ..ResourceLogs::default()
+        }],
+    }
+}
+
+/// A minimal OTLP metrics request: one gauge data point, enough for the metrics transform to
+/// emit a row.
+fn single_gauge_metrics_request() -> ExportMetricsServiceRequest {
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "cpu".to_string(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: 1_700_000_000_000_000_000,
+                            value: Some(number_data_point::Value::AsDouble(1.0)),
+                            ..NumberDataPoint::default()
+                        }],
+                    })),
+                    ..Metric::default()
+                }],
+                ..ScopeMetrics::default()
+            }],
+            ..ResourceMetrics::default()
+        }],
+    }
+}
+
+/// One WAL-fed table and the WAL segment its production ingest path writes into its topic.
+struct WalTableCase {
+    table: &'static str,
+    topic: &'static str,
+    encodings: (&'static [&'static str], &'static [ColumnEncoding]),
+    schema: Schema,
+    partition_spec: PartitionSpec,
+    sort_order: SortOrder,
+    row_groups: Vec<PreparedWalRowGroup>,
+}
+
+/// The WAL-fed tables that have a WAL topic, each with one segment built by its production
+/// transform and WAL sorter.
+fn wal_table_cases() -> Vec<WalTableCase> {
+    let tenant = test_tenant("tenant-a");
+    let logs_batch = logs_to_record_batch(&single_record_logs_request(), &tenant)
+        .expect("logs transform")
+        .expect("one logs row");
+    let (spans_batch, _) = spans_to_record_batch(&evaluated_traces_request(), &tenant).expect("spans transform");
+    let (metrics_batch, _) =
+        metrics_to_record_batch(&single_gauge_metrics_request(), &tenant).expect("metrics transform");
+    let (operations_batch, _) =
+        operations_to_record_batch(&evaluated_traces_request(), &tenant).expect("operations transform");
+    let logs = logs_schema().expect("logs schema");
+    let spans = spans_schema().expect("spans schema");
+    let metrics = metrics_schema().expect("metrics schema");
+    let operations = operations_schema().expect("operations schema");
+    vec![
+        WalTableCase {
+            table: LOGS_TABLE,
+            topic: LOGS_TOPIC,
+            encodings: (LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS),
+            partition_spec: logs_partition_spec(&logs).expect("logs partition spec"),
+            sort_order: logs_sort_order(&logs).expect("logs sort order"),
+            schema: logs,
+            row_groups: sort_logs(&logs_batch, 2, None)
+                .expect("prepare logs segment")
+                .expect("logs row groups")
+                .write_request
+                .row_groups,
+        },
+        WalTableCase {
+            table: SPANS_TABLE,
+            topic: SPANS_TOPIC,
+            encodings: (SPANS_BLOOM_COLUMNS, SPANS_COLUMN_ENCODINGS),
+            partition_spec: spans_partition_spec(&spans).expect("spans partition spec"),
+            sort_order: spans_sort_order(&spans).expect("spans sort order"),
+            schema: spans,
+            row_groups: sort_spans(&spans_batch.expect("spans rows"), 2, None)
+                .expect("prepare spans segment")
+                .expect("spans row groups")
+                .write_request
+                .row_groups,
+        },
+        WalTableCase {
+            table: METRICS_TABLE,
+            topic: METRICS_TOPIC,
+            encodings: (METRICS_BLOOM_COLUMNS, METRICS_COLUMN_ENCODINGS),
+            partition_spec: metrics_partition_spec(&metrics).expect("metrics partition spec"),
+            sort_order: metrics_sort_order(&metrics).expect("metrics sort order"),
+            schema: metrics,
+            row_groups: sort_metrics(&metrics_batch.expect("metrics rows"), 2, None)
+                .expect("prepare metrics segment")
+                .expect("metrics row groups")
+                .write_request
+                .row_groups,
+        },
+        WalTableCase {
+            table: OPERATIONS_TABLE,
+            topic: OPERATIONS_TOPIC,
+            encodings: (OPERATIONS_BLOOM_COLUMNS, OPERATIONS_COLUMN_ENCODINGS),
+            partition_spec: operations_partition_spec(&operations).expect("operations partition spec"),
+            sort_order: operations_sort_order(&operations).expect("operations sort order"),
+            schema: operations,
+            row_groups: sort_operations(&operations_batch.expect("operations rows"), 2, None)
+                .expect("prepare operations segment")
+                .expect("operations row groups")
+                .write_request
+                .row_groups,
+        },
+    ]
+}
+
+/// A batch read back from the WAL carries, by value, the Arrow schema of the table it is shifted
+/// into — field-id metadata of nested fields included.
+///
+/// The schema transition in front of the writer passes such a batch through untouched and
+/// rebuilds any other; were the two to differ, every shift would take the rebuild path and a
+/// nested column would fail its strict type comparison.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wal_batch_carries_the_arrow_schema_of_its_table() {
+    let storage = start_object_storage().await;
+    let run_id = Uuid::new_v4().simple().to_string();
+    let catalog = build_catalog(&storage, &format!("catalog-{run_id}")).await;
+    let cancel = CancellationToken::new();
+
+    for case in wal_table_cases() {
+        let queue_reader = write_wal_segments(
+            &storage,
+            &format!("wal-{run_id}-{}", case.topic),
+            case.topic,
+            case.encodings,
+            vec![case.row_groups],
+        )
+        .await;
+        let ident = create_table(&catalog, case.table, case.schema, case.partition_spec, case.sort_order).await;
+        let table = catalog.load_table(&ident).await.expect("load table");
+        let table_schema =
+            Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).expect("table arrow schema"));
+
+        let batches = queue_reader
+            .read_segment(&case.topic.to_string(), 0, &[0], &cancel)
+            .await
+            .expect("open WAL segment")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read WAL segment");
+        let batch = batches.first().expect("one WAL batch");
+        assert_eq!(
+            batch.schema(),
+            table_schema,
+            "a '{}' WAL batch must carry the table's Arrow schema",
+            case.table
+        );
+    }
+}
+
+/// A write attempt writes into the table it loaded, even when a migration adds a column and the
+/// cached table is dropped between that load and the write — what an expired cache TTL or a
+/// sibling shift task's eviction does while the migrate hook commits. Were the writer to load the
+/// table again, the batch built for the loaded schema would lack the new column and be refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_lands_in_the_table_its_attempt_loaded_when_a_column_is_added_before_the_write() {
+    let storage = start_object_storage().await;
+    let run_id = Uuid::new_v4().simple().to_string();
+    let (catalog, ident) = create_logs_table(&storage, &format!("catalog-{run_id}")).await;
+    let shift_storage = IcebergStorage::new(
+        Arc::clone(&catalog),
+        LOGS_TABLE,
+        &shift_config(&storage, &format!("jobs-{run_id}")),
+        64 * 1024 * 1024,
+        LOGS_BLOOM_COLUMNS,
+        LOGS_COLUMN_ENCODINGS,
+    );
+    let cancel = CancellationToken::new();
+    let batch = logs_to_record_batch(&single_record_logs_request(), &test_tenant("tenant-a"))
+        .expect("logs transform")
+        .expect("one logs row");
+
+    let target = shift_storage.load_write_target(&cancel).await.expect("load write target");
+    let table = catalog.load_table(&ident).await.expect("load logs table");
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_schema()
+        .add_column(AddColumn::optional(
+            "environment",
+            Type::Primitive(PrimitiveType::String),
+        ))
+        .apply(tx)
+        .expect("add column applies");
+    tx.commit(catalog.as_ref()).await.expect("add column commits");
+    shift_storage.evict_cached_table().await;
+    let reloaded = shift_storage.load_write_target(&cancel).await.expect("reload write target");
+    assert!(
+        reloaded.arrow_schema().field_with_name("environment").is_ok(),
+        "the fixture must evolve the table the next load reads"
+    );
+
+    let written = shift_storage
+        .write_record_batches(target, futures::stream::once(async { Ok(batch) }).boxed(), &cancel)
+        .await
+        .expect("the write into the loaded table must not be refused");
+
+    assert_eq!(written.rows_written, 1);
+    assert_eq!(written.data_files.len(), 1);
 }

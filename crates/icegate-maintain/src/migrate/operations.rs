@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use iceberg::spec::{NestedFieldRef, TableProperties};
+use iceberg::spec::{NestedField, NestedFieldRef, TableProperties};
 use iceberg::table::Table;
 use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
@@ -46,12 +46,6 @@ struct TableDefinition {
     /// that offset by walking the ancestor chain — expiration must be told to
     /// keep the chain down to its most recent carrier intact.
     carries_wal_offset: bool,
-    /// Whether an existing table gains, in place, the trailing optional
-    /// columns the code adds (see [`add_missing_columns`]). True only for
-    /// `prices`: the Shifter resolves WAL segments written by an earlier
-    /// binary against the *current* schema, so evolving a WAL-fed table under
-    /// them is not established safe, while `prices` has no WAL.
-    adds_columns_in_place: bool,
 }
 
 /// Build table definitions from schema module
@@ -68,7 +62,6 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         partition_spec: logs_partition,
         sort_order: logs_sort,
         carries_wal_offset: true,
-        adds_columns_in_place: false,
     });
 
     // Spans table
@@ -81,7 +74,6 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         partition_spec: spans_partition,
         sort_order: spans_sort,
         carries_wal_offset: true,
-        adds_columns_in_place: false,
     });
 
     // Events table
@@ -94,7 +86,6 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         partition_spec: events_partition,
         sort_order: events_sort,
         carries_wal_offset: true,
-        adds_columns_in_place: false,
     });
 
     // Metrics table
@@ -107,7 +98,6 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         partition_spec: metrics_partition,
         sort_order: metrics_sort,
         carries_wal_offset: true,
-        adds_columns_in_place: false,
     });
 
     // Operations table (LLM/GenAI projection over spans — the 5th physical table).
@@ -120,7 +110,6 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         partition_spec: operations_partition,
         sort_order: operations_sort,
         carries_wal_offset: true,
-        adds_columns_in_place: false,
     });
 
     // Prices table (global LLM rate card — the 6th physical table, and the only
@@ -136,7 +125,6 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
         // The pricing crawler writes this table, not the Shifter: its snapshots
         // carry no WAL offset, so expiration has no carrier to preserve here.
         carries_wal_offset: false,
-        adds_columns_in_place: true,
     });
 
     Ok(definitions)
@@ -157,9 +145,9 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
 /// its properties — that stamp is what makes any later writer expire this
 /// table's snapshots, so a table created without it keeps its history forever.
 /// Existing tables are left untouched, properties included, with one
-/// exception: a table that takes column additions in place (`prices`) gains the
-/// trailing optional columns the code has added since it was created, reported
-/// as [`MigrationOperation::Upgrade`]. Deployments run only this command on
+/// exception: an existing table gains the trailing optional columns the code
+/// has added since it was created, reported as [`MigrationOperation::Upgrade`]
+/// (see [`add_missing_columns`]). Deployments run only this command on
 /// upgrade, so this is the path by which such a column reaches them.
 ///
 /// # Return Value
@@ -175,6 +163,11 @@ fn build_table_definitions() -> Result<Vec<TableDefinition>> {
 /// - Namespace creation fails
 /// - Table creation fails (except for "already exists" errors)
 /// - Loading an existing table, or committing columns added to it, fails
+/// - An existing table's schema differs from the code in a way appending
+///   optional columns cannot resolve, or appending would give a column other
+///   field ids than the schema module does
+///   ([`crate::error::MaintainError::Migration`], naming every such table with
+///   its reason; every other table is still created or evolved first)
 #[allow(clippy::cognitive_complexity)]
 pub async fn create_tables(
     catalog: &Arc<dyn Catalog>,
@@ -197,6 +190,9 @@ pub async fn create_tables(
 
     let definitions = build_table_definitions()?;
     let mut operations = Vec::new();
+    // Every other table is still created or evolved, so one incompatible table
+    // does not hold the rest back and the error names all of them at once.
+    let mut differing_tables: Vec<DifferingTable> = Vec::new();
 
     for def in definitions {
         let table_ident = TableIdent::new(namespace.clone(), def.name.to_string());
@@ -205,20 +201,21 @@ pub async fn create_tables(
         let exists = catalog_ref.table_exists(&table_ident).await?;
 
         if exists {
-            if !def.adds_columns_in_place {
-                tracing::info!("Table {} already exists, skipping", def.name);
-                continue;
-            }
             let table = catalog_ref.load_table(&table_ident).await?;
-            if add_missing_columns(catalog_ref, &def, &table, dry_run).await? {
-                operations.push(MigrationOperation::Upgrade {
+            match add_missing_columns(catalog_ref, &def, &table, dry_run).await? {
+                ColumnAddition::ColumnsAdded => operations.push(MigrationOperation::Upgrade {
                     table_name: def.name.to_string(),
-                });
-            } else {
-                tracing::info!(
-                    "Table {} already exists with no optional columns to append, leaving it unchanged",
-                    def.name
-                );
+                }),
+                ColumnAddition::SchemaCurrent => {
+                    tracing::info!("Table {} already exists with the code's schema, skipping", def.name);
+                }
+                ColumnAddition::Unresolvable(drift) => {
+                    log_schema_differences(def.name, table.metadata().current_schema(), &def.schema);
+                    differing_tables.push(DifferingTable {
+                        table_name: def.name.to_string(),
+                        drift,
+                    });
+                }
             }
             continue;
         }
@@ -234,6 +231,12 @@ pub async fn create_tables(
         operations.push(MigrationOperation::Create {
             table_name: def.name.to_string(),
         });
+    }
+
+    if !differing_tables.is_empty() {
+        return Err(crate::error::MaintainError::Migration(format_upgrade_required_message(
+            &differing_tables,
+        )));
     }
 
     Ok(operations)
@@ -288,10 +291,10 @@ async fn create_table(
 ///
 /// Checks each observability table for schema differences. The only
 /// automatic evolution is the one [`create_tables`] also performs: appending
-/// the code's new optional columns to a table that takes them in place
-/// (`prices`), reported as [`MigrationOperation::Upgrade`]. Any other
-/// difference requires operators to drop and re-create the affected
-/// table(s).
+/// the code's new trailing optional columns to an existing table, reported as
+/// [`MigrationOperation::Upgrade`]. Any other difference, including columns
+/// the table would give other field ids than the schema module does, requires
+/// operators to drop and re-create the affected table(s).
 ///
 /// # Behavior
 ///
@@ -302,7 +305,7 @@ async fn create_table(
 ///   resolves the mismatch, logs differences for every other mismatched
 ///   table discovered during the scan, then returns
 ///   `Err(MaintainError::Migration)` with an aggregated message naming
-///   all tables that must be dropped and re-created. Tables that match the
+///   all tables that must be dropped and re-created, each with its reason. Tables that match the
 ///   code's schema pass silently; missing tables log a warning and are
 ///   skipped (operator must run `migrate create` first).
 ///
@@ -320,8 +323,9 @@ async fn create_table(
 /// - The catalog rejects a `table_exists` or `load_table` call, or a commit
 ///   appending columns.
 /// - One or more tables have schemas that differ from the code in a way
-///   appending columns cannot resolve, and we're not in dry-run mode (see
-///   `MaintainError::Migration`).
+///   appending columns cannot resolve, or appending would give a column other
+///   field ids than the schema module does, and we're not in dry-run mode
+///   (see `MaintainError::Migration`).
 #[allow(clippy::cognitive_complexity)]
 pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Result<Vec<MigrationOperation>> {
     let catalog_ref = catalog.as_ref();
@@ -330,7 +334,7 @@ pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Resul
     let mut operations = Vec::new();
     // Collect every mismatched table instead of bailing on the first one so
     // operators see the full remediation list in a single run.
-    let mut differing_tables: Vec<String> = Vec::new();
+    let mut differing_tables: Vec<DifferingTable> = Vec::new();
 
     for def in definitions {
         let table_ident = TableIdent::new(namespace.clone(), def.name.to_string());
@@ -357,17 +361,32 @@ pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Resul
 
         if needs_upgrade {
             log_schema_differences(def.name, current_schema, target_schema);
-            if def.adds_columns_in_place && add_missing_columns(catalog_ref, &def, &table, dry_run).await? {
-                operations.push(MigrationOperation::Upgrade {
-                    table_name: def.name.to_string(),
-                });
-            } else if dry_run {
-                tracing::info!("[dry-run] Would require manual migration for table: {}", def.name);
+            let drift = match add_missing_columns(catalog_ref, &def, &table, dry_run).await? {
+                ColumnAddition::ColumnsAdded => {
+                    operations.push(MigrationOperation::Upgrade {
+                        table_name: def.name.to_string(),
+                    });
+                    continue;
+                }
+                // `schemas_differ` found a difference, so appending nothing
+                // cannot leave the table on the code's schema.
+                ColumnAddition::SchemaCurrent => UnresolvableDrift::IncompatibleSchema,
+                ColumnAddition::Unresolvable(drift) => drift,
+            };
+            if dry_run {
+                tracing::info!(
+                    "[dry-run] Would require manual migration for table {}: {}",
+                    def.name,
+                    drift
+                );
                 operations.push(MigrationOperation::Upgrade {
                     table_name: def.name.to_string(),
                 });
             } else {
-                differing_tables.push(def.name.to_string());
+                differing_tables.push(DifferingTable {
+                    table_name: def.name.to_string(),
+                    drift,
+                });
             }
         } else {
             tracing::info!("Table {} schema is up to date", def.name);
@@ -384,20 +403,30 @@ pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Resul
 }
 
 /// Build the operator-facing error message when one or more tables' schemas
-/// in the catalog differ from the code and automatic evolution is not
-/// supported. Accepts one or more table names, uses singular/plural wording
-/// based on the count, and joins names with `, ` for the bracketed list so
-/// the operator sees the full remediation list in one run.
-fn format_upgrade_required_message(table_names: &[String]) -> String {
-    let (subject, remediation) = if table_names.len() == 1 {
+/// in the catalog differ from the code in a way appending trailing optional
+/// columns cannot resolve. Accepts one or more tables, uses singular/plural wording
+/// based on the count, joins names with `, ` for the bracketed list, and states
+/// each table's reason, so the operator sees the full remediation list in one run.
+fn format_upgrade_required_message(differing_tables: &[DifferingTable]) -> String {
+    let (subject, remediation) = if differing_tables.len() == 1 {
         ("Table", "the table")
     } else {
         ("Tables", "the tables")
     };
-    let list = table_names.join(", ");
+    let list = differing_tables
+        .iter()
+        .map(|table| table.table_name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let reasons = differing_tables
+        .iter()
+        .map(|table| format!("{}: {}", table.table_name, table.drift))
+        .collect::<Vec<_>>()
+        .join("; ");
     format!(
-        "{subject} [{list}] schema in catalog differs from code. Automatic evolution \
-         is not supported; drop {remediation} manually and re-run `icegate-maintain migrate create`."
+        "{subject} [{list}] schema in catalog differs from code ({reasons}). Only optional columns \
+         appended at the end, with the field ids the table assigns them, are applied automatically; \
+         drop {remediation} manually and re-run `icegate-maintain migrate create`."
     )
 }
 
@@ -405,11 +434,10 @@ fn format_upgrade_required_message(table_names: &[String]) -> String {
 /// is the whole of the difference; `None` for any other drift.
 ///
 /// Every `current` field must match the `target` field at the same position
-/// by name, type, and required flag. Position matters because writers build
-/// Arrow batches positionally from the code's schema while the Parquet writer
-/// binds them to the table's, and an added column always lands last. An added
-/// field must be optional because rows already in the table have no value for
-/// it. An empty slice means there is nothing to add.
+/// by name, type, and required flag, so only columns the code appends after
+/// its last existing one are planned. An added field must be optional because
+/// rows already in the table have no value for it. An empty slice means there
+/// is nothing to add.
 fn plan_column_additions<'a>(
     current: &iceberg::spec::Schema,
     target: &'a iceberg::spec::Schema,
@@ -430,37 +458,100 @@ fn plan_column_additions<'a>(
 /// with neither data files nor properties is refused.
 const ADDED_COLUMNS_PROPERTY: &str = "icegate.added-columns";
 
+/// What [`add_missing_columns`] found, and in non-dry-run did, to an existing table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ColumnAddition {
+    /// The trailing optional columns of the code's schema were appended (in
+    /// dry-run: would be).
+    ColumnsAdded,
+    /// The table already has the code's schema; nothing was touched.
+    SchemaCurrent,
+    /// Appending columns cannot bring the table to the code's schema; nothing
+    /// was touched.
+    Unresolvable(UnresolvableDrift),
+}
+
+/// Why appending columns cannot bring an existing table to the code's schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnresolvableDrift {
+    /// The drift is not a set of trailing optional columns.
+    IncompatibleSchema,
+    /// The table would give a field of an appended column another id than the
+    /// schema module does (see [`find_added_field_id_mismatch`]).
+    FieldIdMismatch(FieldIdMismatch),
+}
+
+impl std::fmt::Display for UnresolvableDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncompatibleSchema => {
+                f.write_str("the schema differs from the code beyond optional columns appended at the end")
+            }
+            Self::FieldIdMismatch(mismatch) => write!(
+                f,
+                "column '{}': field '{}' has id {} in the schema module, but the table would assign it {}",
+                mismatch.column_name, mismatch.field_name, mismatch.code_id, mismatch.table_id
+            ),
+        }
+    }
+}
+
+/// An existing table that appending columns cannot bring to the code's schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DifferingTable {
+    table_name: String,
+    drift: UnresolvableDrift,
+}
+
 /// Append to the existing `table` the optional columns `def`'s schema adds,
 /// in one commit.
 ///
-/// Returns whether the table was evolved, or in dry-run would be. Returns
-/// `false`, touching nothing, when the table is already current or its drift
-/// is anything other than appended optional columns — `migrate upgrade`
-/// reports that drift. Rows already in the table read the new columns as
-/// NULL. The same commit adds a snapshot with no data, so the current snapshot
-/// names the evolved schema: scans project the current snapshot's schema, and
-/// without it every reader would keep the old columns until the next append.
-/// It is added even to a table with no snapshot yet: a commit retried after a
-/// concurrent first append would otherwise leave that append, stamped with the
-/// previous schema, current. Only the schema changes otherwise: the table
-/// keeps the sort order it was created with, which no reader or writer of a
-/// table this applies to relies on.
+/// Rows already in the table read the new columns as NULL. The same commit
+/// adds a snapshot with no data, so the current snapshot names the evolved
+/// schema: scans project the current snapshot's schema, and without it every
+/// reader would keep the old columns until the next append. That snapshot
+/// carries the WAL offset of the snapshot it supersedes, resolved against the
+/// base the commit lands on (pinned in the `icegatetech/iceberg-rust` fork by
+/// `test_fast_append_inherits_summary_property_from_the_base_it_commits_on`),
+/// so a reader resolving the offset from the current snapshot alone still
+/// finds it, even when a shift commit lands first.
+///
+/// A table that carries the WAL offset and has no snapshot yet gets the
+/// schema change alone: a stamp there would be its only snapshot, with no
+/// offset to inherit, and `resolve_committed_offset` refuses such a table
+/// instead of resuming the WAL from its start. The price is a race: a first
+/// shift append committed concurrently with the migration, on the previous
+/// schema, stays current, and readers project the previous columns until the
+/// next append. A table without the WAL offset (`prices`) is stamped even with
+/// no snapshot, which closes that race for it.
+///
+/// Columns whose field ids the table would assign differently from the schema
+/// module (see [`find_added_field_id_mismatch`]) are not appended: the result
+/// is [`ColumnAddition::Unresolvable`], in dry-run as well.
+///
+/// Only the schema changes otherwise: the table keeps the partition spec and
+/// sort order it was created with.
 async fn add_missing_columns(
     catalog: &dyn Catalog,
     def: &TableDefinition,
     table: &Table,
     dry_run: bool,
-) -> Result<bool> {
+) -> Result<ColumnAddition> {
     let Some(columns) = plan_column_additions(table.metadata().current_schema(), &def.schema) else {
-        return Ok(false);
+        return Ok(ColumnAddition::Unresolvable(UnresolvableDrift::IncompatibleSchema));
     };
     if columns.is_empty() {
-        return Ok(false);
+        return Ok(ColumnAddition::SchemaCurrent);
+    }
+    if let Some(mismatch) = find_added_field_id_mismatch(columns, table.metadata().last_column_id()) {
+        return Ok(ColumnAddition::Unresolvable(UnresolvableDrift::FieldIdMismatch(
+            mismatch,
+        )));
     }
     let names: Vec<&str> = columns.iter().map(|field| field.name.as_str()).collect();
     if dry_run {
         tracing::info!("[dry-run] Would add columns {:?} to table {}", names, def.name);
-        return Ok(true);
+        return Ok(ColumnAddition::ColumnsAdded);
     }
 
     let tx = Transaction::new(table);
@@ -468,14 +559,77 @@ async fn add_missing_columns(
         action.add_column(AddColumn::optional(&field.name, field.field_type.as_ref().clone()))
     });
     let tx = action.apply(tx)?;
-    // Actions apply in order within one commit, so this snapshot is stamped
-    // with the schema the action above adds.
-    let stamp = tx
-        .fast_append()
-        .set_snapshot_properties(HashMap::from([(ADDED_COLUMNS_PROPERTY.to_string(), names.join(","))]));
-    stamp.apply(tx)?.commit(catalog).await?;
+    let tx = if def.carries_wal_offset && table.metadata().current_snapshot().is_none() {
+        tx
+    } else {
+        // Actions apply in order within one commit, so this snapshot is stamped
+        // with the schema the action above adds.
+        let stamp = tx
+            .fast_append()
+            .set_snapshot_properties(HashMap::from([(ADDED_COLUMNS_PROPERTY.to_string(), names.join(","))]))
+            .inherit_summary_property(WAL_OFFSET_PROPERTY);
+        stamp.apply(tx)?
+    };
+    tx.commit(catalog).await?;
     tracing::info!("Added columns {:?} to table {}", names, def.name);
-    Ok(true)
+    Ok(ColumnAddition::ColumnsAdded)
+}
+
+/// A field of an added column whose id in the schema module differs from the
+/// id the table assigns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FieldIdMismatch {
+    /// Name of the appended column.
+    column_name: String,
+    /// Name of the field: the column itself or one nested in it.
+    field_name: String,
+    /// Id the schema module gives the field.
+    code_id: i32,
+    /// Id the table assigns the field.
+    table_id: i32,
+}
+
+/// The first field of `columns` that the table would give another id than the
+/// schema module does; `None` when every id matches.
+///
+/// The table assigns an added column fresh ids, continuing from its
+/// `last_column_id` in pre-order: a field takes the next id, then its nested
+/// fields take theirs, a map's key before its value. The WAL and the Shifter
+/// write Arrow data tagged with the schema module's ids, nested fields
+/// included, and a batch whose nested ids differ from the table's never takes
+/// the table's schema, so such a column must not be appended.
+fn find_added_field_id_mismatch(columns: &[NestedFieldRef], last_column_id: i32) -> Option<FieldIdMismatch> {
+    let mut next_id = last_column_id;
+    columns
+        .iter()
+        .find_map(|column| find_field_id_mismatch(&column.name, column, &mut next_id))
+}
+
+/// The first field of `field`, in pre-order, whose id is not the id the table
+/// assigns it; `next_id` is the last id assigned before `field` and is
+/// advanced past every field visited.
+fn find_field_id_mismatch(column_name: &str, field: &NestedField, next_id: &mut i32) -> Option<FieldIdMismatch> {
+    use iceberg::spec::Type;
+
+    *next_id = next_id.saturating_add(1);
+    if field.id != *next_id {
+        return Some(FieldIdMismatch {
+            column_name: column_name.to_string(),
+            field_name: field.name.clone(),
+            code_id: field.id,
+            table_id: *next_id,
+        });
+    }
+    match field.field_type.as_ref() {
+        Type::Primitive(_) | Type::Variant(_) => None,
+        Type::Struct(struct_type) => struct_type
+            .fields()
+            .iter()
+            .find_map(|nested| find_field_id_mismatch(column_name, nested, next_id)),
+        Type::List(list_type) => find_field_id_mismatch(column_name, &list_type.element_field, next_id),
+        Type::Map(map_type) => find_field_id_mismatch(column_name, &map_type.key_field, next_id)
+            .or_else(|| find_field_id_mismatch(column_name, &map_type.value_field, next_id)),
+    }
 }
 
 /// Check if two schemas differ
@@ -598,9 +752,16 @@ fn log_schema_differences(table_name: &str, current: &iceberg::spec::Schema, tar
 mod tests {
     use super::*;
 
+    fn incompatible_table(table_name: &str) -> DifferingTable {
+        DifferingTable {
+            table_name: table_name.to_string(),
+            drift: UnresolvableDrift::IncompatibleSchema,
+        }
+    }
+
     #[test]
     fn format_upgrade_error_message_single_table_uses_singular_wording() {
-        let msg = format_upgrade_required_message(&["spans".to_string()]);
+        let msg = format_upgrade_required_message(&[incompatible_table("spans")]);
         assert!(msg.starts_with("Table ["));
         assert!(msg.contains("spans"));
         assert!(msg.contains("drop the table manually"));
@@ -609,11 +770,35 @@ mod tests {
 
     #[test]
     fn format_upgrade_error_message_multiple_tables_uses_plural_wording() {
-        let msg = format_upgrade_required_message(&["logs".to_string(), "spans".to_string()]);
+        let msg = format_upgrade_required_message(&[incompatible_table("logs"), incompatible_table("spans")]);
         assert!(msg.starts_with("Tables ["));
         assert!(msg.contains("logs"));
         assert!(msg.contains("spans"));
         assert!(msg.contains("drop the tables manually"));
+    }
+
+    /// The message names each table's reason, so an id mismatch reads apart from schema drift.
+    #[test]
+    fn format_upgrade_error_message_states_each_table_reason() {
+        let mismatch = DifferingTable {
+            table_name: "operations".to_string(),
+            drift: UnresolvableDrift::FieldIdMismatch(FieldIdMismatch {
+                column_name: "evaluations".to_string(),
+                field_name: "element".to_string(),
+                code_id: 66,
+                table_id: 67,
+            }),
+        };
+        let msg = format_upgrade_required_message(&[incompatible_table("logs"), mismatch]);
+        assert!(
+            msg.contains(&format!("logs: {}", UnresolvableDrift::IncompatibleSchema)),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("operations: column 'evaluations': field 'element' has id 66"),
+            "{msg}"
+        );
+        assert!(msg.contains("would assign it 67"), "{msg}");
     }
 
     #[test]
@@ -754,8 +939,8 @@ mod tests {
     fn plan_column_additions_refuses_drift_that_is_not_a_trailing_optional_column() {
         // Each case leaves drift only a drop-and-recreate can resolve: rows
         // already in the table cannot fill a required column, a column added
-        // mid-schema would misalign the positional writer, and a changed or
-        // removed column is not an addition at all.
+        // before an existing one is not an append, and a changed or removed
+        // column is not an addition at all.
         let current = string_schema(&[("a", true), ("b", false)]);
         let cases = [
             (
@@ -771,6 +956,9 @@ mod tests {
                 string_schema(&[("a", false), ("b", false), ("c", false)]),
             ),
             ("removed column", string_schema(&[("a", true), ("c", false)])),
+            // The table is ahead of this binary, as after a rollback; reading it as "nothing to
+            // add" would let `migrate create` pass over a schema this binary does not know.
+            ("table wider than the code", string_schema(&[("a", true)])),
         ];
         for (case, target) in cases {
             assert_eq!(added_names(&current, &target), None, "{case}");
@@ -799,14 +987,182 @@ mod tests {
         );
     }
 
+    /// The table numbers an added column's fields in pre-order, a map's key before its value, and
+    /// continues from the last id it assigned, so a nested mismatch or an earlier column's nested
+    /// fields decide what comes after them. The WAL tags its data with the schema module's ids, so
+    /// any disagreement has to stop the migration.
     #[test]
-    fn only_prices_adds_columns_in_place() {
-        // The Shifter resolves WAL segments written by an earlier binary
-        // against the current schema, so evolving a WAL-fed table in place is
-        // not established safe; `prices` has no WAL.
+    fn find_added_field_id_mismatch_compares_nested_fields_in_preorder() {
+        use iceberg::spec::{ListType, MapType, PrimitiveType, StructType, Type};
+
+        let long = || Type::Primitive(PrimitiveType::Long);
+        let list = |id, element_id| {
+            NestedFieldRef::from(NestedField::optional(
+                id,
+                "column",
+                Type::List(ListType::new(
+                    NestedField::list_element(element_id, long(), false).into(),
+                )),
+            ))
+        };
+        let map = |key_id, value_id| {
+            NestedFieldRef::from(NestedField::optional(
+                11,
+                "column",
+                Type::Map(MapType::new(
+                    NestedField::map_key_element(key_id, long()).into(),
+                    NestedField::map_value_element(value_id, long(), false).into(),
+                )),
+            ))
+        };
+        let struct_of = |field_id| {
+            NestedFieldRef::from(NestedField::optional(
+                11,
+                "column",
+                Type::Struct(StructType::new(vec![
+                    NestedField::optional(field_id, "a", long()).into(),
+                ])),
+            ))
+        };
+        let primitive = |id| NestedFieldRef::from(NestedField::optional(id, "next", long()));
+        let mismatch = |column_name: &str, field_name: &str, code_id, table_id| {
+            Some(FieldIdMismatch {
+                column_name: column_name.to_string(),
+                field_name: field_name.to_string(),
+                code_id,
+                table_id,
+            })
+        };
+
+        let cases = [
+            ("matching list", vec![list(11, 12)], None),
+            (
+                "list element off by one",
+                vec![list(11, 13)],
+                mismatch("column", "element", 13, 12),
+            ),
+            (
+                "struct field off by one",
+                vec![struct_of(13)],
+                mismatch("column", "a", 13, 12),
+            ),
+            (
+                "map key off by one",
+                vec![map(13, 14)],
+                mismatch("column", "key", 13, 12),
+            ),
+            (
+                "map value off by one",
+                vec![map(12, 14)],
+                mismatch("column", "value", 14, 13),
+            ),
+            ("column after a nested one", vec![list(11, 12), primitive(13)], None),
+            (
+                "column after a nested one reusing its id",
+                vec![list(11, 12), primitive(12)],
+                mismatch("next", "next", 12, 13),
+            ),
+        ];
+        for (case, columns, expected) in cases {
+            assert_eq!(find_added_field_id_mismatch(&columns, 10), expected, "{case}");
+        }
+    }
+
+    /// `logs`, `spans`, `events`, and `metrics` end in a required column today, so `create_tables`
+    /// cannot show that appending works for them; the next release's column must not be the first to
+    /// find out.
+    #[tokio::test]
+    async fn add_missing_columns_appends_an_optional_column_to_every_table_definition() {
+        use iceberg::spec::{PrimitiveType, Schema, Type};
+        use icegate_common::catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle};
+        use tokio_util::sync::CancellationToken;
+
+        const COMMITTED_OFFSET: &str = "42";
+        const OTHER_PROPERTY: &str = "test.other-property";
+        const ADDED_COLUMN: &str = "next_release_column";
+
+        let catalog = CatalogBuilder::from_config(
+            &CatalogConfig {
+                backend: CatalogBackend::Memory,
+                warehouse: format!("memory://migrate-operations-{}", uuid::Uuid::new_v4()),
+                properties: HashMap::new(),
+                cache: None,
+            },
+            &IoHandle::noop(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("memory catalog");
+        let namespace = NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("create namespace");
+
         let definitions = build_table_definitions().expect("build table definitions");
-        for def in &definitions {
-            assert_eq!(def.adds_columns_in_place, def.name == PRICES_TABLE, "{}", def.name);
+        assert_eq!(definitions.len(), 6);
+        for def in definitions {
+            create_table(catalog.as_ref(), &namespace, &def, &SnapshotExpirationConfig::default())
+                .await
+                .expect("create table");
+            let ident = TableIdent::new(namespace.clone(), def.name.to_string());
+            let table = catalog.load_table(&ident).await.expect("load table");
+            let property = if def.name == PRICES_TABLE {
+                OTHER_PROPERTY
+            } else {
+                WAL_OFFSET_PROPERTY
+            };
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .fast_append()
+                .set_snapshot_properties(HashMap::from([(property.to_string(), COMMITTED_OFFSET.to_string())]))
+                .apply(tx)
+                .expect("snapshot applies");
+            let before = tx.commit(catalog.as_ref()).await.expect("snapshot commits");
+            let snapshots_before = before.metadata().snapshots().count();
+            let added_id = before.metadata().last_column_id() + 1;
+            // Built on the table's schema, not the definition's: the memory catalog renumbers fields
+            // on `create_table`, so the definition's ids would collide with `added_id`.
+            let current_fields = before.metadata().current_schema().as_struct().fields();
+            let wider_definition = TableDefinition {
+                name: def.name,
+                schema: Schema::builder()
+                    .with_fields(current_fields.iter().cloned().chain([Arc::new(NestedField::optional(
+                        added_id,
+                        ADDED_COLUMN,
+                        Type::Primitive(PrimitiveType::String),
+                    ))]))
+                    .build()
+                    .expect("wider schema builds"),
+                partition_spec: def.partition_spec.clone(),
+                sort_order: def.sort_order.clone(),
+                carries_wal_offset: def.carries_wal_offset,
+            };
+
+            let result = add_missing_columns(catalog.as_ref(), &wider_definition, &before, false)
+                .await
+                .expect("add columns");
+
+            assert_eq!(result, ColumnAddition::ColumnsAdded, "{}", def.name);
+            let after = catalog.load_table(&ident).await.expect("load table");
+            let metadata = after.metadata();
+            assert_eq!(metadata.uuid(), before.metadata().uuid(), "{}", def.name);
+            let added = metadata
+                .current_schema()
+                .field_by_name(ADDED_COLUMN)
+                .unwrap_or_else(|| panic!("{} must gain the column", def.name));
+            assert!(!added.required, "{}", def.name);
+            assert_eq!(added.id, added_id, "{}", def.name);
+            assert_eq!(metadata.snapshots().count(), snapshots_before + 1, "{}", def.name);
+            let current = metadata.current_snapshot().expect("current snapshot");
+            assert_eq!(current.schema_id(), Some(metadata.current_schema_id()), "{}", def.name);
+            let expected_offset = (def.name != PRICES_TABLE).then(|| COMMITTED_OFFSET.to_string());
+            assert_eq!(
+                current.summary().additional_properties.get(WAL_OFFSET_PROPERTY),
+                expected_offset.as_ref(),
+                "{}",
+                def.name
+            );
         }
     }
 }

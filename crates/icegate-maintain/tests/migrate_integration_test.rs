@@ -13,26 +13,41 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use arrow::array::{
+    Array, ArrayRef, FixedSizeBinaryArray, Int64Array, StringArray, TimestampMicrosecondArray, new_null_array,
+};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::record_batch::RecordBatch;
+use arrow::row::{OwnedRow, RowConverter, SortField};
+use async_trait::async_trait;
 use chrono::DateTime;
-use futures::StreamExt;
-use iceberg::spec::Schema;
+use futures::{StreamExt, TryStreamExt};
+use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::{Catalog, NamespaceIdent, TableCreation};
+use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
+use iceberg::{Catalog, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent};
 use icegate_common::{
-    CancellationToken, ICEGATE_NAMESPACE, LOGS_TABLE, PRICES_TABLE,
+    CancellationToken, EVENTS_TABLE, ICEGATE_NAMESPACE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, PRICES_TABLE,
+    SPANS_TABLE, WAL_OFFSET_PROPERTY,
     catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle},
     iceberg_write::{WriteConfig, write_record_batches_to_parquet},
-    icegate_table_ident,
-    schema::{COL_MAX_WEEK_MINUTE, COL_MIN_WEEK_MINUTE, prices_schema},
+    icegate_table_ident, resolve_committed_offset,
+    schema::{
+        COL_BODY, COL_KIND, COL_MAX_WEEK_MINUTE, COL_MIN_WEEK_MINUTE, events_schema, logs_schema, metrics_schema,
+        operations_schema, prices_schema, spans_schema,
+    },
     testing::{S3TestContainer, create_s3_bucket},
 };
+use icegate_maintain::error::MaintainError;
 use icegate_maintain::migrate::config::SnapshotExpirationConfig;
 use icegate_maintain::migrate::operations::{MigrationOperation, create_tables, upgrade_schemas};
 use icegate_maintain::pricing::read::read_live_rates;
 use icegate_maintain::pricing::source::{RateObservation, ValidFromSource};
 use icegate_maintain::pricing::writer::{append_prices, build_price_batch};
+use uuid::Uuid;
 
 /// Object-storage bucket used as the Iceberg warehouse root for the catalog under test.
 const BUCKET_NAME: &str = "warehouse";
@@ -546,4 +561,825 @@ async fn create_stamps_the_evolved_schema_on_a_prices_table_with_no_snapshot() {
         read_live_rates(&catalog).await.expect("evolved table reads").is_empty(),
         "the stamp adds no rows"
     );
+}
+
+/// Every table the schema module defines, with its code schema.
+fn code_schemas() -> Vec<(&'static str, Schema)> {
+    vec![
+        (LOGS_TABLE, logs_schema().expect("logs schema")),
+        (SPANS_TABLE, spans_schema().expect("spans schema")),
+        (EVENTS_TABLE, events_schema().expect("events schema")),
+        (METRICS_TABLE, metrics_schema().expect("metrics schema")),
+        (OPERATIONS_TABLE, operations_schema().expect("operations schema")),
+        (PRICES_TABLE, prices_schema().expect("prices schema")),
+    ]
+}
+
+/// `schema` without its trailing run of optional top-level columns: the layout of a table created
+/// before those columns were added. Returns the layout and the names of the columns it drops.
+fn schema_before_trailing_optional_columns(schema: &Schema) -> (Schema, Vec<String>) {
+    let fields = schema.as_struct().fields();
+    let kept_len = fields.iter().rposition(|field| field.required).map_or(0, |index| index + 1);
+    let (kept, dropped) = fields.split_at(kept_len);
+    let previous = Schema::builder()
+        .with_fields(kept.iter().cloned())
+        .build()
+        .expect("previous schema builds");
+    (previous, dropped.iter().map(|field| field.name.clone()).collect())
+}
+
+/// Commit to `table` one snapshot holding `rows`, if any, and recording `offset` as the committed
+/// WAL offset, as a Shifter commit leaves it.
+async fn commit_fixture_snapshot(catalog: &Arc<dyn Catalog>, table: &Table, rows: Option<RecordBatch>, offset: u64) {
+    let data_files = match rows {
+        Some(batch) => {
+            let write_config = WriteConfig {
+                row_group_size: 1_000,
+                data_page_size_limit_bytes: 1024 * 1024,
+                max_file_size_bytes: 16 * 1024 * 1024,
+                bloom_filter_columns: &[],
+                column_encodings: &[],
+            };
+            write_record_batches_to_parquet(
+                table.clone(),
+                write_config,
+                futures::stream::once(async { Ok(batch) }).boxed(),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("fixture rows written")
+            .data_files
+        }
+        None => Vec::new(),
+    };
+    let tx = Transaction::new(table);
+    tx.fast_append()
+        .set_snapshot_properties(HashMap::from([(WAL_OFFSET_PROPERTY.to_string(), offset.to_string())]))
+        .add_data_files(data_files)
+        .apply(tx)
+        .expect("fixture snapshot applies")
+        .commit(catalog.as_ref())
+        .await
+        .expect("fixture snapshot commits");
+}
+
+/// Two rows in `schema`, distinct in every required column; optional columns are NULL.
+fn two_distinct_rows(schema: &SchemaRef) -> RecordBatch {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| -> ArrayRef {
+            if field.is_nullable() {
+                return new_null_array(field.data_type(), 2);
+            }
+            match field.data_type() {
+                DataType::Utf8 => Arc::new(StringArray::from(vec![
+                    format!("{}-0", field.name()),
+                    format!("{}-1", field.name()),
+                ])),
+                DataType::Int64 => Arc::new(Int64Array::from(vec![0, 1])),
+                DataType::Timestamp(TimeUnit::Microsecond, timezone) => Arc::new(
+                    TimestampMicrosecondArray::from(vec![1_700_000_000_000_000, 1_700_000_000_000_001])
+                        .with_timezone_opt(timezone.clone()),
+                ),
+                DataType::FixedSizeBinary(width) => {
+                    let width = usize::try_from(*width).expect("a fixed-size width is non-negative");
+                    Arc::new(
+                        FixedSizeBinaryArray::try_from_iter((0..2u8).map(|row| vec![row; width]))
+                            .expect("fixed-size binary column builds"),
+                    )
+                }
+                other => panic!("no fixture value for required column {} of type {other}", field.name()),
+            }
+        })
+        .collect();
+    RecordBatch::try_new(Arc::clone(schema), columns).expect("fixture rows build")
+}
+
+/// The rows of `batches` over `columns`, in a canonical order.
+fn canonical_rows(converter: &RowConverter, batches: &[RecordBatch], columns: &[String]) -> Vec<OwnedRow> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let arrays: Vec<ArrayRef> = columns
+            .iter()
+            .map(|column| Arc::clone(batch.column_by_name(column).expect("column is read")))
+            .collect();
+        let batch_rows = converter.convert_columns(&arrays).expect("rows convert");
+        rows.extend(batch_rows.iter().map(|row| row.owned()));
+    }
+    rows.sort();
+    rows
+}
+
+/// Every row of `table`'s current snapshot.
+async fn scan_rows(table: &Table) -> Vec<RecordBatch> {
+    table
+        .scan()
+        .select_all()
+        .build()
+        .expect("scan builds")
+        .to_arrow()
+        .await
+        .expect("scan opens")
+        .try_collect()
+        .await
+        .expect("scan reads")
+}
+
+/// Create `name` in the IceGate namespace with `schema`.
+async fn create_table_with_schema(catalog: &Arc<dyn Catalog>, name: &str, schema: Schema) -> Table {
+    catalog
+        .create_table(
+            &NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()),
+            TableCreation::builder().name(name.to_string()).schema(schema).build(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("create {name}: {error}"))
+}
+
+/// `migrate create` brings every existing table to the code's schema in place: a table that
+/// lacks trailing optional columns of the code gains them without being re-created, keeps every
+/// row it held, and reads the new columns of those rows as NULL; the snapshot that stamps the
+/// evolved schema keeps the committed WAL offset, so a reader resolving it from the current
+/// snapshot still finds it. A table already on the code's schema is left alone, and a second run
+/// changes nothing.
+#[tokio::test]
+async fn create_appends_the_trailing_optional_columns_of_the_code_and_leaves_other_tables_alone() {
+    const COMMITTED_OFFSET: u64 = 42;
+    let (_store, config) = setup_containers().await;
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
+        .await
+        .expect("Failed to create catalog");
+    catalog
+        .create_namespace(&NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), HashMap::new())
+        .await
+        .expect("namespace created");
+
+    let mut cases = Vec::new();
+    // The rows each evolved table held before the migration, with its columns at that time.
+    let mut rows_before = Vec::new();
+    for (name, code_schema) in code_schemas() {
+        let (previous, added) = schema_before_trailing_optional_columns(&code_schema);
+        let table = create_table_with_schema(&catalog, name, previous).await;
+        let rows = (!added.is_empty()).then(|| {
+            let arrow_schema =
+                Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).expect("previous arrow schema"));
+            if name == PRICES_TABLE {
+                let other = RateObservation {
+                    model: "other-model".to_string(),
+                    ..price_row()
+                };
+                build_price_batch(&[price_row(), other])
+                    .expect("prices batch builds")
+                    .project(&(0..arrow_schema.fields().len()).collect::<Vec<_>>())
+                    .expect("previous columns are a prefix")
+            } else {
+                two_distinct_rows(&arrow_schema)
+            }
+        });
+        if let Some(batch) = &rows {
+            rows_before.push((name, batch.clone()));
+        }
+        commit_fixture_snapshot(&catalog, &table, rows, COMMITTED_OFFSET).await;
+        let table = catalog.load_table(&icegate_table_ident(name)).await.expect("load table");
+        cases.push((
+            name,
+            added,
+            table.metadata().uuid(),
+            table.metadata().snapshots().count(),
+            code_schema,
+        ));
+    }
+    // `prices` is the one table whose snapshots carry no WAL offset, so the offset check below
+    // covers an evolved table only when another table evolves too.
+    assert!(
+        cases.iter().any(|(name, added, ..)| *name != PRICES_TABLE && !added.is_empty()),
+        "the fixture must evolve a table that carries the WAL offset: {:?}",
+        cases.iter().map(|(name, added, ..)| (name, added.len())).collect::<Vec<_>>()
+    );
+
+    let ops = create_tables(&catalog, &SnapshotExpirationConfig::default(), false)
+        .await
+        .expect("create evolves the existing tables");
+
+    for (name, expected) in &rows_before {
+        let table = catalog.load_table(&icegate_table_ident(name)).await.expect("load table");
+        let rows_after = scan_rows(&table).await;
+        let kept_columns: Vec<String> = expected.schema().fields().iter().map(|field| field.name().clone()).collect();
+        let converter = RowConverter::new(
+            expected
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| SortField::new(field.data_type().clone()))
+                .collect(),
+        )
+        .expect("row converter builds");
+        assert_eq!(
+            canonical_rows(&converter, &rows_after, &kept_columns),
+            canonical_rows(&converter, std::slice::from_ref(expected), &kept_columns),
+            "{name}: every row survives the migration unchanged"
+        );
+        let (_, added, ..) = cases.iter().find(|(case, ..)| case == name).expect("case of the table");
+        for batch in &rows_after {
+            for column in added {
+                let values = batch.column_by_name(column).expect("added column is read");
+                assert_eq!(values.null_count(), batch.num_rows(), "{name}.{column} reads as NULL");
+            }
+        }
+    }
+
+    for (name, added, uuid, snapshot_count, code_schema) in &cases {
+        let is_upgraded = ops
+            .iter()
+            .any(|op| matches!(op, MigrationOperation::Upgrade { table_name } if table_name == name));
+        assert_eq!(is_upgraded, !added.is_empty(), "{name}: upgrade reported");
+        let table = catalog.load_table(&icegate_table_ident(name)).await.expect("load table");
+        let metadata = table.metadata();
+        assert_eq!(metadata.uuid(), *uuid, "{name} must be evolved, not re-created");
+        for column in added {
+            assert!(
+                metadata
+                    .current_schema()
+                    .field_by_name(column)
+                    .is_some_and(|field| !field.required),
+                "{name} must gain the optional column {column}"
+            );
+        }
+        // The WAL and the Shifter tag Arrow data with the schema module's field ids, nested ones
+        // included, so the evolved table must carry exactly those ids.
+        assert_eq!(
+            schema_to_arrow_schema(metadata.current_schema()).expect("evolved arrow schema"),
+            schema_to_arrow_schema(code_schema).expect("code arrow schema"),
+            "{name}: the evolved table must carry the schema module's field ids"
+        );
+        let expected_snapshots = snapshot_count + usize::from(!added.is_empty());
+        assert_eq!(metadata.snapshots().count(), expected_snapshots, "{name}: snapshots");
+        let current = metadata.current_snapshot().expect("current snapshot");
+        assert_eq!(current.schema_id(), Some(metadata.current_schema_id()), "{name}");
+        assert_eq!(
+            current.summary().additional_properties.get(WAL_OFFSET_PROPERTY),
+            Some(&COMMITTED_OFFSET.to_string()),
+            "{name}: the current snapshot must carry the committed WAL offset"
+        );
+        assert_eq!(
+            resolve_committed_offset(metadata).expect("offset resolves"),
+            Some(COMMITTED_OFFSET),
+            "{name}"
+        );
+    }
+    assert!(
+        !ops.iter().any(|op| matches!(op, MigrationOperation::Create { .. })),
+        "every table already exists: {ops:?}"
+    );
+
+    let again = create_tables(&catalog, &SnapshotExpirationConfig::default(), false)
+        .await
+        .expect("second create runs");
+    assert!(again.is_empty(), "nothing left to evolve: {again:?}");
+    for (name, added, _, snapshot_count, _) in &cases {
+        let table = catalog.load_table(&icegate_table_ident(name)).await.expect("load table");
+        let expected_snapshots = snapshot_count + usize::from(!added.is_empty());
+        assert_eq!(
+            table.metadata().snapshots().count(),
+            expected_snapshots,
+            "{name}: a second run adds no snapshot"
+        );
+    }
+}
+
+/// Catalog on which a Shifter commit lands right after the first load of `table`, so the caller
+/// holds a table that is already stale when it starts its own transaction.
+#[derive(Debug)]
+struct CatalogWithConcurrentShiftCommit {
+    inner: Arc<dyn Catalog>,
+    table: TableIdent,
+    shift_offset: u64,
+    is_shift_committed: AtomicBool,
+}
+
+#[async_trait]
+impl Catalog for CatalogWithConcurrentShiftCommit {
+    async fn list_namespaces(&self, parent: Option<&NamespaceIdent>) -> iceberg::Result<Vec<NamespaceIdent>> {
+        self.inner.list_namespaces(parent).await
+    }
+
+    async fn create_namespace(
+        &self,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
+    ) -> iceberg::Result<Namespace> {
+        self.inner.create_namespace(namespace, properties).await
+    }
+
+    async fn get_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<Namespace> {
+        self.inner.get_namespace(namespace).await
+    }
+
+    async fn namespace_exists(&self, namespace: &NamespaceIdent) -> iceberg::Result<bool> {
+        self.inner.namespace_exists(namespace).await
+    }
+
+    async fn update_namespace(
+        &self,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
+    ) -> iceberg::Result<()> {
+        self.inner.update_namespace(namespace, properties).await
+    }
+
+    async fn drop_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<()> {
+        self.inner.drop_namespace(namespace).await
+    }
+
+    async fn list_tables(&self, namespace: &NamespaceIdent) -> iceberg::Result<Vec<TableIdent>> {
+        self.inner.list_tables(namespace).await
+    }
+
+    async fn create_table(&self, namespace: &NamespaceIdent, creation: TableCreation) -> iceberg::Result<Table> {
+        self.inner.create_table(namespace, creation).await
+    }
+
+    async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
+        let loaded = self.inner.load_table(table).await?;
+        if *table == self.table && !self.is_shift_committed.swap(true, Ordering::SeqCst) {
+            commit_fixture_snapshot(&self.inner, &loaded, None, self.shift_offset).await;
+        }
+        Ok(loaded)
+    }
+
+    async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+        self.inner.drop_table(table).await
+    }
+
+    async fn purge_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+        self.inner.purge_table(table).await
+    }
+
+    async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
+        self.inner.table_exists(table).await
+    }
+
+    async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
+        self.inner.rename_table(src, dest).await
+    }
+
+    async fn register_table(&self, table: &TableIdent, metadata_location: String) -> iceberg::Result<Table> {
+        self.inner.register_table(table, metadata_location).await
+    }
+
+    async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
+        self.inner.update_table(commit).await
+    }
+}
+
+/// A Shifter commit landing while the migration holds a stale table must not lose its offset: the
+/// stamp inherits from the base the commit lands on. A stamp carrying the older offset would make
+/// the Shifter resume behind what is already committed and re-commit that part of the WAL.
+#[tokio::test]
+async fn create_stamps_the_offset_of_a_shift_commit_that_lands_during_the_migration() {
+    const OFFSET_BEFORE_MIGRATION: u64 = 42;
+    const OFFSET_OF_CONCURRENT_SHIFT: u64 = 43;
+    let (_store, config) = setup_containers().await;
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
+        .await
+        .expect("Failed to create catalog");
+    catalog
+        .create_namespace(&NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), HashMap::new())
+        .await
+        .expect("namespace created");
+    let (previous, added) = schema_before_trailing_optional_columns(&operations_schema().expect("operations schema"));
+    assert!(!added.is_empty(), "the fixture must evolve the table");
+    let table = create_table_with_schema(&catalog, OPERATIONS_TABLE, previous).await;
+    commit_fixture_snapshot(&catalog, &table, None, OFFSET_BEFORE_MIGRATION).await;
+    let ident = icegate_table_ident(OPERATIONS_TABLE);
+    let before = catalog.load_table(&ident).await.expect("load table");
+    let racing_catalog: Arc<dyn Catalog> = Arc::new(CatalogWithConcurrentShiftCommit {
+        inner: Arc::clone(&catalog),
+        table: ident.clone(),
+        shift_offset: OFFSET_OF_CONCURRENT_SHIFT,
+        is_shift_committed: AtomicBool::new(false),
+    });
+
+    create_tables(&racing_catalog, &SnapshotExpirationConfig::default(), false)
+        .await
+        .expect("create evolves the table");
+
+    let after = catalog.load_table(&ident).await.expect("load table");
+    let metadata = after.metadata();
+    assert_eq!(
+        metadata.uuid(),
+        before.metadata().uuid(),
+        "the table must not be re-created"
+    );
+    for column in &added {
+        assert!(metadata.current_schema().field_by_name(column).is_some(), "{column}");
+    }
+    assert_eq!(
+        metadata.snapshots().count(),
+        before.metadata().snapshots().count() + 2,
+        "the racing shift commit and the stamp"
+    );
+    let current = metadata.current_snapshot().expect("current snapshot");
+    assert_eq!(current.schema_id(), Some(metadata.current_schema_id()));
+    assert_eq!(
+        current.summary().additional_properties.get(WAL_OFFSET_PROPERTY),
+        Some(&OFFSET_OF_CONCURRENT_SHIFT.to_string())
+    );
+    assert_eq!(
+        resolve_committed_offset(metadata).expect("offset resolves"),
+        Some(OFFSET_OF_CONCURRENT_SHIFT)
+    );
+}
+
+/// A table the Shifter writes, migrated before its first shift, gains its columns and stays
+/// snapshot-less: a stamp would be its only snapshot, without a WAL offset, and resolving the
+/// committed offset would then refuse the table instead of starting the WAL from its beginning.
+#[tokio::test]
+async fn create_adds_columns_to_a_shifter_table_with_no_snapshot_without_a_snapshot() {
+    let (_store, config) = setup_containers().await;
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
+        .await
+        .expect("Failed to create catalog");
+    catalog
+        .create_namespace(&NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), HashMap::new())
+        .await
+        .expect("namespace created");
+
+    let mut cases = Vec::new();
+    for (name, code_schema) in code_schemas() {
+        if name == PRICES_TABLE {
+            continue;
+        }
+        let (previous, added) = schema_before_trailing_optional_columns(&code_schema);
+        create_table_with_schema(&catalog, name, previous).await;
+        cases.push((name, added));
+    }
+    assert!(
+        cases.iter().any(|(_, added)| !added.is_empty()),
+        "the fixture must evolve a table that carries the WAL offset"
+    );
+
+    create_tables(&catalog, &SnapshotExpirationConfig::default(), false)
+        .await
+        .expect("create evolves the existing tables");
+
+    for (name, added) in &cases {
+        let table = catalog.load_table(&icegate_table_ident(name)).await.expect("load table");
+        let metadata = table.metadata();
+        for column in added {
+            assert!(
+                metadata.current_schema().field_by_name(column).is_some(),
+                "{name} must gain the column {column}"
+            );
+        }
+        assert!(
+            metadata.current_snapshot().is_none(),
+            "{name}: no snapshot is committed"
+        );
+        assert_eq!(
+            resolve_committed_offset(metadata).expect("the offset of a table with no snapshot resolves"),
+            None,
+            "{name}: the Shifter starts the WAL from its beginning"
+        );
+    }
+}
+
+/// A column whose field ids in the schema module are not the ids the table assigns it is refused
+/// before anything is committed. Here the table's last column id is past the schema module's
+/// because a column was added and dropped before, so the table would give the appended columns
+/// other ids than the WAL tags its data with. The refusal waits for the whole pass: every other
+/// table is still created.
+#[tokio::test]
+async fn create_refuses_a_column_whose_field_ids_the_table_would_assign_differently() {
+    let (_store, config) = setup_containers().await;
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
+        .await
+        .expect("Failed to create catalog");
+    catalog
+        .create_namespace(&NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), HashMap::new())
+        .await
+        .expect("namespace created");
+    let (previous, added) = schema_before_trailing_optional_columns(&operations_schema().expect("operations schema"));
+    let first_added = added.first().expect("operations ends with optional columns").clone();
+    let table = create_table_with_schema(&catalog, OPERATIONS_TABLE, previous).await;
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_schema()
+        .add_column(AddColumn::optional(
+            "retired_column",
+            Type::Primitive(PrimitiveType::String),
+        ))
+        .apply(tx)
+        .expect("addition applies");
+    let table = tx.commit(catalog.as_ref()).await.expect("addition commits");
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_schema()
+        .delete_column("retired_column")
+        .apply(tx)
+        .expect("deletion applies");
+    let before = tx.commit(catalog.as_ref()).await.expect("deletion commits");
+
+    let result = create_tables(&catalog, &SnapshotExpirationConfig::default(), false).await;
+
+    assert!(
+        matches!(&result, Err(MaintainError::Migration(message)) if message.contains(&first_added)),
+        "got {result:?}"
+    );
+    let after = catalog
+        .load_table(&icegate_table_ident(OPERATIONS_TABLE))
+        .await
+        .expect("load table");
+    assert_eq!(
+        after.metadata_location(),
+        before.metadata_location(),
+        "operations must not change"
+    );
+    for name in [LOGS_TABLE, SPANS_TABLE, EVENTS_TABLE, METRICS_TABLE, PRICES_TABLE] {
+        assert!(
+            catalog.table_exists(&icegate_table_ident(name)).await.expect("table_exists"),
+            "{name} must be created despite the refused table"
+        );
+    }
+}
+
+/// `schema` with its optional top-level column `column` retyped to `Long`.
+fn schema_with_retyped_column(schema: &Schema, column: &str) -> Schema {
+    let fields = schema.as_struct().fields().iter().map(|field| {
+        if field.name == column {
+            assert!(!field.required, "the fixture retypes an optional column");
+            Arc::new(NestedField::optional(
+                field.id,
+                field.name.clone(),
+                Type::Primitive(PrimitiveType::Long),
+            ))
+        } else {
+            Arc::clone(field)
+        }
+    });
+    Schema::builder().with_fields(fields).build().expect("retyped schema builds")
+}
+
+/// A drift other than trailing optional columns cannot be applied in place, so `migrate create`
+/// refuses it with a migration error and leaves those tables as they were. The refusal waits for
+/// the whole pass: the tables after the first incompatible one are still created.
+#[tokio::test]
+async fn create_refuses_drift_that_is_not_a_trailing_optional_column() {
+    let (_store, config) = setup_containers().await;
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
+        .await
+        .expect("Failed to create catalog");
+    catalog
+        .create_namespace(&NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), HashMap::new())
+        .await
+        .expect("namespace created");
+    let logs = create_table_with_schema(
+        &catalog,
+        LOGS_TABLE,
+        schema_with_retyped_column(&logs_schema().expect("logs schema"), COL_BODY),
+    )
+    .await;
+    let spans = create_table_with_schema(
+        &catalog,
+        SPANS_TABLE,
+        schema_with_retyped_column(&spans_schema().expect("spans schema"), COL_KIND),
+    )
+    .await;
+
+    let result = create_tables(&catalog, &SnapshotExpirationConfig::default(), false).await;
+
+    assert!(matches!(result, Err(MaintainError::Migration(_))), "got {result:?}");
+    for (name, before) in [(LOGS_TABLE, &logs), (SPANS_TABLE, &spans)] {
+        let after = catalog.load_table(&icegate_table_ident(name)).await.expect("load table");
+        assert_eq!(
+            after.metadata_location(),
+            before.metadata_location(),
+            "{name} must not change"
+        );
+    }
+    for name in [EVENTS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, PRICES_TABLE] {
+        assert!(
+            catalog.table_exists(&icegate_table_ident(name)).await.expect("table_exists"),
+            "{name} must be created despite the incompatible tables"
+        );
+    }
+}
+
+/// A memory catalog: these tests decide what a pass over the tables does, and the commits it makes
+/// reach real storage in the tests above. The namespace is left to the caller.
+async fn memory_catalog() -> Arc<dyn Catalog> {
+    let config = CatalogConfig {
+        backend: CatalogBackend::Memory,
+        warehouse: format!("memory://migrate-{}", Uuid::new_v4()),
+        properties: HashMap::new(),
+        cache: None,
+    };
+    CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
+        .await
+        .expect("memory catalog")
+}
+
+/// [`memory_catalog`] with the IceGate namespace and an `operations` table lacking its trailing
+/// optional columns. Returns the table and the names of those columns.
+async fn catalog_with_previous_operations() -> (Arc<dyn Catalog>, Table, Vec<String>) {
+    let catalog = memory_catalog().await;
+    catalog
+        .create_namespace(&NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), HashMap::new())
+        .await
+        .expect("namespace created");
+    let (previous, added) = schema_before_trailing_optional_columns(&operations_schema().expect("operations schema"));
+    assert!(!added.is_empty(), "the fixture must leave columns to append");
+    let operations = create_table_with_schema(&catalog, OPERATIONS_TABLE, previous).await;
+    (catalog, operations, added)
+}
+
+/// Create `logs` with a column of another type, a drift appending cannot resolve.
+async fn create_retyped_logs(catalog: &Arc<dyn Catalog>) -> Table {
+    create_table_with_schema(
+        catalog,
+        LOGS_TABLE,
+        schema_with_retyped_column(&logs_schema().expect("logs schema"), COL_BODY),
+    )
+    .await
+}
+
+/// Assert `before` is still the current version of its table.
+async fn assert_table_unchanged(catalog: &Arc<dyn Catalog>, before: &Table) {
+    let after = catalog.load_table(before.identifier()).await.expect("load table");
+    assert_eq!(
+        after.metadata_location(),
+        before.metadata_location(),
+        "{} must not change",
+        before.identifier().name()
+    );
+}
+
+fn is_upgrade_of(op: &MigrationOperation, table: &str) -> bool {
+    matches!(op, MigrationOperation::Upgrade { table_name } if table_name == table)
+}
+
+/// A dry run reports the columns `migrate create` would append and commits nothing, and it leaves
+/// the columns absent, so an operator's preview cannot be what migrates the table.
+#[tokio::test]
+async fn dry_run_create_reports_the_columns_it_would_append_and_leaves_the_table_unchanged() {
+    let (catalog, operations, added) = catalog_with_previous_operations().await;
+
+    let ops = create_tables(&catalog, &SnapshotExpirationConfig::default(), true)
+        .await
+        .expect("dry run");
+
+    assert!(ops.iter().any(|op| is_upgrade_of(op, OPERATIONS_TABLE)), "got {ops:?}");
+    assert_table_unchanged(&catalog, &operations).await;
+    let after = catalog.load_table(operations.identifier()).await.expect("load table");
+    for column in &added {
+        assert!(
+            after.metadata().current_schema().field_by_name(column).is_none(),
+            "{column}"
+        );
+    }
+}
+
+/// A dry run of `migrate create` refuses the drift the real run would refuse, touching no table.
+#[tokio::test]
+async fn dry_run_create_refuses_unresolvable_drift_and_leaves_the_tables_unchanged() {
+    let (catalog, operations, _) = catalog_with_previous_operations().await;
+    let logs = create_retyped_logs(&catalog).await;
+
+    let result = create_tables(&catalog, &SnapshotExpirationConfig::default(), true).await;
+
+    assert!(matches!(result, Err(MaintainError::Migration(_))), "got {result:?}");
+    assert_table_unchanged(&catalog, &operations).await;
+    assert_table_unchanged(&catalog, &logs).await;
+}
+
+/// Unlike `migrate create`, a dry run of `migrate upgrade` previews every mismatched table as an
+/// upgrade instead of failing, whether or not appending would resolve it.
+#[tokio::test]
+async fn dry_run_upgrade_previews_every_mismatched_table_and_leaves_them_unchanged() {
+    let (catalog, operations, _) = catalog_with_previous_operations().await;
+    let logs = create_retyped_logs(&catalog).await;
+
+    let ops = upgrade_schemas(&catalog, true).await.expect("dry run");
+
+    assert_eq!(ops.len(), 2, "got {ops:?}");
+    assert!(ops.iter().any(|op| is_upgrade_of(op, OPERATIONS_TABLE)), "got {ops:?}");
+    assert!(ops.iter().any(|op| is_upgrade_of(op, LOGS_TABLE)), "got {ops:?}");
+    assert_table_unchanged(&catalog, &operations).await;
+    assert_table_unchanged(&catalog, &logs).await;
+}
+
+#[tokio::test]
+async fn upgrade_appends_the_trailing_optional_columns_in_place() {
+    let (catalog, operations, added) = catalog_with_previous_operations().await;
+
+    let ops = upgrade_schemas(&catalog, false).await.expect("upgrade");
+
+    assert_eq!(ops.len(), 1, "got {ops:?}");
+    assert!(is_upgrade_of(&ops[0], OPERATIONS_TABLE), "got {ops:?}");
+    let after = catalog.load_table(operations.identifier()).await.expect("load table");
+    assert_eq!(
+        after.metadata().uuid(),
+        operations.metadata().uuid(),
+        "the table must not be re-created"
+    );
+    for column in &added {
+        assert!(
+            after.metadata().current_schema().field_by_name(column).is_some(),
+            "{column}"
+        );
+    }
+}
+
+/// `migrate upgrade` still evolves what it can before refusing the rest, and unlike `migrate create`
+/// it never creates a missing table.
+#[tokio::test]
+async fn upgrade_evolves_what_it_can_refuses_the_rest_and_creates_nothing() {
+    let (catalog, operations, added) = catalog_with_previous_operations().await;
+    let logs = create_retyped_logs(&catalog).await;
+
+    let result = upgrade_schemas(&catalog, false).await;
+
+    assert!(matches!(result, Err(MaintainError::Migration(_))), "got {result:?}");
+    let after = catalog.load_table(operations.identifier()).await.expect("load table");
+    for column in &added {
+        assert!(
+            after.metadata().current_schema().field_by_name(column).is_some(),
+            "{column}"
+        );
+    }
+    assert_table_unchanged(&catalog, &logs).await;
+    assert!(
+        !catalog
+            .table_exists(&icegate_table_ident(SPANS_TABLE))
+            .await
+            .expect("table_exists"),
+        "a missing table is left to `migrate create`"
+    );
+}
+
+/// A batch carrying columns the table lacks is refused, never projected onto the table: dropping
+/// them would lose rate data without anyone noticing.
+#[tokio::test]
+async fn append_prices_refuses_a_batch_with_a_column_the_table_lacks() {
+    let catalog = memory_catalog().await;
+    let (table, _) = create_previous_prices_table(&catalog).await;
+
+    let result = append_prices(&catalog, &[price_row()]).await;
+
+    assert!(matches!(result, Err(MaintainError::Storage(_))), "got {result:?}");
+    let after = catalog.load_table(table.identifier()).await.expect("load prices");
+    assert!(after.metadata().current_snapshot().is_none(), "nothing is committed");
+}
+
+/// The pricing writer brings its batch to the table's schema: once a newer release has appended
+/// an optional column to `prices`, a crawl with this binary still appends, and its rows read the
+/// column this binary does not know as NULL.
+#[tokio::test]
+async fn append_prices_fills_a_column_the_code_lacks_with_null() {
+    const EXTRA_COLUMN: &str = "added_by_a_newer_release";
+    let (_store, config) = setup_containers().await;
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
+        .await
+        .expect("Failed to create catalog");
+    catalog
+        .create_namespace(&NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), HashMap::new())
+        .await
+        .expect("namespace created");
+    let code_schema = prices_schema().expect("prices schema");
+    let next_id = code_schema.highest_field_id() + 1;
+    let wider = Schema::builder()
+        .with_fields(
+            code_schema
+                .as_struct()
+                .fields()
+                .iter()
+                .cloned()
+                .chain([Arc::new(NestedField::optional(
+                    next_id,
+                    EXTRA_COLUMN,
+                    Type::Primitive(PrimitiveType::String),
+                ))]),
+        )
+        .build()
+        .expect("wider prices schema builds");
+    create_table_with_schema(&catalog, PRICES_TABLE, wider).await;
+
+    let row = price_row();
+    append_prices(&catalog, std::slice::from_ref(&row))
+        .await
+        .expect("the append into the wider table succeeds");
+
+    let table = catalog
+        .load_table(&icegate_table_ident(PRICES_TABLE))
+        .await
+        .expect("load prices");
+    let batches = scan_rows(&table).await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    for batch in &batches {
+        let extra = batch.column_by_name(EXTRA_COLUMN).expect("the extra column is read");
+        assert_eq!(extra.null_count(), batch.num_rows(), "the extra column is NULL");
+    }
+    let live = read_live_rates(&catalog).await.expect("prices read");
+    assert!(live.get(&row.key()).is_some(), "the appended row is live");
 }

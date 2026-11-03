@@ -6,11 +6,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arrow::record_batch::RecordBatch;
+use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::{
     Catalog, TableIdent,
+    arrow::schema_to_arrow_schema,
     spec::DataFile,
     table::Table,
     transaction::{ApplyTransactionAction, Transaction},
@@ -43,15 +44,33 @@ use crate::error::{IngestError, Result};
 /// Stream of merge-ordered record batches written to Iceberg.
 pub type BoxRecordBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>;
 
+/// The table one write attempt loads once: batches are brought to its schema and
+/// written into it, so the two can never come from different loads.
+pub trait WriteTarget: Send {
+    /// Arrow form of the table's current schema.
+    fn arrow_schema(&self) -> &SchemaRef;
+}
+
 /// Iceberg storage dependency surface for shift executors.
 #[async_trait]
 pub trait Storage: Send + Sync {
+    /// Table a write attempt brings its batches to and writes them into.
+    type Target: WriteTarget;
+
     /// Fetch the last committed offset, if any.
     async fn get_last_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>>;
 
-    /// Write parquet files from record batches without committing.
+    /// Load the table the next write attempt writes into; a cached table is
+    /// served until its TTL expires or [`Self::evict_cached_table`] drops it.
+    async fn load_write_target(&self, cancel_token: &CancellationToken) -> Result<Self::Target>;
+
+    /// Drop the cached table so the next load reads it from the catalog.
+    async fn evict_cached_table(&self);
+
+    /// Write parquet files from record batches into `target` without committing.
     async fn write_record_batches(
         &self,
+        target: Self::Target,
         batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles>;
@@ -121,12 +140,19 @@ impl IcebergStorage {
         }
     }
 
-    async fn load_table(&self, cancel_token: &CancellationToken) -> Result<Table> {
+    /// Load the table the next write attempt writes into; see [`Storage::load_write_target`].
+    pub async fn load_write_target(&self, cancel_token: &CancellationToken) -> Result<CachedTable> {
         self.retry(cancel_token, || self.loader.load_cached()).await
     }
 
+    /// Drop the cached table; see [`Storage::evict_cached_table`].
+    pub async fn evict_cached_table(&self) {
+        self.loader.evict().await;
+    }
+
     async fn load_table_fresh(&self, cancel_token: &CancellationToken) -> Result<Table> {
-        self.retry(cancel_token, || self.loader.load_fresh()).await
+        self.retry(cancel_token, || async { Ok(self.loader.load_fresh().await?.table) })
+            .await
     }
 
     /// Returns the last committed WAL offset from the Iceberg snapshot history.
@@ -159,15 +185,14 @@ impl IcebergStorage {
     /// pipeline (partition split → fanout rolling Parquet writer → orphan
     /// cleanup on failure), which also moves the CPU-heavy Arrow → Parquet
     /// encoding onto a `spawn_blocking` thread so the ingest hot path is not
-    /// starved. This method only loads the (cached) table, assembles the
-    /// [`WriteConfig`] from the storage's per-table tunables, and bridges the
-    /// ingest stream's error type.
+    /// starved. This method only assembles the [`WriteConfig`] from the
+    /// storage's per-table tunables and bridges the ingest stream's error type.
     pub async fn write_record_batches(
         &self,
+        target: CachedTable,
         batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
-        let table = self.load_table(cancel_token).await?;
         let cfg = WriteConfig {
             row_group_size: self.row_group_size,
             data_page_size_limit_bytes: self.data_page_size_limit_bytes,
@@ -182,12 +207,18 @@ impl IcebergStorage {
         // Cancelled/queue-read accounting before calling here), while the common
         // pipeline wants `icegate_common::Error`. The orphan rule and dependency
         // direction forbid a `From<IngestError> for icegate_common::Error` impl,
-        // so map explicitly at the call site.
-        let common_stream = batches.map_err(|e| icegate_common::Error::Write(e.to_string())).boxed();
+        // so map explicitly at the call site. A schema-transition failure keeps
+        // its type so it returns as `IngestError::SchemaTransition`.
+        let common_stream = batches
+            .map_err(|e| match e {
+                IngestError::SchemaTransition(e) => icegate_common::Error::SchemaTransition(e),
+                other => icegate_common::Error::Write(other.to_string()),
+            })
+            .boxed();
 
         // `?` converts the returned `icegate_common::Error` into `IngestError`
         // via the existing `From` impl (write-pipeline messages map to `Shift`).
-        Ok(write_record_batches_to_parquet(table, cfg, common_stream, cancel_token).await?)
+        Ok(write_record_batches_to_parquet(target.table, cfg, common_stream, cancel_token).await?)
     }
 
     /// Commits parquet data files to Iceberg with offset tracking.
@@ -308,16 +339,27 @@ impl IcebergStorage {
 
 #[async_trait]
 impl Storage for IcebergStorage {
+    type Target = CachedTable;
+
     async fn get_last_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>> {
         self.get_last_offset(cancel_token).await
     }
 
+    async fn load_write_target(&self, cancel_token: &CancellationToken) -> Result<CachedTable> {
+        self.load_write_target(cancel_token).await
+    }
+
+    async fn evict_cached_table(&self) {
+        self.evict_cached_table().await;
+    }
+
     async fn write_record_batches(
         &self,
+        target: CachedTable,
         batches: BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> Result<WrittenDataFiles> {
-        self.write_record_batches(batches, cancel_token).await
+        self.write_record_batches(target, batches, cancel_token).await
     }
 
     async fn get_data_files(
@@ -347,9 +389,20 @@ struct TableLoader {
     ttl: Duration,
 }
 
-struct CachedTable {
+/// A table as one catalog read loaded it; the [`WriteTarget`] of [`IcebergStorage`].
+#[derive(Clone)]
+pub struct CachedTable {
     table: Table,
+    /// Arrow form of `table`'s current schema, converted once per catalog read
+    /// rather than once per shift attempt.
+    arrow_schema: SchemaRef,
     loaded_at: Instant,
+}
+
+impl WriteTarget for CachedTable {
+    fn arrow_schema(&self) -> &SchemaRef {
+        &self.arrow_schema
+    }
 }
 
 impl TableLoader {
@@ -366,28 +419,115 @@ impl TableLoader {
         self.catalog.as_ref()
     }
 
-    async fn load_cached(&self) -> Result<Table> {
+    async fn load_cached(&self) -> Result<CachedTable> {
         if let Some(cached) = self.cache.read().await.as_ref()
             && cached.loaded_at.elapsed() <= self.ttl
         {
-            return Ok(cached.table.clone());
+            return Ok(cached.clone());
         }
 
         self.load_fresh().await
     }
 
-    async fn load_fresh(&self) -> Result<Table> {
+    async fn load_fresh(&self) -> Result<CachedTable> {
         let table = self
             .catalog
             .load_table(&self.table_ident)
             .await
             .map_err(|e| IngestError::Shift(format!("failed to load table '{}': {e}", self.table_ident.name())))?;
-
-        *self.cache.write().await = Some(CachedTable {
-            table: table.clone(),
+        let arrow_schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).map_err(|e| {
+            IngestError::Shift(format!(
+                "failed to convert the schema of table '{}' to Arrow: {e}",
+                self.table_ident.name()
+            ))
+        })?);
+        let cached = CachedTable {
+            table,
+            arrow_schema,
             loaded_at: Instant::now(),
-        });
+        };
 
-        Ok(table)
+        *self.cache.write().await = Some(cached.clone());
+
+        Ok(cached)
+    }
+
+    async fn evict(&self) {
+        *self.cache.write().await = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use iceberg::{NamespaceIdent, TableCreation};
+    use icegate_common::{
+        ICEGATE_NAMESPACE, LOGS_TABLE,
+        catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle},
+        schema::{logs_partition_spec, logs_schema, logs_sort_order},
+        schema_transition::SchemaTransitionError,
+    };
+    use uuid::Uuid;
+
+    use super::*;
+
+    /// The Shifter tells a stale cached table from any other write failure by this error's type,
+    /// so the type has to survive the trip through the shared write pipeline and back: as a plain
+    /// message it would come out as a terminal `IngestError::Shift`, and the cache would stay.
+    #[tokio::test]
+    async fn write_record_batches_keeps_the_type_of_a_schema_transition_error_from_the_stream() {
+        let catalog = CatalogBuilder::from_config(
+            &CatalogConfig {
+                backend: CatalogBackend::Memory,
+                warehouse: format!("memory://iceberg-storage-{}", Uuid::new_v4()),
+                properties: HashMap::new(),
+                cache: None,
+            },
+            &IoHandle::noop(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("memory catalog");
+        let namespace = NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("create namespace");
+        let schema = logs_schema().expect("logs schema");
+        let partition_spec = logs_partition_spec(&schema).expect("logs partition spec");
+        let sort_order = logs_sort_order(&schema).expect("logs sort order");
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name(LOGS_TABLE.to_string())
+                    .schema(schema)
+                    .partition_spec(partition_spec.into_unbound())
+                    .sort_order(sort_order)
+                    .build(),
+            )
+            .await
+            .expect("create logs table");
+        let storage = IcebergStorage::new(catalog, LOGS_TABLE, &ShiftConfig::default(), 64 * 1024 * 1024, &[], &[]);
+        let cancel = CancellationToken::new();
+        let target = storage.load_write_target(&cancel).await.expect("load write target");
+        let batches = futures::stream::once(async {
+            Err(IngestError::SchemaTransition(SchemaTransitionError::ColumnNotInTable {
+                column: "extra".to_string(),
+            }))
+        })
+        .boxed();
+
+        let error = storage.write_record_batches(target, batches, &cancel).await.err();
+
+        assert!(
+            matches!(
+                &error,
+                Some(IngestError::SchemaTransition(SchemaTransitionError::ColumnNotInTable { column }))
+                    if column == "extra"
+            ),
+            "got {error:?}"
+        );
     }
 }

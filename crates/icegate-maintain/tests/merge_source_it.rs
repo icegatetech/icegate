@@ -41,9 +41,11 @@ use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use icegate_catalog_s3::S3Catalog;
+use icegate_common::iceberg_write::{WriteConfig, write_record_batches_to_parquet};
 use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats};
 use icegate_common::merge::sort_key::{SortColumnCache, SortColumnsDescriptor};
-use icegate_common::merge::{MergeInput, MergePosition, RowGroupsMerger, SortedBatchMergerConfig};
+use icegate_common::merge::{MergeInput, MergePosition, MergeSource, RowGroupsMerger, SortedBatchMergerConfig};
+use icegate_common::parquet_encoding::{LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS};
 use icegate_common::schema::{
     COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, logs_partition_spec, logs_schema,
     logs_sort_order,
@@ -332,5 +334,69 @@ async fn iceberg_merge_source_interleaves_two_overlapping_sorted_files() {
     assert_eq!(
         actual, expected,
         "merged output must be the globally sorted interleave of both files"
+    );
+}
+
+/// A batch read back from a data file the production write pipeline wrote carries, by value,
+/// the Arrow schema of its table — field-id metadata of nested fields included.
+///
+/// The schema transition in front of the compaction writer passes such a batch through
+/// untouched and rebuilds any other; were the two to differ, every rewrite would take the
+/// rebuild path and a nested column would fail its strict type comparison.
+#[tokio::test]
+async fn a_data_file_batch_carries_the_arrow_schema_of_its_table() {
+    let (_store, conn) = setup_object_store().await;
+    let catalog = build_s3_catalog(&conn);
+    let ident = create_logs_table(&catalog).await;
+    let table = catalog.load_table(&ident).await.unwrap();
+    let table_schema = Arc::new(
+        iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).expect("table arrow schema"),
+    );
+
+    let cancel_token = CancellationToken::new();
+    let batch = logs_batch(&[("svc-a", DAY_MICROS + 10)]);
+    let written = write_record_batches_to_parquet(
+        table,
+        WriteConfig {
+            row_group_size: 1024,
+            data_page_size_limit_bytes: 1024 * 1024,
+            max_file_size_bytes: 1024 * 1024 * 1024,
+            bloom_filter_columns: LOGS_BLOOM_COLUMNS,
+            column_encodings: LOGS_COLUMN_ENCODINGS,
+        },
+        Box::pin(futures::stream::iter([Ok(batch)])),
+        &cancel_token,
+    )
+    .await
+    .expect("write data file");
+    fast_append(&catalog, &ident, written.data_files).await;
+
+    let base = catalog.load_table(&ident).await.unwrap();
+    let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");
+    let stats = list_data_files_with_stats(&base, descriptor)
+        .await
+        .expect("list data files with stats");
+    let [stat] = stats.as_slice() else {
+        panic!("one written data file must be enumerated, got {}", stats.len());
+    };
+    let position = MergePosition::new(0);
+    let source = IcebergMergeSource::new(
+        base.file_io().clone(),
+        HashMap::from([(position, stat.data_file.file_path().to_string())]),
+    );
+    let input = MergeInput::new(position, stat.size_bytes(), stat.boundary_range().clone());
+
+    let batches: Vec<RecordBatch> = source
+        .open(&input, &cancel_token)
+        .await
+        .expect("open data file")
+        .try_collect()
+        .await
+        .expect("read data file");
+    let batch = batches.first().expect("one data file batch");
+    assert_eq!(
+        batch.schema(),
+        table_schema,
+        "a data file batch must carry the table's Arrow schema"
     );
 }

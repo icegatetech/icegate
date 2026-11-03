@@ -416,6 +416,8 @@ impl<S> Storage for StorageWithMetrics<S>
 where
     S: Storage + 'static,
 {
+    type Target = S::Target;
+
     async fn get_last_offset(&self, cancel_token: &CancellationToken) -> crate::error::Result<Option<u64>> {
         let start = Instant::now();
         let result = self.inner.get_last_offset(cancel_token).await;
@@ -427,13 +429,22 @@ where
         result
     }
 
+    async fn load_write_target(&self, cancel_token: &CancellationToken) -> crate::error::Result<S::Target> {
+        self.inner.load_write_target(cancel_token).await
+    }
+
+    async fn evict_cached_table(&self) {
+        self.inner.evict_cached_table().await;
+    }
+
     async fn write_record_batches(
         &self,
+        target: S::Target,
         batches: super::iceberg_storage::BoxRecordBatchStream,
         cancel_token: &CancellationToken,
     ) -> crate::error::Result<WrittenDataFiles> {
         let start = Instant::now();
-        let result = self.inner.write_record_batches(batches, cancel_token).await;
+        let result = self.inner.write_record_batches(target, batches, cancel_token).await;
         self.metrics.record_parquet_write_duration(
             start.elapsed(),
             &self.topic,
