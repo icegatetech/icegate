@@ -357,11 +357,100 @@ struct CollectorConfigMapData {
     document: String,
 }
 
-/// Load the collector document the k8s stands deploy, unwrapped from its `ConfigMap`.
-fn load_k8s_stand_collector() -> CollectorDocument {
+/// The collector document the k8s stands deploy, unwrapped from its `ConfigMap`.
+fn read_k8s_stand_collector_document() -> String {
     let config_map: CollectorConfigMap = load_config_file(Path::new(K8S_STAND_COLLECTOR_CONFIG_MAP))
         .expect("the k8s stand collector ConfigMap must load");
-    serde_yaml::from_str(&config_map.data.document).expect("the k8s stand collector document must parse")
+    config_map.data.document
+}
+
+/// Load the collector document the k8s stands deploy.
+fn load_k8s_stand_collector() -> CollectorDocument {
+    serde_yaml::from_str(&read_k8s_stand_collector_document()).expect("the k8s stand collector document must parse")
+}
+
+/// The parts of the k8s stand collector's document the environment test reads:
+/// the actions of its `resource` processor and the processors of its `traces`
+/// pipeline. Separate from [`CollectorDocument`], which also reads the Compose
+/// collector's document, where these sections differ.
+#[derive(Deserialize)]
+struct CollectorResourceDocument {
+    processors: CollectorProcessors,
+    service: CollectorService,
+}
+
+#[derive(Deserialize)]
+struct CollectorProcessors {
+    resource: CollectorResourceProcessor,
+}
+
+#[derive(Deserialize)]
+struct CollectorResourceProcessor {
+    attributes: Vec<CollectorResourceAction>,
+}
+
+#[derive(Deserialize)]
+struct CollectorResourceAction {
+    key: String,
+    value: Option<String>,
+    from_attribute: Option<String>,
+    action: String,
+}
+
+#[derive(Deserialize)]
+struct CollectorService {
+    pipelines: CollectorPipelines,
+}
+
+#[derive(Deserialize)]
+struct CollectorPipelines {
+    traces: CollectorPipeline,
+}
+
+#[derive(Deserialize)]
+struct CollectorPipeline {
+    processors: Vec<String>,
+}
+
+/// The client's value under `deployment.environment` is meant to win over the
+/// default the stand adds, so the copy comes first and both actions are `insert`.
+/// This pins the order and the actions in our document; what the collector does
+/// with them is not under test here.
+#[test]
+fn the_k8s_stand_collector_copies_the_old_environment_key_before_it_inserts_its_default() {
+    let document: CollectorResourceDocument = serde_yaml::from_str(&read_k8s_stand_collector_document())
+        .expect("the k8s stand collector document must parse");
+
+    assert!(
+        document
+            .service
+            .pipelines
+            .traces
+            .processors
+            .iter()
+            .any(|processor| processor == "resource"),
+        "operations come from the traces pipeline, so it must run the resource processor"
+    );
+
+    let actions: Vec<&CollectorResourceAction> = document
+        .processors
+        .resource
+        .attributes
+        .iter()
+        .filter(|action| action.key == "deployment.environment.name")
+        .collect();
+    let [copy_action, default_action] = actions.as_slice() else {
+        panic!("expected the copy and the default, got {} actions", actions.len());
+    };
+
+    assert_eq!(copy_action.from_attribute.as_deref(), Some("deployment.environment"));
+    assert_eq!(copy_action.action, "insert");
+    assert_eq!(default_action.from_attribute, None);
+    assert!(
+        default_action.value.is_some(),
+        "the second action must carry the default"
+    );
+    assert_eq!(default_action.action, "insert");
 }
 
 /// The directory holding one subdirectory per k8s stand overlay. Every overlay

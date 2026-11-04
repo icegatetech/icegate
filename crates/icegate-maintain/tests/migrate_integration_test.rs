@@ -705,6 +705,105 @@ async fn create_table_with_schema(catalog: &Arc<dyn Catalog>, name: &str, schema
         .unwrap_or_else(|error| panic!("create {name}: {error}"))
 }
 
+/// The migration production runs: an `operations` table holding rows and a committed WAL offset,
+/// one release behind the code, gains `environment` with the id the schema module gives it. Its
+/// rows survive and read the column as NULL, the current snapshot keeps the offset, and a second
+/// run changes nothing.
+#[tokio::test]
+async fn create_appends_environment_with_id_79_to_operations_on_the_previous_layout() {
+    const COMMITTED_OFFSET: u64 = 42;
+    let (_store, config) = setup_containers().await;
+    let catalog = CatalogBuilder::from_config(&config, &IoHandle::noop(), CancellationToken::new())
+        .await
+        .expect("Failed to create catalog");
+    catalog
+        .create_namespace(&NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), HashMap::new())
+        .await
+        .expect("namespace created");
+    let code_schema = operations_schema().expect("operations schema");
+    let previous_schema = Schema::builder()
+        .with_fields(
+            code_schema
+                .as_struct()
+                .fields()
+                .iter()
+                .filter(|field| field.name != "environment")
+                .cloned(),
+        )
+        .build()
+        .expect("previous schema builds");
+    let table = create_table_with_schema(&catalog, OPERATIONS_TABLE, previous_schema).await;
+    let previous_arrow_schema =
+        Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).expect("previous arrow schema"));
+    let rows_before = two_distinct_rows(&previous_arrow_schema);
+    commit_fixture_snapshot(&catalog, &table, Some(rows_before.clone()), Some(COMMITTED_OFFSET)).await;
+    let ident = icegate_table_ident(OPERATIONS_TABLE);
+    let before = catalog.load_table(&ident).await.expect("load table");
+
+    let ops = create_tables(&catalog, &SnapshotExpirationConfig::default(), false)
+        .await
+        .expect("create evolves operations");
+
+    assert!(ops.iter().any(|op| is_upgrade_of(op, OPERATIONS_TABLE)), "got {ops:?}");
+    let after = catalog.load_table(&ident).await.expect("load table");
+    let metadata = after.metadata();
+    assert_eq!(
+        metadata.uuid(),
+        before.metadata().uuid(),
+        "the table must not be re-created"
+    );
+    let environment = metadata
+        .current_schema()
+        .field_by_name("environment")
+        .expect("environment field");
+    assert_eq!(environment.id, 79);
+    assert!(!environment.required);
+    assert_eq!(*environment.field_type, Type::Primitive(PrimitiveType::String));
+    assert_eq!(metadata.last_column_id(), 79);
+    let current = metadata.current_snapshot().expect("current snapshot");
+    assert_eq!(current.schema_id(), Some(metadata.current_schema_id()));
+    assert_eq!(
+        current.summary().additional_properties.get(WAL_OFFSET_PROPERTY),
+        Some(&COMMITTED_OFFSET.to_string())
+    );
+
+    // The fixture's optional columns are all NULL, so its required columns identify a row in full.
+    let required_fields: Vec<_> = rows_before
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| !field.is_nullable())
+        .cloned()
+        .collect();
+    let required_columns: Vec<String> = required_fields.iter().map(|field| field.name().clone()).collect();
+    let converter = RowConverter::new(
+        required_fields
+            .iter()
+            .map(|field| SortField::new(field.data_type().clone()))
+            .collect(),
+    )
+    .expect("row converter builds");
+    let rows_after = scan_rows(&after).await;
+    assert_eq!(
+        canonical_rows(&converter, &rows_after, &required_columns),
+        canonical_rows(&converter, std::slice::from_ref(&rows_before), &required_columns),
+        "every row survives the migration unchanged"
+    );
+    for batch in &rows_after {
+        let environment = batch.column_by_name("environment").expect("environment is read");
+        assert_eq!(environment.null_count(), batch.num_rows(), "earlier rows read NULL");
+    }
+
+    let second_run = create_tables(&catalog, &SnapshotExpirationConfig::default(), false)
+        .await
+        .expect("second run succeeds");
+    assert!(
+        !second_run.iter().any(|op| is_upgrade_of(op, OPERATIONS_TABLE)),
+        "got {second_run:?}"
+    );
+    assert_table_unchanged(&catalog, &after).await;
+}
+
 /// `migrate create` brings every existing table to the code's schema in place: a table that
 /// lacks trailing optional columns of the code gains them without being re-created, keeps every
 /// row it held, and reads the new columns of those rows as NULL; the snapshot that stamps the

@@ -552,7 +552,9 @@ mod tests {
         OPERATIONS_TABLE, OPERATIONS_TOPIC,
         parquet_encoding::{OPERATIONS_BLOOM_COLUMNS, OPERATIONS_COLUMN_ENCODINGS},
         resolve_committed_offset,
-        schema::{COL_EVALUATIONS, operations_partition_spec, operations_schema, operations_sort_order},
+        schema::{
+            COL_ENVIRONMENT, COL_EVALUATIONS, operations_partition_spec, operations_schema, operations_sort_order,
+        },
     };
     use parquet::{
         arrow::arrow_writer::ArrowWriter,
@@ -579,7 +581,7 @@ mod tests {
             instrumentation::StorageWithMetrics,
             pipeline_it_tests::{
                 build_catalog, create_table, decode_evaluations, evaluated_traces_request, expected_stored_evaluations,
-                shift_config, start_object_storage, write_wal_segments,
+                scan_operations_batches, shift_config, start_object_storage, write_wal_segments,
             },
             test_utils::data_file as test_data_file,
         },
@@ -1651,7 +1653,7 @@ mod tests {
     /// this module; the fixture comes from [`crate::shift::pipeline_it_tests`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shift_segments_through_the_metrics_wrapper_reloads_a_stale_table_and_fills_a_column_the_wal_lacks() {
-        const ENVIRONMENT_COLUMN: &str = "environment";
+        const COLUMN_THE_CODE_LACKS: &str = "added_by_a_newer_release";
 
         let object_storage = start_object_storage().await;
         let run_id = uuid::Uuid::new_v4().simple().to_string();
@@ -1699,11 +1701,11 @@ mod tests {
                     .as_struct()
                     .fields()
                     .iter()
-                    .filter(|field| field.name != COL_EVALUATIONS)
+                    .filter(|field| field.name != COL_EVALUATIONS && field.name != COL_ENVIRONMENT)
                     .cloned(),
             )
             .build()
-            .expect("schema without evaluations");
+            .expect("schema without the appended columns");
         let ident = create_table(
             &catalog,
             OPERATIONS_TABLE,
@@ -1741,11 +1743,17 @@ mod tests {
         storage.load_write_target(&cancel).await.expect("cache the previous table");
         let table = catalog.load_table(&ident).await.expect("load previous table");
         let tx = Transaction::new(&table);
+        // The order is the schema module's: only it gives `evaluations` and `environment` the ids
+        // the WAL carries, and the schema transition compares types along with nested ids.
         let tx = tx
             .update_schema()
             .add_column(AddColumn::optional(COL_EVALUATIONS, evaluations_type))
             .add_column(AddColumn::optional(
-                ENVIRONMENT_COLUMN,
+                COL_ENVIRONMENT,
+                Type::Primitive(PrimitiveType::String),
+            ))
+            .add_column(AddColumn::optional(
+                COLUMN_THE_CODE_LACKS,
                 Type::Primitive(PrimitiveType::String),
             ))
             .apply(tx)
@@ -1787,22 +1795,16 @@ mod tests {
             resolve_committed_offset(table.metadata()).expect("committed offset"),
             Some(0)
         );
-        let batches = table
-            .scan()
-            .select_all()
-            .build()
-            .expect("operations scan")
-            .to_arrow()
-            .await
-            .expect("operations scan stream")
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("operations batches");
+        let batches = scan_operations_batches(&catalog, &ident).await;
         let mut rows = Vec::new();
         for batch in &batches {
             rows.extend(decode_evaluations(batch));
-            let environment = batch.column_by_name(ENVIRONMENT_COLUMN).expect("environment column");
-            assert_eq!(environment.null_count(), batch.num_rows(), "environment reads as NULL");
+            let column = batch.column_by_name(COLUMN_THE_CODE_LACKS).expect("the column the code lacks");
+            assert_eq!(
+                column.null_count(),
+                batch.num_rows(),
+                "the column the code lacks reads as NULL"
+            );
         }
         rows.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(rows, expected_stored_evaluations());

@@ -13,6 +13,8 @@ mod otel;
 mod projection;
 mod traceloop;
 
+use std::cell::OnceCell;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
@@ -27,9 +29,13 @@ use icegate_common::schema::{
     COL_NAME, COL_RESPONSE_ID, COL_SCORE_LABEL, COL_SCORE_VALUE, COL_TARGET_SCOPE, COL_TARGET_SPAN_ID,
     COL_TARGET_TRACE_ID,
 };
+use opentelemetry_proto::tonic::common::v1::KeyValue;
 
 use self::projection::{EvaluationResult, OperationRow, project_operation_row};
-use super::attributes::{SERVICE_NAME_KEY, extract_string_value, list_element_field, list_struct_fields, now_micros};
+use super::attributes::{
+    DEPLOYMENT_ENVIRONMENT_KEY, DEPLOYMENT_ENVIRONMENT_NAME_KEY, SERVICE_NAME_KEY, extract_string_value,
+    list_element_field, list_struct_fields, now_micros,
+};
 use super::nested_builders::{field_builder_missing, nested_field_index, nested_struct_builders};
 
 /// Process-wide cache of the derived operations Arrow schema.
@@ -75,9 +81,10 @@ fn append_str_list(builder: &mut ListBuilder<StringBuilder>, value: Option<&Vec<
 
 /// Transforms an OTLP traces export request into the `operations` Arrow batch.
 ///
-/// Walks `resource_spans -> scope_spans -> spans`, promoting `service.name`
-/// from each resource's attributes, and projects every LLM/GenAI span into one
-/// typed operations row via the pure [`project_operation_row`] driver. Non-LLM
+/// Walks `resource_spans -> scope_spans -> spans`, promoting `service.name` and
+/// the deployment environment from each resource's attributes, and projects
+/// every LLM/GenAI span into one typed operations row via the pure
+/// [`project_operation_row`] driver. Non-LLM
 /// spans produce no row and are counted (logged as `non_llm_skipped`).
 /// Qualifying spans that fail ID validation or strict typed parsing (D6) are
 /// dropped and counted in the returned `drops`.
@@ -124,7 +131,7 @@ pub fn operations_to_record_batch(
     let mut non_llm_skipped: usize = 0;
     let mut skipped_evaluations: usize = 0;
 
-    let empty_attrs: Vec<opentelemetry_proto::tonic::common::v1::KeyValue> = Vec::new();
+    let empty_attrs: Vec<KeyValue> = Vec::new();
     // TODO(low): this is a second full walk of every span, independent of the
     // `spans_to_record_batch` pass. Fusing both into one iteration would drop the
     // duplicate walk, but re-serialize the two CPU passes the ingest handlers now
@@ -132,16 +139,19 @@ pub fn operations_to_record_batch(
     // Revisit if this walk becomes a measurable ingest hot-path cost.
     for resource_spans in &request.resource_spans {
         let resource_attrs = resource_spans.resource.as_ref().map_or(&empty_attrs, |r| &r.attributes);
-        let service_name = resource_attrs
-            .iter()
-            .find(|kv| kv.key == SERVICE_NAME_KEY)
-            .and_then(|kv| extract_string_value(kv.value.as_ref()));
+        let service_name = find_string_attribute(resource_attrs, SERVICE_NAME_KEY);
+        // Resolved by the resource's first row, so a resource without LLM spans never pays for it.
+        let environment: OnceCell<Option<Rc<str>>> = OnceCell::new();
 
         for scope_spans in &resource_spans.scope_spans {
             let scope = scope_spans.scope.as_ref();
             for span in &scope_spans.spans {
                 match project_operation_row(span, scope, tenant_id, service_name.as_deref(), ingested_at) {
-                    Ok(Some(projected)) => {
+                    Ok(Some(mut projected)) => {
+                        projected
+                            .row
+                            .environment
+                            .clone_from(environment.get_or_init(|| resolve_environment(resource_attrs)));
                         skipped_evaluations += projected.skipped_evaluations;
                         rows.push(projected.row);
                     }
@@ -180,6 +190,7 @@ pub fn operations_to_record_batch(
     let mut span_id_b = FixedSizeBinaryBuilder::with_capacity(row_count, 8);
     let mut parent_span_id_b = FixedSizeBinaryBuilder::with_capacity(row_count, 8);
     let mut service_name_b = StringBuilder::with_capacity(row_count, row_count * 32);
+    let mut environment_b = StringBuilder::with_capacity(row_count, row_count * 16);
     let mut scope_name_b = StringBuilder::with_capacity(row_count, row_count * 32);
     let mut scope_version_b = StringBuilder::with_capacity(row_count, row_count * 16);
     let mut timestamp_b: Vec<i64> = Vec::with_capacity(row_count);
@@ -256,6 +267,7 @@ pub fn operations_to_record_batch(
         }
         tenant_id_b.append_value(&row.tenant_id);
         append_opt_str(&mut service_name_b, row.service_name.as_deref());
+        append_opt_str(&mut environment_b, row.environment.as_deref());
         append_opt_str(&mut scope_name_b, row.scope_name.as_deref());
         append_opt_str(&mut scope_version_b, row.scope_version.as_deref());
         timestamp_b.push(row.timestamp);
@@ -390,6 +402,7 @@ pub fn operations_to_record_batch(
         Arc::new(finish_reasons_b.finish()),
         Arc::new(encoding_formats_b.finish()),
         Arc::new(evaluations_b.finish()),
+        Arc::new(environment_b.finish()),
     ];
 
     let batch = RecordBatch::try_new(schema, columns).map_err(|e| {
@@ -398,6 +411,24 @@ pub fn operations_to_record_batch(
     })?;
 
     Ok((Some(batch), drops))
+}
+
+/// The deployment environment of a resource: the value of
+/// [`DEPLOYMENT_ENVIRONMENT_NAME_KEY`], else of [`DEPLOYMENT_ENVIRONMENT_KEY`];
+/// `None` when neither gives one. An empty string is a value.
+fn resolve_environment(resource_attrs: &[KeyValue]) -> Option<Rc<str>> {
+    find_string_attribute(resource_attrs, DEPLOYMENT_ENVIRONMENT_NAME_KEY)
+        .or_else(|| find_string_attribute(resource_attrs, DEPLOYMENT_ENVIRONMENT_KEY))
+        .map(Rc::<str>::from)
+}
+
+/// The string form of the first attribute named `key`; `None` when no attribute
+/// has that name or its value has no string form.
+fn find_string_attribute(attributes: &[KeyValue], key: &str) -> Option<String> {
+    attributes
+        .iter()
+        .find(|kv| kv.key == key)
+        .and_then(|kv| extract_string_value(kv.value.as_ref()))
 }
 
 /// Append an `Option<&str>` to a `StringBuilder`, mapping `None` to a NULL.
@@ -542,6 +573,7 @@ mod tests {
     };
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, KeyValue, any_value::Value};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, span::Event};
 
     use super::operations_to_record_batch;
@@ -639,6 +671,39 @@ mod tests {
                 schema_url: String::new(),
             }],
         }
+    }
+
+    fn request_with_resource(attributes: Vec<KeyValue>, spans: Vec<Span>) -> ExportTraceServiceRequest {
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes,
+                    ..Resource::default()
+                }),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    /// The string column `column` of `batch`, addressed by name, as one value per row.
+    fn read_string_column(batch: &RecordBatch, column: &str) -> Vec<Option<String>> {
+        let values = batch
+            .column_by_name(column)
+            .unwrap_or_else(|| panic!("column {column} present"))
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap_or_else(|| panic!("column {column} is Utf8"));
+        values.iter().map(|value| value.map(str::to_string)).collect()
+    }
+
+    /// The `environment` column of `batch` as one value per row.
+    fn read_environments(batch: &RecordBatch) -> Vec<Option<String>> {
+        read_string_column(batch, "environment")
     }
 
     /// Two LLM spans: one evaluated four times — twice through `OpenInference`
@@ -1009,5 +1074,175 @@ mod tests {
             .expect("input_messages is Utf8");
         assert!(!input_messages.is_null(0), "input_messages must be populated");
         assert!(input_messages.value(0).contains("hello"));
+    }
+
+    #[test]
+    fn environment_takes_the_new_key_then_the_old_one_from_the_resource() {
+        const NEW_KEY: &str = "deployment.environment.name";
+        const OLD_KEY: &str = "deployment.environment";
+
+        let llm_span = || span_with(1, vec![kv_str("gen_ai.operation.name", "chat")]);
+        // An interned value has no string form until the request's string table reaches the
+        // transform, so it gives no value and the old key is read.
+        let interned_new_key = KeyValue {
+            key_strindex: 0,
+            key: NEW_KEY.to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::StringValueStrindex(0)),
+            }),
+        };
+        let cases = [
+            (
+                "new key",
+                request_with_resource(vec![kv_str(NEW_KEY, "prod")], vec![llm_span()]),
+                Some("prod"),
+            ),
+            (
+                "old key",
+                request_with_resource(vec![kv_str(OLD_KEY, "staging")], vec![llm_span()]),
+                Some("staging"),
+            ),
+            (
+                "new key before the old one",
+                request_with_resource(
+                    vec![kv_str(NEW_KEY, "prod"), kv_str(OLD_KEY, "staging")],
+                    vec![llm_span()],
+                ),
+                Some("prod"),
+            ),
+            (
+                "old key before the new one",
+                request_with_resource(
+                    vec![kv_str(OLD_KEY, "staging"), kv_str(NEW_KEY, "prod")],
+                    vec![llm_span()],
+                ),
+                Some("prod"),
+            ),
+            (
+                "empty new key is a value",
+                request_with_resource(vec![kv_str(NEW_KEY, ""), kv_str(OLD_KEY, "staging")], vec![llm_span()]),
+                Some(""),
+            ),
+            (
+                "empty old key is a value",
+                request_with_resource(vec![kv_str(OLD_KEY, "")], vec![llm_span()]),
+                Some(""),
+            ),
+            (
+                "new key with a non-string value",
+                request_with_resource(vec![kv_int(NEW_KEY, 42), kv_str(OLD_KEY, "staging")], vec![llm_span()]),
+                Some("42"),
+            ),
+            (
+                "new key without a string form",
+                request_with_resource(vec![interned_new_key, kv_str(OLD_KEY, "staging")], vec![llm_span()]),
+                Some("staging"),
+            ),
+            (
+                "neither key",
+                request_with_resource(vec![kv_str("service.name", "svc")], vec![llm_span()]),
+                None,
+            ),
+            ("no resource", request_with(vec![llm_span()]), None),
+            (
+                "new key on the span only",
+                request_with_resource(
+                    Vec::new(),
+                    vec![span_with(
+                        1,
+                        vec![kv_str("gen_ai.operation.name", "chat"), kv_str(NEW_KEY, "prod")],
+                    )],
+                ),
+                None,
+            ),
+        ];
+
+        for (case, request, expected) in cases {
+            let (batch, drops) = operations_to_record_batch(&request, &test_tenant("t")).expect("transform");
+            assert_eq!(drops, 0, "{case}");
+            assert_eq!(
+                read_environments(&batch.expect("one row")),
+                vec![expected.map(str::to_string)],
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_name_takes_the_resource_attribute_and_is_null_without_it() {
+        let llm_span = || span_with(1, vec![kv_str("gen_ai.operation.name", "chat")]);
+        let environment = || kv_str("deployment.environment.name", "prod");
+        let cases = [
+            (
+                "both attributes",
+                vec![kv_str("service.name", "svc"), environment()],
+                Some("svc".to_string()),
+            ),
+            ("no service.name", vec![environment()], None),
+        ];
+
+        for (case, attributes, expected_service_name) in cases {
+            let request = request_with_resource(attributes, vec![llm_span()]);
+            let (batch, drops) = operations_to_record_batch(&request, &test_tenant("t")).expect("transform");
+            assert_eq!(drops, 0, "{case}");
+            let batch = batch.expect("one row");
+            assert_eq!(
+                read_string_column(&batch, "service_name"),
+                vec![expected_service_name],
+                "{case}"
+            );
+            assert_eq!(read_environments(&batch), vec![Some("prod".to_string())], "{case}");
+        }
+    }
+
+    #[test]
+    fn every_row_of_a_resource_takes_its_environment_when_a_non_llm_span_comes_first() {
+        let llm_attributes = || vec![kv_str("gen_ai.operation.name", "chat")];
+        let request = request_with_resource(
+            vec![kv_str("deployment.environment.name", "prod")],
+            vec![
+                span_with(1, vec![kv_str("http.method", "GET")]),
+                span_with(2, llm_attributes()),
+                span_with(3, llm_attributes()),
+            ],
+        );
+
+        let (batch, drops) = operations_to_record_batch(&request, &test_tenant("t")).expect("transform");
+        assert_eq!(drops, 0);
+        let prod = Some("prod".to_string());
+        assert_eq!(read_environments(&batch.expect("two rows")), vec![prod.clone(), prod]);
+    }
+
+    #[test]
+    fn each_resource_spans_gives_its_rows_its_own_environment() {
+        let llm_attributes = || vec![kv_str("gen_ai.operation.name", "chat")];
+        let mut request = request_with_resource(
+            vec![kv_str("deployment.environment.name", "prod")],
+            vec![span_with(1, llm_attributes())],
+        );
+        request
+            .resource_spans
+            .extend(request_with_resource(Vec::new(), vec![span_with(2, llm_attributes())]).resource_spans);
+
+        let (batch, drops) = operations_to_record_batch(&request, &test_tenant("t")).expect("transform");
+        assert_eq!(drops, 0);
+        let batch = batch.expect("two rows");
+
+        let span_ids = batch
+            .column_by_name("span_id")
+            .expect("span_id column present")
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("span_id is FixedSizeBinary");
+        let mut rows: Vec<(Vec<u8>, Option<String>)> = span_ids
+            .iter()
+            .map(|span_id| span_id.expect("span_id is required").to_vec())
+            .zip(read_environments(&batch))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(vec![1u8; 8], Some("prod".to_string())), (vec![2u8; 8], None)]
+        );
     }
 }

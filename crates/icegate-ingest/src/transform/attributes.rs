@@ -21,6 +21,10 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Valu
 pub(crate) const SERVICE_NAME_KEY: &str = "service.name";
 /// See [`SERVICE_NAME_KEY`]. Promoted to its own column on metrics only.
 pub(crate) const SERVICE_INSTANCE_ID_KEY: &str = "service.instance.id";
+/// See [`SERVICE_NAME_KEY`]. Promoted to `operations.environment`.
+pub(crate) const DEPLOYMENT_ENVIRONMENT_NAME_KEY: &str = "deployment.environment.name";
+/// See [`SERVICE_NAME_KEY`]. Fallback source of `operations.environment`.
+pub(crate) const DEPLOYMENT_ENVIRONMENT_KEY: &str = "deployment.environment";
 
 /// Extracts a string value from an OTLP `AnyValue` reference.
 ///

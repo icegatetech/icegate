@@ -7,6 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 use icegate_common::TenantId;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
@@ -271,6 +272,11 @@ pub(crate) struct OperationRow {
     pub(crate) parent_span_id: Option<[u8; 8]>,
     /// Service name, mirrored from `spans.service_name`; `None` when absent.
     pub(crate) service_name: Option<String>,
+    /// Deployment environment of the resource, filled by the caller of
+    /// [`project_operation_row`]. One value per `ResourceSpans`, so rows share it
+    /// instead of each holding a copy; `Rc`, not `Arc`, because rows stay on the
+    /// thread that builds them and need no atomic reference count.
+    pub(crate) environment: Option<Rc<str>>,
     /// OTLP `scope_spans.scope.name`.
     pub(crate) scope_name: Option<String>,
     /// OTLP `scope_spans.scope.version`.
@@ -1141,6 +1147,9 @@ fn resolve_evaluations(view: &AttributeView, span: &Span, subject: EvaluationSub
 
 /// Project one OTLP span (+ scope + tenant) into an optional operations row.
 ///
+/// The row's `environment` stays `None`: the caller fills it, so that the value
+/// is resolved only for a resource that produced a row.
+///
 /// `Ok(None)` = no convention marker and no evaluation evidence present
 /// (non-LLM span; caller counts as `non_llm_skipped`). `Err` = hard projection
 /// failure (invalid id, or a failed strict typed parse / token overflow under
@@ -1249,6 +1258,7 @@ pub(crate) fn project_operation_row(
         span_id,
         parent_span_id,
         service_name: service_name.map(str::to_string),
+        environment: None,
         scope_name: scope.map(|s| s.name.clone()).filter(|s| !s.is_empty()),
         scope_version: scope.map(|s| s.version.clone()).filter(|s| !s.is_empty()),
         timestamp,
@@ -1494,6 +1504,7 @@ mod tests {
             span_id: [0xCD; 8],
             parent_span_id: None,
             service_name: None,
+            environment: None,
             scope_name: Some("my.sdk".to_string()),
             scope_version: Some("1.2.3".to_string()),
             timestamp: 1_000,
