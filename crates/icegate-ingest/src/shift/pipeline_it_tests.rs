@@ -41,9 +41,9 @@ use icegate_common::{
     parquet_writer::ColumnEncoding,
     resolve_committed_offset,
     schema::{
-        logs_partition_spec, logs_schema, logs_sort_order, metrics_partition_spec, metrics_schema, metrics_sort_order,
-        operations_partition_spec, operations_schema, operations_sort_order, spans_partition_spec, spans_schema,
-        spans_sort_order,
+        COL_ENVIRONMENT, logs_partition_spec, logs_schema, logs_sort_order, metrics_partition_spec, metrics_schema,
+        metrics_sort_order, operations_partition_spec, operations_schema, operations_sort_order, spans_partition_spec,
+        spans_schema, spans_sort_order,
     },
     testing::{S3TestContainer, create_s3_bucket, create_s3_object_store},
 };
@@ -56,6 +56,7 @@ use opentelemetry_proto::tonic::{
     common::v1::{AnyValue, KeyValue, any_value::Value},
     logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
     metrics::v1::{Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point},
+    resource::v1::Resource,
     trace::v1::{
         ResourceSpans, ScopeSpans, Span,
         span::{Event, Link},
@@ -593,6 +594,215 @@ pub(super) fn expected_stored_evaluations() -> Vec<(Vec<u8>, Option<Vec<StoredEv
     ]
 }
 
+/// Run one iteration of the production shifter over the `operations` topic and answer the WAL
+/// offset its snapshot claims.
+async fn run_operations_shifter(
+    storage: &ObjectStorage,
+    catalog: &Arc<dyn Catalog>,
+    ident: &TableIdent,
+    queue_reader: Arc<ParquetQueueReader>,
+    run_id: &str,
+) -> u64 {
+    let config = shift_config(storage, &format!("jobs-{run_id}"));
+    let jobs_storage = config.jobsmanager.storage.to_s3_config().expect("job state storage");
+    let jobs = &[ShiftJobSpec {
+        job_name: "shift_operations",
+        topic: OPERATIONS_TOPIC,
+        table: OPERATIONS_TABLE,
+        descriptor: SortColumnsDescriptor::operations().expect("operations descriptor"),
+        planner_partition_spec: &CURRENT_PLANNER_PARTITION_SPEC,
+        bloom_filter_columns: OPERATIONS_BLOOM_COLUMNS,
+        column_encodings: OPERATIONS_COLUMN_ENCODINGS,
+    }];
+    let shifter = Shifter::new_with_max_iterations(
+        Arc::clone(catalog),
+        queue_reader,
+        Arc::new(config),
+        jobs_storage,
+        ShiftMetrics::new_disabled(),
+        Arc::new(jobmanager::NoopMetrics),
+        jobs,
+        Some(1),
+    )
+    .await
+    .expect("build the production shifter");
+
+    let handle = shifter.start().expect("start the shifter");
+    let committed_offset = wait_for_committed_offset(catalog, ident).await;
+    handle.shutdown().await.expect("shut the shifter down");
+    committed_offset
+}
+
+/// Every batch an Iceberg table scan of the committed `operations` table reads, which binds
+/// columns by field id, as a query engine reading the table does.
+pub(super) async fn scan_operations_batches(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> Vec<RecordBatch> {
+    let table = catalog.load_table(ident).await.expect("load committed operations table");
+    table
+        .scan()
+        .build()
+        .expect("operations scan")
+        .to_arrow()
+        .await
+        .expect("operations scan stream")
+        .try_collect()
+        .await
+        .expect("operations batches")
+}
+
+/// Decode every row of `batch` into its span id and its `environment`, both addressed by name.
+fn decode_environments(batch: &RecordBatch) -> Vec<(Vec<u8>, Option<String>)> {
+    let span_ids = batch
+        .column_by_name("span_id")
+        .expect("span_id column")
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .expect("span_id is FixedSizeBinary");
+    let environments = batch
+        .column_by_name("environment")
+        .expect("environment column")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("environment is Utf8");
+    (0..batch.num_rows())
+        .map(|row| {
+            let environment = (!environments.is_null(row)).then(|| environments.value(row).to_string());
+            (span_ids.value(row).to_vec(), environment)
+        })
+        .collect()
+}
+
+/// One `ResourceSpans` holding one LLM span, with `attributes` on its resource.
+fn llm_resource_spans(span_id: [u8; 8], attributes: Vec<KeyValue>) -> ResourceSpans {
+    ResourceSpans {
+        resource: Some(Resource {
+            attributes,
+            ..Resource::default()
+        }),
+        scope_spans: vec![ScopeSpans {
+            spans: vec![traced_span(span_id, vec![kv_str("gen_ai.operation.name", "chat")])],
+            ..ScopeSpans::default()
+        }],
+        ..ResourceSpans::default()
+    }
+}
+
+/// The `environment` of a resource reaches Iceberg through the whole ingest path, and a WAL
+/// segment of the previous layout in the same topic reads the column as NULL: what a table holds
+/// while pods of two releases write during a canary rollout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn environment_reaches_iceberg_and_a_segment_of_the_previous_layout_reads_it_as_null() {
+    const SPAN_OF_THE_PREVIOUS_LAYOUT: [u8; 8] = [1u8; 8];
+    const SPAN_WITH_ENVIRONMENT: [u8; 8] = [2u8; 8];
+    const SPAN_WITHOUT_ENVIRONMENT: [u8; 8] = [3u8; 8];
+
+    let storage = start_object_storage().await;
+    let run_id = Uuid::new_v4().simple().to_string();
+    let tenant = test_tenant("tenant-a");
+    let new_key = || vec![kv_str("deployment.environment.name", "prod")];
+
+    let (current_batch, _) = operations_to_record_batch(
+        &ExportTraceServiceRequest {
+            resource_spans: vec![llm_resource_spans(SPAN_OF_THE_PREVIOUS_LAYOUT, new_key())],
+        },
+        &tenant,
+    )
+    .expect("operations transform");
+    let current_batch = current_batch.expect("one operations row");
+    let previous_columns: Vec<usize> = current_batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name() != COL_ENVIRONMENT)
+        .map(|(index, _)| index)
+        .collect();
+    let previous_batch = current_batch.project(&previous_columns).expect("previous layout batch");
+    assert!(
+        previous_batch.schema().field_with_name("environment").is_err(),
+        "the fixture must write a segment lacking the column"
+    );
+    let (next_batch, _) = operations_to_record_batch(
+        &ExportTraceServiceRequest {
+            resource_spans: vec![
+                llm_resource_spans(SPAN_WITH_ENVIRONMENT, new_key()),
+                llm_resource_spans(SPAN_WITHOUT_ENVIRONMENT, Vec::new()),
+            ],
+        },
+        &tenant,
+    )
+    .expect("operations transform");
+    let segments = [previous_batch, next_batch.expect("two operations rows")]
+        .iter()
+        .map(|batch| {
+            sort_operations(batch, 2, None)
+                .expect("prepare WAL segment")
+                .expect("segment row groups")
+                .write_request
+                .row_groups
+        })
+        .collect();
+    let queue_reader = write_wal_segments(
+        &storage,
+        &format!("wal-{run_id}"),
+        OPERATIONS_TOPIC,
+        (OPERATIONS_BLOOM_COLUMNS, OPERATIONS_COLUMN_ENCODINGS),
+        segments,
+    )
+    .await;
+
+    let catalog = build_catalog(&storage, &format!("catalog-{run_id}")).await;
+    let code_schema = operations_schema().expect("operations schema");
+    let previous_schema = Schema::builder()
+        .with_fields(
+            code_schema
+                .as_struct()
+                .fields()
+                .iter()
+                .filter(|field| field.name != COL_ENVIRONMENT)
+                .cloned(),
+        )
+        .build()
+        .expect("previous operations schema");
+    let ident = create_table(
+        &catalog,
+        OPERATIONS_TABLE,
+        previous_schema,
+        operations_partition_spec(&code_schema).expect("operations partition spec"),
+        operations_sort_order(&code_schema).expect("operations sort order"),
+    )
+    .await;
+    // The table assigns the id itself, as it does in a real migration.
+    let table = catalog.load_table(&ident).await.expect("load previous table");
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_schema()
+        .add_column(AddColumn::optional(
+            COL_ENVIRONMENT,
+            Type::Primitive(PrimitiveType::String),
+        ))
+        .apply(tx)
+        .expect("add column applies");
+    tx.commit(catalog.as_ref()).await.expect("add column commits");
+
+    let committed_offset = run_operations_shifter(&storage, &catalog, &ident, queue_reader, &run_id).await;
+    assert_eq!(committed_offset, 1, "the snapshot must claim both WAL segments");
+
+    let mut rows: Vec<_> = scan_operations_batches(&catalog, &ident)
+        .await
+        .iter()
+        .flat_map(decode_environments)
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (vec![1u8; 8], None),
+            (vec![2u8; 8], Some("prod".to_string())),
+            (vec![3u8; 8], None),
+        ]
+    );
+}
+
 /// Evaluation results survive the whole ingest path: the OTLP transform, the WAL the production
 /// writer encodes, the production shifter, and an Iceberg commit. They are read back through an
 /// Iceberg table scan, which binds the nested `evaluations` fields by field id, as a query engine
@@ -623,47 +833,14 @@ async fn evaluation_results_reach_iceberg_through_the_production_shifter() {
     let sort_order = operations_sort_order(&schema).expect("operations sort order");
     let ident = create_table(&catalog, OPERATIONS_TABLE, schema, partition_spec, sort_order).await;
 
-    let config = shift_config(&storage, &format!("jobs-{run_id}"));
-    let jobs_storage = config.jobsmanager.storage.to_s3_config().expect("job state storage");
-    let jobs = &[ShiftJobSpec {
-        job_name: "shift_operations",
-        topic: OPERATIONS_TOPIC,
-        table: OPERATIONS_TABLE,
-        descriptor: SortColumnsDescriptor::operations().expect("operations descriptor"),
-        planner_partition_spec: &CURRENT_PLANNER_PARTITION_SPEC,
-        bloom_filter_columns: OPERATIONS_BLOOM_COLUMNS,
-        column_encodings: OPERATIONS_COLUMN_ENCODINGS,
-    }];
-    let shifter = Shifter::new_with_max_iterations(
-        Arc::clone(&catalog),
-        queue_reader,
-        Arc::new(config),
-        jobs_storage,
-        ShiftMetrics::new_disabled(),
-        Arc::new(jobmanager::NoopMetrics),
-        jobs,
-        Some(1),
-    )
-    .await
-    .expect("build the production shifter");
-
-    let handle = shifter.start().expect("start the shifter");
-    let committed_offset = wait_for_committed_offset(&catalog, &ident).await;
-    handle.shutdown().await.expect("shut the shifter down");
+    let committed_offset = run_operations_shifter(&storage, &catalog, &ident, queue_reader, &run_id).await;
     assert_eq!(committed_offset, 0, "the snapshot must claim the one WAL segment");
 
-    let table = catalog.load_table(&ident).await.expect("load committed operations table");
-    let mut stream = table
-        .scan()
-        .build()
-        .expect("operations scan")
-        .to_arrow()
+    let mut rows: Vec<_> = scan_operations_batches(&catalog, &ident)
         .await
-        .expect("operations scan stream");
-    let mut rows = Vec::new();
-    while let Some(batch) = stream.try_next().await.expect("operations batch") {
-        rows.extend(decode_evaluations(&batch));
-    }
+        .iter()
+        .flat_map(decode_evaluations)
+        .collect();
     rows.sort_by(|left, right| left.0.cmp(&right.0));
 
     assert_eq!(

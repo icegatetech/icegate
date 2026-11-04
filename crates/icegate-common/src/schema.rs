@@ -468,7 +468,8 @@ pub fn spans_schema() -> Result<Schema> {
 /// The scalar fields take the lowest ids in declaration order; the three
 /// `List<String>` columns follow them so each list and its element hold
 /// adjacent ids. `evaluations`, a `List<Struct>`, is appended after that block
-/// so every earlier id stays where it was.
+/// so every earlier id stays where it was. `environment` follows `evaluations`
+/// at the next free id, the id `migrate create` assigns it on an existing table.
 ///
 /// # Partitioning
 /// - `tenant_id` (identity)
@@ -893,6 +894,12 @@ pub fn operations_schema() -> Result<Schema> {
                     ])),
                     true,
                 )))),
+            )),
+            // ── resource: appended after `evaluations`, see `# Field IDs` above ──
+            Arc::new(NestedField::optional(
+                79,
+                COL_ENVIRONMENT,
+                Type::Primitive(PrimitiveType::String),
             )),
         ])
         .build()?;
@@ -1844,6 +1851,8 @@ pub const COL_SPAN_ATTRIBUTES: &str = "span_attributes";
 pub const COL_SEVERITY_TEXT: &str = "severity_text";
 /// Service name extracted from resource attributes.
 pub const COL_SERVICE_NAME: &str = "service_name";
+/// Operations — deployment environment of the resource that produced the operation.
+pub const COL_ENVIRONMENT: &str = "environment";
 /// W3C Trace Context trace identifier (`FIXED_LEN_BYTE_ARRAY(16)`).
 pub const COL_TRACE_ID: &str = "trace_id";
 /// W3C Trace Context span identifier (`FIXED_LEN_BYTE_ARRAY(8)`).
@@ -2189,10 +2198,10 @@ mod tests {
     #[test]
     fn test_operations_schema() {
         let schema = operations_schema().expect("Failed to create operations schema");
-        // 58 scalar fields (1..=58), 3 List<String> columns (59..=64), and the
-        // `evaluations` List<Struct> appended last (65..=78). highest_field_id
-        // includes nested ids.
-        assert_eq!(schema.highest_field_id(), 78);
+        // 58 scalar fields (1..=58), 3 List<String> columns (59..=64), the
+        // `evaluations` List<Struct> (65..=78), and `environment` appended last
+        // (79). highest_field_id includes nested ids.
+        assert_eq!(schema.highest_field_id(), 79);
         assert_eq!(schema.schema_id(), 5);
         assert!(schema.field_by_name("tenant_id").is_some());
         assert!(schema.field_by_name("trace_id").is_some());
@@ -2326,6 +2335,19 @@ mod tests {
                 (78, "target_span_id", &Type::Primitive(PrimitiveType::Fixed(8)), false),
             ]
         );
+    }
+
+    #[test]
+    fn test_operations_environment_is_the_last_column_an_optional_string_with_id_79() {
+        use iceberg::spec::{PrimitiveType, Type};
+
+        let schema = operations_schema().expect("Failed to create operations schema");
+        let last_column = schema.as_struct().fields().last().expect("operations has columns");
+
+        assert_eq!(last_column.name, "environment");
+        assert_eq!(last_column.id, 79);
+        assert!(!last_column.required, "a resource without the attribute stores NULL");
+        assert_eq!(*last_column.field_type, Type::Primitive(PrimitiveType::String));
     }
 
     #[test]

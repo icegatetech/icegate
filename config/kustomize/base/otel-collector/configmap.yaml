@@ -242,9 +242,14 @@ data:
       # Shared environment/demo labels. Added to both logs and traces.
       resource:
         attributes:
-          - key: deployment.environment
+          # The client's value under the old key is meant to win over the default
+          # below, so its copy comes first.
+          - key: deployment.environment.name
+            from_attribute: deployment.environment
+            action: insert
+          - key: deployment.environment.name
             value: kubernetes
-            action: upsert
+            action: insert
           - key: demo.source
             value: kubernetes
             action: upsert

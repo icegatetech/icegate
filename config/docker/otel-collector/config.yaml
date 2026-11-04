@@ -75,9 +75,9 @@ processors:
       - key: service.namespace
         value: icegate
         action: upsert
-      - key: deployment.environment
+      - key: deployment.environment.name
         value: docker-compose
-        action: upsert
+        action: insert
       - key: demo.source
         value: docker-compose
         action: upsert

@@ -538,7 +538,9 @@ CREATE TABLE iceberg.triplecloud.operations (
         target_scope VARCHAR NOT NULL,     -- span | trace | session
         target_trace_id VARBINARY,         -- 16 bytes; NULL when unknown or session scope
         target_span_id VARBINARY           -- 8 bytes; span scope only, NULL when unknown
-    ))
+    )),
+    -- Resource. Appended after `evaluations` so every earlier field id stays put.
+    environment VARCHAR                    -- resource deployment.environment.name, else deployment.environment
 )
 WITH (
     format = 'PARQUET',
@@ -697,9 +699,17 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 
 ---
 
-**Version:** 1.8
-**Last Updated:** 2026-10-29
+**Version:** 1.9
+**Last Updated:** 2026-11-04
 **Schema Source:** `crates/icegate-common/src/schema.rs`
+
+**Notable Changes in v1.9:**
+- `operations` gains `environment` (`VARCHAR`, nullable, appended last at id 79).
+- The value comes from the resource attribute `deployment.environment.name`, else from
+  `deployment.environment`. An empty string counts as a value.
+- Not breaking for storage: `migrate create` (and `migrate upgrade`) append the column in
+  place, and rows written before read it as NULL.
+- Every pod must already run `SchemaTransition` by this point.
 
 **Notable Changes in v1.8:**
 - `prices` gains `min_week_minute` and `max_week_minute` (`INTEGER`, nullable, appended
