@@ -33,6 +33,15 @@ pub enum MigrationOperation {
         /// Name of the table to upgrade
         table_name: String,
     },
+    /// A table a real run would refuse: appending columns cannot bring it to
+    /// the code's schema. Only a dry run of [`upgrade_schemas`] reports it; a
+    /// real run returns an error instead.
+    ManualMigrationRequired {
+        /// Name of the table.
+        table_name: String,
+        /// Why appending columns cannot resolve the difference.
+        reason: String,
+    },
 }
 
 /// Table schema definition with partition spec and sort order
@@ -299,8 +308,10 @@ async fn create_table(
 /// # Behavior
 ///
 /// - **Dry-run mode**: logs differences for every mismatched table and
-///   returns `Ok(operations)` containing one `MigrationOperation::Upgrade`
-///   entry per mismatch so the operator can preview the full list.
+///   returns `Ok(operations)` with one entry per mismatch:
+///   `MigrationOperation::Upgrade` when appending columns would resolve it,
+///   `MigrationOperation::ManualMigrationRequired` when a real run would
+///   refuse the table.
 /// - **Non-dry-run mode**: appends columns to every table where that
 ///   resolves the mismatch, logs differences for every other mismatched
 ///   table discovered during the scan, then returns
@@ -374,13 +385,9 @@ pub async fn upgrade_schemas(catalog: &Arc<dyn Catalog>, dry_run: bool) -> Resul
                 ColumnAddition::Unresolvable(drift) => drift,
             };
             if dry_run {
-                tracing::info!(
-                    "[dry-run] Would require manual migration for table {}: {}",
-                    def.name,
-                    drift
-                );
-                operations.push(MigrationOperation::Upgrade {
+                operations.push(MigrationOperation::ManualMigrationRequired {
                     table_name: def.name.to_string(),
+                    reason: drift.to_string(),
                 });
             } else {
                 differing_tables.push(DifferingTable {

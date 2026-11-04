@@ -243,7 +243,9 @@ impl Storage for RecordingStorage {
         Ok(crate::transform::logs_arrow_schema()?)
     }
 
-    async fn evict_cached_table(&self) {}
+    async fn reload_write_target(&self, cancel_token: &CancellationToken) -> Result<SchemaRef> {
+        self.load_write_target(cancel_token).await
+    }
 
     async fn write_record_batches(
         &self,
@@ -352,8 +354,8 @@ impl Storage for IcebergStorageWithHistory {
         self.inner.load_write_target(cancel_token).await
     }
 
-    async fn evict_cached_table(&self) {
-        self.inner.evict_cached_table().await;
+    async fn reload_write_target(&self, cancel_token: &CancellationToken) -> Result<CachedTable> {
+        self.inner.reload_write_target(cancel_token).await
     }
 
     async fn write_record_batches(

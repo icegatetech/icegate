@@ -981,7 +981,12 @@ mod tests {
             .project(&(0..batch.num_columns() - 1).collect::<Vec<_>>())
             .expect("narrower batch");
 
-        for (case, refused_batch) in [("wider", wider), ("narrower", narrower)] {
+        for (case, batches) in [
+            ("wider alone", vec![wider.clone()]),
+            ("narrower alone", vec![narrower.clone()]),
+            ("wider after a matching batch", vec![batch.clone(), wider]),
+            ("narrower after a matching batch", vec![batch, narrower]),
+        ] {
             let error = write_record_batches_to_parquet(
                 table.clone(),
                 WriteConfig {
@@ -991,7 +996,7 @@ mod tests {
                     bloom_filter_columns: &[],
                     column_encodings: &[],
                 },
-                futures::stream::once(async { Ok(refused_batch) }).boxed(),
+                futures::stream::iter(batches.into_iter().map(Ok)).boxed(),
                 &super::CancellationToken::new(),
             )
             .await

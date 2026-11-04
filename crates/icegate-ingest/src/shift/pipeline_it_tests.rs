@@ -844,9 +844,9 @@ async fn a_wal_batch_carries_the_arrow_schema_of_its_table() {
 }
 
 /// A write attempt writes into the table it loaded, even when a migration adds a column and the
-/// cached table is dropped between that load and the write — what an expired cache TTL or a
-/// sibling shift task's eviction does while the migrate hook commits. Were the writer to load the
-/// table again, the batch built for the loaded schema would lack the new column and be refused.
+/// table is read again between that load and the write — what an expired cache TTL or a sibling
+/// shift task's reload does while the migrate hook commits. Were the writer to load the table
+/// again, the batch built for the loaded schema would lack the new column and be refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_write_lands_in_the_table_its_attempt_loaded_when_a_column_is_added_before_the_write() {
     let storage = start_object_storage().await;
@@ -877,8 +877,7 @@ async fn a_write_lands_in_the_table_its_attempt_loaded_when_a_column_is_added_be
         .apply(tx)
         .expect("add column applies");
     tx.commit(catalog.as_ref()).await.expect("add column commits");
-    shift_storage.evict_cached_table().await;
-    let reloaded = shift_storage.load_write_target(&cancel).await.expect("reload write target");
+    let reloaded = shift_storage.reload_write_target(&cancel).await.expect("reload write target");
     assert!(
         reloaded.arrow_schema().field_with_name("environment").is_ok(),
         "the fixture must evolve the table the next load reads"

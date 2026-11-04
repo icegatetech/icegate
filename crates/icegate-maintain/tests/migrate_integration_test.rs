@@ -109,7 +109,7 @@ async fn test_migrate_create_tables() {
         .iter()
         .map(|op| match op {
             MigrationOperation::Create { table_name } => table_name.as_str(),
-            MigrationOperation::Upgrade { .. } => {
+            MigrationOperation::Upgrade { .. } | MigrationOperation::ManualMigrationRequired { .. } => {
                 panic!("Expected Create operation")
             }
         })
@@ -588,9 +588,14 @@ fn schema_before_trailing_optional_columns(schema: &Schema) -> (Schema, Vec<Stri
     (previous, dropped.iter().map(|field| field.name.clone()).collect())
 }
 
-/// Commit to `table` one snapshot holding `rows`, if any, and recording `offset` as the committed
-/// WAL offset, as a Shifter commit leaves it.
-async fn commit_fixture_snapshot(catalog: &Arc<dyn Catalog>, table: &Table, rows: Option<RecordBatch>, offset: u64) {
+/// Commit to `table` one snapshot holding `rows`, if any, and recording `offset`, if any, as the
+/// committed WAL offset. An offset stands for a Shifter commit, its absence for a pricing crawler's.
+async fn commit_fixture_snapshot(
+    catalog: &Arc<dyn Catalog>,
+    table: &Table,
+    rows: Option<RecordBatch>,
+    offset: Option<u64>,
+) {
     let data_files = match rows {
         Some(batch) => {
             let write_config = WriteConfig {
@@ -613,8 +618,11 @@ async fn commit_fixture_snapshot(catalog: &Arc<dyn Catalog>, table: &Table, rows
         None => Vec::new(),
     };
     let tx = Transaction::new(table);
+    let properties = offset
+        .map(|offset| HashMap::from([(WAL_OFFSET_PROPERTY.to_string(), offset.to_string())]))
+        .unwrap_or_default();
     tx.fast_append()
-        .set_snapshot_properties(HashMap::from([(WAL_OFFSET_PROPERTY.to_string(), offset.to_string())]))
+        .set_snapshot_properties(properties)
         .add_data_files(data_files)
         .apply(tx)
         .expect("fixture snapshot applies")
@@ -700,9 +708,9 @@ async fn create_table_with_schema(catalog: &Arc<dyn Catalog>, name: &str, schema
 /// `migrate create` brings every existing table to the code's schema in place: a table that
 /// lacks trailing optional columns of the code gains them without being re-created, keeps every
 /// row it held, and reads the new columns of those rows as NULL; the snapshot that stamps the
-/// evolved schema keeps the committed WAL offset, so a reader resolving it from the current
-/// snapshot still finds it. A table already on the code's schema is left alone, and a second run
-/// changes nothing.
+/// evolved schema keeps the committed WAL offset of a table that has one, so a reader resolving it
+/// from the current snapshot still finds it. A table already on the code's schema is left alone,
+/// and a second run changes nothing.
 #[tokio::test]
 async fn create_appends_the_trailing_optional_columns_of_the_code_and_leaves_other_tables_alone() {
     const COMMITTED_OFFSET: u64 = 42;
@@ -740,7 +748,13 @@ async fn create_appends_the_trailing_optional_columns_of_the_code_and_leaves_oth
         if let Some(batch) = &rows {
             rows_before.push((name, batch.clone()));
         }
-        commit_fixture_snapshot(&catalog, &table, rows, COMMITTED_OFFSET).await;
+        commit_fixture_snapshot(
+            &catalog,
+            &table,
+            rows,
+            (name != PRICES_TABLE).then_some(COMMITTED_OFFSET),
+        )
+        .await;
         let table = catalog.load_table(&icegate_table_ident(name)).await.expect("load table");
         cases.push((
             name,
@@ -817,16 +831,28 @@ async fn create_appends_the_trailing_optional_columns_of_the_code_and_leaves_oth
         assert_eq!(metadata.snapshots().count(), expected_snapshots, "{name}: snapshots");
         let current = metadata.current_snapshot().expect("current snapshot");
         assert_eq!(current.schema_id(), Some(metadata.current_schema_id()), "{name}");
-        assert_eq!(
-            current.summary().additional_properties.get(WAL_OFFSET_PROPERTY),
-            Some(&COMMITTED_OFFSET.to_string()),
-            "{name}: the current snapshot must carry the committed WAL offset"
-        );
-        assert_eq!(
-            resolve_committed_offset(metadata).expect("offset resolves"),
-            Some(COMMITTED_OFFSET),
-            "{name}"
-        );
+        if *name == PRICES_TABLE {
+            assert_eq!(
+                current.summary().additional_properties.get(WAL_OFFSET_PROPERTY),
+                None,
+                "{name}: the pricing crawler's table must not gain a WAL offset"
+            );
+            assert!(
+                resolve_committed_offset(metadata).is_err(),
+                "{name}: a snapshot chain without an offset must not resolve"
+            );
+        } else {
+            assert_eq!(
+                current.summary().additional_properties.get(WAL_OFFSET_PROPERTY),
+                Some(&COMMITTED_OFFSET.to_string()),
+                "{name}: the current snapshot must carry the committed WAL offset"
+            );
+            assert_eq!(
+                resolve_committed_offset(metadata).expect("offset resolves"),
+                Some(COMMITTED_OFFSET),
+                "{name}"
+            );
+        }
     }
     assert!(
         !ops.iter().any(|op| matches!(op, MigrationOperation::Create { .. })),
@@ -903,7 +929,7 @@ impl Catalog for CatalogWithConcurrentShiftCommit {
     async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
         let loaded = self.inner.load_table(table).await?;
         if *table == self.table && !self.is_shift_committed.swap(true, Ordering::SeqCst) {
-            commit_fixture_snapshot(&self.inner, &loaded, None, self.shift_offset).await;
+            commit_fixture_snapshot(&self.inner, &loaded, None, Some(self.shift_offset)).await;
         }
         Ok(loaded)
     }
@@ -951,7 +977,7 @@ async fn create_stamps_the_offset_of_a_shift_commit_that_lands_during_the_migrat
     let (previous, added) = schema_before_trailing_optional_columns(&operations_schema().expect("operations schema"));
     assert!(!added.is_empty(), "the fixture must evolve the table");
     let table = create_table_with_schema(&catalog, OPERATIONS_TABLE, previous).await;
-    commit_fixture_snapshot(&catalog, &table, None, OFFSET_BEFORE_MIGRATION).await;
+    commit_fixture_snapshot(&catalog, &table, None, Some(OFFSET_BEFORE_MIGRATION)).await;
     let ident = icegate_table_ident(OPERATIONS_TABLE);
     let before = catalog.load_table(&ident).await.expect("load table");
     let racing_catalog: Arc<dyn Catalog> = Arc::new(CatalogWithConcurrentShiftCommit {
@@ -1253,10 +1279,10 @@ async fn dry_run_create_refuses_unresolvable_drift_and_leaves_the_tables_unchang
     assert_table_unchanged(&catalog, &logs).await;
 }
 
-/// Unlike `migrate create`, a dry run of `migrate upgrade` previews every mismatched table as an
-/// upgrade instead of failing, whether or not appending would resolve it.
+/// Unlike `migrate create`, a dry run of `migrate upgrade` previews every mismatched table instead
+/// of failing, and it tells a table it would upgrade from one a real run would refuse.
 #[tokio::test]
-async fn dry_run_upgrade_previews_every_mismatched_table_and_leaves_them_unchanged() {
+async fn dry_run_upgrade_tells_tables_it_would_upgrade_from_tables_requiring_manual_migration() {
     let (catalog, operations, _) = catalog_with_previous_operations().await;
     let logs = create_retyped_logs(&catalog).await;
 
@@ -1264,7 +1290,14 @@ async fn dry_run_upgrade_previews_every_mismatched_table_and_leaves_them_unchang
 
     assert_eq!(ops.len(), 2, "got {ops:?}");
     assert!(ops.iter().any(|op| is_upgrade_of(op, OPERATIONS_TABLE)), "got {ops:?}");
-    assert!(ops.iter().any(|op| is_upgrade_of(op, LOGS_TABLE)), "got {ops:?}");
+    assert!(
+        ops.iter().any(|op| matches!(
+            op,
+            MigrationOperation::ManualMigrationRequired { table_name, reason }
+                if table_name == LOGS_TABLE && !reason.is_empty()
+        )),
+        "got {ops:?}"
+    );
     assert_table_unchanged(&catalog, &operations).await;
     assert_table_unchanged(&catalog, &logs).await;
 }

@@ -60,6 +60,8 @@ pub struct SchemaTransition {
 impl SchemaTransition {
     /// Build the rule taking `source_schema` batches to `target_schema`.
     ///
+    /// `target_schema` must not repeat a column name; this rule does not check it.
+    ///
     /// # Errors
     ///
     /// Returns [`SchemaTransitionError::ColumnNotInTable`] when the source has a
@@ -345,7 +347,7 @@ mod tests {
         assert_eq!(changed_nullability, expected);
     }
 
-    /// The Shifter drops its cached table only for an extra column, so that verdict must win when
+    /// The Shifter reads its table again only for an extra column, so that verdict must win when
     /// the same schemas also differ in a way that alone would end the task.
     #[test]
     fn an_extra_column_is_reported_ahead_of_any_other_difference() {

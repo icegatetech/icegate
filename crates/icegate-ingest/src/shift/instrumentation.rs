@@ -433,8 +433,8 @@ where
         self.inner.load_write_target(cancel_token).await
     }
 
-    async fn evict_cached_table(&self) {
-        self.inner.evict_cached_table().await;
+    async fn reload_write_target(&self, cancel_token: &CancellationToken) -> crate::error::Result<S::Target> {
+        self.inner.reload_write_target(cancel_token).await
     }
 
     async fn write_record_batches(

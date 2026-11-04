@@ -385,10 +385,11 @@ where
     /// Turn a schema-transition failure into a write failure.
     ///
     /// A batch carrying a column the table lacks means the cached table may
-    /// predate a migration, so the cache is dropped and the table reloaded. When
-    /// the reloaded table has the column, the retry of
+    /// predate a migration, so the table is read from the catalog again. When
+    /// that table has the column, the retry of
     /// [`Self::write_row_groups_with_retry`] writes into it; when it does not,
-    /// the failure is final, because every retry would load the same table.
+    /// the failure is final, because the verdict rests on the catalog rather than
+    /// on a table another read left in the cache.
     async fn transition_write_error(
         &self,
         error: SchemaTransitionError,
@@ -397,8 +398,7 @@ where
         let SchemaTransitionError::ColumnNotInTable { column } = &error else {
             return ShiftWriteError::from(crate::error::IngestError::SchemaTransition(error));
         };
-        self.storage.evict_cached_table().await;
-        let has_column = match self.storage.load_write_target(cancel_token).await {
+        let has_column = match self.storage.reload_write_target(cancel_token).await {
             Ok(reloaded) => reloaded.arrow_schema().field_with_name(column).is_ok(),
             Err(err) => return ShiftWriteError::from(err),
         };
@@ -850,27 +850,36 @@ mod tests {
         }
     }
 
+    /// A catalog failure as `IcebergStorage` reports it.
+    fn catalog_error(is_retryable: bool) -> IngestError {
+        IngestError::Iceberg(
+            iceberg::Error::new(iceberg::ErrorKind::Unexpected, "catalog failure").with_retryable(is_retryable),
+        )
+    }
+
     struct FakeStorage {
         writes: Mutex<Vec<Vec<arrow::record_batch::RecordBatch>>>,
         write_calls: AtomicUsize,
         fail_attempts_remaining: AtomicUsize,
         fail_retryable: bool,
         returned_data_files: Vec<DataFile>,
-        /// Table schema served until the first eviction, standing for a table cached before a
-        /// migration; `None` serves the schema of [`test_batch`] from the start.
+        /// Table schema served until the first completed reload, standing for a table cached before
+        /// a migration; `None` serves the schema of [`test_batch`] from the start.
         stale_table_schema: Option<arrow::datatypes::SchemaRef>,
-        /// Whether `stale_table_schema` is still served after an eviction, standing for a catalog
-        /// whose table never gained the column.
-        is_stale_after_eviction: bool,
-        /// Table schema served after an eviction, standing for a table a migration evolved; `None`
+        /// Whether `stale_table_schema` is still served after a reload, standing for a catalog whose
+        /// table never gained the column.
+        is_stale_after_reload: bool,
+        /// Table schema served after a reload, standing for a table a migration evolved; `None`
         /// serves the schema of [`test_batch`].
         evolved_table_schema: Option<arrow::datatypes::SchemaRef>,
-        /// How many loads right after an eviction fail with a transient catalog error.
-        transient_load_failures_after_eviction: AtomicUsize,
+        /// How many reloads fail with a transient catalog error.
+        transient_reload_failures: AtomicUsize,
         /// Whether every load fails with a terminal catalog error.
         is_load_refused: bool,
         load_calls: AtomicUsize,
-        evict_calls: AtomicUsize,
+        reload_calls: AtomicUsize,
+        /// Reloads that returned a table; a failed reload leaves the cached table in place.
+        completed_reloads: AtomicUsize,
     }
 
     impl FakeStorage {
@@ -882,12 +891,13 @@ mod tests {
                 fail_retryable: false,
                 returned_data_files: Vec::new(),
                 stale_table_schema: None,
-                is_stale_after_eviction: false,
+                is_stale_after_reload: false,
                 evolved_table_schema: None,
-                transient_load_failures_after_eviction: AtomicUsize::new(0),
+                transient_reload_failures: AtomicUsize::new(0),
                 is_load_refused: false,
                 load_calls: AtomicUsize::new(0),
-                evict_calls: AtomicUsize::new(0),
+                reload_calls: AtomicUsize::new(0),
+                completed_reloads: AtomicUsize::new(0),
             }
         }
 
@@ -899,17 +909,18 @@ mod tests {
                 fail_retryable: true,
                 returned_data_files,
                 stale_table_schema: None,
-                is_stale_after_eviction: false,
+                is_stale_after_reload: false,
                 evolved_table_schema: None,
-                transient_load_failures_after_eviction: AtomicUsize::new(0),
+                transient_reload_failures: AtomicUsize::new(0),
                 is_load_refused: false,
                 load_calls: AtomicUsize::new(0),
-                evict_calls: AtomicUsize::new(0),
+                reload_calls: AtomicUsize::new(0),
+                completed_reloads: AtomicUsize::new(0),
             }
         }
 
         /// Storage whose cached table predates `stale_table_schema`'s missing columns until it is
-        /// evicted; every write succeeds.
+        /// reloaded; every write succeeds.
         fn with_stale_table_schema(
             stale_table_schema: arrow::datatypes::SchemaRef,
             returned_data_files: Vec<DataFile>,
@@ -920,12 +931,21 @@ mod tests {
             }
         }
 
-        /// Storage serving `table_schema` before and after an eviction, standing for a catalog a
-        /// reload cannot change.
-        fn with_table_schema_unchanged_by_eviction(table_schema: arrow::datatypes::SchemaRef) -> Self {
+        /// Storage serving `table_schema` before and after a reload, standing for a catalog a reload
+        /// cannot change.
+        fn with_table_schema_unchanged_by_reload(table_schema: arrow::datatypes::SchemaRef) -> Self {
             Self {
-                is_stale_after_eviction: true,
+                is_stale_after_reload: true,
                 ..Self::with_stale_table_schema(table_schema, Vec::new())
+            }
+        }
+
+        /// The table schema a load serves at this point of the test.
+        fn current_table_schema(&self) -> arrow::datatypes::SchemaRef {
+            let is_reloaded = self.completed_reloads.load(Ordering::SeqCst) > 0;
+            match &self.stale_table_schema {
+                Some(stale) if self.is_stale_after_reload || !is_reloaded => Arc::clone(stale),
+                _ => self.evolved_table_schema.clone().unwrap_or_else(|| test_batch(0).schema()),
             }
         }
     }
@@ -941,30 +961,27 @@ mod tests {
         async fn load_write_target(&self, _cancel_token: &CancellationToken) -> Result<arrow::datatypes::SchemaRef> {
             self.load_calls.fetch_add(1, Ordering::SeqCst);
             if self.is_load_refused {
-                return Err(IngestError::Shift("catalog refused the table load".to_string()));
+                return Err(catalog_error(false));
             }
-            let is_evicted = self.evict_calls.load(Ordering::SeqCst) > 0;
-            if is_evicted
-                && self
-                    .transient_load_failures_after_eviction
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        (remaining > 0).then_some(remaining.saturating_sub(1))
-                    })
-                    .is_ok()
-            {
-                return Err(IngestError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "transient catalog failure",
-                )));
-            }
-            Ok(match &self.stale_table_schema {
-                Some(stale) if self.is_stale_after_eviction || !is_evicted => Arc::clone(stale),
-                _ => self.evolved_table_schema.clone().unwrap_or_else(|| test_batch(0).schema()),
-            })
+            Ok(self.current_table_schema())
         }
 
-        async fn evict_cached_table(&self) {
-            self.evict_calls.fetch_add(1, Ordering::SeqCst);
+        async fn reload_write_target(&self, _cancel_token: &CancellationToken) -> Result<arrow::datatypes::SchemaRef> {
+            self.reload_calls.fetch_add(1, Ordering::SeqCst);
+            if self.is_load_refused {
+                return Err(catalog_error(false));
+            }
+            let is_transient_failure = self
+                .transient_reload_failures
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then_some(remaining.saturating_sub(1))
+                })
+                .is_ok();
+            if is_transient_failure {
+                return Err(catalog_error(true));
+            }
+            self.completed_reloads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.current_table_schema())
         }
 
         async fn write_record_batches(
@@ -1322,10 +1339,10 @@ mod tests {
     }
 
     /// A WAL batch carrying a column the cached table lacks means the table was cached before a
-    /// migration added it: the runner drops the cache and the retry shifts against the evolved
+    /// migration added it: the runner reads the table again and the retry shifts against the evolved
     /// table instead of failing the task.
     #[tokio::test]
-    async fn shift_segments_evicts_a_table_cached_before_a_column_was_added_and_retries() {
+    async fn shift_segments_reloads_a_table_cached_before_a_column_was_added_and_retries() {
         let queue_reader = Arc::new(FakeQueueReader {
             batches_by_offset: HashMap::from([(1, vec![test_batch(1)])]),
             delay_by_offset: HashMap::new(),
@@ -1364,16 +1381,16 @@ mod tests {
             .expect("the retry against the evolved table must succeed");
 
         assert_eq!(result.status, TaskStatus::Ok);
-        assert_eq!(storage.evict_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.reload_calls.load(Ordering::SeqCst), 1);
         let writes = storage.writes.lock().await;
         assert_eq!(writes.len(), 1, "only the retry reaches the writer");
         assert_eq!(values_from_batches(&writes[0]), vec![1]);
         assert_eq!(writes[0][0].schema(), current_schema);
     }
 
-    /// A WAL batch carrying a column the table never gains: the reload after the eviction still
-    /// lacks it, so the task fails as a write failure at once instead of retrying the same table
-    /// until its attempts or its deadline run out.
+    /// A WAL batch carrying a column the table never gains: the reloaded table still lacks it, so
+    /// the task fails as a write failure at once instead of retrying the same table until its
+    /// attempts or its deadline run out.
     #[tokio::test]
     async fn shift_segments_fails_without_retrying_when_the_reloaded_table_still_lacks_the_column() {
         let queue_reader = Arc::new(FakeQueueReader {
@@ -1386,7 +1403,7 @@ mod tests {
             concurrency_gate: None,
             release_gate: None,
         });
-        let storage = Arc::new(FakeStorage::with_table_schema_unchanged_by_eviction(schema_without(
+        let storage = Arc::new(FakeStorage::with_table_schema_unchanged_by_reload(schema_without(
             "value",
         )));
         let runner = ShiftTaskRunnerImpl::new(
@@ -1414,9 +1431,9 @@ mod tests {
 
         assert_eq!(failure.reason(), ShiftTaskFailureReason::Write);
         assert_eq!(
-            storage.evict_calls.load(Ordering::SeqCst),
+            storage.reload_calls.load(Ordering::SeqCst),
             1,
-            "a retry would evict again: the failure must end the task after one reload"
+            "a retry would reload again: the failure must end the task after one reload"
         );
         assert!(storage.writes.lock().await.is_empty(), "no attempt reaches the writer");
     }
@@ -1476,9 +1493,9 @@ mod tests {
 
     /// The first row group fits the cached table, so the prefetch passes and the write starts; only
     /// the second one, read from the running write, reveals the column the cached table lacks. The
-    /// cache must be dropped from this path too, or every retry would fail against the same table.
+    /// table must be read again from this path too, or every retry would fail against the same table.
     #[tokio::test]
-    async fn shift_segments_evicts_the_table_when_a_later_row_group_carries_a_column_it_lacks() {
+    async fn shift_segments_reloads_the_table_when_a_later_row_group_carries_a_column_it_lacks() {
         let first_group = ordered_single_row_batch("svc", 30, 1);
         let second_group = batch_with_extra_column(&ordered_single_row_batch("svc", 20, 2), "from-the-wal");
         let segment = vec![first_group, second_group.clone()];
@@ -1502,7 +1519,7 @@ mod tests {
             2,
             "the first attempt must reach the writer"
         );
-        assert_eq!(storage.evict_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.reload_calls.load(Ordering::SeqCst), 1);
         let writes = storage.writes.lock().await;
         assert_eq!(writes.len(), 1, "only the retry completes its write");
         let rows = writes[0]
@@ -1535,7 +1552,8 @@ mod tests {
     }
 
     /// A retyped column and a required column the batch lacks are not a stale cache: a reload cannot
-    /// resolve them, so the task fails at once, without touching the cache or the writer.
+    /// resolve them, so the task fails at once, without reading the table again or reaching the
+    /// writer.
     #[tokio::test]
     async fn shift_segments_fails_without_a_reload_on_a_schema_difference_other_than_an_extra_column() {
         let batch_schema = test_batch(0).schema();
@@ -1561,7 +1579,7 @@ mod tests {
             ("required column missing from the batch", required_column_missing),
         ] {
             let segment = vec![test_batch(1)];
-            let storage = Arc::new(FakeStorage::with_table_schema_unchanged_by_eviction(table_schema));
+            let storage = Arc::new(FakeStorage::with_table_schema_unchanged_by_reload(table_schema));
             let runner = logs_runner(queue_reader_of_one_segment(segment.clone()), &storage);
 
             let failure = runner
@@ -1571,19 +1589,20 @@ mod tests {
                 .unwrap_or_else(|| panic!("{case}: the task must fail"));
 
             assert_eq!(failure.reason(), ShiftTaskFailureReason::Write, "{case}");
-            assert_eq!(storage.evict_calls.load(Ordering::SeqCst), 0, "{case}: cache kept");
+            assert_eq!(storage.reload_calls.load(Ordering::SeqCst), 0, "{case}: no reload");
             assert_eq!(storage.load_calls.load(Ordering::SeqCst), 1, "{case}: no retry");
             assert_eq!(storage.write_calls.load(Ordering::SeqCst), 0, "{case}: no write");
         }
     }
 
     /// A catalog hiccup during the reload says nothing about the table's columns, so it must not
-    /// turn into the final "the table never gained the column" verdict.
+    /// turn into the final "the table never gained the column" verdict. The next attempt still meets
+    /// the stale table, which is why the reload runs twice.
     #[tokio::test]
-    async fn shift_segments_retries_when_the_reload_after_an_eviction_fails_transiently() {
+    async fn shift_segments_retries_when_the_reload_fails_transiently() {
         let segment = vec![test_batch(1)];
         let storage = Arc::new(FakeStorage {
-            transient_load_failures_after_eviction: AtomicUsize::new(1),
+            transient_reload_failures: AtomicUsize::new(1),
             ..FakeStorage::with_stale_table_schema(
                 schema_without("value"),
                 vec![test_data_file("s3://warehouse/logs/part-00001.parquet", 1)],
@@ -1597,7 +1616,7 @@ mod tests {
             .expect("the retry after the transient reload failure must succeed");
 
         assert_eq!(result.status, TaskStatus::Ok);
-        assert_eq!(storage.evict_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.reload_calls.load(Ordering::SeqCst), 2);
         let writes = storage.writes.lock().await;
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0][0].schema(), test_batch(0).schema());
@@ -1626,12 +1645,12 @@ mod tests {
 
     /// The production stack end to end around a migration: a real WAL, a real table cached before
     /// the migration, and the metrics wrapper the Shifter puts in front of the storage. The segment
-    /// is wider than the cached table, so the eviction has to pass through the wrapper for the retry
+    /// is wider than the cached table, so the reload has to pass through the wrapper for the retry
     /// to see the evolved table; that table is in turn wider than the segment, as it is for an old
     /// pod once a newer release has migrated it. Lives here because `shift_segments` is private to
     /// this module; the fixture comes from [`crate::shift::pipeline_it_tests`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn shift_segments_through_the_metrics_wrapper_evicts_a_stale_table_and_fills_a_column_the_wal_lacks() {
+    async fn shift_segments_through_the_metrics_wrapper_reloads_a_stale_table_and_fills_a_column_the_wal_lacks() {
         const ENVIRONMENT_COLUMN: &str = "environment";
 
         let object_storage = start_object_storage().await;
@@ -1695,7 +1714,7 @@ mod tests {
         .await;
 
         // The default TTL could expire on a slow container and refresh the cache by itself, which
-        // would pass this test without the eviction it is about.
+        // would pass this test without the reload it is about.
         let mut config = shift_config(&object_storage, &format!("jobs-{run_id}"));
         config.write.table_cache_ttl_secs = 3600;
         let storage = Arc::new(StorageWithMetrics::new(

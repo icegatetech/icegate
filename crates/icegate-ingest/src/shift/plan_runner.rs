@@ -501,7 +501,9 @@ mod tests {
             ))
         }
 
-        async fn evict_cached_table(&self) {}
+        async fn reload_write_target(&self, cancel_token: &CancellationToken) -> IngestResult<SchemaRef> {
+            self.load_write_target(cancel_token).await
+        }
 
         async fn write_record_batches(
             &self,
@@ -610,7 +612,9 @@ mod tests {
             ))
         }
 
-        async fn evict_cached_table(&self) {}
+        async fn reload_write_target(&self, cancel_token: &CancellationToken) -> IngestResult<SchemaRef> {
+            self.load_write_target(cancel_token).await
+        }
 
         async fn write_record_batches(
             &self,

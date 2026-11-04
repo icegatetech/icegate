@@ -61,11 +61,15 @@ pub trait Storage: Send + Sync {
     async fn get_last_offset(&self, cancel_token: &CancellationToken) -> Result<Option<u64>>;
 
     /// Load the table the next write attempt writes into; a cached table is
-    /// served until its TTL expires or [`Self::evict_cached_table`] drops it.
+    /// served until its TTL expires or [`Self::reload_write_target`] replaces it.
     async fn load_write_target(&self, cancel_token: &CancellationToken) -> Result<Self::Target>;
 
-    /// Drop the cached table so the next load reads it from the catalog.
-    async fn evict_cached_table(&self);
+    /// Read the table from the catalog, whatever the cache holds, and cache it.
+    ///
+    /// The returned table reflects the catalog at the time of this call. A read
+    /// that started earlier can still overwrite the cache afterwards, so a later
+    /// [`Self::load_write_target`] may serve an older table.
+    async fn reload_write_target(&self, cancel_token: &CancellationToken) -> Result<Self::Target>;
 
     /// Write parquet files from record batches into `target` without committing.
     async fn write_record_batches(
@@ -145,9 +149,9 @@ impl IcebergStorage {
         self.retry(cancel_token, || self.loader.load_cached()).await
     }
 
-    /// Drop the cached table; see [`Storage::evict_cached_table`].
-    pub async fn evict_cached_table(&self) {
-        self.loader.evict().await;
+    /// Read the table from the catalog; see [`Storage::reload_write_target`].
+    pub async fn reload_write_target(&self, cancel_token: &CancellationToken) -> Result<CachedTable> {
+        self.retry(cancel_token, || self.loader.load_fresh()).await
     }
 
     async fn load_table_fresh(&self, cancel_token: &CancellationToken) -> Result<Table> {
@@ -317,7 +321,7 @@ impl IcebergStorage {
                             Err(err) => {
                                 let retryable = err.is_retryable();
                                 if retryable {
-                                    tracing::debug!(?err, retryable, "Iceberg storage operation failed, retrying");
+                                    tracing::warn!(error = %err, "Iceberg storage operation failed, retrying");
                                 } else {
                                     tracing::debug!(?err, retryable, "Iceberg storage operation failed, not retryable");
                                 }
@@ -349,8 +353,8 @@ impl Storage for IcebergStorage {
         self.load_write_target(cancel_token).await
     }
 
-    async fn evict_cached_table(&self) {
-        self.evict_cached_table().await;
+    async fn reload_write_target(&self, cancel_token: &CancellationToken) -> Result<CachedTable> {
+        self.reload_write_target(cancel_token).await
     }
 
     async fn write_record_batches(
@@ -430,11 +434,12 @@ impl TableLoader {
     }
 
     async fn load_fresh(&self) -> Result<CachedTable> {
-        let table = self
-            .catalog
-            .load_table(&self.table_ident)
-            .await
-            .map_err(|e| IngestError::Shift(format!("failed to load table '{}': {e}", self.table_ident.name())))?;
+        let table = self.catalog.load_table(&self.table_ident).await.map_err(|e| {
+            IngestError::Iceberg(
+                e.with_context("operation", "load table")
+                    .with_context("table", self.table_ident.name()),
+            )
+        })?;
         let arrow_schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).map_err(|e| {
             IngestError::Shift(format!(
                 "failed to convert the schema of table '{}' to Arrow: {e}",
@@ -451,17 +456,16 @@ impl TableLoader {
 
         Ok(cached)
     }
-
-    async fn evict(&self) {
-        *self.cache.write().await = None;
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
-    use iceberg::{NamespaceIdent, TableCreation};
+    use iceberg::{ErrorKind, Namespace, NamespaceIdent, TableCommit, TableCreation};
     use icegate_common::{
         ICEGATE_NAMESPACE, LOGS_TABLE,
         catalog::{CatalogBackend, CatalogBuilder, CatalogConfig, IoHandle},
@@ -472,11 +476,8 @@ mod tests {
 
     use super::*;
 
-    /// The Shifter tells a stale cached table from any other write failure by this error's type,
-    /// so the type has to survive the trip through the shared write pipeline and back: as a plain
-    /// message it would come out as a terminal `IngestError::Shift`, and the cache would stay.
-    #[tokio::test]
-    async fn write_record_batches_keeps_the_type_of_a_schema_transition_error_from_the_stream() {
+    /// A memory catalog holding the logs table in the IceGate namespace.
+    async fn create_memory_logs_catalog() -> Arc<dyn Catalog> {
         let catalog = CatalogBuilder::from_config(
             &CatalogConfig {
                 backend: CatalogBackend::Memory,
@@ -509,6 +510,234 @@ mod tests {
             )
             .await
             .expect("create logs table");
+        catalog
+    }
+
+    /// Catalog whose first `failures_left` table loads fail, flagged retryable or not.
+    #[derive(Debug)]
+    struct CatalogFailingLoads {
+        inner: Arc<dyn Catalog>,
+        failures_left: AtomicUsize,
+        is_failure_retryable: bool,
+        load_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Catalog for CatalogFailingLoads {
+        async fn list_namespaces(&self, parent: Option<&NamespaceIdent>) -> iceberg::Result<Vec<NamespaceIdent>> {
+            self.inner.list_namespaces(parent).await
+        }
+
+        async fn create_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+            properties: HashMap<String, String>,
+        ) -> iceberg::Result<Namespace> {
+            self.inner.create_namespace(namespace, properties).await
+        }
+
+        async fn get_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<Namespace> {
+            self.inner.get_namespace(namespace).await
+        }
+
+        async fn namespace_exists(&self, namespace: &NamespaceIdent) -> iceberg::Result<bool> {
+            self.inner.namespace_exists(namespace).await
+        }
+
+        async fn update_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+            properties: HashMap<String, String>,
+        ) -> iceberg::Result<()> {
+            self.inner.update_namespace(namespace, properties).await
+        }
+
+        async fn drop_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<()> {
+            self.inner.drop_namespace(namespace).await
+        }
+
+        async fn list_tables(&self, namespace: &NamespaceIdent) -> iceberg::Result<Vec<TableIdent>> {
+            self.inner.list_tables(namespace).await
+        }
+
+        async fn create_table(&self, namespace: &NamespaceIdent, creation: TableCreation) -> iceberg::Result<Table> {
+            self.inner.create_table(namespace, creation).await
+        }
+
+        async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
+            let is_failing = self
+                .failures_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                .is_ok();
+            if is_failing {
+                return Err(iceberg::Error::new(ErrorKind::Unexpected, "catalog load failed")
+                    .with_retryable(self.is_failure_retryable));
+            }
+            self.inner.load_table(table).await
+        }
+
+        async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+            self.inner.drop_table(table).await
+        }
+
+        async fn purge_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+            self.inner.purge_table(table).await
+        }
+
+        async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
+            self.inner.table_exists(table).await
+        }
+
+        async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
+            self.inner.rename_table(src, dest).await
+        }
+
+        async fn register_table(&self, table: &TableIdent, metadata_location: String) -> iceberg::Result<Table> {
+            self.inner.register_table(table, metadata_location).await
+        }
+
+        async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
+            self.inner.update_table(commit).await
+        }
+    }
+
+    /// The catalog decides what is transient, so its flag has to survive the mapping to
+    /// `IngestError`: as a `Shift` message the failure would end the attempt without a retry.
+    #[tokio::test]
+    async fn load_write_target_retries_a_catalog_failure_flagged_retryable() {
+        let catalog = Arc::new(CatalogFailingLoads {
+            inner: create_memory_logs_catalog().await,
+            failures_left: AtomicUsize::new(1),
+            is_failure_retryable: true,
+            load_calls: AtomicUsize::new(0),
+        });
+        let storage = IcebergStorage::new(
+            Arc::clone(&catalog) as Arc<dyn Catalog>,
+            LOGS_TABLE,
+            &ShiftConfig::default(),
+            64 * 1024 * 1024,
+            &[],
+            &[],
+        );
+
+        storage
+            .load_write_target(&CancellationToken::new())
+            .await
+            .expect("the retry after the transient failure must load the table");
+
+        assert_eq!(catalog.load_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn load_write_target_does_not_retry_a_catalog_failure_not_flagged_retryable() {
+        let catalog = Arc::new(CatalogFailingLoads {
+            inner: create_memory_logs_catalog().await,
+            failures_left: AtomicUsize::new(1),
+            is_failure_retryable: false,
+            load_calls: AtomicUsize::new(0),
+        });
+        let storage = IcebergStorage::new(
+            Arc::clone(&catalog) as Arc<dyn Catalog>,
+            LOGS_TABLE,
+            &ShiftConfig::default(),
+            64 * 1024 * 1024,
+            &[],
+            &[],
+        );
+
+        let error = storage
+            .load_write_target(&CancellationToken::new())
+            .await
+            .err()
+            .expect("a terminal catalog failure must reach the caller");
+
+        assert!(matches!(error, IngestError::Iceberg(_)), "got {error:?}");
+        // Reads the rendered error and checks the identifier, not the wording around it.
+        assert!(
+            error.to_string().contains(LOGS_TABLE),
+            "the error must name the table: {error}"
+        );
+        assert_eq!(catalog.load_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A catalog hiccup during the reload must not end the attempt: the reload decides whether the
+    /// table gained a column, and a failed read says nothing about that.
+    #[tokio::test]
+    async fn reload_write_target_retries_a_catalog_failure_flagged_retryable() {
+        let catalog = Arc::new(CatalogFailingLoads {
+            inner: create_memory_logs_catalog().await,
+            failures_left: AtomicUsize::new(1),
+            is_failure_retryable: true,
+            load_calls: AtomicUsize::new(0),
+        });
+        let storage = IcebergStorage::new(
+            Arc::clone(&catalog) as Arc<dyn Catalog>,
+            LOGS_TABLE,
+            &ShiftConfig::default(),
+            64 * 1024 * 1024,
+            &[],
+            &[],
+        );
+
+        storage
+            .reload_write_target(&CancellationToken::new())
+            .await
+            .expect("the retry after the transient failure must reload the table");
+
+        assert_eq!(catalog.load_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// The verdict "the table lacks this column" ends a shift task, so it must rest on a catalog
+    /// read: a table some other read left in the cache says nothing about a migration committed
+    /// since.
+    #[tokio::test]
+    async fn reload_write_target_reads_the_catalog_while_the_cached_table_is_within_its_ttl() {
+        let catalog = create_memory_logs_catalog().await;
+        let storage = IcebergStorage::new(
+            Arc::clone(&catalog),
+            LOGS_TABLE,
+            &ShiftConfig::default(),
+            64 * 1024 * 1024,
+            &[],
+            &[],
+        );
+        let cancel = CancellationToken::new();
+        storage.load_write_target(&cancel).await.expect("load write target");
+        let table = catalog.load_table(&icegate_table_ident(LOGS_TABLE)).await.expect("load table");
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_schema()
+            .add_column(iceberg::transaction::AddColumn::optional(
+                "environment",
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+            ))
+            .apply(tx)
+            .expect("add column applies");
+        tx.commit(catalog.as_ref()).await.expect("add column commits");
+
+        let cached = storage.load_write_target(&cancel).await.expect("load cached target");
+        let reloaded = storage.reload_write_target(&cancel).await.expect("reload write target");
+        let next = storage.load_write_target(&cancel).await.expect("load after the reload");
+
+        assert!(
+            cached.arrow_schema().field_with_name("environment").is_err(),
+            "the fixture needs a cached table"
+        );
+        assert!(reloaded.arrow_schema().field_with_name("environment").is_ok());
+        assert!(
+            next.arrow_schema().field_with_name("environment").is_ok(),
+            "the reload refreshes the cache"
+        );
+    }
+
+    /// The Shifter tells a stale cached table from any other write failure by this error's type,
+    /// so the type has to survive the trip through the shared write pipeline and back: as a plain
+    /// message it would come out as a terminal `IngestError::Shift`, and the table would not be
+    /// read again.
+    #[tokio::test]
+    async fn write_record_batches_keeps_the_type_of_a_schema_transition_error_from_the_stream() {
+        let catalog = create_memory_logs_catalog().await;
         let storage = IcebergStorage::new(catalog, LOGS_TABLE, &ShiftConfig::default(), 64 * 1024 * 1024, &[], &[]);
         let cancel = CancellationToken::new();
         let target = storage.load_write_target(&cancel).await.expect("load write target");
