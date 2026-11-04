@@ -33,9 +33,9 @@ use arrow::record_batch::RecordBatch;
 use common::{build_s3_catalog, setup_object_store};
 use futures::TryStreamExt;
 use iceberg::arrow::ArrowFileReader;
-use iceberg::spec::{DataFile, DataFileFormat};
+use iceberg::spec::{DataFile, DataFileFormat, PrimitiveType, Type};
 use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator};
@@ -49,6 +49,7 @@ use icegate_common::iceberg_write::WriteConfig;
 use icegate_common::manifest_scan::{DataFileStats, list_data_files_with_stats};
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
 use icegate_common::parquet_encoding::{LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS};
+use icegate_common::resolve_committed_offset;
 use icegate_common::schema::{
     COL_LOG_ATTRIBUTES, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, logs_partition_spec, logs_schema,
     logs_sort_order,
@@ -70,6 +71,8 @@ const DAY_MICROS: i64 = 1_749_600_000_000_000;
 /// the tiny seeded data, so the whole rewrite lands in one output file,
 /// exercising the many-to-one happy path.
 const TARGET_FILE_SIZE_BYTES: u64 = 128 * 1024 * 1024;
+/// Optional column a test adds to the table after the first append.
+const ENVIRONMENT_COLUMN: &str = "environment";
 
 /// Create the namespace and `logs` table, returning the table identifier.
 async fn create_logs_table(catalog: &S3Catalog) -> TableIdent {
@@ -410,6 +413,146 @@ async fn rewrite_executor_compacts_partition_preserving_rows_and_order() {
     assert_eq!(
         physical_after, expected_sorted,
         "post-rewrite physical order must be globally sorted by (service_name ASC, timestamp DESC)"
+    );
+}
+
+/// Read every row of the table's data files as `(body, service_name, timestamp, environment)`.
+async fn read_rows_with_environment(
+    table: &Table,
+    descriptor: &SortColumnsDescriptor,
+) -> Vec<(String, String, i64, Option<String>)> {
+    let stats = list_data_files_with_stats(table, descriptor).await.expect("list files");
+    let mut rows = Vec::new();
+    for stat in &stats {
+        let input = table.file_io().new_input(stat.data_file.file_path()).expect("open data file");
+        let meta = input.metadata().await.expect("stat data file");
+        let reader = input.reader().await.expect("data file reader");
+        let mut stream = ParquetRecordBatchStreamBuilder::new(ArrowFileReader::new(meta, reader))
+            .await
+            .expect("parquet builder")
+            .build()
+            .expect("parquet stream");
+        while let Some(batch) = stream.try_next().await.expect("read batch") {
+            let mut flattened = Vec::new();
+            append_rows(&batch, &mut flattened);
+            let environments = batch
+                .column_by_name(ENVIRONMENT_COLUMN)
+                .expect("the output carries the column the table gained")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("environment is Utf8");
+            rows.extend(
+                flattened.into_iter().enumerate().map(|(row, (body, service_name, timestamp))| {
+                    let environment = environments.is_valid(row).then(|| environments.value(row).to_string());
+                    (body, service_name, timestamp, environment)
+                }),
+            );
+        }
+    }
+    rows
+}
+
+/// A table that gained an optional column between two appends holds files of two layouts, and
+/// their key ranges overlap, so one merge opens both. Compaction must bring the older file to the
+/// table's schema: its rows read the new column as NULL, the newer file's rows keep their values.
+#[tokio::test]
+async fn rewrite_merges_a_file_written_before_a_column_was_added_with_one_written_after() {
+    let (_store, conn) = setup_object_store().await;
+    let catalog = Arc::new(build_s3_catalog(&conn));
+    let ident = create_logs_table(&catalog).await;
+    let descriptor = SortColumnsDescriptor::logs().expect("logs descriptor");
+
+    let table = catalog.load_table(&ident).await.unwrap();
+    let older_file = write_one_file(
+        &table,
+        logs_batch(&[("svc-a", DAY_MICROS + 30), ("svc-c", DAY_MICROS + 50)], 0),
+    )
+    .await;
+    fast_append_with_offset(&catalog, &ident, vec![older_file], 42).await;
+
+    let table = catalog.load_table(&ident).await.unwrap();
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_schema()
+        .add_column(AddColumn::optional(
+            ENVIRONMENT_COLUMN,
+            Type::Primitive(PrimitiveType::String),
+        ))
+        .apply(tx)
+        .unwrap();
+    tx.commit(catalog.as_ref()).await.unwrap();
+
+    let table = catalog.load_table(&ident).await.unwrap();
+    let previous_layout = logs_batch(&[("svc-b", DAY_MICROS + 40), ("svc-d", DAY_MICROS + 60)], 2);
+    let mut columns = previous_layout.columns().to_vec();
+    columns.push(Arc::new(StringArray::from(vec![Some("prod"), Some("prod")])));
+    let current_layout = RecordBatch::try_new(
+        Arc::new(iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).unwrap()),
+        columns,
+    )
+    .expect("batch in the evolved layout");
+    let newer_file = write_one_file(&table, current_layout).await;
+    fast_append_with_offset(&catalog, &ident, vec![newer_file], 43).await;
+
+    let before = catalog.load_table(&ident).await.unwrap();
+    let mut stats: Vec<DataFileStats> = list_data_files_with_stats(&before, descriptor).await.expect("list stats");
+    stats.sort_by(|left, right| left.min_key().compare(right.min_key()));
+    assert_eq!(stats.len(), 2, "one file of each layout");
+    let rewrite_input = RewriteInput {
+        table: TABLE.to_string(),
+        partition_key: stats[0].partition_key().to_string(),
+        input_file_paths: stats.iter().map(|s| s.data_file.file_path().to_string()).collect(),
+        trace_context: None,
+    };
+    let write_cfg = WriteConfig {
+        row_group_size: 20_000,
+        data_page_size_limit_bytes: 2 * 1024 * 1024,
+        max_file_size_bytes: TARGET_FILE_SIZE_BYTES,
+        bloom_filter_columns: LOGS_BLOOM_COLUMNS,
+        column_encodings: LOGS_COLUMN_ENCODINGS,
+    };
+    let dyn_catalog: Arc<dyn Catalog> = catalog.clone();
+    let executor = CompactFilesExecutor::new(dyn_catalog, write_cfg, descriptor, CompactMetrics::new());
+
+    let outcome = executor
+        .execute(&rewrite_input, &CancellationToken::new())
+        .await
+        .expect("execute rewrite");
+
+    assert!(
+        matches!(
+            outcome,
+            RewriteOutcome::Committed {
+                input_files: 2,
+                output_files: 1,
+                ..
+            }
+        ),
+        "the rewrite must merge both files into one"
+    );
+    let after = catalog.load_table(&ident).await.unwrap();
+    let mut rows = read_rows_with_environment(&after, descriptor).await;
+    rows.sort();
+    let row = |body: &str, service_name: &str, timestamp: i64, environment: Option<&str>| {
+        (
+            body.to_string(),
+            service_name.to_string(),
+            timestamp,
+            environment.map(str::to_string),
+        )
+    };
+    assert_eq!(
+        rows,
+        vec![
+            row("msg-0", "svc-a", DAY_MICROS + 30, None),
+            row("msg-1", "svc-c", DAY_MICROS + 50, None),
+            row("msg-2", "svc-b", DAY_MICROS + 40, Some("prod")),
+            row("msg-3", "svc-d", DAY_MICROS + 60, Some("prod")),
+        ]
+    );
+    assert_eq!(
+        resolve_committed_offset(after.metadata()).expect("committed offset"),
+        Some(43)
     );
 }
 

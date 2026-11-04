@@ -15,8 +15,11 @@
 
 use std::{collections::HashSet, panic::AssertUnwindSafe, pin::Pin, sync::Arc};
 
-use arrow::record_batch::RecordBatch;
-use futures::{FutureExt, Stream, TryStreamExt};
+use arrow::{
+    datatypes::{Schema, SchemaRef},
+    record_batch::RecordBatch,
+};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use iceberg::{
     arrow::RecordBatchPartitionSplitter,
     io::FileIO,
@@ -170,8 +173,10 @@ impl LocationGenerator for TrackingLocationGenerator {
 ///
 /// Returns [`CommonError::Iceberg`] for writer/splitter failures and
 /// [`CommonError::Write`] for cancellation, row-count overflow, partition-split
-/// failures, or a panic on the blocking thread. On any error the partially
-/// written data files are deleted from object storage before returning.
+/// failures, or a panic on the blocking thread. A batch whose columns do not
+/// match the table's current schema by position, name, type, and nullability is
+/// refused with [`CommonError::BatchSchemaMismatch`]. On any error the partially written data files
+/// are deleted from object storage before returning.
 pub async fn write_record_batches_to_parquet(
     table: Table,
     cfg: WriteConfig,
@@ -208,7 +213,7 @@ pub async fn write_record_batches_to_parquet(
 async fn write_parquet_files_once(
     table: Table,
     cfg: WriteConfig,
-    mut batches: CommonRecordBatchStream,
+    batches: CommonRecordBatchStream,
     cancel_token: &CancellationToken,
 ) -> Result<WrittenDataFiles> {
     let table_metadata = table.metadata().clone();
@@ -233,6 +238,8 @@ async fn write_parquet_files_once(
     );
 
     let parquet_writer_builder = ParquetWriterBuilder::new(writer_props, table_metadata.current_schema().clone());
+    let table_arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(table_metadata.current_schema())?);
+    let mut batches = verify_batch_schemas(batches, table_arrow_schema);
 
     // Convert to `usize` for the iceberg writer API. On 64-bit targets `u64`
     // never overflows `usize`; saturate on 32-bit targets.
@@ -291,6 +298,104 @@ async fn write_parquet_files_once(
             cleanup_generated_data_files(&table_file_io, &generated_paths).await;
             std::panic::resume_unwind(panic_payload);
         }
+    }
+}
+
+/// Fail the stream on the first batch whose schema [`verify_batch_schema`]
+/// refuses against `table_schema`.
+///
+/// The full comparison runs once per distinct schema in the stream; see
+/// [`VerifiedBatchSchemas`].
+fn verify_batch_schemas(batches: CommonRecordBatchStream, table_schema: SchemaRef) -> CommonRecordBatchStream {
+    let mut verified_schemas = VerifiedBatchSchemas::new(table_schema);
+    batches
+        .map(move |batch| {
+            let batch = batch?;
+            verified_schemas.verify_schema(batch.schema_ref())?;
+            Ok(batch)
+        })
+        .boxed()
+}
+
+/// Batch schemas already checked against one table schema, one per distinct schema.
+///
+/// Merged output alternates between the schemas of its inputs (`slice` keeps the
+/// input's schema), so remembering only the last verified schema would repeat the
+/// full comparison at every switch. A parquet reader gives every batch a schema
+/// `Arc` of its own, so a schema is recognised by `Arc` identity first and by value
+/// otherwise: a batch with a remembered `Arc` costs a pointer comparison, one with
+/// another `Arc` of a remembered schema a value comparison, and neither adds an
+/// entry. Memory is one entry per distinct schema, not per batch.
+#[derive(Debug)]
+struct VerifiedBatchSchemas {
+    table_schema: SchemaRef,
+    verified_schemas: Vec<SchemaRef>,
+}
+
+impl VerifiedBatchSchemas {
+    const fn new(table_schema: SchemaRef) -> Self {
+        Self {
+            table_schema,
+            verified_schemas: Vec::new(),
+        }
+    }
+
+    /// Check `batch_schema` against the table schema unless an equal schema passed before.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommonError::BatchSchemaMismatch`] from [`verify_batch_schema`].
+    fn verify_schema(&mut self, batch_schema: &SchemaRef) -> Result<()> {
+        if self.verified_schemas.iter().any(|verified| Arc::ptr_eq(verified, batch_schema))
+            || self.verified_schemas.iter().any(|verified| **verified == **batch_schema)
+        {
+            return Ok(());
+        }
+        verify_batch_schema(batch_schema, &self.table_schema)?;
+        self.verified_schemas.push(Arc::clone(batch_schema));
+        Ok(())
+    }
+}
+
+/// Check that `batch_schema` binds to `table_schema` position by position.
+///
+/// Name, Arrow type, and nullability must match at every position; top-level
+/// field metadata is not compared (pinned by
+/// `verify_batch_schema_accepts_a_batch_matching_the_table_by_position`).
+///
+/// # Errors
+///
+/// Returns [`CommonError::BatchSchemaMismatch`] naming the first differing
+/// column, or the first extra or missing one when the counts differ.
+fn verify_batch_schema(batch_schema: &Schema, table_schema: &Schema) -> Result<()> {
+    let batch_fields = batch_schema.fields();
+    let table_fields = table_schema.fields();
+    for (position, (batch_field, table_field)) in batch_fields.iter().zip(table_fields.iter()).enumerate() {
+        if batch_field.name() != table_field.name()
+            || batch_field.data_type() != table_field.data_type()
+            || batch_field.is_nullable() != table_field.is_nullable()
+        {
+            return Err(CommonError::BatchSchemaMismatch(format!(
+                "column {position} is '{}' {:?} (nullable: {}) in the batch but '{}' {:?} (nullable: {}) in the table",
+                batch_field.name(),
+                batch_field.data_type(),
+                batch_field.is_nullable(),
+                table_field.name(),
+                table_field.data_type(),
+                table_field.is_nullable(),
+            )));
+        }
+    }
+    match batch_fields.len().cmp(&table_fields.len()) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => Err(CommonError::BatchSchemaMismatch(format!(
+            "the batch carries column '{}' the table schema does not have",
+            batch_fields[table_fields.len()].name()
+        ))),
+        std::cmp::Ordering::Less => Err(CommonError::BatchSchemaMismatch(format!(
+            "the batch lacks column '{}' of the table schema",
+            table_fields[batch_fields.len()].name()
+        ))),
     }
 }
 
@@ -482,6 +587,151 @@ mod tests {
     #[test]
     fn writer_max_parquet_bytes_saturates_on_overflow() {
         assert_eq!(writer_max_parquet_bytes(u64::MAX), u64::MAX);
+    }
+
+    fn id_and_name_schema() -> ArrowSchema {
+        ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ])
+    }
+
+    #[test]
+    fn verify_batch_schema_accepts_a_batch_matching_the_table_by_position() {
+        let field_id = HashMap::from([("PARQUET:field_id".to_string(), "1".to_string())]);
+        let table = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(field_id),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        assert!(super::verify_batch_schema(&id_and_name_schema(), &table).is_ok());
+    }
+
+    #[test]
+    fn verify_batch_schema_refuses_an_extra_a_missing_and_a_retyped_column() {
+        let table = id_and_name_schema();
+        let cases = [
+            (
+                "extra column",
+                ArrowSchema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("name", DataType::Utf8, true),
+                    Field::new("environment", DataType::Utf8, true),
+                ]),
+            ),
+            (
+                "missing column",
+                ArrowSchema::new(vec![Field::new("id", DataType::Int64, false)]),
+            ),
+            (
+                "retyped column",
+                ArrowSchema::new(vec![
+                    Field::new("id", DataType::Int32, false),
+                    Field::new("name", DataType::Utf8, true),
+                ]),
+            ),
+        ];
+        for (case, batch) in cases {
+            let result = super::verify_batch_schema(&batch, &table);
+            assert!(
+                matches!(result, Err(crate::error::CommonError::BatchSchemaMismatch(_))),
+                "{case}: got {result:?}"
+            );
+        }
+    }
+
+    /// The columns share one type, so only the name or the nullability can tell them
+    /// apart: binding by position alone is what would write a column's data under
+    /// another column's name.
+    #[test]
+    fn verify_batch_schema_refuses_a_column_of_another_name_or_nullability() {
+        let table = ArrowSchema::new(vec![
+            Field::new("first", DataType::Utf8, false),
+            Field::new("second", DataType::Utf8, true),
+        ]);
+        let cases = [
+            (
+                "columns in the reverse order",
+                ArrowSchema::new(vec![
+                    Field::new("second", DataType::Utf8, false),
+                    Field::new("first", DataType::Utf8, true),
+                ]),
+            ),
+            (
+                "renamed column",
+                ArrowSchema::new(vec![
+                    Field::new("first", DataType::Utf8, false),
+                    Field::new("third", DataType::Utf8, true),
+                ]),
+            ),
+            (
+                "column of another nullability",
+                ArrowSchema::new(vec![
+                    Field::new("first", DataType::Utf8, true),
+                    Field::new("second", DataType::Utf8, true),
+                ]),
+            ),
+        ];
+        for (case, batch) in cases {
+            let result = super::verify_batch_schema(&batch, &table);
+            assert!(
+                matches!(result, Err(crate::error::CommonError::BatchSchemaMismatch(_))),
+                "{case}: got {result:?}"
+            );
+        }
+    }
+
+    /// Merged output alternates between the schemas of its inputs: each schema is
+    /// remembered after its first comparison, not only the last one seen.
+    #[test]
+    fn verified_batch_schemas_remember_every_alternating_schema() {
+        let mut verified_schemas = super::VerifiedBatchSchemas::new(Arc::new(id_and_name_schema()));
+        let first_input = Arc::new(id_and_name_schema());
+        // Top-level field metadata is not compared against the table, so this schema
+        // matches the table while differing from the first input by value.
+        let second_input = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false)
+                .with_metadata(HashMap::from([("PARQUET:field_id".to_string(), "1".to_string())])),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        for schema in [&first_input, &second_input, &first_input, &second_input] {
+            verified_schemas.verify_schema(schema).expect("schema matches the table");
+        }
+
+        assert_eq!(verified_schemas.verified_schemas.len(), 2);
+    }
+
+    /// A parquet reader gives every batch a schema `Arc` of its own: batches of one
+    /// schema under distinct `Arc`s keep a single entry.
+    #[test]
+    fn verified_batch_schemas_keep_one_entry_for_one_schema_under_distinct_arcs() {
+        let mut verified_schemas = super::VerifiedBatchSchemas::new(Arc::new(id_and_name_schema()));
+
+        for _ in 0..3 {
+            verified_schemas
+                .verify_schema(&Arc::new(id_and_name_schema()))
+                .expect("schema matches the table");
+        }
+
+        assert_eq!(verified_schemas.verified_schemas.len(), 1);
+    }
+
+    #[test]
+    fn verified_batch_schemas_refuse_a_mismatched_schema_every_time() {
+        let mut verified_schemas = super::VerifiedBatchSchemas::new(Arc::new(id_and_name_schema()));
+        let retyped = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        for attempt in 0..2 {
+            let result = verified_schemas.verify_schema(&retyped);
+            assert!(
+                matches!(result, Err(crate::error::CommonError::BatchSchemaMismatch(_))),
+                "attempt {attempt}: got {result:?}"
+            );
+        }
+        assert!(verified_schemas.verified_schemas.is_empty());
     }
 
     #[tokio::test]
@@ -676,19 +926,8 @@ mod tests {
         RecordBatch::try_new(arrow_schema, columns).expect("spans record batch")
     }
 
-    /// End-to-end encoding regression for the real `spans` schema written
-    /// through [`write_record_batches_to_parquet`]. Pins the GH-120 / GH-135
-    /// invariants the in-memory shift E2E left unchecked:
-    /// - `trace_id` / `span_id` use `DELTA_BYTE_ARRAY`
-    /// - `timestamp` uses `DELTA_BINARY_PACKED`
-    /// - bloom filters present on `trace_id` / `span_id`
-    /// - bloom filters lie after the data of every row group: the writer
-    ///   behind [`write_record_batches_to_parquet`] keeps
-    ///   `BloomFilterPosition::End` from `build_writer_properties`
-    /// - column compression is ZSTD
-    #[tokio::test]
-    async fn spans_write_pins_encoding_bloom_and_compression() {
-        // In-memory Iceberg table from the production spans schema/spec/sort.
+    /// In-memory Iceberg table from the production spans schema/spec/sort.
+    async fn create_spans_table() -> iceberg::table::Table {
         let catalog_config = CatalogConfig {
             backend: CatalogBackend::Memory,
             warehouse: format!("memory://iceberg-write-spans-{}", Uuid::new_v4()),
@@ -712,7 +951,7 @@ mod tests {
         let partition_spec = spans_partition_spec(&iceberg_schema).expect("spans partition spec");
         let sort_order = spans_sort_order(&iceberg_schema).expect("spans sort order");
         let table_name = format!("spans_enc_{}", Uuid::new_v4().simple());
-        let table = catalog
+        catalog
             .create_table(
                 &namespace,
                 TableCreation::builder()
@@ -723,7 +962,65 @@ mod tests {
                     .build(),
             )
             .await
-            .expect("create spans table");
+            .expect("create spans table")
+    }
+
+    /// The write pipeline itself refuses a batch that does not carry the table's columns, whichever
+    /// side is wider: the Parquet writer on its own would drop an extra column without a word.
+    #[tokio::test]
+    async fn write_refuses_a_batch_wider_or_narrower_than_the_table() {
+        let table = create_spans_table().await;
+        let batch = spans_batch(table.metadata().current_schema(), 4);
+
+        let mut wider_fields = batch.schema().fields().to_vec();
+        wider_fields.push(Arc::new(Field::new("environment", DataType::Utf8, true)));
+        let mut wider_columns = batch.columns().to_vec();
+        wider_columns.push(new_null_array(&DataType::Utf8, batch.num_rows()));
+        let wider = RecordBatch::try_new(Arc::new(ArrowSchema::new(wider_fields)), wider_columns).expect("wider batch");
+        let narrower = batch
+            .project(&(0..batch.num_columns() - 1).collect::<Vec<_>>())
+            .expect("narrower batch");
+
+        for (case, batches) in [
+            ("wider alone", vec![wider.clone()]),
+            ("narrower alone", vec![narrower.clone()]),
+            ("wider after a matching batch", vec![batch.clone(), wider]),
+            ("narrower after a matching batch", vec![batch, narrower]),
+        ] {
+            let error = write_record_batches_to_parquet(
+                table.clone(),
+                WriteConfig {
+                    row_group_size: 16,
+                    data_page_size_limit_bytes: 2 * 1024 * 1024,
+                    max_file_size_bytes: writer_max_parquet_bytes(64 * 1024 * 1024),
+                    bloom_filter_columns: &[],
+                    column_encodings: &[],
+                },
+                futures::stream::iter(batches.into_iter().map(Ok)).boxed(),
+                &super::CancellationToken::new(),
+            )
+            .await
+            .err();
+            assert!(
+                matches!(error, Some(crate::error::CommonError::BatchSchemaMismatch(_))),
+                "{case}: got {error:?}"
+            );
+        }
+    }
+
+    /// End-to-end encoding regression for the real `spans` schema written
+    /// through [`write_record_batches_to_parquet`]. Pins the GH-120 / GH-135
+    /// invariants the in-memory shift E2E left unchecked:
+    /// - `trace_id` / `span_id` use `DELTA_BYTE_ARRAY`
+    /// - `timestamp` uses `DELTA_BINARY_PACKED`
+    /// - bloom filters present on `trace_id` / `span_id`
+    /// - bloom filters lie after the data of every row group: the writer
+    ///   behind [`write_record_batches_to_parquet`] keeps
+    ///   `BloomFilterPosition::End` from `build_writer_properties`
+    /// - column compression is ZSTD
+    #[tokio::test]
+    async fn spans_write_pins_encoding_bloom_and_compression() {
+        let table = create_spans_table().await;
         let file_io = table.file_io().clone();
 
         // Build the batch from the table's CURRENT schema: `create_table` may

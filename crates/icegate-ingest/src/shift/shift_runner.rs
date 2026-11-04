@@ -5,7 +5,11 @@ use std::sync::{
 
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
-use icegate_common::retrier::{Retrier, RetrierConfig};
+use icegate_common::{
+    merge::SchemaTransitionMergeSource,
+    retrier::{Retrier, RetrierConfig},
+    schema_transition::SchemaTransitionError,
+};
 use icegate_queue::{QueueReader, Topic};
 use jobmanager::{Error, TaskContext};
 use tokio_util::sync::CancellationToken;
@@ -14,7 +18,7 @@ use tracing::error;
 use super::{
     SegmentToRead, ShiftInput, ShiftOutput,
     executor::{TaskStatus, parse_task_input},
-    iceberg_storage::Storage,
+    iceberg_storage::{Storage, WriteTarget},
     row_groups_merger::{
         NoopRowGroupsMergerObserver, RowGroupsMerger, RowGroupsMergerObserver, SortedBatchMergerConfig, WalMergeSource,
         wal_inputs_from_segments,
@@ -325,9 +329,18 @@ where
         segments: &[SegmentToRead],
         cancel_token: &CancellationToken,
     ) -> Result<crate::shift::iceberg_storage::WrittenDataFiles, ShiftWriteError> {
-        let source = Arc::new(WalMergeSource::new(
+        let target = self
+            .storage
+            .load_write_target(cancel_token)
+            .await
+            .map_err(ShiftWriteError::from)?;
+        let wal_source = Arc::new(WalMergeSource::new(
             Arc::clone(&self.queue_reader) as Arc<dyn QueueReader>,
             self.topic.clone(),
+        ));
+        let source = Arc::new(SchemaTransitionMergeSource::new(
+            wal_source,
+            Arc::clone(target.arrow_schema()),
         ));
         let mut merger = RowGroupsMerger::new(
             source,
@@ -341,10 +354,14 @@ where
         )
         .map_err(|err| ShiftWriteError::queue_read(bridge_merge_error(err, cancel_token)))?
         .with_observer(Arc::clone(&self.row_groups_merger_observer));
-        merger
-            .prefetch_first_group()
-            .await
-            .map_err(|err| ShiftWriteError::queue_read(bridge_merge_error(err, cancel_token)))?;
+        if let Err(err) = merger.prefetch_first_group().await {
+            return Err(match bridge_merge_error(err, cancel_token) {
+                crate::error::IngestError::SchemaTransition(error) => {
+                    self.transition_write_error(error, cancel_token).await
+                }
+                other => ShiftWriteError::queue_read(other),
+            });
+        }
 
         // The shared merger yields `icegate_common::Error`; bridge it back to
         // `IngestError` for the storage write pipeline, re-detecting
@@ -356,24 +373,57 @@ where
             .into_stream()
             .map_err(move |err| bridge_merge_error(err, &write_cancel_token))
             .boxed();
-        self.storage
-            .write_record_batches(merged_stream, cancel_token)
-            .await
-            .map_err(ShiftWriteError::from)
+        match self.storage.write_record_batches(target, merged_stream, cancel_token).await {
+            Ok(written) => Ok(written),
+            Err(crate::error::IngestError::SchemaTransition(error)) => {
+                Err(self.transition_write_error(error, cancel_token).await)
+            }
+            Err(other) => Err(ShiftWriteError::from(other)),
+        }
+    }
+
+    /// Turn a schema-transition failure into a write failure.
+    ///
+    /// A batch carrying a column the table lacks means the cached table may
+    /// predate a migration, so the table is read from the catalog again. When
+    /// that table has the column, the retry of
+    /// [`Self::write_row_groups_with_retry`] writes into it; when it does not,
+    /// the failure is final, because the verdict rests on the catalog rather than
+    /// on a table another read left in the cache.
+    async fn transition_write_error(
+        &self,
+        error: SchemaTransitionError,
+        cancel_token: &CancellationToken,
+    ) -> ShiftWriteError {
+        let SchemaTransitionError::ColumnNotInTable { column } = &error else {
+            return ShiftWriteError::from(crate::error::IngestError::SchemaTransition(error));
+        };
+        let has_column = match self.storage.reload_write_target(cancel_token).await {
+            Ok(reloaded) => reloaded.arrow_schema().field_with_name(column).is_ok(),
+            Err(err) => return ShiftWriteError::from(err),
+        };
+        let write_error = ShiftWriteError::from(crate::error::IngestError::SchemaTransition(error));
+        if has_column {
+            write_error
+        } else {
+            write_error.into_final()
+        }
     }
 }
 
 /// Bridge a merger `icegate_common::Error` back into `IngestError`.
 ///
-/// The merger collapses every failure (including cancellation and WAL reads)
-/// into `icegate_common::Error::Write`. To preserve the Shifter's typed failure
-/// accounting, this reclassifies that flat error:
+/// The merger collapses cancellation and WAL reads into
+/// `icegate_common::Error::Write`, while a schema-transition failure passes
+/// through it as `icegate_common::Error::SchemaTransition`. To preserve the
+/// Shifter's typed failure accounting, this reclassifies the error:
 ///
 /// 1. If the shared cancel token fired, report `IngestError::Cancelled` (the
 ///    merger has no `Cancelled` variant of its own).
 /// 2. Else, if the failure was stamped by [`WalMergeSource`], report
 ///    `IngestError::ShiftQueueRead` so the `QueueRead` failure reason survives.
-/// 3. Otherwise fall back to the standard `From` mapping (`Write` -> `Shift`).
+/// 3. Otherwise fall back to the standard `From` mapping (`Write` -> `Shift`,
+///    `SchemaTransition` -> `SchemaTransition`).
 fn bridge_merge_error(err: icegate_common::Error, cancel_token: &CancellationToken) -> crate::error::IngestError {
     if cancel_token.is_cancelled() {
         return crate::error::IngestError::Cancelled;
@@ -393,6 +443,9 @@ fn bridge_merge_error(err: icegate_common::Error, cancel_token: &CancellationTok
 struct ShiftWriteError {
     reason: ShiftTaskFailureReason,
     source: crate::error::IngestError,
+    /// Set when the write path has established that a retry would meet the same
+    /// failure, overriding a `source` that is retryable in general.
+    is_final: bool,
 }
 
 impl ShiftWriteError {
@@ -403,11 +456,18 @@ impl ShiftWriteError {
         Self {
             reason: ShiftTaskFailureReason::QueueRead,
             source: err,
+            is_final: false,
         }
     }
 
+    /// Mark the failure as one no retry of this task can resolve.
+    const fn into_final(mut self) -> Self {
+        self.is_final = true;
+        self
+    }
+
     fn is_retryable(&self) -> bool {
-        self.source.is_retryable()
+        !self.is_final && self.source.is_retryable()
     }
 }
 
@@ -416,6 +476,7 @@ impl icegate_common::RetryError for ShiftWriteError {
         Self {
             reason: ShiftTaskFailureReason::Cancelled,
             source: crate::error::IngestError::Cancelled,
+            is_final: false,
         }
     }
 
@@ -423,6 +484,7 @@ impl icegate_common::RetryError for ShiftWriteError {
         Self {
             reason: ShiftTaskFailureReason::Write,
             source: crate::error::IngestError::MaxAttemptsReached,
+            is_final: false,
         }
     }
 }
@@ -434,7 +496,11 @@ impl From<crate::error::IngestError> for ShiftWriteError {
             crate::error::IngestError::Cancelled => ShiftTaskFailureReason::Cancelled,
             _ => ShiftTaskFailureReason::Write,
         };
-        Self { reason, source: err }
+        Self {
+            reason,
+            source: err,
+            is_final: false,
+        }
     }
 }
 
@@ -472,13 +538,22 @@ mod tests {
     };
 
     use arrow::{
-        array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray},
+        array::{Array, ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray},
         datatypes::{DataType, Field, Schema, TimeUnit},
     };
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::TryStreamExt;
-    use iceberg::spec::DataFile;
+    use iceberg::{
+        spec::{DataFile, PrimitiveType, Type},
+        transaction::{AddColumn, ApplyTransactionAction, Transaction},
+    };
+    use icegate_common::{
+        OPERATIONS_TABLE, OPERATIONS_TOPIC,
+        parquet_encoding::{OPERATIONS_BLOOM_COLUMNS, OPERATIONS_COLUMN_ENCODINGS},
+        resolve_committed_offset,
+        schema::{COL_EVALUATIONS, operations_partition_spec, operations_schema, operations_sort_order},
+    };
     use parquet::{
         arrow::arrow_writer::ArrowWriter,
         file::{
@@ -496,13 +571,23 @@ mod tests {
     use super::{ShiftTaskFailureReason, ShiftTaskRunnerImpl, ShiftWriteError};
     use crate::{
         error::{IngestError, Result},
+        infra::metrics::ShiftMetrics,
         shift::{
-            PlannedRowGroup, SegmentToRead, ShiftInput, ShiftOutput,
+            IcebergStorage, PlannedRowGroup, SegmentToRead, ShiftInput, ShiftOutput,
             executor::TaskStatus,
-            iceberg_storage::{Storage, WrittenDataFiles},
+            iceberg_storage::{Storage, WriteTarget, WrittenDataFiles},
+            instrumentation::StorageWithMetrics,
+            pipeline_it_tests::{
+                build_catalog, create_table, decode_evaluations, evaluated_traces_request, expected_stored_evaluations,
+                shift_config, start_object_storage, write_wal_segments,
+            },
             test_utils::data_file as test_data_file,
         },
-        wal::{SortColumnsDescriptor, logs_row_group_boundary_range_from_batch},
+        transform::{operations_to_record_batch, test_support::test_tenant},
+        wal::{
+            SortColumnsDescriptor, deserialize_row_group_boundary_range, logs_row_group_boundary_range_from_batch,
+            sort_operations,
+        },
     };
 
     struct FakeQueueReader {
@@ -765,12 +850,36 @@ mod tests {
         }
     }
 
+    /// A catalog failure as `IcebergStorage` reports it.
+    fn catalog_error(is_retryable: bool) -> IngestError {
+        IngestError::Iceberg(
+            iceberg::Error::new(iceberg::ErrorKind::Unexpected, "catalog failure").with_retryable(is_retryable),
+        )
+    }
+
     struct FakeStorage {
         writes: Mutex<Vec<Vec<arrow::record_batch::RecordBatch>>>,
         write_calls: AtomicUsize,
         fail_attempts_remaining: AtomicUsize,
         fail_retryable: bool,
         returned_data_files: Vec<DataFile>,
+        /// Table schema served until the first completed reload, standing for a table cached before
+        /// a migration; `None` serves the schema of [`test_batch`] from the start.
+        stale_table_schema: Option<arrow::datatypes::SchemaRef>,
+        /// Whether `stale_table_schema` is still served after a reload, standing for a catalog whose
+        /// table never gained the column.
+        is_stale_after_reload: bool,
+        /// Table schema served after a reload, standing for a table a migration evolved; `None`
+        /// serves the schema of [`test_batch`].
+        evolved_table_schema: Option<arrow::datatypes::SchemaRef>,
+        /// How many reloads fail with a transient catalog error.
+        transient_reload_failures: AtomicUsize,
+        /// Whether every load fails with a terminal catalog error.
+        is_load_refused: bool,
+        load_calls: AtomicUsize,
+        reload_calls: AtomicUsize,
+        /// Reloads that returned a table; a failed reload leaves the cached table in place.
+        completed_reloads: AtomicUsize,
     }
 
     impl FakeStorage {
@@ -781,6 +890,14 @@ mod tests {
                 fail_attempts_remaining: AtomicUsize::new(usize::MAX),
                 fail_retryable: false,
                 returned_data_files: Vec::new(),
+                stale_table_schema: None,
+                is_stale_after_reload: false,
+                evolved_table_schema: None,
+                transient_reload_failures: AtomicUsize::new(0),
+                is_load_refused: false,
+                load_calls: AtomicUsize::new(0),
+                reload_calls: AtomicUsize::new(0),
+                completed_reloads: AtomicUsize::new(0),
             }
         }
 
@@ -791,18 +908,85 @@ mod tests {
                 fail_attempts_remaining: AtomicUsize::new(fail_attempts),
                 fail_retryable: true,
                 returned_data_files,
+                stale_table_schema: None,
+                is_stale_after_reload: false,
+                evolved_table_schema: None,
+                transient_reload_failures: AtomicUsize::new(0),
+                is_load_refused: false,
+                load_calls: AtomicUsize::new(0),
+                reload_calls: AtomicUsize::new(0),
+                completed_reloads: AtomicUsize::new(0),
+            }
+        }
+
+        /// Storage whose cached table predates `stale_table_schema`'s missing columns until it is
+        /// reloaded; every write succeeds.
+        fn with_stale_table_schema(
+            stale_table_schema: arrow::datatypes::SchemaRef,
+            returned_data_files: Vec<DataFile>,
+        ) -> Self {
+            Self {
+                stale_table_schema: Some(stale_table_schema),
+                ..Self::fail_then_succeed(0, returned_data_files)
+            }
+        }
+
+        /// Storage serving `table_schema` before and after a reload, standing for a catalog a reload
+        /// cannot change.
+        fn with_table_schema_unchanged_by_reload(table_schema: arrow::datatypes::SchemaRef) -> Self {
+            Self {
+                is_stale_after_reload: true,
+                ..Self::with_stale_table_schema(table_schema, Vec::new())
+            }
+        }
+
+        /// The table schema a load serves at this point of the test.
+        fn current_table_schema(&self) -> arrow::datatypes::SchemaRef {
+            let is_reloaded = self.completed_reloads.load(Ordering::SeqCst) > 0;
+            match &self.stale_table_schema {
+                Some(stale) if self.is_stale_after_reload || !is_reloaded => Arc::clone(stale),
+                _ => self.evolved_table_schema.clone().unwrap_or_else(|| test_batch(0).schema()),
             }
         }
     }
 
     #[async_trait]
     impl Storage for FakeStorage {
+        type Target = arrow::datatypes::SchemaRef;
+
         async fn get_last_offset(&self, _cancel_token: &CancellationToken) -> Result<Option<u64>> {
             panic!("get_last_offset is not expected in shift runner tests");
         }
 
+        async fn load_write_target(&self, _cancel_token: &CancellationToken) -> Result<arrow::datatypes::SchemaRef> {
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
+            if self.is_load_refused {
+                return Err(catalog_error(false));
+            }
+            Ok(self.current_table_schema())
+        }
+
+        async fn reload_write_target(&self, _cancel_token: &CancellationToken) -> Result<arrow::datatypes::SchemaRef> {
+            self.reload_calls.fetch_add(1, Ordering::SeqCst);
+            if self.is_load_refused {
+                return Err(catalog_error(false));
+            }
+            let is_transient_failure = self
+                .transient_reload_failures
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then_some(remaining.saturating_sub(1))
+                })
+                .is_ok();
+            if is_transient_failure {
+                return Err(catalog_error(true));
+            }
+            self.completed_reloads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.current_table_schema())
+        }
+
         async fn write_record_batches(
             &self,
+            _target: arrow::datatypes::SchemaRef,
             batches: crate::shift::iceberg_storage::BoxRecordBatchStream,
             _cancel_token: &CancellationToken,
         ) -> Result<WrittenDataFiles> {
@@ -866,6 +1050,19 @@ mod tests {
             ],
         )
         .expect("batch")
+    }
+
+    /// The schema of [`test_batch`] without `column`: a table that lacks it.
+    fn schema_without(column: &str) -> arrow::datatypes::SchemaRef {
+        Arc::new(Schema::new(
+            test_batch(0)
+                .schema()
+                .fields()
+                .iter()
+                .filter(|field| field.name() != column)
+                .cloned()
+                .collect::<Vec<_>>(),
+        ))
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -1139,6 +1336,476 @@ mod tests {
                 ("svc-4".to_string(), "svc-5".to_string()),
             ]
         );
+    }
+
+    /// A WAL batch carrying a column the cached table lacks means the table was cached before a
+    /// migration added it: the runner reads the table again and the retry shifts against the evolved
+    /// table instead of failing the task.
+    #[tokio::test]
+    async fn shift_segments_reloads_a_table_cached_before_a_column_was_added_and_retries() {
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::from([(1, vec![test_batch(1)])]),
+            delay_by_offset: HashMap::new(),
+            fail_offset: None,
+            started_reads: None,
+            active_reads: None,
+            max_active_reads: None,
+            concurrency_gate: None,
+            release_gate: None,
+        });
+        let current_schema = test_batch(0).schema();
+        let storage = Arc::new(FakeStorage::with_stale_table_schema(
+            schema_without("value"),
+            vec![test_data_file("s3://warehouse/logs/part-00001.parquet", 1)],
+        ));
+        let runner = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(&storage),
+            "logs",
+            2,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted");
+        let segment = vec![test_batch(1)];
+        let input = ShiftInput {
+            segments: vec![SegmentToRead {
+                segment_offset: 1,
+                row_groups: planned_row_groups(&segment, &[0]),
+            }],
+            trace_context: None,
+        };
+
+        let result = runner
+            .shift_segments(input, &CancellationToken::new())
+            .await
+            .expect("the retry against the evolved table must succeed");
+
+        assert_eq!(result.status, TaskStatus::Ok);
+        assert_eq!(storage.reload_calls.load(Ordering::SeqCst), 1);
+        let writes = storage.writes.lock().await;
+        assert_eq!(writes.len(), 1, "only the retry reaches the writer");
+        assert_eq!(values_from_batches(&writes[0]), vec![1]);
+        assert_eq!(writes[0][0].schema(), current_schema);
+    }
+
+    /// A WAL batch carrying a column the table never gains: the reloaded table still lacks it, so
+    /// the task fails as a write failure at once instead of retrying the same table until its
+    /// attempts or its deadline run out.
+    #[tokio::test]
+    async fn shift_segments_fails_without_retrying_when_the_reloaded_table_still_lacks_the_column() {
+        let queue_reader = Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::from([(1, vec![test_batch(1)])]),
+            delay_by_offset: HashMap::new(),
+            fail_offset: None,
+            started_reads: None,
+            active_reads: None,
+            max_active_reads: None,
+            concurrency_gate: None,
+            release_gate: None,
+        });
+        let storage = Arc::new(FakeStorage::with_table_schema_unchanged_by_reload(schema_without(
+            "value",
+        )));
+        let runner = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(&storage),
+            "logs",
+            2,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted");
+        let segment = vec![test_batch(1)];
+        let input = ShiftInput {
+            segments: vec![SegmentToRead {
+                segment_offset: 1,
+                row_groups: planned_row_groups(&segment, &[0]),
+            }],
+            trace_context: None,
+        };
+
+        let failure = runner
+            .shift_segments(input, &CancellationToken::new())
+            .await
+            .err()
+            .expect("a column the table never gains must fail the task");
+
+        assert_eq!(failure.reason(), ShiftTaskFailureReason::Write);
+        assert_eq!(
+            storage.reload_calls.load(Ordering::SeqCst),
+            1,
+            "a retry would reload again: the failure must end the task after one reload"
+        );
+        assert!(storage.writes.lock().await.is_empty(), "no attempt reaches the writer");
+    }
+
+    /// A queue reader serving one segment at offset 1.
+    fn queue_reader_of_one_segment(batches: Vec<arrow::record_batch::RecordBatch>) -> Arc<FakeQueueReader> {
+        Arc::new(FakeQueueReader {
+            batches_by_offset: HashMap::from([(1, batches)]),
+            delay_by_offset: HashMap::new(),
+            fail_offset: None,
+            started_reads: None,
+            active_reads: None,
+            max_active_reads: None,
+            concurrency_gate: None,
+            release_gate: None,
+        })
+    }
+
+    /// A runner over `storage` that writes one row per output batch.
+    fn logs_runner(
+        queue_reader: Arc<FakeQueueReader>,
+        storage: &Arc<FakeStorage>,
+    ) -> ShiftTaskRunnerImpl<FakeQueueReader, FakeStorage> {
+        ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(storage),
+            "logs",
+            1,
+            SortColumnsDescriptor::logs().expect("logs descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted")
+    }
+
+    /// A shift task over every row group of the one segment at offset 1.
+    fn input_of_one_segment(batches: &[arrow::record_batch::RecordBatch]) -> ShiftInput {
+        let row_group_idxs = (0..batches.len()).collect::<Vec<_>>();
+        ShiftInput {
+            segments: vec![SegmentToRead {
+                segment_offset: 1,
+                row_groups: planned_row_groups(batches, &row_group_idxs),
+            }],
+            trace_context: None,
+        }
+    }
+
+    /// `batch` with a trailing nullable `Utf8` column `extra` holding `value` in every row.
+    fn batch_with_extra_column(
+        batch: &arrow::record_batch::RecordBatch,
+        value: &str,
+    ) -> arrow::record_batch::RecordBatch {
+        let mut fields = batch.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new("extra", DataType::Utf8, true)));
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(StringArray::from(vec![Some(value); batch.num_rows()])) as ArrayRef);
+        arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("batch with extra")
+    }
+
+    /// The first row group fits the cached table, so the prefetch passes and the write starts; only
+    /// the second one, read from the running write, reveals the column the cached table lacks. The
+    /// table must be read again from this path too, or every retry would fail against the same table.
+    #[tokio::test]
+    async fn shift_segments_reloads_the_table_when_a_later_row_group_carries_a_column_it_lacks() {
+        let first_group = ordered_single_row_batch("svc", 30, 1);
+        let second_group = batch_with_extra_column(&ordered_single_row_batch("svc", 20, 2), "from-the-wal");
+        let segment = vec![first_group, second_group.clone()];
+        let storage = Arc::new(FakeStorage {
+            evolved_table_schema: Some(second_group.schema()),
+            ..FakeStorage::with_stale_table_schema(
+                test_batch(0).schema(),
+                vec![test_data_file("s3://warehouse/logs/part-00001.parquet", 2)],
+            )
+        });
+        let runner = logs_runner(queue_reader_of_one_segment(segment.clone()), &storage);
+
+        let result = runner
+            .shift_segments(input_of_one_segment(&segment), &CancellationToken::new())
+            .await
+            .expect("the retry against the evolved table must succeed");
+
+        assert_eq!(result.status, TaskStatus::Ok);
+        assert_eq!(
+            storage.write_calls.load(Ordering::SeqCst),
+            2,
+            "the first attempt must reach the writer"
+        );
+        assert_eq!(storage.reload_calls.load(Ordering::SeqCst), 1);
+        let writes = storage.writes.lock().await;
+        assert_eq!(writes.len(), 1, "only the retry completes its write");
+        let rows = writes[0]
+            .iter()
+            .flat_map(|batch| {
+                let values = batch
+                    .column_by_name("value")
+                    .expect("value column")
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("value is Int64");
+                let extras = batch
+                    .column_by_name("extra")
+                    .expect("extra column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("extra is Utf8");
+                (0..batch.num_rows())
+                    .map(|row| {
+                        (
+                            values.value(row),
+                            extras.is_valid(row).then(|| extras.value(row).to_string()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        drop(writes);
+        assert_eq!(rows, vec![(1, None), (2, Some("from-the-wal".to_string()))]);
+    }
+
+    /// A retyped column and a required column the batch lacks are not a stale cache: a reload cannot
+    /// resolve them, so the task fails at once, without reading the table again or reaching the
+    /// writer.
+    #[tokio::test]
+    async fn shift_segments_fails_without_a_reload_on_a_schema_difference_other_than_an_extra_column() {
+        let batch_schema = test_batch(0).schema();
+        let retyped_value = Arc::new(Schema::new(
+            batch_schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    if field.name() == "value" {
+                        Arc::new(Field::new("value", DataType::Int32, false))
+                    } else {
+                        Arc::clone(field)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let mut fields_with_required_column = batch_schema.fields().to_vec();
+        fields_with_required_column.push(Arc::new(Field::new("required_column", DataType::Utf8, false)));
+        let required_column_missing = Arc::new(Schema::new(fields_with_required_column));
+
+        for (case, table_schema) in [
+            ("retyped column", retyped_value),
+            ("required column missing from the batch", required_column_missing),
+        ] {
+            let segment = vec![test_batch(1)];
+            let storage = Arc::new(FakeStorage::with_table_schema_unchanged_by_reload(table_schema));
+            let runner = logs_runner(queue_reader_of_one_segment(segment.clone()), &storage);
+
+            let failure = runner
+                .shift_segments(input_of_one_segment(&segment), &CancellationToken::new())
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{case}: the task must fail"));
+
+            assert_eq!(failure.reason(), ShiftTaskFailureReason::Write, "{case}");
+            assert_eq!(storage.reload_calls.load(Ordering::SeqCst), 0, "{case}: no reload");
+            assert_eq!(storage.load_calls.load(Ordering::SeqCst), 1, "{case}: no retry");
+            assert_eq!(storage.write_calls.load(Ordering::SeqCst), 0, "{case}: no write");
+        }
+    }
+
+    /// A catalog hiccup during the reload says nothing about the table's columns, so it must not
+    /// turn into the final "the table never gained the column" verdict. The next attempt still meets
+    /// the stale table, which is why the reload runs twice.
+    #[tokio::test]
+    async fn shift_segments_retries_when_the_reload_fails_transiently() {
+        let segment = vec![test_batch(1)];
+        let storage = Arc::new(FakeStorage {
+            transient_reload_failures: AtomicUsize::new(1),
+            ..FakeStorage::with_stale_table_schema(
+                schema_without("value"),
+                vec![test_data_file("s3://warehouse/logs/part-00001.parquet", 1)],
+            )
+        });
+        let runner = logs_runner(queue_reader_of_one_segment(segment.clone()), &storage);
+
+        let result = runner
+            .shift_segments(input_of_one_segment(&segment), &CancellationToken::new())
+            .await
+            .expect("the retry after the transient reload failure must succeed");
+
+        assert_eq!(result.status, TaskStatus::Ok);
+        assert_eq!(storage.reload_calls.load(Ordering::SeqCst), 2);
+        let writes = storage.writes.lock().await;
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0][0].schema(), test_batch(0).schema());
+    }
+
+    /// A catalog failure on the first load is a write-side failure, not a WAL read: the failure
+    /// reason is what the shift metrics and alerts split on.
+    #[tokio::test]
+    async fn shift_segments_reports_a_failed_table_load_as_a_write_failure() {
+        let segment = vec![test_batch(1)];
+        let storage = Arc::new(FakeStorage {
+            is_load_refused: true,
+            ..FakeStorage::fail_then_succeed(0, Vec::new())
+        });
+        let runner = logs_runner(queue_reader_of_one_segment(segment.clone()), &storage);
+
+        let failure = runner
+            .shift_segments(input_of_one_segment(&segment), &CancellationToken::new())
+            .await
+            .err()
+            .expect("a refused table load must fail the task");
+
+        assert_eq!(failure.reason(), ShiftTaskFailureReason::Write);
+        assert_eq!(storage.write_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The production stack end to end around a migration: a real WAL, a real table cached before
+    /// the migration, and the metrics wrapper the Shifter puts in front of the storage. The segment
+    /// is wider than the cached table, so the reload has to pass through the wrapper for the retry
+    /// to see the evolved table; that table is in turn wider than the segment, as it is for an old
+    /// pod once a newer release has migrated it. Lives here because `shift_segments` is private to
+    /// this module; the fixture comes from [`crate::shift::pipeline_it_tests`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shift_segments_through_the_metrics_wrapper_reloads_a_stale_table_and_fills_a_column_the_wal_lacks() {
+        const ENVIRONMENT_COLUMN: &str = "environment";
+
+        let object_storage = start_object_storage().await;
+        let run_id = uuid::Uuid::new_v4().simple().to_string();
+        let cancel = CancellationToken::new();
+
+        let (batch, _) = operations_to_record_batch(&evaluated_traces_request(), &test_tenant("tenant-a"))
+            .expect("operations transform");
+        let row_groups = sort_operations(&batch.expect("three operations rows"), 2, None)
+            .expect("prepare WAL segment")
+            .expect("segment row groups")
+            .write_request
+            .row_groups;
+        let planned_row_groups = row_groups
+            .iter()
+            .enumerate()
+            .map(|(row_group_idx, row_group)| PlannedRowGroup {
+                row_group_idx,
+                row_group_bytes: 1,
+                boundary_range: deserialize_row_group_boundary_range(
+                    row_group.metadata.as_deref().expect("row group metadata"),
+                )
+                .expect("boundary range"),
+            })
+            .collect::<Vec<_>>();
+        let queue_reader = write_wal_segments(
+            &object_storage,
+            &format!("wal-{run_id}"),
+            OPERATIONS_TOPIC,
+            (OPERATIONS_BLOOM_COLUMNS, OPERATIONS_COLUMN_ENCODINGS),
+            vec![row_groups],
+        )
+        .await;
+
+        let catalog = build_catalog(&object_storage, &format!("catalog-{run_id}")).await;
+        let code_schema = operations_schema().expect("operations schema");
+        let evaluations_type = code_schema
+            .field_by_name(COL_EVALUATIONS)
+            .expect("evaluations field")
+            .field_type
+            .as_ref()
+            .clone();
+        let previous_schema = iceberg::spec::Schema::builder()
+            .with_fields(
+                code_schema
+                    .as_struct()
+                    .fields()
+                    .iter()
+                    .filter(|field| field.name != COL_EVALUATIONS)
+                    .cloned(),
+            )
+            .build()
+            .expect("schema without evaluations");
+        let ident = create_table(
+            &catalog,
+            OPERATIONS_TABLE,
+            previous_schema,
+            operations_partition_spec(&code_schema).expect("operations partition spec"),
+            operations_sort_order(&code_schema).expect("operations sort order"),
+        )
+        .await;
+
+        // The default TTL could expire on a slow container and refresh the cache by itself, which
+        // would pass this test without the reload it is about.
+        let mut config = shift_config(&object_storage, &format!("jobs-{run_id}"));
+        config.write.table_cache_ttl_secs = 3600;
+        let storage = Arc::new(StorageWithMetrics::new(
+            Arc::new(IcebergStorage::new(
+                Arc::clone(&catalog),
+                OPERATIONS_TABLE,
+                &config,
+                64 * 1024 * 1024,
+                OPERATIONS_BLOOM_COLUMNS,
+                OPERATIONS_COLUMN_ENCODINGS,
+            )),
+            ShiftMetrics::new_disabled(),
+            OPERATIONS_TOPIC,
+        ));
+        let runner = ShiftTaskRunnerImpl::new(
+            queue_reader,
+            Arc::clone(&storage),
+            OPERATIONS_TOPIC,
+            config.write.row_group_size,
+            SortColumnsDescriptor::operations().expect("operations descriptor"),
+        )
+        .expect("non-zero output_batch_size must be accepted");
+
+        storage.load_write_target(&cancel).await.expect("cache the previous table");
+        let table = catalog.load_table(&ident).await.expect("load previous table");
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_schema()
+            .add_column(AddColumn::optional(COL_EVALUATIONS, evaluations_type))
+            .add_column(AddColumn::optional(
+                ENVIRONMENT_COLUMN,
+                Type::Primitive(PrimitiveType::String),
+            ))
+            .apply(tx)
+            .expect("add columns applies");
+        tx.commit(catalog.as_ref()).await.expect("add columns commits");
+        let cached = storage.load_write_target(&cancel).await.expect("load cached table");
+        assert!(
+            cached.arrow_schema().field_with_name(COL_EVALUATIONS).is_err(),
+            "the fixture must leave the previous table in the cache"
+        );
+
+        let result = runner
+            .shift_segments(
+                ShiftInput {
+                    segments: vec![SegmentToRead {
+                        segment_offset: 0,
+                        row_groups: planned_row_groups,
+                    }],
+                    trace_context: None,
+                },
+                &cancel,
+            )
+            .await
+            .unwrap_or_else(|failure| panic!("shift must succeed: {:?}", failure.into_error()));
+
+        assert_eq!(result.status, TaskStatus::Ok);
+        let output: ShiftOutput = serde_json::from_slice(&result.output).expect("shift output");
+        let data_files = storage
+            .get_data_files(&output.parquet_files, &cancel)
+            .await
+            .expect("data files of the shift output");
+        storage
+            .commit(data_files, OPERATIONS_TABLE, 0, &cancel)
+            .await
+            .expect("commit the shift output");
+
+        let table = catalog.load_table(&ident).await.expect("load evolved table");
+        assert_eq!(
+            resolve_committed_offset(table.metadata()).expect("committed offset"),
+            Some(0)
+        );
+        let batches = table
+            .scan()
+            .select_all()
+            .build()
+            .expect("operations scan")
+            .to_arrow()
+            .await
+            .expect("operations scan stream")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("operations batches");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            rows.extend(decode_evaluations(batch));
+            let environment = batch.column_by_name(ENVIRONMENT_COLUMN).expect("environment column");
+            assert_eq!(environment.null_count(), batch.num_rows(), "environment reads as NULL");
+        }
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(rows, expected_stored_evaluations());
     }
 
     #[tokio::test]

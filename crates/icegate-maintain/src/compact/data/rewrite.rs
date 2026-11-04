@@ -36,7 +36,9 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use icegate_common::iceberg_write::{WriteConfig, write_record_batches_to_parquet};
 use icegate_common::manifest_scan::{DataFileStats, list_data_files_in_partition};
 use icegate_common::merge::sort_key::SortColumnsDescriptor;
-use icegate_common::merge::{MergeInput, MergePosition, RowGroupsMerger, SortedBatchMergerConfig};
+use icegate_common::merge::{
+    MergeInput, MergePosition, RowGroupsMerger, SchemaTransitionMergeSource, SortedBatchMergerConfig,
+};
 use icegate_common::{WAL_OFFSET_PROPERTY, icegate_table_ident};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -446,7 +448,15 @@ impl CompactFilesExecutor {
             ));
         }
 
-        let source = IcebergMergeSource::new(table.file_io().clone(), paths_by_position);
+        // The writer is built from this same `table`, so its current schema is
+        // the target of `SchemaTransitionMergeSource`.
+        let table_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
+            table.metadata().current_schema(),
+        )?);
+        let source = SchemaTransitionMergeSource::new(
+            Arc::new(IcebergMergeSource::new(table.file_io().clone(), paths_by_position)),
+            table_schema,
+        );
         let merger = RowGroupsMerger::new(
             Arc::new(source),
             inputs,

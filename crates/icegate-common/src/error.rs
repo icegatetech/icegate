@@ -55,6 +55,20 @@ pub enum CommonError {
     #[error("wal offset resolution error: {0}")]
     WalOffset(String),
 
+    /// A batch read from a merge input cannot take the table's current schema.
+    ///
+    /// Kept typed so a caller can tell a stale table (the batch carries a column
+    /// the loaded table lacks) from a schema the code no longer supports.
+    #[error("schema transition error: {0}")]
+    SchemaTransition(#[from] crate::schema_transition::SchemaTransitionError),
+
+    /// A batch handed to the Parquet writer does not match the table schema.
+    ///
+    /// The batch must carry the table's columns in the table's order; the
+    /// message names the first differing column.
+    #[error("batch schema mismatch: {0}")]
+    BatchSchemaMismatch(String),
+
     /// Server-side TLS error: a certificate or private key file that cannot be read or
     /// parsed, a certificate and key that are not a pair, a TLS setup the crypto
     /// provider cannot build, or a certificate reload task that cannot be started because

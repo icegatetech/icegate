@@ -129,6 +129,8 @@ pub mod parquet_writer;
 pub mod retrier;
 /// Schema definitions for Iceberg tables.
 pub mod schema;
+/// Bringing Arrow batches of an older or newer schema to a table's current schema.
+pub mod schema_transition;
 /// Storage configuration.
 pub mod storage;
 /// Tenant identification and the tenant policy every surface resolves through.

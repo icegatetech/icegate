@@ -19,6 +19,7 @@ This document contains Trino SQL DDL statements for creating Iceberg tables to s
 - [Post-Creation Tasks](#post-creation-tasks)
 - [Type Mappings](#type-mappings)
 - [Migration Guide](#migration-guide)
+  - [Appending an optional column](#appending-an-optional-column)
   - [Trace and Span ID storage change (GH-135)](#trace-and-span-id-storage-change-gh-135)
 
 ---
@@ -770,6 +771,14 @@ ALTER TABLE iceberg.triplecloud.logs EXECUTE expire_snapshots(retention_threshol
 ---
 
 ## Migration Guide
+
+### Appending an optional column
+
+A new trailing optional column in `schema.rs` MUST number itself and its nested fields in
+pre-order, continuing from the table's last column id: the column takes the next id, then
+its nested fields take theirs — a struct's fields in order, a list's element, a map's key
+before its value. The rule is checked by `find_added_field_id_mismatch` in
+[`operations.rs`](../../icegate-maintain/src/migrate/operations.rs).
 
 ### Trace and Span ID storage change (GH-135)
 

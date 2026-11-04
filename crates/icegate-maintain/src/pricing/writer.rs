@@ -8,7 +8,9 @@ use futures::StreamExt;
 use iceberg::Catalog;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use icegate_common::error::CommonError;
 use icegate_common::iceberg_write::{WriteConfig, write_record_batches_to_parquet};
+use icegate_common::schema_transition::SchemaTransition;
 use icegate_common::{PRICES_TABLE, icegate_table_ident};
 use tokio_util::sync::CancellationToken;
 
@@ -136,6 +138,11 @@ pub async fn append_prices(catalog: &Arc<dyn Catalog>, rates: &[RateObservation]
     let batch = build_price_batch(rates)?;
     let ident = icegate_table_ident(PRICES_TABLE);
     let table = catalog.load_table(&ident).await?;
+    // A newer release may already have appended columns this binary's schema lacks.
+    let table_schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+    let batch = SchemaTransition::try_new(batch.schema(), table_schema)
+        .map_err(CommonError::from)?
+        .apply(batch)?;
 
     // Writer construction mirrors the ingest shift / compaction paths, both of
     // which funnel through this same shared pipeline (see
