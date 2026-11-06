@@ -580,7 +580,7 @@ pub(crate) async fn get_documents(
             snapshot: &current_snapshot.snapshot,
             requests: &requests,
         };
-        serialize_mget_answer(&MgetAnswer { docs }, max_answer_bytes)
+        serialize_bounded_answer(&MgetAnswer { docs }, max_answer_bytes)
     })
     .await?;
     Ok(build_json_response(answer_body))
@@ -596,19 +596,22 @@ fn serialize_bulk_answer(answer: &BulkAnswer) -> Result<Vec<u8>, OpenSearchError
     serde_json::to_vec(answer).map_err(|error| OpenSearchError::internal(format!("serializing a bulk answer: {error}")))
 }
 
-/// Serialize an `_mget` answer as JSON, for [`build_json_response`], into at most `max_answer_bytes`.
+/// Serialize `answer` as JSON, for [`build_json_response`], into at most `max_answer_bytes`.
 ///
 /// # Errors
 ///
 /// Returns `400` `answer_too_large` when the answer would pass the bound, so no client reads part of
 /// one; `500` for any other failure, which no answer can cause: its map keys are strings.
-fn serialize_mget_answer(answer: &MgetAnswer<'_>, max_answer_bytes: usize) -> Result<Vec<u8>, OpenSearchError> {
+pub(crate) fn serialize_bounded_answer(
+    answer: &impl Serialize,
+    max_answer_bytes: usize,
+) -> Result<Vec<u8>, OpenSearchError> {
     let mut buffer = BoundedBuffer::new(max_answer_bytes);
     let serialization = serde_json::to_writer(&mut buffer, answer);
     if buffer.has_refused_write {
         return Err(OpenSearchError::answer_too_large(max_answer_bytes));
     }
-    serialization.map_err(|error| OpenSearchError::internal(format!("serializing an _mget answer: {error}")))?;
+    serialization.map_err(|error| OpenSearchError::internal(format!("serializing an answer: {error}")))?;
     Ok(buffer.bytes)
 }
 
@@ -653,7 +656,7 @@ impl io::Write for BoundedBuffer {
 
 /// The `200` of a serialized answer. Its content type is what the `filter_path` middleware reads to
 /// recognize a JSON answer.
-fn build_json_response(answer_body: Vec<u8>) -> Response {
+pub(crate) fn build_json_response(answer_body: Vec<u8>) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], answer_body).into_response()
 }
 

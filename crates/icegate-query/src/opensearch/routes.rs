@@ -22,6 +22,7 @@ use super::config::OpenSearchConfig;
 use super::error::OpenSearchError;
 use super::fields;
 use super::filter_path::apply_filter_path;
+use super::search;
 use super::state::OpenSearchState;
 use super::system_index;
 use super::system_index::{
@@ -111,6 +112,11 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
         .route(
             "/{index}/_count",
             get(system_index::search::count_documents).post(system_index::search::count_documents),
+        )
+        .route("/_search", get(search::search_indices).post(search::search_indices))
+        .route(
+            "/{index}/_search",
+            get(search::search_indices).post(search::search_indices),
         )
         .route("/_template/{name}", delete(delete_index_template))
         .route("/_cat/templates/{pattern}", get(cat::list_index_templates))

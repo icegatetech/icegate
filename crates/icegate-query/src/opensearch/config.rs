@@ -149,8 +149,8 @@ pub struct SystemIndicesConfig {
     /// would exceed it is refused with `413` and changes nothing.
     pub max_snapshot_bytes: usize,
     /// The bytes of stored documents one answer may carry; at least `max_snapshot_bytes`, so an
-    /// answer naming each stored document once fits. An `_mget` past it is refused whole with `400`,
-    /// and `_bulk` update items past it fail one by one.
+    /// answer naming each stored document once fits. An `_mget` or a `_search` past it is refused
+    /// whole with `400`, and `_bulk` update items past it fail one by one.
     pub max_answer_bytes: usize,
 }
 

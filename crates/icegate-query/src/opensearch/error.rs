@@ -5,7 +5,8 @@
 //! empty body. The shape is
 //! `{"error": {"root_cause": [{type, reason, <metadata>}], type, reason, <metadata>}, "status": N}`,
 //! where the metadata keys (for example the missing `index`) are present only on errors that carry
-//! them; a `503` adds `details` beside `reason` and a `Retry-After` header.
+//! them; a `503` adds `details` beside `reason` and a `Retry-After` header. An error that wraps a
+//! shard-level failure renders that failure as its root cause instead of repeating its own keys.
 //!
 //! `503` is reserved for the conditions a client should retry: memory-pressure shedding, the
 //! query deadline and system-index write contention. A limit a request can avoid by asking for
@@ -26,12 +27,19 @@ const CONTENT_TYPE_JSON: &str = "application/json; charset=UTF-8";
 pub(crate) struct OpenSearchError {
     /// HTTP status of the answer, repeated as the envelope's `status`.
     status: StatusCode,
-    /// The envelope's `type`, on the error and on its root cause.
+    /// The envelope's `type`, on the error and, unless `root_cause` replaces it, on its root cause.
     error_type: &'static str,
-    /// The envelope's `reason`, on the error and on its root cause.
+    /// The envelope's `reason`, on the error and, unless `root_cause` replaces it, on its root
+    /// cause.
     reason: String,
-    /// Extra keys rendered after `type` and `reason`, on the error and on its root cause.
-    metadata: Map<String, Value>,
+    /// Keys rendered beside `type` and `reason` on the error and, unless `root_cause` replaces
+    /// it, on its root cause. This map and `root_cause` are boxed so that every
+    /// `Result<_, OpenSearchError>` stays small (clippy `result_large_err`), and the allocation
+    /// lands on the failing path.
+    metadata: Box<Map<String, Value>>,
+    /// The cause rendered as `root_cause[0]` in place of this error's own, for an error that
+    /// wraps a shard-level failure.
+    root_cause: Option<Box<Map<String, Value>>>,
 }
 
 impl OpenSearchError {
@@ -41,7 +49,8 @@ impl OpenSearchError {
             status,
             error_type,
             reason: reason.into(),
-            metadata: Map::new(),
+            metadata: Box::default(),
+            root_cause: None,
         }
     }
 
@@ -91,20 +100,20 @@ impl OpenSearchError {
         )
     }
 
-    /// Attach `key: value` to the error and its root cause.
+    /// Attach `key: value` to the error and, unless `root_cause` replaces it, to its root cause.
     fn with_metadata(mut self, key: &str, value: impl Into<Value>) -> Self {
         self.metadata.insert(key.to_string(), value.into());
         self
     }
 
     /// The error object without `root_cause`: `type`, `reason` and every metadata entry, as a
-    /// `_bulk` or `_mget` item carries its failure and as the envelope's error and root cause
-    /// render it.
+    /// `_bulk` or `_mget` item carries its failure and as the envelope's error renders it, and its
+    /// root cause too unless the error wraps a shard-level failure.
     pub(crate) fn render_cause(&self) -> Map<String, Value> {
         let mut cause = Map::new();
         cause.insert("type".to_string(), Value::String(self.error_type.to_string()));
         cause.insert("reason".to_string(), Value::String(self.reason.clone()));
-        for (key, value) in &self.metadata {
+        for (key, value) in &*self.metadata {
             cause.insert(key.clone(), value.clone());
         }
         cause
@@ -127,6 +136,51 @@ impl OpenSearchError {
         .with_metadata("index_uuid", "_na_")
         .with_metadata("resource.id", index)
         .with_metadata("resource.type", "index_or_alias")
+    }
+
+    /// A query that failed on the shard of `index` (`400`): a sort on a field the mapping lacks
+    /// without `unmapped_type`, or on a field that cannot be sorted on. Rendered as a
+    /// `search_phase_execution_exception` (phase `query`, grouped, one failed shard) whose root
+    /// cause is the `query_shard_exception`; the entry of `failed_shards` carries `shard`, `index`
+    /// and `reason`.
+    pub(crate) fn query_shard(index: &str, reason: &str) -> Self {
+        let mut shard_cause = Map::new();
+        shard_cause.insert("type".to_string(), json!("query_shard_exception"));
+        shard_cause.insert("reason".to_string(), json!(reason));
+        shard_cause.insert("index".to_string(), json!(index));
+        shard_cause.insert("index_uuid".to_string(), json!("_na_"));
+        let failed_shards = json!([{"shard": 0, "index": index, "reason": Value::Object(shard_cause.clone())}]);
+        let mut error = Self::new(
+            StatusCode::BAD_REQUEST,
+            "search_phase_execution_exception",
+            "all shards failed",
+        )
+        .with_metadata("phase", "query")
+        .with_metadata("grouped", true)
+        .with_metadata("failed_shards", failed_shards);
+        error.root_cause = Some(Box::new(shard_cause));
+        error
+    }
+
+    /// The sort field `field` reads as different kinds in `first_index` and `other_index` (`400`),
+    /// which `field` and `indices` carry for a client.
+    pub(crate) fn sort_field_conflict(field: &str, first_index: &str, other_index: &str) -> Self {
+        Self::illegal_argument(format!(
+            "the sort field [{field}] has different types in the indices [{first_index}] and [{other_index}]"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("indices", json!([first_index, other_index]))
+    }
+
+    /// The document `id` of `index` holds a value of the sort field `field` that does not read as
+    /// the field's type (`400`), which `field`, `index` and `id` carry for a client.
+    pub(crate) fn unreadable_sort_value(field: &str, index: &str, id: &str) -> Self {
+        Self::illegal_argument(format!(
+            "the sort field [{field}] of document [{id}] in index [{index}] holds a value that does not read as its type"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("index", index)
+        .with_metadata("id", id)
     }
 
     /// The system index `index` already exists (`400`).
@@ -203,8 +257,8 @@ impl OpenSearchError {
         )
     }
 
-    /// An answer would pass `max_answer_bytes` (`400`), which a request avoids by naming fewer
-    /// documents. An `_mget` is refused whole; on a `_bulk` only the update item fails.
+    /// An answer would pass `max_answer_bytes` (`400`), which a request avoids by asking for less.
+    /// An `_mget` or a `_search` is refused whole; on a `_bulk` only the update item fails.
     pub(crate) fn answer_too_large(max_answer_bytes: usize) -> Self {
         Self::illegal_argument(format!(
             "the answer would pass opensearch.system_indices.max_answer_bytes ({max_answer_bytes} bytes)"
@@ -225,12 +279,11 @@ impl IntoResponse for OpenSearchError {
             tracing::error!(error_type = self.error_type, reason = %self.reason, "opensearch request failed");
         }
         let cause = self.render_cause();
+        // `self` is not read as a whole again, so the override moves out of it; without one the
+        // root cause repeats the error's keys: built once, cloned into the cause list.
+        let root_cause = self.root_cause.map_or_else(|| cause.clone(), |root_cause| *root_cause);
         let mut error = Map::new();
-        // The root cause repeats the error's keys: built once, cloned into the cause list.
-        error.insert(
-            "root_cause".to_string(),
-            Value::Array(vec![Value::Object(cause.clone())]),
-        );
+        error.insert("root_cause".to_string(), Value::Array(vec![Value::Object(root_cause)]));
         error.extend(cause);
         if is_retryable {
             // `reason` is not read again, so it moves into `details`; `status` is `Copy`.
@@ -493,5 +546,37 @@ mod tests {
         assert_eq!(missing["status"], 404);
         assert_eq!(missing["error"]["type"], "document_missing_exception");
         assert_eq!(missing["error"]["index"], ".kibana_1");
+    }
+
+    #[tokio::test]
+    async fn a_query_shard_error_wraps_its_cause_as_the_root_cause() {
+        let shard_cause = json!({
+            "type": "query_shard_exception",
+            "reason": "No mapping found for [title] in order to sort on",
+            "index": ".kibana_1",
+            "index_uuid": "_na_"
+        });
+
+        let (status, body) = render_envelope(OpenSearchError::query_shard(
+            ".kibana_1",
+            "No mapping found for [title] in order to sort on",
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            json!({
+                "error": {
+                    "type": "search_phase_execution_exception",
+                    "reason": "all shards failed",
+                    "phase": "query",
+                    "grouped": true,
+                    "failed_shards": [{"shard": 0, "index": ".kibana_1", "reason": shard_cause.clone()}],
+                    "root_cause": [shard_cause]
+                },
+                "status": 400
+            })
+        );
     }
 }

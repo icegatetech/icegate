@@ -2208,3 +2208,349 @@ async fn count_under_tenant_b_counts_none_of_tenant_a_documents() -> TestResult 
     server.shutdown().await;
     Ok(())
 }
+
+/// A find-style query for one single-namespace type: the type, and either no namespace or the
+/// default one, never a multi-namespace document.
+fn build_find_index_patterns_body() -> Value {
+    json!({
+        "seq_no_primary_term": true,
+        "query": {"bool": {"filter": [{"bool": {
+            "should": [{"bool": {
+                "must": [{"term": {"type": "index-pattern"}}],
+                "should": [{"bool": {"must_not": [{"exists": {"field": "namespace"}}]}}],
+                "minimum_should_match": 1,
+                "must_not": [{"exists": {"field": "namespaces"}}]
+            }}],
+            "minimum_should_match": 1
+        }}]}},
+        "sort": [{"updated_at": {"order": "desc", "unmapped_type": "date"}}]
+    })
+}
+
+#[tokio::test]
+async fn a_find_style_search_returns_hits_with_seq_no_primary_term_and_an_integer_total() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    let logs = json!({"type": "index-pattern", "index-pattern": {"title": "logs-*"}, "updated_at": "2026-10-02T00:00:00.000Z"});
+    let spans = json!({"type": "index-pattern", "index-pattern": {"title": "spans-*"}, "updated_at": "2026-10-03T00:00:00.000Z"});
+    put_saved_object(&server, TENANT_A, "index-pattern:logs", &logs).await?;
+    put_saved_object(&server, TENANT_A, "index-pattern:spans", &spans).await?;
+    put_saved_object(
+        &server,
+        TENANT_A,
+        "index-pattern:other-space",
+        &json!({"type": "index-pattern", "namespace": "space-1", "updated_at": "2026-10-04T00:00:00.000Z"}),
+    )
+    .await?;
+    put_saved_object(
+        &server,
+        TENANT_A,
+        "dashboard:a",
+        &json!({"type": "dashboard", "updated_at": "2026-10-05T00:00:00.000Z"}),
+    )
+    .await?;
+
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search?size=20&from=0&rest_total_hits_as_int=true",
+        Some(&build_find_index_patterns_body()),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(answer["took"].is_u64(), "{answer}");
+    assert_eq!(answer["timed_out"], false);
+    assert_eq!(answer["_shards"], build_expected_shards());
+    assert_eq!(
+        answer["hits"],
+        json!({
+            "total": 2,
+            "max_score": null,
+            "hits": [
+                {"_index": ".kibana_1", "_id": "index-pattern:spans", "_seq_no": 1, "_primary_term": 1, "_score": null, "_source": spans, "sort": [1_790_985_600_000_i64]},
+                {"_index": ".kibana_1", "_id": "index-pattern:logs", "_seq_no": 0, "_primary_term": 1, "_score": null, "_source": logs, "sort": [1_790_899_200_000_i64]}
+            ]
+        })
+    );
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_of_a_missing_system_index_is_404_and_of_an_alias_reads_its_index() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_saved_object(&server, TENANT_A, "dashboard:a", &json!({"type": "dashboard"})).await?;
+
+    let (missing_status, missing_answer) =
+        send_request(&server, Method::POST, TENANT_A, "/.kibana_9/_search", Some(&json!({}))).await?;
+    let (alias_status, alias_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search",
+        Some(&json!({"query": {"ids": {"values": ["dashboard:a"]}}})),
+    )
+    .await?;
+    let (get_status, get_answer) = send_request(&server, Method::GET, TENANT_A, "/.kibana/_search", None).await?;
+
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    assert_eq!(missing_answer["error"]["type"], "index_not_found_exception");
+    assert_eq!(alias_status, StatusCode::OK);
+    assert_eq!(
+        alias_answer["hits"],
+        json!({
+            "total": {"value": 1, "relation": "eq"},
+            "max_score": 1.0,
+            "hits": [{"_index": ".kibana_1", "_id": "dashboard:a", "_score": 1.0, "_source": {"type": "dashboard"}}]
+        })
+    );
+    assert_eq!(get_status, StatusCode::OK);
+    assert_eq!(get_answer["hits"]["total"], json!({"value": 1, "relation": "eq"}));
+    server.shutdown().await;
+    Ok(())
+}
+
+/// `from: -1` is refused by the handler's body parser, so the `parsing_exception` proves the
+/// index-less route reaches the handler: an unmatched route answers `illegal_argument_exception`.
+#[tokio::test]
+async fn search_without_an_index_in_the_path_reaches_the_handler_on_get_and_post() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    let body = json!({"from": -1});
+
+    for method in [Method::GET, Method::POST] {
+        let (status, answer) = send_request(&server, method.clone(), TENANT_A, "/_search", Some(&body)).await?;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method}");
+        assert_eq!(answer["error"]["type"], "parsing_exception", "{method}");
+    }
+    server.shutdown().await;
+    Ok(())
+}
+
+/// The test catalog holds data tables and no system index, so the empty expression selects data
+/// indices, which the handler refuses once the body has parsed.
+#[tokio::test]
+async fn a_valid_search_without_an_index_in_the_path_selects_the_data_indices_and_is_a_400() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+
+    let (status, answer) = send_request(&server, Method::POST, TENANT_A, "/_search", Some(&json!({}))).await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_search_applies_the_index_options_of_its_query_string() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    let (no_index_status, no_index_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana_*/_search?allow_no_indices=false",
+        None,
+    )
+    .await?;
+    let (empty_wildcard_status, empty_wildcard_answer) =
+        send_request(&server, Method::POST, TENANT_A, "/.kibana_*/_search", None).await?;
+    let (skipped_name_status, skipped_name_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana_9/_search?ignore_unavailable=true",
+        None,
+    )
+    .await?;
+    let (disallowed_status, disallowed_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana_9/_search?ignore_unavailable=true&allow_no_indices=false",
+        None,
+    )
+    .await?;
+    let (empty_aggregations_status, empty_aggregations_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana_*/_search",
+        Some(&json!({"aggs": {}})),
+    )
+    .await?;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_saved_object(&server, TENANT_A, "dashboard:a", &json!({"type": "dashboard"})).await?;
+
+    let (wildcard_status, wildcard_answer) =
+        send_request(&server, Method::POST, TENANT_A, "/.kibana_*/_search", None).await?;
+    let (ignored_status, ignored_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana_1,.kibana_9/_search?ignore_unavailable=true",
+        None,
+    )
+    .await?;
+    let (unavailable_status, unavailable_answer) =
+        send_request(&server, Method::POST, TENANT_A, "/.kibana_1,.kibana_9/_search", None).await?;
+    let (bad_option_status, bad_option_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana_1/_search?expand_wildcards=sideways",
+        None,
+    )
+    .await?;
+
+    assert_eq!(no_index_status, StatusCode::NOT_FOUND);
+    assert_eq!(no_index_answer["error"]["type"], "index_not_found_exception");
+    let expected_empty_hits = json!({"total": {"value": 0, "relation": "eq"}, "max_score": null, "hits": []});
+    assert_eq!(empty_wildcard_status, StatusCode::OK, "{empty_wildcard_answer}");
+    assert_eq!(empty_wildcard_answer["hits"], expected_empty_hits);
+    assert_eq!(empty_wildcard_answer["timed_out"], false);
+    assert_eq!(empty_wildcard_answer["_shards"], build_expected_shards());
+    assert_eq!(skipped_name_status, StatusCode::OK, "{skipped_name_answer}");
+    assert_eq!(skipped_name_answer["hits"], expected_empty_hits);
+    assert_eq!(disallowed_status, StatusCode::NOT_FOUND);
+    assert_eq!(disallowed_answer["error"]["type"], "index_not_found_exception");
+    assert_eq!(empty_aggregations_status, StatusCode::BAD_REQUEST);
+    assert_eq!(empty_aggregations_answer["error"]["type"], "illegal_argument_exception");
+    let expected_total = json!({"value": 1, "relation": "eq"});
+    assert_eq!(wildcard_status, StatusCode::OK, "{wildcard_answer}");
+    assert_eq!(wildcard_answer["hits"]["total"], expected_total);
+    assert_eq!(ignored_status, StatusCode::OK, "{ignored_answer}");
+    assert_eq!(ignored_answer["hits"]["total"], expected_total);
+    assert_eq!(unavailable_status, StatusCode::NOT_FOUND);
+    assert_eq!(unavailable_answer["error"]["type"], "index_not_found_exception");
+    assert_eq!(bad_option_status, StatusCode::BAD_REQUEST);
+    assert_eq!(bad_option_answer["error"]["type"], "illegal_argument_exception");
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_search_refuses_an_unknown_parameter_and_accepts_an_ignored_one() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+
+    let (refused_status, refused_answer) =
+        send_request(&server, Method::POST, TENANT_A, "/.kibana/_search?unknown_knob=1", None).await?;
+    let (accepted_status, accepted_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search?preference=_local&timeout=30s&max_concurrent_shard_requests=5&ignore_throttled=false&search_type=query_then_fetch",
+        None,
+    )
+    .await?;
+
+    assert_eq!(refused_status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused_answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(accepted_status, StatusCode::OK, "{accepted_answer}");
+    assert_eq!(accepted_answer["hits"]["total"], json!({"value": 0, "relation": "eq"}));
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregations_on_a_system_index_are_a_400() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+
+    for body in [
+        json!({"size": 0, "aggs": {"types": {"terms": {"field": "type"}}}}),
+        json!({"aggregations": {}}),
+    ] {
+        let (status, answer) = send_request(&server, Method::POST, TENANT_A, "/.kibana/_search", Some(&body)).await?;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(answer["error"]["type"], "illegal_argument_exception", "{body}");
+    }
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_search_resolving_to_data_indices_is_a_400() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+
+    for path in ["/logs/_search", "/.kibana_1,logs/_search"] {
+        let (status, answer) = send_request(&server, Method::POST, TENANT_A, path, Some(&json!({}))).await?;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(answer["error"]["type"], "illegal_argument_exception", "{path}");
+    }
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Each sort clause copies a stored value into every hit, so a body far smaller than one document
+/// multiplies the answer. With `_source` off the sort values are the only stored bytes: one clause
+/// fits the bound and a second doubles them past it. Lengths stay unstated because `took` varies.
+#[tokio::test]
+async fn a_search_answer_multiplied_past_max_answer_bytes_by_its_sort_clauses_is_refused() -> TestResult {
+    let server = start_server_with_answer_bound(6000).await?;
+    let clause = json!({"config.buildNum": {"unmapped_type": "keyword"}});
+
+    let (fitting_status, fitting_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search",
+        Some(&json!({"_source": false, "sort": [clause]})),
+    )
+    .await?;
+    let (refused_status, refused_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search",
+        Some(&json!({"_source": false, "sort": [clause, clause]})),
+    )
+    .await?;
+
+    assert_eq!(fitting_status, StatusCode::OK, "{fitting_answer}");
+    assert_eq!(fitting_answer["hits"]["total"], json!({"value": 2, "relation": "eq"}));
+    assert_eq!(refused_status, StatusCode::BAD_REQUEST);
+    assert_answer_bound_refusal(&refused_answer["error"]);
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tenant_b_search_returns_none_of_tenant_a_documents() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    create_kibana_index(&server, TENANT_B).await?;
+    put_saved_object(&server, TENANT_A, "dashboard:a", &json!({"type": "dashboard"})).await?;
+    put_saved_object(&server, TENANT_A, "dashboard:b", &json!({"type": "dashboard"})).await?;
+
+    let (_, owner_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search?rest_total_hits_as_int=true",
+        Some(&json!({})),
+    )
+    .await?;
+    let (_, other_tenant_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_B,
+        "/.kibana/_search?rest_total_hits_as_int=true",
+        Some(&json!({})),
+    )
+    .await?;
+
+    assert_eq!(owner_answer["hits"]["total"], 2);
+    assert_eq!(
+        other_tenant_answer["hits"],
+        json!({"total": 0, "max_score": null, "hits": []})
+    );
+    server.shutdown().await;
+    Ok(())
+}

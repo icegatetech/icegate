@@ -410,7 +410,7 @@ fn send_error_to_all(replies: Vec<oneshot::Sender<Result<SystemOutcome, OpenSear
 
 /// Run `work` on the blocking pool (see the module doc). `task` names the work in the `500` a
 /// failed join answers: the work panicked, or the runtime is shutting down.
-pub(super) async fn run_blocking_work<T: Send + 'static>(
+pub(crate) async fn run_blocking_work<T: Send + 'static>(
     task: &str,
     work: impl FnOnce() -> Result<T, OpenSearchError> + Send + 'static,
 ) -> Result<T, OpenSearchError> {

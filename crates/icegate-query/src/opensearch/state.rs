@@ -16,8 +16,8 @@ pub(crate) struct OpenSearchState {
     pub(crate) catalog: IndexCatalog,
     /// The per-tenant store of the system indices.
     pub(crate) system_store: Arc<SystemIndexStore>,
-    /// `opensearch.system_indices.max_answer_bytes`. `_mget` enforces it while serializing, and
-    /// `_bulk` carries it to the snapshot on each operation through `ReturnedSources`, so it is not
-    /// one of `SystemIndexLimits`.
+    /// `opensearch.system_indices.max_answer_bytes`. `_mget` and `_search` enforce it while
+    /// serializing, and `_bulk` carries it to the snapshot on each operation through
+    /// `ReturnedSources`, so it is not one of `SystemIndexLimits`.
     pub(crate) max_answer_bytes: usize,
 }

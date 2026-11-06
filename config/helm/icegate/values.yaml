@@ -290,7 +290,7 @@ query:
       cacheMaxBytes: 268435456
       # -- Largest decoded snapshot one tenant may hold, in bytes. A write past it is answered 413 and changes nothing.
       maxSnapshotBytes: 134217728
-      # -- Bytes of stored documents one answer may carry; at least maxSnapshotBytes. An _mget past it is refused whole with 400, and _bulk update items past it fail one by one.
+      # -- Bytes of stored documents one answer may carry; at least maxSnapshotBytes. An _mget or _search past it is refused whole with 400, and _bulk update items past it fail one by one.
       maxAnswerBytes: 268435456
 
   ## Prometheus metrics endpoint

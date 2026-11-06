@@ -95,6 +95,18 @@ pub(crate) struct DeclaredFieldType {
     pub(crate) is_multi_field: bool,
 }
 
+impl DeclaredFieldType {
+    /// The path holding the values of `field`, the path this type was declared for: its parent for
+    /// a multi-field, `field` itself otherwise.
+    pub(crate) fn resolve_source_path(self, field: &str) -> &str {
+        if self.is_multi_field {
+            field.rsplit_once('.').map_or(field, |(parent, _)| parent)
+        } else {
+            field
+        }
+    }
+}
+
 /// Whether the document `id` with `source` matches `query` under `mappings`, with `now` the
 /// request's instant for date math.
 ///
@@ -309,14 +321,9 @@ impl<'a> DocumentView<'a> {
             });
         }
         if let Some(declared_type) = find_mapped_field(self.mappings, field)? {
-            let source_path = if declared_type.is_multi_field {
-                field.rsplit_once('.').map_or(field, |(parent, _)| parent)
-            } else {
-                field
-            };
             return Ok(DocumentFieldValues {
                 kind: Some(declared_type.kind),
-                values: self.collect_values(source_path),
+                values: self.collect_values(declared_type.resolve_source_path(field)),
             });
         }
         if let Some(parent) = field.strip_suffix(KEYWORD_SUBFIELD_SUFFIX)
@@ -530,7 +537,7 @@ fn infer_kind(values: &[&Value]) -> Option<FieldKind> {
 }
 
 /// A value's text: a string as it is, a number or a boolean in its JSON spelling.
-fn render_text(value: &Value) -> Option<Cow<'_, str>> {
+pub(crate) fn render_text(value: &Value) -> Option<Cow<'_, str>> {
     match value {
         Value::String(text) => Some(Cow::Borrowed(text)),
         Value::Number(number) => Some(Cow::Owned(number.to_string())),
@@ -693,7 +700,7 @@ fn parse_numeric(value: &Value, field: &str) -> Result<ComparableNumber, OpenSea
 }
 
 /// A finite number, or a string holding one.
-fn read_numeric(value: &Value) -> Option<f64> {
+pub(crate) fn read_numeric(value: &Value) -> Option<f64> {
     match value {
         Value::Number(number) => number.as_f64(),
         Value::String(text) => text.trim().parse::<f64>().ok().filter(|number| number.is_finite()),
@@ -725,7 +732,7 @@ fn parse_boolean(value: &Value, field: &str) -> Result<bool, OpenSearchError> {
 }
 
 /// `true` or `false`, as a JSON boolean or its string.
-fn read_boolean(value: &Value) -> Option<bool> {
+pub(crate) fn read_boolean(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(flag) => Some(*flag),
         Value::String(text) if text == "true" => Some(true),
@@ -743,7 +750,7 @@ fn rank_boolean(flag: bool) -> ComparableNumber {
 }
 
 /// A stored date in microseconds: a date string or epoch milliseconds.
-fn read_date_micros(value: &Value) -> Option<i64> {
+pub(crate) fn read_date_micros(value: &Value) -> Option<i64> {
     let millis = match value {
         Value::String(text) => parse_stored_date_millis(text)?,
         Value::Number(number) => number.as_i64()?,

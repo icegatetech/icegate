@@ -25,4 +25,4 @@ pub(crate) use client::{
     resolve_system_indices_location,
 };
 pub(crate) use snapshot::{MappedField, SystemSnapshot};
-pub(crate) use store::{CurrentSnapshot, SystemIndexLimits, SystemIndexStore};
+pub(crate) use store::{CurrentSnapshot, SystemIndexLimits, SystemIndexStore, run_blocking_work};
