@@ -122,6 +122,34 @@ impl OpenSearchError {
         .with_metadata("index_uuid", "_na_")
     }
 
+    /// A write conditioned on a document state that does not hold (`409`): a stale
+    /// `if_seq_no` / `if_primary_term`, a condition on a missing document, or a create of an
+    /// existing id. An update of a missing document without `upsert` is
+    /// [`document_missing`](Self::document_missing) instead, with or without a condition.
+    pub(crate) fn version_conflict(index: &str, id: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "version_conflict_engine_exception",
+            format!("[{id}]: version conflict"),
+        )
+        .with_metadata("index", index)
+        .with_metadata("shard", "0")
+        .with_metadata("index_uuid", "_na_")
+    }
+
+    /// An update of a missing document that carries no `upsert` (`404`), before any condition it
+    /// carries is checked.
+    pub(crate) fn document_missing(index: &str, id: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "document_missing_exception",
+            format!("[{id}]: document missing"),
+        )
+        .with_metadata("index", index)
+        .with_metadata("shard", "0")
+        .with_metadata("index_uuid", "_na_")
+    }
+
     /// A write addressed to `index`, which accepts none: a data index, or a name that would create
     /// an index outside the system indices (`403`).
     pub(crate) fn cluster_block(index: &str) -> Self {
@@ -407,5 +435,28 @@ mod tests {
         let (status, body) = render_envelope(OpenSearchError::snapshot_too_large(1024)).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(body["status"], 413);
+    }
+
+    #[tokio::test]
+    async fn version_conflict_and_document_missing_carry_their_index_metadata() {
+        let (conflict_status, conflict) =
+            render_envelope(OpenSearchError::version_conflict(".kibana_1", "config:3.9.0")).await;
+        let (missing_status, missing) =
+            render_envelope(OpenSearchError::document_missing(".kibana_1", "config:3.9.0")).await;
+
+        assert_eq!(conflict_status, StatusCode::CONFLICT);
+        assert_eq!(conflict["status"], 409);
+        assert_eq!(conflict["error"]["type"], "version_conflict_engine_exception");
+        assert_eq!(conflict["error"]["index"], ".kibana_1");
+        assert_eq!(conflict["error"]["shard"], "0");
+        assert_eq!(conflict["error"]["index_uuid"], "_na_");
+        assert_eq!(
+            conflict["error"]["root_cause"][0]["type"],
+            "version_conflict_engine_exception"
+        );
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["status"], 404);
+        assert_eq!(missing["error"]["type"], "document_missing_exception");
+        assert_eq!(missing["error"]["index"], ".kibana_1");
     }
 }

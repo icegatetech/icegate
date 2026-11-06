@@ -38,7 +38,7 @@ enum CatIndicesColumn {
     PrimaryShards,
     /// `rep`: the replica count, always zero.
     ReplicaShards,
-    /// `docs.count`: the tenant's committed rows.
+    /// `docs.count`: the tenant's committed rows, or a system index's documents.
     DocsCount,
     /// `docs.deleted`: always zero.
     DocsDeleted,
@@ -223,7 +223,8 @@ impl EndpointParameters for CatTemplatesParameters {
 /// answers like `/_cat/indices`. Without an expression every index the tenant sees is listed,
 /// exact-name tables included, as long as `expand_wildcards` expands to open indices; otherwise
 /// nothing is listed. A dot-prefixed system index is listed only when a part starts with `.` or
-/// `expand_wildcards` includes hidden; an alias lists the index it names.
+/// `expand_wildcards` includes hidden; an alias lists the index it names. A system index's
+/// `docs.count` is its document count, and its sizes are null.
 pub(crate) async fn list_cat_indices(
     State(state): State<OpenSearchState>,
     Extension(tenant): Extension<TenantId>,
@@ -307,18 +308,27 @@ pub(crate) async fn list_cat_indices(
                 .collect()
         })
         .collect();
-    // A system index holds its mappings and settings in the tenant's snapshot and no document,
-    // and has no storage of its own: its count is 0 and its sizes are null.
-    let system_figures = CatFigures {
-        document_count: Some(0),
-        store_bytes: None,
-    };
-    rows.extend(system_indices.iter().map(|index| {
-        columns
-            .iter()
-            .map(|column| render_cell(*column, index, system_figures, &tenant, byte_rendering))
-            .collect::<Vec<_>>()
-    }));
+    // A system index has no storage of its own, so its sizes are null; its count is the number
+    // of documents the tenant's snapshot holds for it. The session caches the snapshot, so this
+    // is the snapshot the listing read, and a listing with no system index reads none.
+    if !system_indices.is_empty() {
+        let snapshot = &session.read_system_snapshot().await?.snapshot;
+        for index in &system_indices {
+            let system_index = snapshot
+                .find_index(index)
+                .ok_or_else(|| OpenSearchError::index_not_found(index))?;
+            let figures = CatFigures {
+                document_count: Some(system_index.document_count()),
+                store_bytes: None,
+            };
+            rows.push(
+                columns
+                    .iter()
+                    .map(|column| render_cell(*column, index, figures, &tenant, byte_rendering))
+                    .collect(),
+            );
+        }
+    }
     let column_names: Vec<&str> = columns.iter().copied().map(CatIndicesColumn::name).collect();
     Ok(render_rows(
         &column_names,

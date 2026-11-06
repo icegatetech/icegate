@@ -8,6 +8,7 @@
 mod api;
 mod client;
 mod codec;
+pub(crate) mod documents;
 mod snapshot;
 mod store;
 

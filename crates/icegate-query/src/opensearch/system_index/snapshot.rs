@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::opensearch::error::OpenSearchError;
+use crate::opensearch::script::DocumentScript;
 
 /// Characters a system-index name must not contain.
 const INVALID_INDEX_NAME_CHARACTERS: [char; 12] = ['\\', '/', '*', '?', '"', '<', '>', '|', ' ', ',', '#', ':'];
@@ -34,6 +35,9 @@ const AGGREGATABLE_TYPES: [&str; 14] = [
 ];
 /// Mapping types a field can be searched on but not aggregated on.
 const SEARCH_ONLY_TYPES: [&str; 2] = ["text", "match_only_text"];
+/// The `_primary_term` of every system-index document. The store keeps one copy of each
+/// document and never fails over, so the term never advances.
+pub(crate) const PRIMARY_TERM: i64 = 1;
 
 /// Everything one tenant keeps in its system indices: the state one snapshot object holds.
 ///
@@ -56,9 +60,51 @@ pub(crate) struct SystemIndex {
     pub(crate) mappings: Value,
     /// The settings the index was created with, stored and returned verbatim.
     pub(crate) settings: Value,
+    /// Documents by `_id`.
+    #[serde(default)]
+    documents: BTreeMap<String, StoredDocument>,
+    /// The `_seq_no` the next write or delete of this index takes. It only grows, so a
+    /// sequence number is never reused.
+    #[serde(default)]
+    next_seq_no: i64,
 }
 
 impl SystemIndex {
+    /// An index with no documents, holding `mappings` and `settings` verbatim.
+    pub(crate) const fn new(mappings: Value, settings: Value) -> Self {
+        Self {
+            mappings,
+            settings,
+            documents: BTreeMap::new(),
+            next_seq_no: 0,
+        }
+    }
+
+    /// The document stored under `id`.
+    pub(crate) fn find_document(&self, id: &str) -> Option<&StoredDocument> {
+        self.documents.get(id)
+    }
+
+    /// The number of documents the index holds; deleted documents are not counted.
+    pub(crate) fn document_count(&self) -> u64 {
+        u64::try_from(self.documents.len()).unwrap_or(u64::MAX)
+    }
+
+    /// Store `source` under `id` with the next `_seq_no`, which it returns.
+    fn store_document(&mut self, id: &str, source: Value) -> i64 {
+        let seq_no = Self::take_seq_no(&mut self.next_seq_no);
+        self.documents.insert(id.to_string(), StoredDocument { source, seq_no });
+        seq_no
+    }
+
+    /// Hand out the next `_seq_no` of an index's `next_seq_no`; no two calls return the same one.
+    /// It takes the field, not the index, so an update can hold its stored document meanwhile.
+    const fn take_seq_no(next_seq_no: &mut i64) -> i64 {
+        let seq_no = *next_seq_no;
+        *next_seq_no += 1;
+        seq_no
+    }
+
     /// The fields the stored mapping declares, depth first in mapping order. A property without
     /// a `type` is an `object`; object and nested properties list their children after them, and
     /// multi-fields follow their field.
@@ -96,6 +142,161 @@ fn collect_mapped_fields(properties: &Map<String, Value>, prefix: &str, fields: 
     }
 }
 
+/// One document of a system index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredDocument {
+    /// The `_source`, stored and returned verbatim.
+    pub(crate) source: Value,
+    /// The `_seq_no` of the write that produced this version.
+    pub(crate) seq_no: i64,
+}
+
+/// How a document write treats an existing document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpType {
+    /// Replace an existing document, or create a missing one.
+    Index,
+    /// Create only: an existing id is a version conflict.
+    Create,
+}
+
+/// The optimistic-concurrency condition of a write. Both values or neither are set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct WriteConcurrency {
+    /// The `_seq_no` the stored document must have.
+    pub(crate) if_seq_no: Option<i64>,
+    /// The `_primary_term` the stored document must have.
+    pub(crate) if_primary_term: Option<i64>,
+}
+
+impl WriteConcurrency {
+    /// Build a condition from the request's `if_seq_no` and `if_primary_term`.
+    ///
+    /// # Errors
+    ///
+    /// `illegal_argument_exception` when only one of the two is given.
+    pub(crate) fn new(if_seq_no: Option<i64>, if_primary_term: Option<i64>) -> Result<Self, OpenSearchError> {
+        if if_seq_no.is_some() != if_primary_term.is_some() {
+            return Err(OpenSearchError::illegal_argument(
+                "if_seq_no and if_primary_term must be given together",
+            ));
+        }
+        Ok(Self {
+            if_seq_no,
+            if_primary_term,
+        })
+    }
+
+    /// Whether the write is conditioned on the stored document.
+    pub(crate) const fn is_conditional(&self) -> bool {
+        self.if_seq_no.is_some()
+    }
+
+    /// Check the condition against the document the write would replace; `None` is a missing
+    /// document, which no condition matches.
+    fn check_stored_document(
+        &self,
+        index: &str,
+        id: &str,
+        stored_document: Option<&StoredDocument>,
+    ) -> Result<(), OpenSearchError> {
+        let (Some(if_seq_no), Some(if_primary_term)) = (self.if_seq_no, self.if_primary_term) else {
+            return Ok(());
+        };
+        match stored_document {
+            Some(document) if document.seq_no == if_seq_no && if_primary_term == PRIMARY_TERM => Ok(()),
+            Some(_) | None => Err(OpenSearchError::version_conflict(index, id)),
+        }
+    }
+}
+
+/// A create or index of one document.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DocumentWrite {
+    /// The index or alias the request named.
+    pub(crate) index: String,
+    /// The document `_id`, already percent-decoded.
+    pub(crate) id: String,
+    /// The new `_source`, a JSON object.
+    pub(crate) source: Value,
+    /// Whether an existing document may be replaced.
+    pub(crate) op_type: OpType,
+    /// The condition on the stored document.
+    pub(crate) concurrency: WriteConcurrency,
+}
+
+/// What an update changes in an existing document.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DocumentChange {
+    /// A partial document merged into `_source`.
+    Merge(Value),
+    /// A recognized script run on `_source`.
+    Script(DocumentScript),
+}
+
+/// An update of one document.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DocumentUpdate {
+    /// The index or alias the request named.
+    pub(crate) index: String,
+    /// The document `_id`.
+    pub(crate) id: String,
+    /// The change applied to an existing document.
+    pub(crate) change: DocumentChange,
+    /// The `_source` stored as given when the document is missing; the change does not run then.
+    pub(crate) upsert: Option<Value>,
+    /// The condition on the stored document.
+    pub(crate) concurrency: WriteConcurrency,
+}
+
+/// A delete of one document.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DocumentDelete {
+    /// The index or alias the request named.
+    pub(crate) index: String,
+    /// The document `_id`.
+    pub(crate) id: String,
+    /// The condition on the stored document.
+    pub(crate) concurrency: WriteConcurrency,
+}
+
+/// The `result` of a document write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteResult {
+    /// The id was new.
+    Created,
+    /// An existing document was replaced or changed.
+    Updated,
+    /// An update changed nothing; no `_seq_no` was taken.
+    Noop,
+}
+
+impl WriteResult {
+    /// The `result` value of a write answer.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+            Self::Noop => "noop",
+        }
+    }
+}
+
+/// The outcome of a create, index or update.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WrittenDocument {
+    /// The concrete index the request's index or alias resolved to.
+    pub(crate) index: String,
+    /// What the write did.
+    pub(crate) result: WriteResult,
+    /// The document's `_seq_no` after the write.
+    pub(crate) seq_no: i64,
+    /// The document's `_primary_term`.
+    pub(crate) primary_term: i64,
+    /// The `_source` after the write, carried by updates only: their answer can return it.
+    pub(crate) source: Option<Value>,
+}
+
 /// A change a write asks the store to apply to a tenant's snapshot.
 #[derive(Debug, Clone)]
 pub(crate) enum SystemOperation {
@@ -113,6 +314,12 @@ pub(crate) enum SystemOperation {
         /// The actions, in request order.
         actions: Vec<AliasAction>,
     },
+    /// Create or replace one document (`_create`, `_doc`).
+    IndexDocument(DocumentWrite),
+    /// Update one document (`_update`).
+    UpdateDocument(DocumentUpdate),
+    /// Delete one document.
+    DeleteDocument(DocumentDelete),
 }
 
 /// What applying an operation did.
@@ -125,6 +332,17 @@ pub(crate) enum SystemOutcome {
     },
     /// Every alias action of a request was applied.
     AliasesApplied,
+    /// A document was created, replaced or updated.
+    DocumentWritten(WrittenDocument),
+    /// A delete ran. Every delete takes a `_seq_no`, whether or not the document existed.
+    DocumentDeleted {
+        /// The concrete index.
+        index: String,
+        /// Whether a document was removed.
+        found: bool,
+        /// The `_seq_no` the delete took.
+        seq_no: i64,
+    },
 }
 
 impl SystemSnapshot {
@@ -137,7 +355,12 @@ impl SystemSnapshot {
     /// index that does not exist (or that an earlier action of the request removed), and
     /// `illegal_argument_exception` for an alias name no system index may carry, an alias named
     /// like an index, an alias that already names another index, or a removal of an alias that
-    /// does not name the given index.
+    /// does not name the given index. For document operations: `index_not_found_exception` when the
+    /// request's index or alias names no system index (a write creates none);
+    /// `document_missing_exception` for an update of a missing document without `upsert`, which is
+    /// checked before any condition; `version_conflict_engine_exception` for a create of an existing
+    /// id or any other condition that does not hold, a condition on a missing document included;
+    /// and `illegal_argument_exception` for a script that cannot run on the stored document.
     pub(crate) fn apply(&mut self, operation: &SystemOperation) -> Result<SystemOutcome, OpenSearchError> {
         match operation {
             SystemOperation::CreateIndex {
@@ -146,6 +369,9 @@ impl SystemSnapshot {
                 settings,
             } => self.create_index(name, mappings, settings),
             SystemOperation::ApplyAliasActions { actions } => self.apply_alias_actions(actions),
+            SystemOperation::IndexDocument(write) => self.write_document(write),
+            SystemOperation::UpdateDocument(update) => self.update_document(update),
+            SystemOperation::DeleteDocument(delete) => self.delete_document(delete),
         }
     }
 
@@ -192,13 +418,8 @@ impl SystemSnapshot {
         if self.indices.contains_key(name) || self.aliases.contains_key(name) {
             return Err(OpenSearchError::resource_already_exists(name));
         }
-        self.indices.insert(
-            name.to_string(),
-            SystemIndex {
-                mappings: mappings.clone(),
-                settings: settings.clone(),
-            },
-        );
+        self.indices
+            .insert(name.to_string(), SystemIndex::new(mappings.clone(), settings.clone()));
         Ok(SystemOutcome::IndexCreated { name: name.to_string() })
     }
 
@@ -257,6 +478,130 @@ impl SystemSnapshot {
         self.aliases = aliases;
         Ok(SystemOutcome::AliasesApplied)
     }
+
+    /// The concrete index `name` (an index or an alias of one index) resolves to, for a write.
+    fn find_index_for_write(&mut self, name: &str) -> Result<(String, &mut SystemIndex), OpenSearchError> {
+        let concrete_index = self
+            .resolve_name(name)
+            .ok_or_else(|| OpenSearchError::index_not_found(name))?
+            .to_string();
+        let index = self
+            .indices
+            .get_mut(&concrete_index)
+            .ok_or_else(|| OpenSearchError::index_not_found(name))?;
+        Ok((concrete_index, index))
+    }
+
+    /// Create or replace a document; the refusals precede every mutation.
+    fn write_document(&mut self, write: &DocumentWrite) -> Result<SystemOutcome, OpenSearchError> {
+        let (index_name, index) = self.find_index_for_write(&write.index)?;
+        let stored_document = index.find_document(&write.id);
+        if write.op_type == OpType::Create && stored_document.is_some() {
+            return Err(OpenSearchError::version_conflict(&index_name, &write.id));
+        }
+        write
+            .concurrency
+            .check_stored_document(&index_name, &write.id, stored_document)?;
+        let result = if stored_document.is_some() {
+            WriteResult::Updated
+        } else {
+            WriteResult::Created
+        };
+        let seq_no = index.store_document(&write.id, write.source.clone());
+        Ok(SystemOutcome::DocumentWritten(WrittenDocument {
+            index: index_name,
+            result,
+            seq_no,
+            primary_term: PRIMARY_TERM,
+            source: None,
+        }))
+    }
+
+    /// Change a document, or store the `upsert` of a missing one. A refused change leaves the
+    /// stored document as it was, and a merge that changes nothing takes no `_seq_no`.
+    fn update_document(&mut self, update: &DocumentUpdate) -> Result<SystemOutcome, OpenSearchError> {
+        let (index_name, index) = self.find_index_for_write(&update.index)?;
+        let Some(stored_document) = index.documents.get_mut(&update.id) else {
+            let Some(upsert) = &update.upsert else {
+                return Err(OpenSearchError::document_missing(&index_name, &update.id));
+            };
+            update.concurrency.check_stored_document(&index_name, &update.id, None)?;
+            let seq_no = index.store_document(&update.id, upsert.clone());
+            return Ok(SystemOutcome::DocumentWritten(WrittenDocument {
+                index: index_name,
+                result: WriteResult::Created,
+                seq_no,
+                primary_term: PRIMARY_TERM,
+                source: Some(upsert.clone()),
+            }));
+        };
+        update
+            .concurrency
+            .check_stored_document(&index_name, &update.id, Some(&*stored_document))?;
+        match &update.change {
+            DocumentChange::Merge(partial_document) => {
+                // The copy is what detects a noop: the merge cannot say whether it changed anything.
+                let mut merged_source = stored_document.source.clone();
+                merge_partial_document(&mut merged_source, partial_document);
+                if merged_source == stored_document.source {
+                    return Ok(SystemOutcome::DocumentWritten(WrittenDocument {
+                        index: index_name,
+                        result: WriteResult::Noop,
+                        seq_no: stored_document.seq_no,
+                        primary_term: PRIMARY_TERM,
+                        source: Some(merged_source),
+                    }));
+                }
+                stored_document.source = merged_source;
+            }
+            DocumentChange::Script(DocumentScript::IncrementCounter(increment)) => {
+                increment.apply_to(&mut stored_document.source)?;
+            }
+        }
+        stored_document.seq_no = SystemIndex::take_seq_no(&mut index.next_seq_no);
+        Ok(SystemOutcome::DocumentWritten(WrittenDocument {
+            index: index_name,
+            result: WriteResult::Updated,
+            seq_no: stored_document.seq_no,
+            primary_term: PRIMARY_TERM,
+            source: Some(stored_document.source.clone()),
+        }))
+    }
+
+    /// Delete a document. A delete of a missing id takes a `_seq_no` too, so a sequence number is
+    /// never reused whichever way the delete went.
+    fn delete_document(&mut self, delete: &DocumentDelete) -> Result<SystemOutcome, OpenSearchError> {
+        let (index_name, index) = self.find_index_for_write(&delete.index)?;
+        delete
+            .concurrency
+            .check_stored_document(&index_name, &delete.id, index.find_document(&delete.id))?;
+        let is_found = index.documents.remove(&delete.id).is_some();
+        let seq_no = SystemIndex::take_seq_no(&mut index.next_seq_no);
+        Ok(SystemOutcome::DocumentDeleted {
+            index: index_name,
+            found: is_found,
+            seq_no,
+        })
+    }
+}
+
+/// Merge `partial_document` into `target` the way a partial-document update does: objects merge
+/// key by key, recursively; every other value, arrays included, replaces the target's value.
+fn merge_partial_document(target: &mut Value, partial_document: &Value) {
+    if let (Value::Object(target_object), Value::Object(partial_object)) = (&mut *target, partial_document) {
+        for (key, partial_value) in partial_object {
+            match target_object.get_mut(key) {
+                Some(target_value) if target_value.is_object() && partial_value.is_object() => {
+                    merge_partial_document(target_value, partial_value);
+                }
+                Some(_) | None => {
+                    target_object.insert(key.clone(), partial_value.clone());
+                }
+            }
+        }
+        return;
+    }
+    *target = partial_document.clone();
 }
 
 /// One action of an `_aliases` request.
@@ -328,6 +673,7 @@ mod tests {
 
     use super::*;
     use crate::opensearch::error::render_envelope;
+    use crate::opensearch::script::CounterIncrement;
 
     fn build_index_creation(name: &str, mappings: Value, settings: Value) -> SystemOperation {
         SystemOperation::CreateIndex {
@@ -624,5 +970,546 @@ mod tests {
                 build_field("config", "object", false, false),
             ]
         );
+    }
+
+    fn build_snapshot_with_index(name: &str) -> SystemSnapshot {
+        let mut snapshot = SystemSnapshot::default();
+        snapshot
+            .apply(&build_index_creation(name, json!({"properties": {}}), json!({})))
+            .expect("the index is created");
+        snapshot
+    }
+
+    fn build_put_operation(
+        index: &str,
+        id: &str,
+        source: Value,
+        op_type: OpType,
+        concurrency: WriteConcurrency,
+    ) -> SystemOperation {
+        SystemOperation::IndexDocument(DocumentWrite {
+            index: index.to_string(),
+            id: id.to_string(),
+            source,
+            op_type,
+            concurrency,
+        })
+    }
+
+    fn build_update_operation(index: &str, id: &str, change: DocumentChange, upsert: Option<Value>) -> SystemOperation {
+        SystemOperation::UpdateDocument(DocumentUpdate {
+            index: index.to_string(),
+            id: id.to_string(),
+            change,
+            upsert,
+            concurrency: WriteConcurrency::default(),
+        })
+    }
+
+    fn build_delete_operation(index: &str, id: &str) -> SystemOperation {
+        SystemOperation::DeleteDocument(DocumentDelete {
+            index: index.to_string(),
+            id: id.to_string(),
+            concurrency: WriteConcurrency::default(),
+        })
+    }
+
+    fn expect_written_document(outcome: SystemOutcome) -> WrittenDocument {
+        let SystemOutcome::DocumentWritten(written_document) = outcome else {
+            panic!("expected a written document, got {outcome:?}");
+        };
+        written_document
+    }
+
+    fn find_stored_document(snapshot: &SystemSnapshot, index: &str, id: &str) -> Option<StoredDocument> {
+        snapshot.find_index(index).and_then(|index| index.find_document(id)).cloned()
+    }
+
+    #[tokio::test]
+    async fn put_with_a_stale_if_seq_no_is_a_version_conflict() {
+        let mut snapshot = build_snapshot_with_index(".kibana_1");
+        snapshot
+            .apply(&build_put_operation(
+                ".kibana_1",
+                "a",
+                json!({"title": "first"}),
+                OpType::Index,
+                WriteConcurrency::default(),
+            ))
+            .expect("the first write lands");
+
+        for (if_seq_no, if_primary_term) in [(7, 1), (0, 2)] {
+            let stale_condition =
+                WriteConcurrency::new(Some(if_seq_no), Some(if_primary_term)).expect("both values given");
+            let error = snapshot
+                .apply(&build_put_operation(
+                    ".kibana_1",
+                    "a",
+                    json!({"title": "second"}),
+                    OpType::Index,
+                    stale_condition,
+                ))
+                .expect_err("a stale condition conflicts");
+            let (status, body) = render_envelope(error).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["error"]["type"], "version_conflict_engine_exception");
+            assert_eq!(body["error"]["index"], ".kibana_1");
+        }
+        assert_eq!(
+            find_stored_document(&snapshot, ".kibana_1", "a"),
+            Some(StoredDocument {
+                source: json!({"title": "first"}),
+                seq_no: 0
+            })
+        );
+
+        let matching_condition = WriteConcurrency::new(Some(0), Some(1)).expect("both values given");
+        let next_document = expect_written_document(
+            snapshot
+                .apply(&build_put_operation(
+                    ".kibana_1",
+                    "a",
+                    json!({"title": "second"}),
+                    OpType::Index,
+                    matching_condition,
+                ))
+                .expect("the matching condition writes"),
+        );
+        assert_eq!(
+            (next_document.result, next_document.seq_no, next_document.primary_term),
+            (WriteResult::Updated, 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_condition_with_only_one_of_seq_no_and_primary_term_is_refused() {
+        for (if_seq_no, if_primary_term) in [(Some(0), None), (None, Some(1))] {
+            let error = WriteConcurrency::new(if_seq_no, if_primary_term).expect_err("a one-sided condition");
+            let (status, body) = render_envelope(error).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_of_an_existing_id_is_a_version_conflict() {
+        let mut snapshot = build_snapshot_with_index(".kibana_1");
+        let created_document = expect_written_document(
+            snapshot
+                .apply(&build_put_operation(
+                    ".kibana_1",
+                    "a",
+                    json!({"title": "first"}),
+                    OpType::Create,
+                    WriteConcurrency::default(),
+                ))
+                .expect("a create of a new id lands"),
+        );
+        assert_eq!(
+            (created_document.result, created_document.seq_no),
+            (WriteResult::Created, 0)
+        );
+
+        let error = snapshot
+            .apply(&build_put_operation(
+                ".kibana_1",
+                "a",
+                json!({"title": "second"}),
+                OpType::Create,
+                WriteConcurrency::default(),
+            ))
+            .expect_err("a create of an existing id conflicts");
+
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["type"], "version_conflict_engine_exception");
+        assert_eq!(
+            find_stored_document(&snapshot, ".kibana_1", "a"),
+            Some(StoredDocument {
+                source: json!({"title": "first"}),
+                seq_no: 0
+            })
+        );
+    }
+
+    /// A refused write takes no `_seq_no`, so the write after three refusals still takes the
+    /// first one.
+    #[tokio::test]
+    async fn a_condition_on_a_missing_document_is_a_version_conflict_and_takes_no_seq_no() {
+        let mut snapshot = build_snapshot_with_index(".kibana_1");
+        let condition = WriteConcurrency::new(Some(0), Some(1)).expect("both values given");
+        let conditioned_operations = [
+            build_put_operation(".kibana_1", "missing", json!({"title": "a"}), OpType::Index, condition),
+            SystemOperation::UpdateDocument(DocumentUpdate {
+                index: ".kibana_1".to_string(),
+                id: "missing".to_string(),
+                change: DocumentChange::Merge(json!({"title": "b"})),
+                upsert: Some(json!({"title": "c"})),
+                concurrency: condition,
+            }),
+            SystemOperation::DeleteDocument(DocumentDelete {
+                index: ".kibana_1".to_string(),
+                id: "missing".to_string(),
+                concurrency: condition,
+            }),
+        ];
+        let snapshot_before_refusals = snapshot.clone();
+
+        for operation in &conditioned_operations {
+            let error = snapshot.apply(operation).expect_err("no document satisfies the condition");
+
+            let (status, body) = render_envelope(error).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{operation:?}");
+            assert_eq!(
+                body["error"]["type"], "version_conflict_engine_exception",
+                "{operation:?}"
+            );
+        }
+
+        assert_eq!(
+            snapshot, snapshot_before_refusals,
+            "a refused operation changes nothing"
+        );
+        let next_document = expect_written_document(
+            snapshot
+                .apply(&build_put_operation(
+                    ".kibana_1",
+                    "a",
+                    json!({}),
+                    OpType::Index,
+                    WriteConcurrency::default(),
+                ))
+                .expect("write"),
+        );
+        assert_eq!(next_document.seq_no, 0);
+    }
+
+    #[tokio::test]
+    async fn a_write_an_update_and_a_delete_naming_a_missing_index_are_index_not_found() {
+        let mut snapshot = build_snapshot_with_index(".kibana_1");
+        let snapshot_before_refusals = snapshot.clone();
+        let operations = [
+            build_put_operation(".missing", "a", json!({}), OpType::Index, WriteConcurrency::default()),
+            build_update_operation(".missing", "a", DocumentChange::Merge(json!({})), Some(json!({}))),
+            build_delete_operation(".missing", "a"),
+        ];
+
+        for operation in &operations {
+            let error = snapshot.apply(operation).expect_err("no automatic index creation");
+
+            let (status, body) = render_envelope(error).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{operation:?}");
+            assert_eq!(body["error"]["type"], "index_not_found_exception", "{operation:?}");
+        }
+
+        assert_eq!(
+            snapshot, snapshot_before_refusals,
+            "a refused operation changes nothing"
+        );
+    }
+
+    #[test]
+    fn seq_no_is_a_per_index_monotonic_counter_and_primary_term_is_one() {
+        let mut snapshot = build_snapshot_with_index(".kibana_1");
+        snapshot
+            .apply(&build_index_creation(".kibana_2", json!({"properties": {}}), json!({})))
+            .expect("the second index is created");
+        let no_condition = WriteConcurrency::default();
+        let mut write_document = |index: &str, id: &str| {
+            expect_written_document(
+                snapshot
+                    .apply(&build_put_operation(index, id, json!({}), OpType::Index, no_condition))
+                    .expect("write"),
+            )
+        };
+
+        let first_document = write_document(".kibana_1", "a");
+        let other_index_document = write_document(".kibana_2", "x");
+        let second_document = write_document(".kibana_1", "b");
+        let delete_outcome = snapshot.apply(&build_delete_operation(".kibana_1", "a")).expect("delete");
+        let missing_delete_outcome = snapshot
+            .apply(&build_delete_operation(".kibana_1", "missing"))
+            .expect("delete of a missing id");
+        let document_after_deletes = expect_written_document(
+            snapshot
+                .apply(&build_put_operation(
+                    ".kibana_1",
+                    "c",
+                    json!({}),
+                    OpType::Index,
+                    no_condition,
+                ))
+                .expect("write"),
+        );
+
+        assert_eq!((first_document.seq_no, first_document.primary_term), (0, 1));
+        assert_eq!((other_index_document.seq_no, other_index_document.primary_term), (0, 1));
+        assert_eq!((second_document.seq_no, second_document.primary_term), (1, 1));
+        assert_eq!(
+            delete_outcome,
+            SystemOutcome::DocumentDeleted {
+                index: ".kibana_1".to_string(),
+                found: true,
+                seq_no: 2
+            }
+        );
+        assert_eq!(
+            missing_delete_outcome,
+            SystemOutcome::DocumentDeleted {
+                index: ".kibana_1".to_string(),
+                found: false,
+                seq_no: 3
+            }
+        );
+        assert_eq!(
+            (document_after_deletes.seq_no, document_after_deletes.primary_term),
+            (4, 1)
+        );
+    }
+
+    #[test]
+    fn update_merges_a_partial_doc_and_upserts_a_missing_document() {
+        let mut snapshot = build_snapshot_with_index(".kibana_1");
+        snapshot
+            .apply(&build_put_operation(
+                ".kibana_1",
+                "dashboard:a",
+                json!({"type": "dashboard", "dashboard": {"title": "Logs", "panels": [1, 2]}}),
+                OpType::Index,
+                WriteConcurrency::default(),
+            ))
+            .expect("write");
+        let merge =
+            DocumentChange::Merge(json!({"dashboard": {"panels": [3]}, "updated_at": "2026-10-08T12:00:00.000Z"}));
+
+        let updated_document = expect_written_document(
+            snapshot
+                .apply(&build_update_operation(".kibana_1", "dashboard:a", merge.clone(), None))
+                .expect("update"),
+        );
+        let repeated_document = expect_written_document(
+            snapshot
+                .apply(&build_update_operation(".kibana_1", "dashboard:a", merge, None))
+                .expect("update"),
+        );
+        let upserted_document = expect_written_document(
+            snapshot
+                .apply(&build_update_operation(
+                    ".kibana_1",
+                    "dashboard:b",
+                    DocumentChange::Merge(json!({"dashboard": {"title": "ignored"}})),
+                    Some(json!({"type": "dashboard", "dashboard": {"title": "Fresh"}})),
+                ))
+                .expect("upsert"),
+        );
+
+        let merged_source = json!({
+            "type": "dashboard",
+            "dashboard": {"title": "Logs", "panels": [3]},
+            "updated_at": "2026-10-08T12:00:00.000Z"
+        });
+        assert_eq!(
+            updated_document,
+            WrittenDocument {
+                index: ".kibana_1".to_string(),
+                result: WriteResult::Updated,
+                seq_no: 1,
+                primary_term: 1,
+                source: Some(merged_source.clone())
+            }
+        );
+        assert_eq!(
+            repeated_document,
+            WrittenDocument {
+                index: ".kibana_1".to_string(),
+                result: WriteResult::Noop,
+                seq_no: 1,
+                primary_term: 1,
+                source: Some(merged_source)
+            }
+        );
+        assert_eq!(
+            upserted_document,
+            WrittenDocument {
+                index: ".kibana_1".to_string(),
+                result: WriteResult::Created,
+                seq_no: 2,
+                primary_term: 1,
+                source: Some(json!({"type": "dashboard", "dashboard": {"title": "Fresh"}}))
+            }
+        );
+    }
+
+    /// One row per pair of JSON kinds a merge step can meet: each step branches only on them.
+    #[test]
+    fn a_partial_document_merges_objects_and_replaces_every_other_value() {
+        let cases = [
+            (
+                "object into object, recursively",
+                json!({"a": {"b": 1, "c": {"d": 2, "e": 3}}}),
+                json!({"a": {"c": {"e": 4, "f": 5}}}),
+                json!({"a": {"b": 1, "c": {"d": 2, "e": 4, "f": 5}}}),
+            ),
+            (
+                "scalar over object",
+                json!({"a": {"b": 1}}),
+                json!({"a": 5}),
+                json!({"a": 5}),
+            ),
+            (
+                "object over scalar",
+                json!({"a": 5}),
+                json!({"a": {"b": 1}}),
+                json!({"a": {"b": 1}}),
+            ),
+            (
+                "array replaces array",
+                json!({"a": [1, 2]}),
+                json!({"a": [3]}),
+                json!({"a": [3]}),
+            ),
+            ("null replaces", json!({"a": 1}), json!({"a": null}), json!({"a": null})),
+            (
+                "a new key is added",
+                json!({"a": 1}),
+                json!({"b": 2}),
+                json!({"a": 1, "b": 2}),
+            ),
+            (
+                "a non-object partial document replaces the whole target",
+                json!({"a": 1}),
+                json!([1]),
+                json!([1]),
+            ),
+        ];
+        for (label, mut target, partial_document, expected) in cases {
+            merge_partial_document(&mut target, &partial_document);
+
+            assert_eq!(target, expected, "{label}");
+        }
+    }
+
+    /// The missing document is reported whether or not the update carries a condition: only an
+    /// `upsert` makes the condition the deciding check.
+    #[tokio::test]
+    async fn update_of_a_missing_document_without_upsert_is_not_found() {
+        let mut snapshot = build_snapshot_with_index(".kibana_1");
+        let condition = WriteConcurrency::new(Some(0), Some(1)).expect("both values given");
+
+        for concurrency in [WriteConcurrency::default(), condition] {
+            let error = snapshot
+                .apply(&SystemOperation::UpdateDocument(DocumentUpdate {
+                    index: ".kibana_1".to_string(),
+                    id: "missing".to_string(),
+                    change: DocumentChange::Merge(json!({"a": 1})),
+                    upsert: None,
+                    concurrency,
+                }))
+                .expect_err("no document and no upsert");
+
+            let (status, body) = render_envelope(error).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{concurrency:?}");
+            assert_eq!(body["error"]["type"], "document_missing_exception", "{concurrency:?}");
+        }
+        assert_eq!(find_stored_document(&snapshot, ".kibana_1", "missing"), None);
+    }
+
+    /// The script runs on the stored document itself, so the stored version is asserted beside
+    /// the answer. A refused script takes no `_seq_no`: the write after it takes the next one.
+    #[tokio::test]
+    async fn increment_counter_adds_its_count_and_sets_updated_at() {
+        let mut snapshot = build_snapshot_with_index(".kibana_1");
+        for (id, source) in [
+            ("ui-metric:a", json!({"type": "ui-metric", "ui-metric": {"count": 4}})),
+            ("ui-metric:b", json!({"type": "ui-metric", "ui-metric": {}})),
+            ("ui-metric:c", json!({"type": "ui-metric"})),
+        ] {
+            snapshot
+                .apply(&build_put_operation(
+                    ".kibana_1",
+                    id,
+                    source,
+                    OpType::Index,
+                    WriteConcurrency::default(),
+                ))
+                .expect("write");
+        }
+        let build_increment = |count| {
+            DocumentChange::Script(DocumentScript::IncrementCounter(CounterIncrement {
+                object_type: "ui-metric".to_string(),
+                counter_field_name: "count".to_string(),
+                count,
+                time: "2026-10-08T12:00:00.000Z".to_string(),
+            }))
+        };
+
+        let added_document = expect_written_document(
+            snapshot
+                .apply(&build_update_operation(
+                    ".kibana_1",
+                    "ui-metric:a",
+                    build_increment(3),
+                    None,
+                ))
+                .expect("increment"),
+        );
+        let initialized_document = expect_written_document(
+            snapshot
+                .apply(&build_update_operation(
+                    ".kibana_1",
+                    "ui-metric:b",
+                    build_increment(2),
+                    None,
+                ))
+                .expect("increment"),
+        );
+        let error = snapshot
+            .apply(&build_update_operation(
+                ".kibana_1",
+                "ui-metric:c",
+                build_increment(1),
+                None,
+            ))
+            .expect_err("no attributes object");
+        let document_after_refusal = expect_written_document(
+            snapshot
+                .apply(&build_put_operation(
+                    ".kibana_1",
+                    "ui-metric:d",
+                    json!({"type": "ui-metric"}),
+                    OpType::Index,
+                    WriteConcurrency::default(),
+                ))
+                .expect("write"),
+        );
+
+        assert_eq!(
+            added_document.source,
+            Some(json!({"type": "ui-metric", "ui-metric": {"count": 7}, "updated_at": "2026-10-08T12:00:00.000Z"}))
+        );
+        assert_eq!(added_document.result, WriteResult::Updated);
+        assert_eq!(added_document.seq_no, 3);
+        assert_eq!(
+            find_stored_document(&snapshot, ".kibana_1", "ui-metric:a"),
+            Some(StoredDocument {
+                source: json!({"type": "ui-metric", "ui-metric": {"count": 7}, "updated_at": "2026-10-08T12:00:00.000Z"}),
+                seq_no: 3
+            })
+        );
+        assert_eq!(
+            initialized_document.source,
+            Some(json!({"type": "ui-metric", "ui-metric": {"count": 2}, "updated_at": "2026-10-08T12:00:00.000Z"}))
+        );
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        assert_eq!(
+            find_stored_document(&snapshot, ".kibana_1", "ui-metric:c"),
+            Some(StoredDocument {
+                source: json!({"type": "ui-metric"}),
+                seq_no: 2
+            })
+        );
+        assert_eq!(document_after_refusal.seq_no, 5);
     }
 }

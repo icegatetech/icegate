@@ -19,6 +19,7 @@ mod filter_path;
 mod glob;
 mod node;
 mod routes;
+mod script;
 mod server;
 mod state;
 pub(crate) mod system_index;

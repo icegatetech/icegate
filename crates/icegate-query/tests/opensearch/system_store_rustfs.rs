@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::join_all;
 use icegate_common::testing::{S3TestContainer, create_s3_bucket, create_s3_object_store};
 use icegate_common::{S3Config, StorageBackend, StorageConfig};
 use icegate_query::QueryConfig;
@@ -12,7 +13,7 @@ use icegate_query::opensearch::build_system_object_store;
 use object_store::path::Path;
 use object_store::{GetOptions, ObjectStore, ObjectStoreExt as _};
 use reqwest::{Method, StatusCode};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Barrier;
 
 use super::harness::TestServer;
@@ -20,6 +21,12 @@ use super::harness::TestServer;
 const BUCKET: &str = "opensearch-system-store";
 /// Upper bound for a race of two writers, so a hung request fails the test instead of the run.
 const RACE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Rounds of the counter race.
+const COUNTER_ROUNDS: usize = 50;
+/// Writers released per round, split evenly across the two replicas.
+const COUNTER_WRITERS_PER_ROUND: usize = 8;
+/// Bound for one round, so a hung write fails the test instead of the run.
+const COUNTER_ROUND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Start RustFS with an empty bucket and the query configuration a deployment storing its tables
 /// in that bucket carries, with the listener enabled. The container guard must outlive every
@@ -232,4 +239,88 @@ async fn a_colon_tenant_segment_round_trips_create_update_conditional_get_and_he
         "{unchanged_answer:?}"
     );
     server.shutdown().await;
+}
+
+/// One counter increment, upserting the document on first use. Answers the writer's number with
+/// the status and body it got, so a failed round can report every writer.
+async fn send_increment(
+    server: &TestServer,
+    round: usize,
+    writer: usize,
+) -> reqwest::Result<(usize, StatusCode, Value)> {
+    let body = json!({
+        "script": {
+            "source": "if (ctx._source[params.type][params.counterFieldName] == null) { ctx._source[params.type][params.counterFieldName] = params.count; } else { ctx._source[params.type][params.counterFieldName] += params.count; } ctx._source.updated_at = params.time;",
+            "lang": "painless",
+            "params": {"count": 1, "time": format!("round-{round}-writer-{writer}"), "type": "ui-metric", "counterFieldName": "count"}
+        },
+        "upsert": {"type": "ui-metric", "ui-metric": {"count": 1}, "updated_at": "first"}
+    });
+    let response = server
+        .request(
+            Method::POST,
+            Some("tenant-a"),
+            "/.kibana/_update/ui-metric:console:opened?refresh=wait_for",
+        )
+        .json(&body)
+        .send()
+        .await?;
+    let status = response.status();
+    let answer = response.json::<Value>().await?;
+    Ok((writer, status, answer))
+}
+
+// Which writer lands first in a round is a scheduling outcome and is not asserted; the contract
+// is that every increment lands exactly once, whichever replica took it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_increment_counters_across_two_replicas_end_at_exactly_n() {
+    let (_container, config) = start_rustfs().await;
+    let (replica_a, replica_b) = start_replicas(&config).await;
+    let index = json!({"mappings": {"dynamic": "strict", "properties": {"type": {"type": "keyword"}}}, "settings": {"number_of_shards": 1}});
+    let create_response = replica_a
+        .request(Method::PUT, Some("tenant-a"), "/.kibana_1")
+        .json(&index)
+        .send()
+        .await
+        .expect("create");
+    assert!(create_response.status().is_success(), "{}", create_response.status());
+    let alias = json!({"actions": [{"add": {"index": ".kibana_1", "alias": ".kibana"}}]});
+    let alias_response = replica_b
+        .request(Method::POST, Some("tenant-a"), "/_aliases")
+        .json(&alias)
+        .send()
+        .await
+        .expect("alias");
+    assert!(alias_response.status().is_success(), "{}", alias_response.status());
+
+    for round in 1..=COUNTER_ROUNDS {
+        let writers = (0..COUNTER_WRITERS_PER_ROUND).map(|writer| {
+            let replica = if writer % 2 == 0 { &replica_a } else { &replica_b };
+            send_increment(replica, round, writer)
+        });
+        let outcomes = tokio::time::timeout(COUNTER_ROUND_TIMEOUT, join_all(writers))
+            .await
+            .unwrap_or_else(|_| panic!("round {round} did not finish within {COUNTER_ROUND_TIMEOUT:?}"));
+        let has_failed_writer = outcomes
+            .iter()
+            .any(|outcome| !matches!(outcome, Ok((_, status, _)) if status.is_success()));
+        assert!(!has_failed_writer, "round {round}: all outcomes {outcomes:?}");
+
+        let read_answer = replica_b
+            .request(Method::GET, Some("tenant-a"), "/.kibana/_doc/ui-metric:console:opened")
+            .send()
+            .await
+            .expect("the counter is read")
+            .json::<Value>()
+            .await
+            .expect("the read is JSON");
+        let expected_count = round * COUNTER_WRITERS_PER_ROUND;
+        assert_eq!(
+            read_answer["_source"]["ui-metric"]["count"],
+            json!(expected_count),
+            "round {round}: every increment lands exactly once; outcomes {outcomes:?}"
+        );
+    }
+    replica_a.shutdown().await;
+    replica_b.shutdown().await;
 }

@@ -14,7 +14,7 @@ use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
 use axum::http::{Method, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use icegate_common::{ShedPolicy, shed_when_pressured};
 
 use super::cluster::{cat, datasources, health, info, resolve, settings};
@@ -24,8 +24,8 @@ use super::fields;
 use super::filter_path::apply_filter_path;
 use super::state::OpenSearchState;
 use super::system_index::{
-    apply_aliases, create_system_index, delete_index_template, describe_system_index, get_alias, get_index_aliases,
-    refresh_index,
+    apply_aliases, create_system_index, delete_index_template, describe_system_index, documents, get_alias,
+    get_index_aliases, refresh_index,
 };
 use crate::infra::metrics::{PROTOCOL_OPENSEARCH, QueryMetrics, QueryRequestRecorder, QueryTenantRejectionRecorder};
 use crate::infra::runtime::QueryRuntime;
@@ -89,6 +89,15 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
         .route("/{index}/_alias", get(get_index_aliases))
         .route("/_aliases", post(apply_aliases))
         .route("/{index}/_refresh", get(refresh_index).post(refresh_index))
+        .route("/{index}/_create/{id}", put(documents::create_document))
+        .route(
+            "/{index}/_doc/{id}",
+            put(documents::index_document)
+                .post(documents::index_document)
+                .get(documents::get_document)
+                .delete(documents::delete_document),
+        )
+        .route("/{index}/_update/{id}", post(documents::update_document))
         .route("/_template/{name}", delete(delete_index_template))
         .route("/_cat/templates/{pattern}", get(cat::list_index_templates))
         .fallback(answer_unmatched_route)

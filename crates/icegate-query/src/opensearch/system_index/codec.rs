@@ -147,7 +147,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::opensearch::system_index::snapshot::{AliasAction, SystemOperation};
+    use crate::opensearch::system_index::snapshot::{
+        AliasAction, DocumentDelete, DocumentWrite, OpType, SystemOperation, SystemOutcome, WriteConcurrency,
+    };
 
     fn build_snapshot() -> SystemSnapshot {
         let mut snapshot = SystemSnapshot::default();
@@ -225,7 +227,12 @@ mod tests {
         assert_eq!(
             snapshot_json,
             json!({
-                "indices": {".kibana_1": {"mappings": {"dynamic": "strict"}, "settings": {"number_of_shards": 1}}},
+                "indices": {".kibana_1": {
+                    "mappings": {"dynamic": "strict"},
+                    "settings": {"number_of_shards": 1},
+                    "documents": {},
+                    "next_seq_no": 0
+                }},
                 "aliases": {".kibana": ".kibana_1"}
             })
         );
@@ -234,11 +241,65 @@ mod tests {
         assert_eq!(decoded_object.snapshot.resolve_name(".kibana"), Some(".kibana_1"));
     }
 
-    /// A snapshot object stored before snapshots held aliases has no `aliases` key. It is
-    /// assembled here from the format's layout (the lineage frame's magic number and payload
-    /// length, little-endian, then the zstd frame of the snapshot JSON), as such a writer stored it.
+    /// Another replica and a restart read documents only from this JSON, the next `_seq_no`
+    /// included: it must survive on its own, because the delete of a missing id took a sequence
+    /// number that no stored document shows.
     #[test]
-    fn a_snapshot_object_without_an_alias_map_decodes_with_its_indices_and_no_alias() {
+    fn a_snapshot_holding_documents_round_trips_through_its_object_with_its_next_seq_no() {
+        let mut snapshot = build_snapshot();
+        let build_write = |id: &str| {
+            SystemOperation::IndexDocument(DocumentWrite {
+                index: ".kibana_1".to_string(),
+                id: id.to_string(),
+                source: json!({"type": "dashboard"}),
+                op_type: OpType::Index,
+                concurrency: WriteConcurrency::default(),
+            })
+        };
+        snapshot.apply(&build_write("dashboard:a")).expect("write");
+        snapshot
+            .apply(&SystemOperation::DeleteDocument(DocumentDelete {
+                index: ".kibana_1".to_string(),
+                id: "dashboard:missing".to_string(),
+                concurrency: WriteConcurrency::default(),
+            }))
+            .expect("delete");
+        let lineage = SnapshotLineage {
+            predecessor: None,
+            operation_ids: Vec::new(),
+        };
+
+        let encoded_object = encode_snapshot_object(&lineage, &snapshot).expect("encode");
+
+        let decompressed_bytes = zstd::decode_all(&encoded_object.bytes[..]).expect("the object is valid zstd");
+        let snapshot_json: Value = serde_json::from_slice(&decompressed_bytes).expect("snapshot JSON");
+        assert_eq!(
+            snapshot_json,
+            json!({
+                "indices": {".kibana_1": {
+                    "mappings": {"dynamic": "strict"},
+                    "settings": {"number_of_shards": 1},
+                    "documents": {"dashboard:a": {"source": {"type": "dashboard"}, "seq_no": 0}},
+                    "next_seq_no": 2
+                }},
+                "aliases": {}
+            })
+        );
+        let mut decoded_snapshot = decode_snapshot_object(&encoded_object.bytes).expect("decode").snapshot;
+        assert_eq!(decoded_snapshot, snapshot);
+        let outcome = decoded_snapshot.apply(&build_write("dashboard:b")).expect("write");
+        let SystemOutcome::DocumentWritten(written_document) = outcome else {
+            panic!("expected a written document, got {outcome:?}");
+        };
+        assert_eq!(written_document.seq_no, 2, "the decoded index keeps its next _seq_no");
+    }
+
+    /// A snapshot object stored before snapshots held aliases or documents has no `aliases` key
+    /// and no `documents` or `next_seq_no` on its indices. It is assembled here from the format's
+    /// layout (the lineage frame's magic number and payload length, little-endian, then the zstd
+    /// frame of the snapshot JSON), as such a writer stored it.
+    #[test]
+    fn a_snapshot_object_without_aliases_or_documents_decodes_with_neither() {
         let lineage_json = br#"{"predecessor":null,"operation_ids":[]}"#;
         let snapshot_json =
             br#"{"indices":{".kibana_1":{"mappings":{"dynamic":"strict"},"settings":{"number_of_shards":1}}}}"#;
