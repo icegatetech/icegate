@@ -24,7 +24,7 @@ use super::fields;
 use super::filter_path::apply_filter_path;
 use super::state::OpenSearchState;
 use super::system_index::{
-    apply_aliases, create_system_index, delete_index_template, describe_system_index, documents, get_alias,
+    apply_aliases, bulk, create_system_index, delete_index_template, describe_system_index, documents, get_alias,
     get_index_aliases, refresh_index,
 };
 use crate::infra::metrics::{PROTOCOL_OPENSEARCH, QueryMetrics, QueryRequestRecorder, QueryTenantRejectionRecorder};
@@ -98,6 +98,15 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
                 .delete(documents::delete_document),
         )
         .route("/{index}/_update/{id}", post(documents::update_document))
+        .route("/_bulk", post(bulk::write_documents).put(bulk::write_documents))
+        .route("/{index}/_bulk", post(bulk::write_documents).put(bulk::write_documents))
+        .route("/_mget", get(bulk::get_documents).post(bulk::get_documents))
+        .route("/{index}/_mget", get(bulk::get_documents).post(bulk::get_documents))
+        .route("/_reindex", post(bulk::refuse_document_task_endpoint))
+        .route("/{index}/_update_by_query", post(bulk::refuse_document_task_endpoint))
+        .route("/{index}/_delete_by_query", post(bulk::refuse_document_task_endpoint))
+        .route("/_tasks", get(bulk::refuse_document_task_endpoint))
+        .route("/_tasks/{task_id}", get(bulk::refuse_document_task_endpoint))
         .route("/_template/{name}", delete(delete_index_template))
         .route("/_cat/templates/{pattern}", get(cat::list_index_templates))
         .fallback(answer_unmatched_route)
@@ -222,6 +231,7 @@ mod tests {
                 },
             ),
             system_store,
+            max_answer_bytes: config.system_indices.max_answer_bytes,
         };
         build_router(state, &runtime, &config)
     }

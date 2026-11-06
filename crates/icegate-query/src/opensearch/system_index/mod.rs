@@ -6,6 +6,7 @@
 //! without them.
 
 mod api;
+pub(crate) mod bulk;
 mod client;
 mod codec;
 pub(crate) mod documents;

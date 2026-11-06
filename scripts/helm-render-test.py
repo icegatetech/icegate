@@ -365,7 +365,7 @@ LONG_FULLNAME_CASES = (  # (description, global.fullnameOverride, expected migra
 # query.yaml it must render into, under the names the binary reads. Both are
 # literals, so the check is not a second reading of the template. The values go in
 # through `--set-json`, which reads a number as a float the way a values file does,
-# so the body limit and the two system-index byte bounds, all above a million, also
+# so the body limit and the three system-index byte bounds, all above a million, also
 # pin the `| int` that keeps each out of the exponent form the binary refuses.
 OPENSEARCH_VALUES = {
     "enabled": True,
@@ -379,6 +379,7 @@ OPENSEARCH_VALUES = {
         "maxScrollLifetimeSecs": 901,
         "cacheMaxBytes": 268435457,
         "maxSnapshotBytes": 134217729,
+        "maxAnswerBytes": 268435458,
     },
 }
 OPENSEARCH_SECTION = {
@@ -394,15 +395,17 @@ OPENSEARCH_SECTION = {
         "max_scroll_lifetime_secs": 901,
         "cache_max_bytes": 268435457,
         "max_snapshot_bytes": 134217729,
+        "max_answer_bytes": 268435458,
     },
 }
 
 # The system_indices section an enabled release renders on the chart defaults: the
-# three bounds, and no location, so the binary resolves the default one.
+# four bounds, and no location, so the binary resolves the default one.
 SYSTEM_INDICES_DEFAULT_SECTION = {
     "max_scroll_lifetime_secs": 900,
     "cache_max_bytes": 268435456,
     "max_snapshot_bytes": 134217728,
+    "max_answer_bytes": 268435456,
 }
 
 

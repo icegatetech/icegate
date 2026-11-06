@@ -13,8 +13,9 @@
 //! queued while it was busy into one snapshot object and one compare-and-swap of the pointer
 //! (`PutMode::Update` on the `ETag` the attempt read, or `PutMode::Create` on an absent pointer).
 //! The snapshot object is stored before the pointer is swapped, so a pointer never names a missing
-//! object. A loop ends once its queue is empty after a batch, so a replica holds no task and no
-//! queue for a tenant that stopped writing; the tenant's next write starts a new loop.
+//! object. A batch none of whose outcomes changes the snapshot stores nothing and swaps nothing. A
+//! loop ends once its queue is empty after a batch, so a replica holds no task and no queue for a
+//! tenant that stopped writing; the tenant's next write starts a new loop.
 //!
 //! Landed detection. Neither a conflict answer (a stale `ETag`, or a create on an existing
 //! pointer) nor a lost answer (any other error) proves that a swap did not land: when a request
@@ -228,9 +229,9 @@ enum SwapAnswer {
 
 /// A batch applied to a copy of the snapshot an attempt starts from.
 enum PreparedBatch {
-    /// Every operation was refused and no lost attempt may still land: the refusals stand on the
-    /// snapshot as it is, without a swap.
-    Refused(Vec<Result<SystemOutcome, OpenSearchError>>),
+    /// No outcome changed the snapshot and no lost attempt may still land: the outcomes stand on
+    /// the snapshot as it is, without a swap.
+    Unchanged(Vec<Result<SystemOutcome, OpenSearchError>>),
     /// The snapshot to swap in, with its outcomes and its encoded snapshot object.
     Encoded {
         /// The snapshot with the batch applied.
@@ -409,7 +410,7 @@ fn send_error_to_all(replies: Vec<oneshot::Sender<Result<SystemOutcome, OpenSear
 
 /// Run `work` on the blocking pool (see the module doc). `task` names the work in the `500` a
 /// failed join answers: the work panicked, or the runtime is shutting down.
-async fn run_snapshot_work<T: Send + 'static>(
+pub(super) async fn run_blocking_work<T: Send + 'static>(
     task: &str,
     work: impl FnOnce() -> Result<T, OpenSearchError> + Send + 'static,
 ) -> Result<T, OpenSearchError> {
@@ -419,9 +420,12 @@ async fn run_snapshot_work<T: Send + 'static>(
 }
 
 /// Apply `operations` to a copy of `base_snapshot` and encode the result with its lineage:
-/// `predecessor` and `operation_ids`. When every operation is refused and `has_lost_attempts` is
-/// false, nothing needs a swap, and the refusals are answered without encoding or building the
-/// lineage.
+/// `predecessor` and `operation_ids`. When no outcome changed the snapshot and `has_lost_attempts`
+/// is false, nothing needs a swap, and the outcomes are answered without encoding or building the
+/// lineage: the pointer was read before anything was applied, so an answer that changes nothing
+/// stands on the state just read, exactly as a refusal does. With `has_lost_attempts` true the
+/// batch is encoded whatever its outcomes, because an attempt that may still land must be settled
+/// by the compare-and-swap.
 ///
 /// # Errors
 ///
@@ -438,8 +442,9 @@ fn prepare_batch(
         .iter()
         .map(|pending_operation| snapshot.apply(&pending_operation.operation))
         .collect();
-    if !has_lost_attempts && outcomes.iter().all(Result::is_err) {
-        return Ok(PreparedBatch::Refused(outcomes));
+    let has_snapshot_change = outcomes.iter().flatten().any(SystemOutcome::changes_snapshot);
+    if !has_lost_attempts && !has_snapshot_change {
+        return Ok(PreparedBatch::Unchanged(outcomes));
     }
     let lineage = SnapshotLineage {
         predecessor: predecessor.map(str::to_string),
@@ -618,7 +623,7 @@ impl StoreShared {
             .bytes()
             .await
             .map_err(|error| OpenSearchError::internal(format!("cannot read the snapshot object {path}: {error}")))?;
-        run_snapshot_work("decoding a system-index snapshot object", move || {
+        run_blocking_work("decoding a system-index snapshot object", move || {
             decode_snapshot_object(&bytes)
         })
         .await
@@ -683,7 +688,7 @@ impl StoreShared {
             let batch_operations = Arc::clone(operations);
             let batch_operation_ids = Arc::clone(&operation_ids);
             let has_lost_attempts = !lost_attempts.is_empty();
-            let prepared_batch = run_snapshot_work("applying a system-index batch", move || {
+            let prepared_batch = run_blocking_work("applying a system-index batch", move || {
                 prepare_batch(
                     &base_snapshot,
                     &batch_operations,
@@ -695,8 +700,8 @@ impl StoreShared {
             .await
             .map_err(BatchFailure::Failed)?;
             let (working_snapshot, outcomes, encoded_object) = match prepared_batch {
-                // Nothing changes: the refusals stand on the state just read, without a swap.
-                PreparedBatch::Refused(outcomes) => return Ok(outcomes),
+                // Nothing changes: the outcomes stand on the state just read, without a swap.
+                PreparedBatch::Unchanged(outcomes) => return Ok(outcomes),
                 PreparedBatch::Encoded {
                     snapshot,
                     outcomes,
@@ -985,7 +990,11 @@ mod tests {
 
     use super::*;
     use crate::opensearch::error::render_envelope;
-    use crate::opensearch::system_index::snapshot::AliasAction;
+    use crate::opensearch::system_index::bulk::{BulkAction, BulkItem, RefusedBulkItem};
+    use crate::opensearch::system_index::snapshot::{
+        AliasAction, DocumentChange, DocumentUpdate, DocumentWrite, OpType, ReturnedSources, WriteConcurrency,
+        WriteResult, WrittenDocument,
+    };
 
     const LOCATION: &str = "s3://opensearch-test/opensearch-system";
     const TENANT_A: &str = "tenant-a";
@@ -2283,6 +2292,261 @@ mod tests {
             reads.iter().all(|read| read.path.starts_with("opensearch-system/tenant-b/")),
             "{reads:?}"
         );
+    }
+
+    /// A create or index of the document `id` of `.kibana_1` holding `{"title": title}`.
+    fn build_title_write(id: &str, title: &str, op_type: OpType) -> DocumentWrite {
+        DocumentWrite {
+            index: ".kibana_1".to_string(),
+            id: id.to_string(),
+            source: json!({"title": title}),
+            op_type,
+            concurrency: WriteConcurrency::default(),
+        }
+    }
+
+    /// An update of the document `id` of `.kibana_1` merging `{"title": title}`.
+    fn build_title_merge(id: &str, title: &str) -> DocumentUpdate {
+        DocumentUpdate {
+            index: ".kibana_1".to_string(),
+            id: id.to_string(),
+            change: DocumentChange::Merge(json!({"title": title})),
+            upsert: None,
+            concurrency: WriteConcurrency::default(),
+        }
+    }
+
+    /// What an update of the document holding `{"title": title}` answers, `_seq_no` as given.
+    fn build_title_update_outcome(result: WriteResult, seq_no: i64, title: &str) -> SystemOutcome {
+        SystemOutcome::DocumentWritten(WrittenDocument {
+            index: ".kibana_1".to_string(),
+            result,
+            seq_no,
+            primary_term: 1,
+            source: Some(json!({"title": title})),
+        })
+    }
+
+    /// Create `.kibana_1` and, in it, the document `a` holding `{"title": "Logs"}` at `_seq_no` 0:
+    /// two snapshot puts and the pointer swaps `create`, `update`.
+    async fn write_titled_document(replica: &SystemIndexStore, tenant: &TenantId) {
+        replica
+            .write(tenant, build_index_creation(".kibana_1"))
+            .await
+            .expect("the index is created");
+        replica
+            .write(
+                tenant,
+                SystemOperation::IndexDocument(build_title_write("a", "Logs", OpType::Index)),
+            )
+            .await
+            .expect("the document is written");
+    }
+
+    #[tokio::test]
+    async fn a_noop_update_answers_noop_without_a_snapshot_put_or_a_pointer_swap() {
+        let (double, scripted_replica, _other_replica) = build_replicas(build_limits());
+        let tenant = build_tenant(TENANT_A);
+        write_titled_document(&scripted_replica, &tenant).await;
+
+        let outcome = scripted_replica
+            .write(&tenant, SystemOperation::UpdateDocument(build_title_merge("a", "Logs")))
+            .await;
+
+        assert_eq!(
+            outcome.expect("a noop is an answer"),
+            build_title_update_outcome(WriteResult::Noop, 0, "Logs")
+        );
+        assert_eq!(double.count_snapshot_puts(), 2);
+        assert_eq!(double.list_pointer_swaps(), ["create", "update"]);
+    }
+
+    /// One item per way an item is refused: at parse time, for a missing index and for a
+    /// conflict. A noop item beside them changes nothing either.
+    #[tokio::test]
+    async fn a_bulk_that_changes_nothing_answers_without_a_snapshot_put_or_a_pointer_swap() {
+        let refused_items = vec![
+            BulkItem::Refused(RefusedBulkItem {
+                action: BulkAction::Index,
+                index: "logs".to_string(),
+                id: "1".to_string(),
+                error: OpenSearchError::cluster_block("logs"),
+            }),
+            BulkItem::Write(DocumentWrite {
+                index: ".missing".to_string(),
+                ..build_title_write("a", "Logs", OpType::Index)
+            }),
+            BulkItem::Write(build_title_write("a", "Errors", OpType::Create)),
+        ];
+        let mut items_with_a_noop = refused_items.clone();
+        items_with_a_noop.push(BulkItem::Update(build_title_merge("a", "Logs")));
+        let cases = [
+            (
+                "every item refused",
+                refused_items,
+                vec![
+                    Some(StatusCode::FORBIDDEN),
+                    Some(StatusCode::NOT_FOUND),
+                    Some(StatusCode::CONFLICT),
+                ],
+            ),
+            (
+                "refused items and a noop",
+                items_with_a_noop,
+                vec![
+                    Some(StatusCode::FORBIDDEN),
+                    Some(StatusCode::NOT_FOUND),
+                    Some(StatusCode::CONFLICT),
+                    None,
+                ],
+            ),
+        ];
+        for (label, items, expected_failures) in cases {
+            let (double, scripted_replica, _other_replica) = build_replicas(build_limits());
+            let tenant = build_tenant(TENANT_A);
+            write_titled_document(&scripted_replica, &tenant).await;
+
+            let outcome = scripted_replica
+                .write(
+                    &tenant,
+                    SystemOperation::Bulk {
+                        items,
+                        returned_sources: None,
+                    },
+                )
+                .await
+                .expect("a bulk answers per item");
+
+            let SystemOutcome::Bulk { items: item_outcomes } = outcome else {
+                panic!("{label}: expected a bulk outcome, got {outcome:?}");
+            };
+            let failures: Vec<Option<StatusCode>> = item_outcomes
+                .iter()
+                .map(|item_outcome| item_outcome.as_ref().err().map(OpenSearchError::status))
+                .collect();
+            assert_eq!(failures, expected_failures, "{label}");
+            assert_eq!(double.count_snapshot_puts(), 2, "{label}");
+            assert_eq!(double.list_pointer_swaps(), ["create", "update"], "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bulk_holding_a_noop_and_a_real_write_puts_and_swaps_once() {
+        let (double, scripted_replica, _other_replica) = build_replicas(build_limits());
+        let tenant = build_tenant(TENANT_A);
+        write_titled_document(&scripted_replica, &tenant).await;
+
+        let outcome = scripted_replica
+            .write(
+                &tenant,
+                SystemOperation::Bulk {
+                    items: vec![
+                        BulkItem::Update(build_title_merge("a", "Logs")),
+                        BulkItem::Update(build_title_merge("a", "Errors")),
+                    ],
+                    returned_sources: Some(ReturnedSources {
+                        includes: Vec::new(),
+                        max_answer_bytes: 1 << 20,
+                    }),
+                },
+            )
+            .await;
+
+        assert_eq!(
+            outcome.expect("a bulk answers per item"),
+            SystemOutcome::Bulk {
+                items: vec![
+                    Ok(build_title_update_outcome(WriteResult::Noop, 0, "Logs")),
+                    Ok(build_title_update_outcome(WriteResult::Updated, 1, "Errors")),
+                ]
+            }
+        );
+        assert_eq!(double.count_snapshot_puts(), 3);
+        assert_eq!(double.list_pointer_swaps(), ["create", "update", "update"]);
+    }
+
+    /// The first write is held mid-swap while a noop and a real write are queued, so the two reach
+    /// the store as one batch, which the real write alone makes worth a swap.
+    #[tokio::test]
+    async fn a_coalesced_batch_holding_a_noop_and_a_real_write_puts_and_swaps_once() {
+        let (double, scripted_replica, _other_replica) = build_replicas(build_limits());
+        let tenant = build_tenant(TENANT_A);
+        write_titled_document(&scripted_replica, &tenant).await;
+        let gate = Gate::default();
+        double.push_swap_faults([PointerSwapFault::Pause(gate.clone())]);
+
+        let mut held_write = Box::pin(scripted_replica.write(&tenant, build_index_creation(".kibana_2")));
+        assert!(futures::poll!(held_write.as_mut()).is_pending());
+        gate.wait_for_request().await;
+        let noop_operation = SystemOperation::UpdateDocument(build_title_merge("a", "Logs"));
+        let real_operation = SystemOperation::UpdateDocument(build_title_merge("a", "Errors"));
+        let mut noop_write = Box::pin(scripted_replica.write(&tenant, noop_operation));
+        let mut real_write = Box::pin(scripted_replica.write(&tenant, real_operation));
+        assert!(futures::poll!(noop_write.as_mut()).is_pending());
+        assert!(futures::poll!(real_write.as_mut()).is_pending());
+        gate.release_request();
+        let (held_outcome, noop_outcome, real_outcome) =
+            tokio::time::timeout(WAIT_TIMEOUT, async { tokio::join!(held_write, noop_write, real_write) })
+                .await
+                .expect("the writes finish");
+
+        assert_eq!(held_outcome.expect("held"), build_creation_outcome(".kibana_2"));
+        assert_eq!(
+            noop_outcome.expect("noop"),
+            build_title_update_outcome(WriteResult::Noop, 0, "Logs")
+        );
+        assert_eq!(
+            real_outcome.expect("real"),
+            build_title_update_outcome(WriteResult::Updated, 1, "Errors")
+        );
+        // Two for the setup, one for the held write and one for the batch.
+        assert_eq!(double.count_snapshot_puts(), 4);
+        assert_eq!(double.list_pointer_swaps(), ["create", "update", "update", "update"]);
+    }
+
+    /// Set up on `prepare_batch` because no `write` reaches it: an attempt only gets lost after a
+    /// swap, so its batch changed the state it read, and while an attempt is lost the batch is
+    /// re-applied to that same state, which gives the same outcomes.
+    #[test]
+    fn a_noop_is_encoded_while_a_lost_attempt_may_still_land() {
+        let mut base_snapshot = SystemSnapshot::default();
+        base_snapshot
+            .apply(&build_index_creation(".kibana_1"))
+            .expect("the index is created");
+        base_snapshot
+            .apply(&SystemOperation::IndexDocument(build_title_write(
+                "a",
+                "Logs",
+                OpType::Index,
+            )))
+            .expect("the document is written");
+        let operation_id = Uuid::from_u128(1);
+        let operations = [PendingOperation {
+            id: operation_id,
+            operation: SystemOperation::UpdateDocument(build_title_merge("a", "Logs")),
+        }];
+        let noop_outcomes = [Ok(build_title_update_outcome(WriteResult::Noop, 0, "Logs"))];
+        let prepare_with_lost_attempts = |has_lost_attempts| {
+            prepare_batch(
+                &base_snapshot,
+                &operations,
+                Some("snap-read"),
+                &[operation_id],
+                has_lost_attempts,
+            )
+            .expect("the batch is prepared")
+        };
+
+        let PreparedBatch::Encoded { snapshot, outcomes, .. } = prepare_with_lost_attempts(true) else {
+            panic!("a lost attempt keeps the batch on the encoded path");
+        };
+        assert_eq!(snapshot, base_snapshot);
+        assert_eq!(outcomes, noop_outcomes);
+
+        let PreparedBatch::Unchanged(outcomes) = prepare_with_lost_attempts(false) else {
+            panic!("without a lost attempt a noop needs no swap");
+        };
+        assert_eq!(outcomes, noop_outcomes);
     }
 
     /// The bound below which each retry's sleep is drawn: the first, its doubling, and the cap

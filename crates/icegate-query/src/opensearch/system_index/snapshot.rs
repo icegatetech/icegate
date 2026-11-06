@@ -4,11 +4,15 @@
 //! the same outcome. The store relies on it when it re-applies an operation after a compare-and-swap
 //! that did not land.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::bulk::BulkItem;
+use super::documents::filter_source;
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::script::DocumentScript;
 
@@ -293,8 +297,21 @@ pub(crate) struct WrittenDocument {
     pub(crate) seq_no: i64,
     /// The document's `_primary_term`.
     pub(crate) primary_term: i64,
-    /// The `_source` after the write, carried by updates only: their answer can return it.
+    /// What the write keeps of the `_source` for its answer's `get`: nothing on a create or an index,
+    /// all of it on `_update`, and on a `_bulk` update only what its `get` renders, which is nothing
+    /// when the request asked for no `get`.
     pub(crate) source: Option<Value>,
+}
+
+/// What the update items of a `_bulk` return under `get`, and the bound on what they keep for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReturnedSources {
+    /// The `_source` paths `get` returns; empty returns all of it.
+    pub(crate) includes: Vec<String>,
+    /// `opensearch.system_indices.max_answer_bytes`: once the sources kept so far reach it, each
+    /// later update item is refused before it changes anything. A bound checked before an item
+    /// applies lets the total pass by that one item's source, and no write ever has to be undone.
+    pub(crate) max_answer_bytes: usize,
 }
 
 /// A change a write asks the store to apply to a tenant's snapshot.
@@ -320,6 +337,14 @@ pub(crate) enum SystemOperation {
     UpdateDocument(DocumentUpdate),
     /// Delete one document.
     DeleteDocument(DocumentDelete),
+    /// The items of one `_bulk`, applied in order in at most one pointer swap.
+    Bulk {
+        /// The parsed items, refused ones included.
+        items: Vec<BulkItem>,
+        /// What update items return under `get`; `None` when the request asked for no `get`, so
+        /// they keep no source.
+        returned_sources: Option<ReturnedSources>,
+    },
 }
 
 /// What applying an operation did.
@@ -343,6 +368,24 @@ pub(crate) enum SystemOutcome {
         /// The `_seq_no` the delete took.
         seq_no: i64,
     },
+    /// The outcome of each `_bulk` item, in request order.
+    Bulk {
+        /// One outcome per item: a failing item changed nothing.
+        items: Vec<Result<Self, OpenSearchError>>,
+    },
+}
+
+impl SystemOutcome {
+    /// Whether the operation that answered this outcome changed the snapshot, so that the store
+    /// must swap it in. A delete always did: it takes a `_seq_no`, whether or not the document
+    /// existed. The match names every outcome, so a new one cannot skip the swap by accident.
+    pub(crate) fn changes_snapshot(&self) -> bool {
+        match self {
+            Self::IndexCreated { .. } | Self::AliasesApplied | Self::DocumentDeleted { .. } => true,
+            Self::DocumentWritten(written_document) => written_document.result != WriteResult::Noop,
+            Self::Bulk { items } => items.iter().flatten().any(Self::changes_snapshot),
+        }
+    }
 }
 
 impl SystemSnapshot {
@@ -360,7 +403,9 @@ impl SystemSnapshot {
     /// `document_missing_exception` for an update of a missing document without `upsert`, which is
     /// checked before any condition; `version_conflict_engine_exception` for a create of an existing
     /// id or any other condition that does not hold, a condition on a missing document included;
-    /// and `illegal_argument_exception` for a script that cannot run on the stored document.
+    /// and `illegal_argument_exception` for a script that cannot run on the stored document. A
+    /// `_bulk` is never refused as a whole: each item's refusal is among its outcomes, and an update
+    /// item past [`ReturnedSources::max_answer_bytes`] is one of those refusals.
     pub(crate) fn apply(&mut self, operation: &SystemOperation) -> Result<SystemOutcome, OpenSearchError> {
         match operation {
             SystemOperation::CreateIndex {
@@ -370,8 +415,22 @@ impl SystemSnapshot {
             } => self.create_index(name, mappings, settings),
             SystemOperation::ApplyAliasActions { actions } => self.apply_alias_actions(actions),
             SystemOperation::IndexDocument(write) => self.write_document(write),
-            SystemOperation::UpdateDocument(update) => self.update_document(update),
+            SystemOperation::UpdateDocument(update) => {
+                self.update_document(update, Some(&[])).map(SystemOutcome::DocumentWritten)
+            }
             SystemOperation::DeleteDocument(delete) => self.delete_document(delete),
+            SystemOperation::Bulk {
+                items,
+                returned_sources,
+            } => {
+                let mut kept_source_bytes = 0;
+                Ok(SystemOutcome::Bulk {
+                    items: items
+                        .iter()
+                        .map(|item| self.apply_bulk_item(item, returned_sources.as_ref(), &mut kept_source_bytes))
+                        .collect(),
+                })
+            }
         }
     }
 
@@ -518,8 +577,13 @@ impl SystemSnapshot {
     }
 
     /// Change a document, or store the `upsert` of a missing one. A refused change leaves the
-    /// stored document as it was, and a merge that changes nothing takes no `_seq_no`.
-    fn update_document(&mut self, update: &DocumentUpdate) -> Result<SystemOutcome, OpenSearchError> {
+    /// stored document as it was, and a merge that changes nothing takes no `_seq_no`. The answer
+    /// keeps what [`keep_source`] selects by `includes` of the `_source` after the update.
+    fn update_document(
+        &mut self,
+        update: &DocumentUpdate,
+        includes: Option<&[String]>,
+    ) -> Result<WrittenDocument, OpenSearchError> {
         let (index_name, index) = self.find_index_for_write(&update.index)?;
         let Some(stored_document) = index.documents.get_mut(&update.id) else {
             let Some(upsert) = &update.upsert else {
@@ -527,13 +591,13 @@ impl SystemSnapshot {
             };
             update.concurrency.check_stored_document(&index_name, &update.id, None)?;
             let seq_no = index.store_document(&update.id, upsert.clone());
-            return Ok(SystemOutcome::DocumentWritten(WrittenDocument {
+            return Ok(WrittenDocument {
                 index: index_name,
                 result: WriteResult::Created,
                 seq_no,
                 primary_term: PRIMARY_TERM,
-                source: Some(upsert.clone()),
-            }));
+                source: keep_source(Cow::Borrowed(upsert), includes),
+            });
         };
         update
             .concurrency
@@ -544,13 +608,13 @@ impl SystemSnapshot {
                 let mut merged_source = stored_document.source.clone();
                 merge_partial_document(&mut merged_source, partial_document);
                 if merged_source == stored_document.source {
-                    return Ok(SystemOutcome::DocumentWritten(WrittenDocument {
+                    return Ok(WrittenDocument {
                         index: index_name,
                         result: WriteResult::Noop,
                         seq_no: stored_document.seq_no,
                         primary_term: PRIMARY_TERM,
-                        source: Some(merged_source),
-                    }));
+                        source: keep_source(Cow::Owned(merged_source), includes),
+                    });
                 }
                 stored_document.source = merged_source;
             }
@@ -559,13 +623,13 @@ impl SystemSnapshot {
             }
         }
         stored_document.seq_no = SystemIndex::take_seq_no(&mut index.next_seq_no);
-        Ok(SystemOutcome::DocumentWritten(WrittenDocument {
+        Ok(WrittenDocument {
             index: index_name,
             result: WriteResult::Updated,
             seq_no: stored_document.seq_no,
             primary_term: PRIMARY_TERM,
-            source: Some(stored_document.source.clone()),
-        }))
+            source: keep_source(Cow::Borrowed(&stored_document.source), includes),
+        })
     }
 
     /// Delete a document. A delete of a missing id takes a `_seq_no` too, so a sequence number is
@@ -582,6 +646,89 @@ impl SystemSnapshot {
             found: is_found,
             seq_no,
         })
+    }
+
+    /// Apply one `_bulk` item. Every arm refuses before it mutates, so a failing item leaves the
+    /// snapshot as the earlier items left it. `kept_source_bytes` carries the running total of
+    /// [`update_bulk_document`](Self::update_bulk_document) from item to item.
+    fn apply_bulk_item(
+        &mut self,
+        item: &BulkItem,
+        returned_sources: Option<&ReturnedSources>,
+        kept_source_bytes: &mut usize,
+    ) -> Result<SystemOutcome, OpenSearchError> {
+        match item {
+            BulkItem::Write(write) => self.write_document(write),
+            BulkItem::Update(update) => self
+                .update_bulk_document(update, returned_sources, kept_source_bytes)
+                .map(SystemOutcome::DocumentWritten),
+            BulkItem::Delete(delete) => self.delete_document(delete),
+            BulkItem::Refused(refused_item) => Err(refused_item.error.clone()),
+        }
+    }
+
+    /// Apply one `_bulk` update item, keeping what its `get` renders. An item keeps nothing unless
+    /// the request asked for `get`, and only an item that keeps a source pays to measure it.
+    ///
+    /// # Errors
+    ///
+    /// `answer_too_large` once the sources kept so far have reached the bound, before the update
+    /// mutates anything; otherwise the refusals of [`update_document`](Self::update_document).
+    fn update_bulk_document(
+        &mut self,
+        update: &DocumentUpdate,
+        returned_sources: Option<&ReturnedSources>,
+        kept_source_bytes: &mut usize,
+    ) -> Result<WrittenDocument, OpenSearchError> {
+        let Some(returned_sources) = returned_sources else {
+            return self.update_document(update, None);
+        };
+        if *kept_source_bytes >= returned_sources.max_answer_bytes {
+            return Err(OpenSearchError::answer_too_large(returned_sources.max_answer_bytes));
+        }
+        let written_document = self.update_document(update, Some(&returned_sources.includes))?;
+        let written_source_bytes = written_document.source.as_ref().map_or(0, count_serialized_bytes);
+        *kept_source_bytes = kept_source_bytes.saturating_add(written_source_bytes);
+        Ok(written_document)
+    }
+}
+
+/// What an update keeps of `source`, the `_source` it wrote, for its `get`: nothing for `None`, all
+/// of it for empty `includes`, otherwise the selected paths. An owned `source` moves into the answer
+/// when all of it is kept, so a source the caller was about to drop is not copied.
+fn keep_source(source: Cow<'_, Value>, includes: Option<&[String]>) -> Option<Value> {
+    let includes = includes?;
+    if includes.is_empty() {
+        Some(source.into_owned())
+    } else {
+        Some(filter_source(&source, includes, &[]))
+    }
+}
+
+/// The length `source` serializes to, the way the answer will write it. Serializing a `Value` into a
+/// writer that never fails cannot fail; should it, the source counts as past every bound, so the
+/// items after it are refused rather than kept uncounted.
+fn count_serialized_bytes(source: &Value) -> usize {
+    let mut byte_counter = ByteCounter::default();
+    serde_json::to_writer(&mut byte_counter, source).map_or(usize::MAX, |()| byte_counter.byte_count)
+}
+
+/// A writer that counts what it is given and keeps none of it, so measuring a source allocates
+/// nothing.
+#[derive(Default)]
+struct ByteCounter {
+    /// The bytes written so far.
+    byte_count: usize,
+}
+
+impl io::Write for ByteCounter {
+    fn write(&mut self, chunk: &[u8]) -> io::Result<usize> {
+        self.byte_count += chunk.len();
+        Ok(chunk.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1386,6 +1533,356 @@ mod tests {
             merge_partial_document(&mut target, &partial_document);
 
             assert_eq!(target, expected, "{label}");
+        }
+    }
+
+    /// A failing item changes nothing, so the items around it leave the snapshot exactly as they
+    /// would have alone, `_seq_no` counter included.
+    #[test]
+    fn a_failing_bulk_item_leaves_the_snapshot_as_the_items_before_it_left_it() {
+        let build_write = |id: &str, title: &str, op_type| {
+            BulkItem::Write(DocumentWrite {
+                index: ".kibana_1".to_string(),
+                id: id.to_string(),
+                source: json!({"title": title}),
+                op_type,
+                concurrency: WriteConcurrency::default(),
+            })
+        };
+        let mut snapshot = build_snapshot_with_index(".kibana_1");
+        let mut snapshot_without_failures = snapshot.clone();
+
+        let outcome = snapshot
+            .apply(&SystemOperation::Bulk {
+                items: vec![
+                    build_write("a", "first", OpType::Index),
+                    build_write("a", "conflicting", OpType::Create),
+                    BulkItem::Delete(DocumentDelete {
+                        index: ".missing".to_string(),
+                        id: "a".to_string(),
+                        concurrency: WriteConcurrency::default(),
+                    }),
+                    build_write("b", "second", OpType::Index),
+                ],
+                returned_sources: None,
+            })
+            .expect("a bulk answers per item");
+        snapshot_without_failures
+            .apply(&SystemOperation::Bulk {
+                items: vec![
+                    build_write("a", "first", OpType::Index),
+                    build_write("b", "second", OpType::Index),
+                ],
+                returned_sources: None,
+            })
+            .expect("a bulk answers per item");
+
+        let SystemOutcome::Bulk { items } = outcome else {
+            panic!("expected a bulk outcome, got {outcome:?}");
+        };
+        let is_ok_by_item: Vec<bool> = items.iter().map(Result::is_ok).collect();
+        assert_eq!(is_ok_by_item, [true, false, false, true]);
+        assert_eq!(snapshot, snapshot_without_failures);
+        assert_eq!(
+            find_stored_document(&snapshot, ".kibana_1", "b"),
+            Some(StoredDocument {
+                source: json!({"title": "second"}),
+                seq_no: 1
+            })
+        );
+    }
+
+    fn build_title_merge(id: &str, title: &str) -> DocumentUpdate {
+        DocumentUpdate {
+            index: ".kibana_1".to_string(),
+            id: id.to_string(),
+            change: DocumentChange::Merge(json!({"title": title})),
+            upsert: None,
+            concurrency: WriteConcurrency::default(),
+        }
+    }
+
+    fn build_returned_sources(includes: &[&str], max_answer_bytes: usize) -> ReturnedSources {
+        ReturnedSources {
+            includes: includes.iter().map(ToString::to_string).collect(),
+            max_answer_bytes,
+        }
+    }
+
+    /// One row per path through an update, crossed with what the request asked `get` to return:
+    /// nothing, some paths, all of it.
+    #[test]
+    fn a_bulk_update_keeps_only_what_its_get_renders() {
+        let upsert_item = DocumentUpdate {
+            upsert: Some(json!({"title": "Fresh", "type": "config"})),
+            ..build_title_merge("b", "ignored")
+        };
+        let updates = [
+            (
+                "changed",
+                build_title_merge("a", "Errors"),
+                WriteResult::Updated,
+                json!({"title": "Errors"}),
+                json!({"title": "Errors", "type": "dashboard"}),
+            ),
+            (
+                "noop",
+                build_title_merge("a", "Logs"),
+                WriteResult::Noop,
+                json!({"title": "Logs"}),
+                json!({"title": "Logs", "type": "dashboard"}),
+            ),
+            (
+                "upsert",
+                upsert_item,
+                WriteResult::Created,
+                json!({"title": "Fresh"}),
+                json!({"title": "Fresh", "type": "config"}),
+            ),
+        ];
+        for (label, update, expected_result, selected_source, whole_source) in updates {
+            let cases = [
+                (None, None),
+                (Some(build_returned_sources(&["title"], 1024)), Some(selected_source)),
+                (Some(build_returned_sources(&[], 1024)), Some(whole_source)),
+            ];
+            for (returned_sources, expected_source) in cases {
+                let mut snapshot = build_snapshot_with_index(".kibana_1");
+                snapshot
+                    .apply(&build_put_operation(
+                        ".kibana_1",
+                        "a",
+                        json!({"title": "Logs", "type": "dashboard"}),
+                        OpType::Index,
+                        WriteConcurrency::default(),
+                    ))
+                    .expect("put");
+
+                let outcome = snapshot
+                    .apply(&SystemOperation::Bulk {
+                        items: vec![BulkItem::Update(update.clone())],
+                        returned_sources,
+                    })
+                    .expect("a bulk answers per item");
+
+                let SystemOutcome::Bulk { items } = outcome else {
+                    panic!("{label}: expected a bulk outcome, got {outcome:?}");
+                };
+                let written_document = expect_written_document(items[0].clone().expect("the update applies"));
+                assert_eq!(written_document.result, expected_result, "{label}");
+                assert_eq!(written_document.source, expected_source, "{label}");
+            }
+        }
+    }
+
+    /// `{"title":"Errors"}` and `{"title":"Traces"}` serialize to 18 bytes each, so a bound of 18 is
+    /// reached by the first update and one of 19 by the second: each row pins the check at the bound
+    /// and just below it. The index and the delete apply past the bound, and a refused update takes
+    /// no `_seq_no`, so the snapshot ends exactly as if the refused items had not been sent.
+    #[test]
+    fn an_update_item_at_or_past_the_answer_bound_is_refused_while_other_items_apply() {
+        let items = vec![
+            BulkItem::Update(build_title_merge("a", "Errors")),
+            BulkItem::Update(build_title_merge("b", "Traces")),
+            BulkItem::Write(DocumentWrite {
+                index: ".kibana_1".to_string(),
+                id: "c".to_string(),
+                source: json!({"title": "Other"}),
+                op_type: OpType::Index,
+                concurrency: WriteConcurrency::default(),
+            }),
+            BulkItem::Update(build_title_merge("a", "Metrics")),
+            BulkItem::Delete(DocumentDelete {
+                index: ".kibana_1".to_string(),
+                id: "d".to_string(),
+                concurrency: WriteConcurrency::default(),
+            }),
+        ];
+        let cases = [
+            (
+                18_usize,
+                [true, false, true, false, true],
+                StoredDocument {
+                    source: json!({"title": "Logs"}),
+                    seq_no: 1,
+                },
+                6_i64,
+            ),
+            (
+                19_usize,
+                [true, true, true, false, true],
+                StoredDocument {
+                    source: json!({"title": "Traces"}),
+                    seq_no: 4,
+                },
+                7_i64,
+            ),
+        ];
+        for (max_answer_bytes, expected_is_applied_by_item, expected_document_b, expected_next_seq_no) in cases {
+            let mut snapshot = build_snapshot_with_index(".kibana_1");
+            for id in ["a", "b", "d"] {
+                snapshot
+                    .apply(&build_put_operation(
+                        ".kibana_1",
+                        id,
+                        json!({"title": "Logs"}),
+                        OpType::Index,
+                        WriteConcurrency::default(),
+                    ))
+                    .expect("put");
+            }
+            let mut snapshot_without_refused_items = snapshot.clone();
+
+            let outcome = snapshot
+                .apply(&SystemOperation::Bulk {
+                    items: items.clone(),
+                    returned_sources: Some(build_returned_sources(&[], max_answer_bytes)),
+                })
+                .expect("a bulk answers per item");
+
+            let SystemOutcome::Bulk { items: item_outcomes } = outcome else {
+                panic!("expected a bulk outcome, got {outcome:?}");
+            };
+            let is_applied_by_item: Vec<bool> = item_outcomes.iter().map(Result::is_ok).collect();
+            assert_eq!(
+                is_applied_by_item, expected_is_applied_by_item,
+                "bound {max_answer_bytes}"
+            );
+            for refusal in item_outcomes.iter().filter(|item_outcome| item_outcome.is_err()) {
+                assert_eq!(
+                    refusal,
+                    &Err(OpenSearchError::answer_too_large(max_answer_bytes)),
+                    "bound {max_answer_bytes}"
+                );
+            }
+            assert_eq!(
+                find_stored_document(&snapshot, ".kibana_1", "a"),
+                Some(StoredDocument {
+                    source: json!({"title": "Errors"}),
+                    seq_no: 3
+                }),
+                "bound {max_answer_bytes}"
+            );
+            assert_eq!(
+                find_stored_document(&snapshot, ".kibana_1", "b"),
+                Some(expected_document_b),
+                "bound {max_answer_bytes}"
+            );
+            assert_eq!(
+                snapshot.find_index(".kibana_1").map(|index| index.next_seq_no),
+                Some(expected_next_seq_no),
+                "bound {max_answer_bytes}"
+            );
+            let applied_items = items
+                .iter()
+                .zip(expected_is_applied_by_item)
+                .filter(|(_, is_applied)| *is_applied)
+                .map(|(item, _)| item.clone())
+                .collect();
+            snapshot_without_refused_items
+                .apply(&SystemOperation::Bulk {
+                    items: applied_items,
+                    returned_sources: None,
+                })
+                .expect("a bulk answers per item");
+            assert_eq!(snapshot, snapshot_without_refused_items, "bound {max_answer_bytes}");
+        }
+    }
+
+    /// The bound counts what an update keeps, not what it stores: the stored source serializes to 37
+    /// bytes and its title alone to 18. Against a bound of 19, the whole source ends the bulk after
+    /// one update, its title after two, and a request that asks for no `get` keeps nothing to bound.
+    #[test]
+    fn the_answer_bound_counts_only_what_update_items_keep() {
+        let cases = [
+            (None, [true, true, true]),
+            (Some(build_returned_sources(&["title"], 19)), [true, true, false]),
+            (Some(build_returned_sources(&[], 19)), [true, false, false]),
+        ];
+        for (returned_sources, expected_is_applied_by_item) in cases {
+            let mut snapshot = build_snapshot_with_index(".kibana_1");
+            snapshot
+                .apply(&build_put_operation(
+                    ".kibana_1",
+                    "a",
+                    json!({"title": "Logs", "type": "dashboard"}),
+                    OpType::Index,
+                    WriteConcurrency::default(),
+                ))
+                .expect("put");
+
+            let outcome = snapshot
+                .apply(&SystemOperation::Bulk {
+                    items: ["Errors", "Traces", "Metrics"]
+                        .map(|title| BulkItem::Update(build_title_merge("a", title)))
+                        .to_vec(),
+                    returned_sources,
+                })
+                .expect("a bulk answers per item");
+
+            let SystemOutcome::Bulk { items } = outcome else {
+                panic!("expected a bulk outcome, got {outcome:?}");
+            };
+            let is_applied_by_item: Vec<bool> = items.iter().map(Result::is_ok).collect();
+            assert_eq!(is_applied_by_item, expected_is_applied_by_item);
+        }
+    }
+
+    /// One row per variant, each `WriteResult`, both kinds of delete and both shapes of `Bulk`.
+    #[test]
+    fn only_an_outcome_that_changed_the_snapshot_asks_for_a_swap() {
+        let build_written = |result| {
+            SystemOutcome::DocumentWritten(WrittenDocument {
+                index: ".kibana_1".to_string(),
+                result,
+                seq_no: 0,
+                primary_term: 1,
+                source: None,
+            })
+        };
+        let build_deleted = |is_found| SystemOutcome::DocumentDeleted {
+            index: ".kibana_1".to_string(),
+            found: is_found,
+            seq_no: 0,
+        };
+        let cases = [
+            (
+                "a created index",
+                SystemOutcome::IndexCreated {
+                    name: ".kibana_1".to_string(),
+                },
+                true,
+            ),
+            ("applied aliases", SystemOutcome::AliasesApplied, true),
+            ("a created document", build_written(WriteResult::Created), true),
+            ("an updated document", build_written(WriteResult::Updated), true),
+            ("a noop", build_written(WriteResult::Noop), false),
+            ("a delete that removed a document", build_deleted(true), true),
+            ("a delete of an unknown id", build_deleted(false), true),
+            (
+                "a bulk of a refusal and a noop",
+                SystemOutcome::Bulk {
+                    items: vec![
+                        Err(OpenSearchError::version_conflict(".kibana_1", "a")),
+                        Ok(build_written(WriteResult::Noop)),
+                    ],
+                },
+                false,
+            ),
+            (
+                "a bulk with an item that changed the snapshot",
+                SystemOutcome::Bulk {
+                    items: vec![
+                        Err(OpenSearchError::version_conflict(".kibana_1", "a")),
+                        Ok(build_written(WriteResult::Noop)),
+                        Ok(build_written(WriteResult::Updated)),
+                    ],
+                },
+                true,
+            ),
+        ];
+        for (label, outcome, expected) in cases {
+            assert_eq!(outcome.changes_snapshot(), expected, "{label}");
         }
     }
 

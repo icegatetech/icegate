@@ -29,6 +29,9 @@ const DEFAULT_MAX_SCROLL_LIFETIME_SECS: u64 = 900;
 const DEFAULT_MAX_SNAPSHOT_BYTES: usize = 4 * DEFAULT_MAX_REQUEST_BODY_BYTES;
 /// Default bound of the decoded-snapshot cache: two snapshots at the default bound.
 const DEFAULT_SYSTEM_CACHE_MAX_BYTES: usize = 2 * DEFAULT_MAX_SNAPSHOT_BYTES;
+/// Default bound of one answer: an answer naming every stored document once fits, with room for
+/// the metadata of each entry.
+const DEFAULT_MAX_ANSWER_BYTES: usize = 2 * DEFAULT_MAX_SNAPSHOT_BYTES;
 
 /// The `OpenSearch`-compatible listener.
 ///
@@ -145,6 +148,10 @@ pub struct SystemIndicesConfig {
     /// Largest decoded (uncompressed JSON) snapshot one tenant may hold, in bytes. A write that
     /// would exceed it is refused with `413` and changes nothing.
     pub max_snapshot_bytes: usize,
+    /// The bytes of stored documents one answer may carry; at least `max_snapshot_bytes`, so an
+    /// answer naming each stored document once fits. An `_mget` past it is refused whole with `400`,
+    /// and `_bulk` update items past it fail one by one.
+    pub max_answer_bytes: usize,
 }
 
 impl SystemIndicesConfig {
@@ -160,13 +167,14 @@ impl SystemIndicesConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`QueryError::Config`] for a zero bound, a cache smaller than one snapshot, or a
-    /// location that is not an `s3://` or `s3a://` URL naming a bucket.
+    /// Returns [`QueryError::Config`] for a zero bound, a cache or an answer bound smaller than one
+    /// snapshot, or a location that is not an `s3://` or `s3a://` URL naming a bucket.
     pub fn validate(&self) -> Result<()> {
         let zero_bound = [
             ("max_scroll_lifetime_secs", self.max_scroll_lifetime_secs == 0),
             ("cache_max_bytes", self.cache_max_bytes == 0),
             ("max_snapshot_bytes", self.max_snapshot_bytes == 0),
+            ("max_answer_bytes", self.max_answer_bytes == 0),
         ]
         .into_iter()
         .find_map(|(key, is_zero)| is_zero.then_some(key));
@@ -180,6 +188,13 @@ impl SystemIndicesConfig {
                 "opensearch.system_indices.cache_max_bytes ({}) must be at least max_snapshot_bytes ({}): \
                  the cache holds whole decoded snapshots",
                 self.cache_max_bytes, self.max_snapshot_bytes
+            )));
+        }
+        if self.max_answer_bytes < self.max_snapshot_bytes {
+            return Err(QueryError::Config(format!(
+                "opensearch.system_indices.max_answer_bytes ({}) must be at least max_snapshot_bytes ({}): \
+                 an answer naming each stored document once has to fit",
+                self.max_answer_bytes, self.max_snapshot_bytes
             )));
         }
         if let Some(location) = &self.location {
@@ -196,6 +211,7 @@ impl Default for SystemIndicesConfig {
             max_scroll_lifetime_secs: DEFAULT_MAX_SCROLL_LIFETIME_SECS,
             cache_max_bytes: DEFAULT_SYSTEM_CACHE_MAX_BYTES,
             max_snapshot_bytes: DEFAULT_MAX_SNAPSHOT_BYTES,
+            max_answer_bytes: DEFAULT_MAX_ANSWER_BYTES,
         }
     }
 }
@@ -402,6 +418,7 @@ mod tests {
                 "max_scroll_lifetime_secs": 901,
                 "cache_max_bytes": 268_435_457,
                 "max_snapshot_bytes": 134_217_729,
+                "max_answer_bytes": 268_435_458,
             },
         }))
         .expect("a section naming every key deserializes");
@@ -420,6 +437,7 @@ mod tests {
         assert_eq!(config.system_indices.max_scroll_lifetime_secs, 901);
         assert_eq!(config.system_indices.cache_max_bytes, 268_435_457);
         assert_eq!(config.system_indices.max_snapshot_bytes, 134_217_729);
+        assert_eq!(config.system_indices.max_answer_bytes, 268_435_458);
     }
 
     #[test]
@@ -438,6 +456,7 @@ mod tests {
         assert_eq!(config.system_indices.max_scroll_lifetime_secs, 900);
         assert_eq!(config.system_indices.cache_max_bytes, 268_435_456);
         assert_eq!(config.system_indices.max_snapshot_bytes, 134_217_728);
+        assert_eq!(config.system_indices.max_answer_bytes, 268_435_456);
     }
 
     /// The size of one maximum saved-object import; IceGate sizes the snapshot bound for two such
@@ -452,6 +471,7 @@ mod tests {
         assert_eq!(defaults.max_scroll_lifetime_secs, 900);
         assert_eq!(defaults.max_snapshot_bytes, 134_217_728);
         assert_eq!(defaults.cache_max_bytes, 268_435_456);
+        assert_eq!(defaults.max_answer_bytes, 268_435_456);
         assert!(defaults.max_snapshot_bytes >= 4 * IMPORT_BOUND_BYTES);
         assert!(defaults.cache_max_bytes >= defaults.max_snapshot_bytes);
         assert!(defaults.validate().is_ok());
@@ -498,10 +518,11 @@ mod tests {
 
     #[test]
     fn system_indices_validation_refuses_zero_limits() {
-        let cases: [(&str, fn(&mut SystemIndicesConfig)); 3] = [
+        let cases: [(&str, fn(&mut SystemIndicesConfig)); 4] = [
             ("max_scroll_lifetime_secs", |config| config.max_scroll_lifetime_secs = 0),
             ("cache_max_bytes", |config| config.cache_max_bytes = 0),
             ("max_snapshot_bytes", |config| config.max_snapshot_bytes = 0),
+            ("max_answer_bytes", |config| config.max_answer_bytes = 0),
         ];
         for (key, zero) in cases {
             let mut config = SystemIndicesConfig::default();
@@ -522,6 +543,7 @@ mod tests {
             max_scroll_lifetime_secs: 1,
             cache_max_bytes: 1,
             max_snapshot_bytes: 1,
+            max_answer_bytes: 1,
         };
 
         assert!(config.validate().is_ok());
@@ -544,6 +566,29 @@ mod tests {
 
         assert!(matches!(undersized_cache_config.validate(), Err(QueryError::Config(_))));
         assert!(equal_cache_config.validate().is_ok());
+    }
+
+    /// An answer naming each stored document once has to fit, so a bound below one snapshot could
+    /// refuse a request no client can make smaller; equal is the smallest accepted bound.
+    #[test]
+    fn system_indices_validation_refuses_an_answer_bound_smaller_than_one_snapshot() {
+        let undersized_answer_config = SystemIndicesConfig {
+            max_answer_bytes: 1_000_000,
+            max_snapshot_bytes: 1_000_001,
+            ..SystemIndicesConfig::default()
+        };
+        let equal_answer_config = SystemIndicesConfig {
+            max_answer_bytes: 1_000_000,
+            max_snapshot_bytes: 1_000_000,
+            ..SystemIndicesConfig::default()
+        };
+
+        assert!(matches!(
+            undersized_answer_config.validate(),
+            Err(QueryError::Config(message))
+                if message.contains("max_answer_bytes") && message.contains("max_snapshot_bytes")
+        ));
+        assert!(equal_answer_config.validate().is_ok());
     }
 
     #[test]

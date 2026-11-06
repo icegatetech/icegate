@@ -97,6 +97,24 @@ impl OpenSearchError {
         self
     }
 
+    /// The error object without `root_cause`: `type`, `reason` and every metadata entry, as a
+    /// `_bulk` or `_mget` item carries its failure and as the envelope's error and root cause
+    /// render it.
+    pub(crate) fn render_cause(&self) -> Map<String, Value> {
+        let mut cause = Map::new();
+        cause.insert("type".to_string(), Value::String(self.error_type.to_string()));
+        cause.insert("reason".to_string(), Value::String(self.reason.clone()));
+        for (key, value) in &self.metadata {
+            cause.insert(key.clone(), value.clone());
+        }
+        cause
+    }
+
+    /// The HTTP status of this error, which a `_bulk` item answers as its `status`.
+    pub(crate) const fn status(&self) -> StatusCode {
+        self.status
+    }
+
     /// `index` does not exist (`404`). `index` is the concrete name that is missing, or the whole
     /// expression when it matched nothing and the endpoint disallows an empty match.
     pub(crate) fn index_not_found(index: &str) -> Self {
@@ -185,6 +203,14 @@ impl OpenSearchError {
         )
     }
 
+    /// An answer would pass `max_answer_bytes` (`400`), which a request avoids by naming fewer
+    /// documents. An `_mget` is refused whole; on a `_bulk` only the update item fails.
+    pub(crate) fn answer_too_large(max_answer_bytes: usize) -> Self {
+        Self::illegal_argument(format!(
+            "the answer would pass opensearch.system_indices.max_answer_bytes ({max_answer_bytes} bytes)"
+        ))
+    }
+
     /// No route serves `method` on `path`: a `400` `illegal_argument_exception` in the envelope,
     /// never a `404` or `405`.
     pub(crate) fn no_handler(method: &Method, path: &str) -> Self {
@@ -198,10 +224,7 @@ impl IntoResponse for OpenSearchError {
         if self.status.is_server_error() && !is_retryable {
             tracing::error!(error_type = self.error_type, reason = %self.reason, "opensearch request failed");
         }
-        let mut cause = Map::new();
-        cause.insert("type".to_string(), json!(self.error_type));
-        cause.insert("reason".to_string(), json!(self.reason));
-        cause.extend(self.metadata);
+        let cause = self.render_cause();
         let mut error = Map::new();
         // The root cause repeats the error's keys: built once, cloned into the cause list.
         error.insert(
@@ -210,7 +233,8 @@ impl IntoResponse for OpenSearchError {
         );
         error.extend(cause);
         if is_retryable {
-            error.insert("details".to_string(), json!(self.reason));
+            // `reason` is not read again, so it moves into `details`; `status` is `Copy`.
+            error.insert("details".to_string(), Value::String(self.reason));
         }
         let body = json!({"error": Value::Object(error), "status": self.status.as_u16()});
         let mut response = (self.status, body.to_string()).into_response();
@@ -435,6 +459,17 @@ mod tests {
         let (status, body) = render_envelope(OpenSearchError::snapshot_too_large(1024)).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(body["status"], 413);
+
+        let (status, body) = render_envelope(OpenSearchError::answer_too_large(1024)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        let reason = body["error"]["reason"].as_str().expect("the reason is a string");
+        assert!(
+            reason.contains("opensearch.system_indices.max_answer_bytes"),
+            "{reason}"
+        );
+        assert!(reason.contains("1024"), "{reason}");
     }
 
     #[tokio::test]

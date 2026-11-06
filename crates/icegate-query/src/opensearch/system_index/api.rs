@@ -235,9 +235,9 @@ pub(crate) async fn create_system_index(
         SystemOutcome::AliasesApplied => Err(OpenSearchError::internal(
             "an index creation answered with an alias outcome",
         )),
-        SystemOutcome::DocumentWritten(_) | SystemOutcome::DocumentDeleted { .. } => Err(OpenSearchError::internal(
-            "the store answered an index operation with a document outcome",
-        )),
+        SystemOutcome::DocumentWritten(_) | SystemOutcome::DocumentDeleted { .. } | SystemOutcome::Bulk { .. } => Err(
+            OpenSearchError::internal("the store answered an index operation with a document outcome"),
+        ),
     }
 }
 
@@ -355,9 +355,9 @@ pub(crate) async fn apply_aliases(
         SystemOutcome::IndexCreated { .. } => Err(OpenSearchError::internal(
             "an alias request answered with an index outcome",
         )),
-        SystemOutcome::DocumentWritten(_) | SystemOutcome::DocumentDeleted { .. } => Err(OpenSearchError::internal(
-            "the store answered an alias operation with a document outcome",
-        )),
+        SystemOutcome::DocumentWritten(_) | SystemOutcome::DocumentDeleted { .. } | SystemOutcome::Bulk { .. } => Err(
+            OpenSearchError::internal("the store answered an alias operation with a document outcome"),
+        ),
     }
 }
 

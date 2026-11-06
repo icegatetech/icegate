@@ -1,5 +1,5 @@
-//! State shared by every `OpenSearch` handler. It holds only `Arc`s and handles that wrap one
-//! (`IndexCatalog`), so axum's per-request clone is cheap.
+//! State shared by every `OpenSearch` handler. It holds only `Arc`s, handles that wrap one
+//! (`IndexCatalog`) and plain numbers, so axum's per-request clone is cheap.
 
 use std::sync::Arc;
 
@@ -16,4 +16,8 @@ pub(crate) struct OpenSearchState {
     pub(crate) catalog: IndexCatalog,
     /// The per-tenant store of the system indices.
     pub(crate) system_store: Arc<SystemIndexStore>,
+    /// `opensearch.system_indices.max_answer_bytes`. `_mget` enforces it while serializing, and
+    /// `_bulk` carries it to the snapshot on each operation through `ReturnedSources`, so it is not
+    /// one of `SystemIndexLimits`.
+    pub(crate) max_answer_bytes: usize,
 }

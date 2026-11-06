@@ -16,6 +16,8 @@
 //! `doc` merges objects key by key and replaces every other value, and a merge that changes
 //! nothing answers `noop` without taking a `_seq_no`.
 
+use std::borrow::Cow;
+
 use axum::Json;
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
@@ -25,8 +27,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::snapshot::{
-    DocumentChange, DocumentDelete, DocumentUpdate, DocumentWrite, OpType, PRIMARY_TERM, SystemOperation,
-    SystemOutcome, WriteConcurrency, WriteResult, WrittenDocument,
+    DocumentChange, DocumentDelete, DocumentUpdate, DocumentWrite, OpType, PRIMARY_TERM, StoredDocument,
+    SystemOperation, SystemOutcome, SystemSnapshot, WriteConcurrency, WriteResult, WrittenDocument,
 };
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::extract::{EndpointParameters, Parameters, PathParameters, RequestBody};
@@ -36,7 +38,10 @@ use crate::opensearch::state::OpenSearchState;
 
 /// Parameters every document write ignores: the write is durable and visible when answered,
 /// and there is one copy, so there is no refresh, wait or timeout to apply.
-const IGNORED_WRITE_PARAMETERS: &[&str] = &["refresh", "timeout", "wait_for_active_shards"];
+pub(crate) const IGNORED_WRITE_PARAMETERS: &[&str] = &["refresh", "timeout", "wait_for_active_shards"];
+
+/// Parameters every document read ignores: a read always sees the latest write.
+pub(crate) const IGNORED_READ_PARAMETERS: &[&str] = &["preference", "realtime", "refresh"];
 
 /// Parameters of `PUT /{index}/_create/{id}` and `PUT|POST /{index}/_doc/{id}`.
 #[derive(Debug, Deserialize)]
@@ -54,13 +59,13 @@ impl EndpointParameters for DocumentWriteParameters {
     const IGNORED: &'static [&'static str] = IGNORED_WRITE_PARAMETERS;
 }
 
-/// Parameters of `GET /{index}/_doc/{id}`: a read always sees the latest write.
+/// Parameters of `GET /{index}/_doc/{id}`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetDocumentParameters {}
 
 impl EndpointParameters for GetDocumentParameters {
-    const IGNORED: &'static [&'static str] = &["preference", "realtime", "refresh"];
+    const IGNORED: &'static [&'static str] = IGNORED_READ_PARAMETERS;
 }
 
 /// Parameters of `DELETE /{index}/_doc/{id}`.
@@ -99,10 +104,10 @@ impl EndpointParameters for UpdateDocumentParameters {
     const IGNORED: &'static [&'static str] = &["refresh", "timeout", "wait_for_active_shards", "retry_on_conflict"];
 }
 
-/// The answer of `GET /{index}/_doc/{id}` for a stored document, in this key order. It borrows the
-/// document, which can be large, so the answer serializes it without copying it first.
+/// The answer of a document read for a stored document, in this key order. It borrows the document,
+/// which can be large, so the answer serializes it without copying it first.
 #[derive(Serialize)]
-struct FoundDocument<'a> {
+pub(crate) struct FoundDocument<'a> {
     /// The concrete index.
     #[serde(rename = "_index")]
     index: &'a str,
@@ -118,9 +123,23 @@ struct FoundDocument<'a> {
     /// Always `true`: a missing document has its own answer.
     #[serde(rename = "found")]
     is_found: bool,
-    /// The `_source` as stored.
-    #[serde(rename = "_source")]
-    source: &'a Value,
+    /// The `_source` as stored, or the part of it the read selected; absent when it selected none.
+    #[serde(rename = "_source", skip_serializing_if = "Option::is_none")]
+    source: Option<Cow<'a, Value>>,
+}
+
+impl<'a> FoundDocument<'a> {
+    /// The answer for the document stored as `id` in the concrete index `index`, at `seq_no`.
+    pub(crate) const fn new(index: &'a str, id: &'a str, seq_no: i64, source: Option<Cow<'a, Value>>) -> Self {
+        Self {
+            index,
+            id,
+            seq_no,
+            primary_term: PRIMARY_TERM,
+            is_found: true,
+            source,
+        }
+    }
 }
 
 /// `PUT /{index}/_create/{id}`: create a document; an existing id is a version conflict.
@@ -228,33 +247,55 @@ pub(crate) async fn get_document(
     PathParameters((index, id)): PathParameters<(String, String)>,
     Parameters(_): Parameters<GetDocumentParameters>,
 ) -> Result<Response, OpenSearchError> {
-    if !index.starts_with('.') {
-        return Err(OpenSearchError::illegal_argument(format!(
-            "[{index}] is a data index, which serves no document reads"
-        )));
-    }
+    refuse_data_index_read(&index)?;
     let current_snapshot = state.system_store.read(&tenant).await?;
-    let concrete_index = current_snapshot
-        .snapshot
-        .resolve_name(&index)
-        .ok_or_else(|| OpenSearchError::index_not_found(&index))?;
-    let system_index = current_snapshot
-        .snapshot
-        .find_index(concrete_index)
-        .ok_or_else(|| OpenSearchError::index_not_found(&index))?;
-    let Some(document) = system_index.find_document(&id) else {
-        let answer = json!({"_index": concrete_index, "_id": id, "found": false});
+    let (concrete_index, stored_document) = find_system_document(&current_snapshot.snapshot, &index, &id)?;
+    let Some(document) = stored_document else {
+        let answer = render_missing_document(concrete_index, &id);
         return Ok((StatusCode::NOT_FOUND, Json(answer)).into_response());
     };
-    Ok(Json(FoundDocument {
-        index: concrete_index,
-        id: &id,
-        seq_no: document.seq_no,
-        primary_term: PRIMARY_TERM,
-        is_found: true,
-        source: &document.source,
-    })
-    .into_response())
+    let source = Some(Cow::Borrowed(&document.source));
+    Ok(Json(FoundDocument::new(concrete_index, &id, document.seq_no, source)).into_response())
+}
+
+/// Refuse a document read naming a data index: only system indices serve document reads.
+///
+/// # Errors
+///
+/// `illegal_argument_exception` naming `index`.
+pub(crate) fn refuse_data_index_read(index: &str) -> Result<(), OpenSearchError> {
+    if index.starts_with('.') {
+        Ok(())
+    } else {
+        Err(OpenSearchError::illegal_argument(format!(
+            "[{index}] is a data index, which serves no document reads"
+        )))
+    }
+}
+
+/// The concrete index `index` addresses in `snapshot`, directly or through an alias, and the
+/// document it stores under `id`; `None` is an unknown id of an existing index.
+///
+/// # Errors
+///
+/// `index_not_found_exception` for a name that is neither a system index nor an alias.
+pub(crate) fn find_system_document<'a>(
+    snapshot: &'a SystemSnapshot,
+    index: &str,
+    id: &str,
+) -> Result<(&'a str, Option<&'a StoredDocument>), OpenSearchError> {
+    let concrete_index = snapshot
+        .resolve_name(index)
+        .ok_or_else(|| OpenSearchError::index_not_found(index))?;
+    let system_index = snapshot
+        .find_index(concrete_index)
+        .ok_or_else(|| OpenSearchError::index_not_found(index))?;
+    Ok((concrete_index, system_index.find_document(id)))
+}
+
+/// The answer of a document read for an unknown id of the concrete index `index`.
+pub(crate) fn render_missing_document(index: &str, id: &str) -> Value {
+    json!({"_index": index, "_id": id, "found": false})
 }
 
 /// `DELETE /{index}/_doc/{id}`: `result: deleted`, or `404 result: not_found`.
@@ -288,9 +329,12 @@ pub(crate) async fn delete_document(
             Json(Value::Object(render_delete(&index, &id, is_found, seq_no))),
         )
             .into_response()),
-        SystemOutcome::IndexCreated { .. } | SystemOutcome::AliasesApplied | SystemOutcome::DocumentWritten(_) => Err(
-            OpenSearchError::internal("the store answered a delete with another operation's outcome"),
-        ),
+        SystemOutcome::IndexCreated { .. }
+        | SystemOutcome::AliasesApplied
+        | SystemOutcome::DocumentWritten(_)
+        | SystemOutcome::Bulk { .. } => Err(OpenSearchError::internal(
+            "the store answered a delete with another operation's outcome",
+        )),
     }
 }
 
@@ -344,11 +388,12 @@ pub(crate) async fn update_document(
 fn take_written_document(outcome: SystemOutcome) -> Result<WrittenDocument, OpenSearchError> {
     match outcome {
         SystemOutcome::DocumentWritten(written_document) => Ok(written_document),
-        SystemOutcome::IndexCreated { .. } | SystemOutcome::AliasesApplied | SystemOutcome::DocumentDeleted { .. } => {
-            Err(OpenSearchError::internal(
-                "the store answered a write with another operation's outcome",
-            ))
-        }
+        SystemOutcome::IndexCreated { .. }
+        | SystemOutcome::AliasesApplied
+        | SystemOutcome::DocumentDeleted { .. }
+        | SystemOutcome::Bulk { .. } => Err(OpenSearchError::internal(
+            "the store answered a write with another operation's outcome",
+        )),
     }
 }
 
@@ -554,6 +599,11 @@ pub(crate) fn render_update_get(written_document: &WrittenDocument, includes: &[
         .source
         .as_ref()
         .map_or(Value::Null, |source| filter_source(source, includes, &[]));
+    render_get_block(written_document, source)
+}
+
+/// The `get` block of an update answer, holding `source` exactly as given.
+pub(crate) fn render_get_block(written_document: &WrittenDocument, source: Value) -> Value {
     let mut get_block = Map::new();
     get_block.insert("_seq_no".to_string(), Value::from(written_document.seq_no));
     get_block.insert("_primary_term".to_string(), Value::from(written_document.primary_term));

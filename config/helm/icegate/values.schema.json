@@ -143,7 +143,8 @@
                 "location": { "type": "string", "pattern": "^$|^s3a?://[^/]+", "description": "s3:// or s3a:// URL; empty resolves to the default prefix under the storage bucket (SystemIndicesConfig::DEFAULT_LOCATION_PREFIX in crates/icegate-query/src/opensearch/config.rs)." },
                 "maxScrollLifetimeSecs": { "type": "integer", "minimum": 1, "description": "Longest system-index scroll, in seconds." },
                 "cacheMaxBytes": { "type": "integer", "minimum": 1, "description": "Bound of the decoded-snapshot cache, in bytes." },
-                "maxSnapshotBytes": { "type": "integer", "minimum": 1, "description": "Largest decoded snapshot per tenant, in bytes." }
+                "maxSnapshotBytes": { "type": "integer", "minimum": 1, "description": "Largest decoded snapshot per tenant, in bytes." },
+                "maxAnswerBytes": { "type": "integer", "minimum": 1, "description": "Bytes of stored documents one answer may carry; at least maxSnapshotBytes." }
               }
             }
           }
