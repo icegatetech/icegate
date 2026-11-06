@@ -10,6 +10,8 @@ pub(crate) mod bulk;
 mod client;
 mod codec;
 pub(crate) mod documents;
+pub(crate) mod evaluate;
+pub(crate) mod search;
 mod snapshot;
 mod store;
 

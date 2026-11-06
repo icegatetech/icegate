@@ -12,7 +12,8 @@
 mod catalog;
 mod cluster;
 mod config;
-mod error;
+mod context;
+pub(crate) mod error;
 mod extract;
 mod fields;
 mod filter_path;

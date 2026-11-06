@@ -23,6 +23,7 @@ use super::error::OpenSearchError;
 use super::fields;
 use super::filter_path::apply_filter_path;
 use super::state::OpenSearchState;
+use super::system_index;
 use super::system_index::{
     apply_aliases, bulk, create_system_index, delete_index_template, describe_system_index, documents, get_alias,
     get_index_aliases, refresh_index,
@@ -107,6 +108,10 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
         .route("/{index}/_delete_by_query", post(bulk::refuse_document_task_endpoint))
         .route("/_tasks", get(bulk::refuse_document_task_endpoint))
         .route("/_tasks/{task_id}", get(bulk::refuse_document_task_endpoint))
+        .route(
+            "/{index}/_count",
+            get(system_index::search::count_documents).post(system_index::search::count_documents),
+        )
         .route("/_template/{name}", delete(delete_index_template))
         .route("/_cat/templates/{pattern}", get(cat::list_index_templates))
         .fallback(answer_unmatched_route)

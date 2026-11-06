@@ -97,6 +97,7 @@ hex = { workspace = true }
 
 # Date and time
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 
 # Utilities
 itoa = { workspace = true }

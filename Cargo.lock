@@ -5351,6 +5351,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "chrono-tz",
  "clap",
  "criterion",
  "datafusion 54.1.0",

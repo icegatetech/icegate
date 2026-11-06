@@ -1844,3 +1844,367 @@ async fn bulk_and_mget_under_tenant_b_see_none_of_tenant_a_documents() -> TestRe
     server.shutdown().await;
     Ok(())
 }
+
+/// The `_shards` block of every count and search answer.
+fn build_expected_shards() -> Value {
+    json!({"total": 1, "successful": 1, "skipped": 0, "failed": 0})
+}
+
+/// Store `source` under `id` in `.kibana`.
+///
+/// # Errors
+///
+/// Fails with the status and the body of an answer that is not a success.
+async fn put_saved_object(server: &TestServer, tenant: &str, id: &str, source: &Value) -> TestResult {
+    let path = format!("/.kibana/_doc/{id}?refresh=wait_for");
+    let (status, body) = send_request(server, Method::PUT, tenant, &path, Some(source)).await?;
+    if !status.is_success() {
+        return Err(format!("storing {id} answered {status}: {body}").into());
+    }
+    Ok(())
+}
+
+/// A migration-style "are any documents outdated" count: for each type, documents holding that
+/// type whose `migrationVersion.<type>` is not the latest version.
+fn build_outdated_count_body() -> Value {
+    json!({"query": {"bool": {"should": [
+        {"bool": {"must": [
+            {"exists": {"field": "dashboard"}},
+            {"bool": {"must_not": {"term": {"migrationVersion.dashboard": "7.9.3"}}}}
+        ]}},
+        {"bool": {"must": [
+            {"exists": {"field": "index-pattern"}},
+            {"bool": {"must_not": {"term": {"migrationVersion.index-pattern": "7.6.0"}}}}
+        ]}}
+    ]}}})
+}
+
+#[tokio::test]
+async fn a_migration_style_count_answers_zero_when_every_document_is_current_and_n_when_n_are_outdated() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_saved_object(
+        &server,
+        TENANT_A,
+        "dashboard:a",
+        &json!({"type": "dashboard", "dashboard": {"title": "A"}, "migrationVersion": {"dashboard": "7.9.3"}}),
+    )
+    .await?;
+    put_saved_object(
+        &server,
+        TENANT_A,
+        "dashboard:b",
+        &json!({"type": "dashboard", "dashboard": {"title": "B"}, "migrationVersion": {"dashboard": "7.9.3"}}),
+    )
+    .await?;
+    put_saved_object(&server, TENANT_A, "index-pattern:c", &json!({"type": "index-pattern", "index-pattern": {"title": "logs-*"}, "migrationVersion": {"index-pattern": "7.6.0"}})).await?;
+    put_saved_object(
+        &server,
+        TENANT_A,
+        "config:3.9.0",
+        &json!({"type": "config", "config": {"buildNum": "9000"}}),
+    )
+    .await?;
+
+    let (current_status, current_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_count",
+        Some(&build_outdated_count_body()),
+    )
+    .await?;
+    put_saved_object(
+        &server,
+        TENANT_A,
+        "dashboard:b",
+        &json!({"type": "dashboard", "dashboard": {"title": "B"}, "migrationVersion": {"dashboard": "7.9.0"}}),
+    )
+    .await?;
+    put_saved_object(
+        &server,
+        TENANT_A,
+        "index-pattern:c",
+        &json!({"type": "index-pattern", "index-pattern": {"title": "logs-*"}}),
+    )
+    .await?;
+    let (outdated_status, outdated_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_count",
+        Some(&build_outdated_count_body()),
+    )
+    .await?;
+
+    assert_eq!(current_status, StatusCode::OK);
+    assert_eq!(current_answer, json!({"count": 0, "_shards": build_expected_shards()}));
+    assert_eq!(outdated_status, StatusCode::OK);
+    assert_eq!(outdated_answer, json!({"count": 2, "_shards": build_expected_shards()}));
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn count_with_a_body_key_other_than_query_is_a_parsing_exception() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+
+    for body in [
+        json!({"query": {"match_all": {}}, "size": 0}),
+        json!({"aggs": {}}),
+        json!({"query": {"match": {"type": "x"}}}),
+    ] {
+        let (status, answer) = send_request(&server, Method::POST, TENANT_A, "/.kibana/_count", Some(&body)).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(answer["error"]["type"], "parsing_exception", "{body}");
+    }
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn count_with_a_malformed_body_or_parameter_is_refused() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+
+    let (malformed_status, malformed_answer) =
+        send_ndjson(&server, TENANT_A, "/.kibana/_count", "{".to_string()).await?;
+    let (array_status, array_answer) =
+        send_request(&server, Method::POST, TENANT_A, "/.kibana/_count", Some(&json!([]))).await?;
+    let (wildcards_status, wildcards_answer) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        "/.kibana/_count?expand_wildcards=bogus",
+        None,
+    )
+    .await?;
+    let (unknown_status, unknown_answer) =
+        send_request(&server, Method::GET, TENANT_A, "/.kibana/_count?unknown=1", None).await?;
+
+    assert_eq!(malformed_status, StatusCode::BAD_REQUEST);
+    assert_eq!(malformed_answer["error"]["type"], "parsing_exception");
+    assert_eq!(array_status, StatusCode::BAD_REQUEST);
+    assert_eq!(array_answer["error"]["type"], "parsing_exception");
+    assert_eq!(wildcards_status, StatusCode::BAD_REQUEST);
+    assert_eq!(wildcards_answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(unknown_status, StatusCode::BAD_REQUEST);
+    assert_eq!(unknown_answer["error"]["type"], "illegal_argument_exception");
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn count_accepts_an_ignored_parameter() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_saved_object(&server, TENANT_A, "dashboard:a", &json!({"type": "dashboard"})).await?;
+
+    for parameter in ["preference=1700000000", "routing=dashboard", "ignore_throttled=false"] {
+        let path = format!("/.kibana/_count?{parameter}");
+        let (status, answer) = send_request(&server, Method::GET, TENANT_A, &path, None).await?;
+
+        assert_eq!(status, StatusCode::OK, "{parameter}");
+        assert_eq!(
+            answer,
+            json!({"count": 1, "_shards": build_expected_shards()}),
+            "{parameter}"
+        );
+    }
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn count_with_a_date_bound_past_the_representable_range_is_a_400() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    let document = json!({"type": "dashboard", "updated_at": "2026-10-08T12:00:00.000Z"});
+    put_saved_object(&server, TENANT_A, "dashboard:a", &document).await?;
+    // The instant is representable, but `+18:00` puts its local time past the largest date, and
+    // the rounding reads that local time on the blocking pool.
+    let body = json!({"query": {"range": {"updated_at": {"gte": "8210266876000000||/d", "time_zone": "+18:00"}}}});
+
+    let (status, answer) = send_request(&server, Method::POST, TENANT_A, "/.kibana/_count", Some(&body)).await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn count_answers_with_fully_successful_shards() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_saved_object(&server, TENANT_A, "dashboard:a", &json!({"type": "dashboard"})).await?;
+    put_saved_object(&server, TENANT_A, "config:3.9.0", &json!({"type": "config"})).await?;
+
+    let (all_status, all_answer) = send_request(&server, Method::GET, TENANT_A, "/.kibana/_count", None).await?;
+    let (empty_query_status, empty_query_answer) =
+        send_request(&server, Method::POST, TENANT_A, "/.kibana/_count", Some(&json!({}))).await?;
+    let (filtered_status, filtered_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana_1/_count",
+        Some(&json!({"query": {"term": {"type": "dashboard"}}})),
+    )
+    .await?;
+    // The wildcard selects the alias and its index: one index, counted once.
+    let (wildcard_status, wildcard_answer) =
+        send_request(&server, Method::GET, TENANT_A, "/.kibana*/_count", None).await?;
+    let (missing_status, missing_answer) =
+        send_request(&server, Method::GET, TENANT_A, "/.kibana_9/_count", None).await?;
+
+    let expected_all = json!({"count": 2, "_shards": build_expected_shards()});
+    assert_eq!((all_status, all_answer), (StatusCode::OK, expected_all.clone()));
+    assert_eq!(
+        (empty_query_status, empty_query_answer),
+        (StatusCode::OK, expected_all.clone())
+    );
+    assert_eq!(
+        (filtered_status, filtered_answer),
+        (StatusCode::OK, json!({"count": 1, "_shards": build_expected_shards()}))
+    );
+    assert_eq!((wildcard_status, wildcard_answer), (StatusCode::OK, expected_all));
+    assert_eq!(
+        (missing_status, missing_answer["error"]["type"].clone()),
+        (StatusCode::NOT_FOUND, json!("index_not_found_exception"))
+    );
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn count_sums_the_documents_of_every_selected_index() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    let second_index = json!({"mappings": build_kibana_mappings(), "settings": {}});
+    let (created_status, _) = send_request(&server, Method::PUT, TENANT_A, "/.kibana_2", Some(&second_index)).await?;
+    assert!(created_status.is_success(), "{created_status}");
+    put_saved_object(&server, TENANT_A, "dashboard:a", &json!({"type": "dashboard"})).await?;
+    put_saved_object(&server, TENANT_A, "config:3.9.0", &json!({"type": "config"})).await?;
+    let (stored_status, _) = send_request(
+        &server,
+        Method::PUT,
+        TENANT_A,
+        "/.kibana_2/_doc/dashboard:a?refresh=wait_for",
+        Some(&json!({"type": "dashboard"})),
+    )
+    .await?;
+    assert!(stored_status.is_success(), "{stored_status}");
+
+    let (all_status, all_answer) =
+        send_request(&server, Method::GET, TENANT_A, "/.kibana_1,.kibana_2/_count", None).await?;
+    let (filtered_status, filtered_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana_1,.kibana_2/_count",
+        Some(&json!({"query": {"term": {"type": "dashboard"}}})),
+    )
+    .await?;
+
+    assert_eq!(
+        (all_status, all_answer),
+        (StatusCode::OK, json!({"count": 3, "_shards": build_expected_shards()}))
+    );
+    assert_eq!(
+        (filtered_status, filtered_answer),
+        (StatusCode::OK, json!({"count": 2, "_shards": build_expected_shards()}))
+    );
+    server.shutdown().await;
+    Ok(())
+}
+
+/// The real clock is the contract here: `now` comes from the request. The two dates sit decades
+/// either side of any instant this test can run at, so the outcome does not depend on it.
+#[tokio::test]
+async fn count_evaluates_date_math_against_the_instant_of_the_request() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    let old_document = json!({"type": "dashboard", "updated_at": "2000-01-01T00:00:00.000Z"});
+    let future_document = json!({"type": "dashboard", "updated_at": "2999-01-01T00:00:00.000Z"});
+    put_saved_object(&server, TENANT_A, "dashboard:old", &old_document).await?;
+    put_saved_object(&server, TENANT_A, "dashboard:future", &future_document).await?;
+    let body = json!({"query": {"range": {"updated_at": {"lt": "now-90d"}}}});
+
+    let (status, answer) = send_request(&server, Method::POST, TENANT_A, "/.kibana/_count", Some(&body)).await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(answer, json!({"count": 1, "_shards": build_expected_shards()}));
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn count_over_an_empty_target_answers_zero_unless_allow_no_indices_is_false() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+
+    let (empty_status, empty_answer) = send_request(&server, Method::GET, TENANT_A, "/.kibana_*/_count", None).await?;
+    let (disallowed_status, disallowed_answer) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        "/.kibana_*/_count?allow_no_indices=false",
+        None,
+    )
+    .await?;
+    create_kibana_index(&server, TENANT_A).await?;
+    let (ignored_status, ignored_answer) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        "/.kibana_9/_count?ignore_unavailable=true",
+        None,
+    )
+    .await?;
+
+    let expected_empty = json!({"count": 0, "_shards": build_expected_shards()});
+    assert_eq!((empty_status, empty_answer), (StatusCode::OK, expected_empty.clone()));
+    assert_eq!(
+        (disallowed_status, disallowed_answer["error"]["type"].clone()),
+        (StatusCode::NOT_FOUND, json!("index_not_found_exception"))
+    );
+    assert_eq!((ignored_status, ignored_answer), (StatusCode::OK, expected_empty));
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn count_on_a_data_index_is_a_400() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+
+    let (status, answer) = send_request(&server, Method::GET, TENANT_A, "/logs/_count", None).await?;
+    let (mixed_status, mixed_answer) =
+        send_request(&server, Method::GET, TENANT_A, "/.kibana_1,logs/_count", None).await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(mixed_status, StatusCode::BAD_REQUEST);
+    assert_eq!(mixed_answer["error"]["type"], "illegal_argument_exception");
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn count_under_tenant_b_counts_none_of_tenant_a_documents() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    create_kibana_index(&server, TENANT_B).await?;
+    put_saved_object(&server, TENANT_A, "dashboard:a", &json!({"type": "dashboard"})).await?;
+    put_saved_object(&server, TENANT_A, "dashboard:b", &json!({"type": "dashboard"})).await?;
+
+    let (_, owner_answer) = send_request(&server, Method::GET, TENANT_A, "/.kibana/_count", None).await?;
+    let (_, other_tenant_answer) = send_request(&server, Method::GET, TENANT_B, "/.kibana/_count", None).await?;
+    let (unknown_status, _) = send_request(&server, Method::GET, "tenant-c", "/.kibana/_count", None).await?;
+
+    assert_eq!(owner_answer["count"], 2);
+    assert_eq!(other_tenant_answer["count"], 0);
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND);
+    server.shutdown().await;
+    Ok(())
+}

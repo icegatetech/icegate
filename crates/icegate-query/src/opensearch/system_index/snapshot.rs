@@ -89,6 +89,11 @@ impl SystemIndex {
         self.documents.get(id)
     }
 
+    /// The documents in `_id` order.
+    pub(crate) fn documents(&self) -> impl Iterator<Item = (&str, &StoredDocument)> {
+        self.documents.iter().map(|(id, document)| (id.as_str(), document))
+    }
+
     /// The number of documents the index holds; deleted documents are not counted.
     pub(crate) fn document_count(&self) -> u64 {
         u64::try_from(self.documents.len()).unwrap_or(u64::MAX)
@@ -851,6 +856,18 @@ mod tests {
         assert_eq!(body["error"]["type"], "resource_already_exists_exception");
         assert_eq!(body["error"]["index"], ".kibana_1");
         assert_eq!(snapshot, snapshot_before_refusal, "a refused operation changes nothing");
+    }
+
+    #[test]
+    fn documents_iterate_in_id_order_whatever_the_write_order() {
+        let mut index = SystemIndex::new(json!({}), json!({}));
+        index.store_document("config:3.9.0", json!({"written": 1}));
+        index.store_document("dashboard:b", json!({"written": 2}));
+        index.store_document("dashboard:a", json!({"written": 3}));
+
+        let ids: Vec<&str> = index.documents().map(|(id, _)| id).collect();
+
+        assert_eq!(ids, ["config:3.9.0", "dashboard:a", "dashboard:b"]);
     }
 
     /// Stored mappings are compared byte for byte (`serde_json` keeps key order in this crate):

@@ -35,6 +35,10 @@ pub mod tempo;
 /// TraceQL query language implementation
 pub mod traceql;
 
+/// The `OpenSearch` Query DSL: its AST, the JSON parser and date math, shared by every `OpenSearch`
+/// evaluator.
+pub(crate) mod query_dsl;
+
 /// Doubles and bootstrap shared by the crate's inline tests.
 #[cfg(test)]
 mod test_support;
