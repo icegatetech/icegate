@@ -5,6 +5,7 @@ members = [
     "crates/icegate-catalog-s3",
     "crates/icegate-queue",
     "crates/icegate-query",
+    "crates/icegate-query-grammar",
     "crates/icegate-ingest",
     "crates/icegate-maintain",
 ]
@@ -56,6 +57,7 @@ redundant_pub_crate = "allow"
 icegate-common = { path = "crates/icegate-common" }
 icegate-catalog-s3 = { path = "crates/icegate-catalog-s3" }
 icegate-queue = { path = "crates/icegate-queue" }
+icegate-query-grammar = { path = "crates/icegate-query-grammar" }
 
 # The job/task framework, extracted to icegatetech/jobmanager as a standalone tool.
 # It is not published to a registry, so a version IS a git rev. Pinned to an immutable

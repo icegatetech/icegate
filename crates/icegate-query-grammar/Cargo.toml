@@ -1,0 +1,19 @@
+[package]
+name = "icegate-query-grammar"
+description = "Generated ANTLR parsers of IceGate's query languages and their parse entry points"
+readme = "README.md"
+keywords = ["antlr", "parser", "lucene", "query-string"]
+categories = ["parser-implementations"]
+version = { workspace = true }
+rust-version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+antlr4rust = { workspace = true }
+thiserror = { workspace = true }

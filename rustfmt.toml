@@ -15,7 +15,10 @@ ignore = [
     "!crates/icegate-query/src/traceql/antlr/tests.rs",
     "!crates/icegate-query/src/traceql/antlr/visitors.rs",
     "crates/icegate-query/src/query_dsl/analyzer/word_break_tables.rs",
-    "crates/icegate-query/src/query_dsl/analyzer/lowercase_table.rs"
+    "crates/icegate-query/src/query_dsl/analyzer/lowercase_table.rs",
+    "crates/icegate-query-grammar/src/lucene/",
+    "!crates/icegate-query-grammar/src/lucene/mod.rs",
+    "!crates/icegate-query-grammar/src/lucene/tests.rs",
 ]
 
 # Basic formatting

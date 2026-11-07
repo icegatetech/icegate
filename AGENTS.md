@@ -63,6 +63,7 @@ goes in `icegate-common`, never copied into a component.
 | `icegate-catalog-s3` | S3-backed Iceberg REST catalog. Has its own `domain`/`services`/`storage` layers.              | [AGENTS](crates/icegate-catalog-s3/AGENTS.md), [README](crates/icegate-catalog-s3/README.md)             |
 | `icegate-queue`      | Generic WAL data queue on object storage: durable-before-ack, exactly-once, per-topic offsets. | [README](crates/icegate-queue/README.md)                                                                 |
 | `icegate-ingest`     | OTLP receivers (gRPC/HTTP), transform, WAL write.                                              | per-tenant task model [README](crates/icegate-ingest/README.md)                                                   |
+| `icegate-query-grammar` | Generated ANTLR parsers of the query languages (Lucene query string) and one parse entry point per start rule; no query semantics. | [README](crates/icegate-query-grammar/README.md) |
 | `icegate-query`      | Query APIs (Loki/Prometheus/Tempo), query engine, LogQL, query CLI.                            | [README](crates/icegate-query/README.md), LogQL [logql/README](crates/icegate-query/src/logql/README.md), Query DSL [query_dsl/README](crates/icegate-query/src/query_dsl/README.md), system indices [system_index/README](crates/icegate-query/src/opensearch/system_index/README.md) |
 | `icegate-maintain`   | Background maintenance: compaction, GC, WAL cleanup, schema migration, maintain CLI.           | [README](crates/icegate-maintain/README.md), compaction [compact/README](crates/icegate-maintain/src/compact/README.md), retention [migrate/README](crates/icegate-maintain/src/migrate/README.md), WAL cleanup [wal_cleanup/README](crates/icegate-maintain/src/wal_cleanup/README.md) |
 
@@ -70,6 +71,8 @@ goes in `icegate-common`, never copied into a component.
 - `icegate-common` is the foundation and depends on no other workspace crate;
 - Components depend on `common` plus the library crates they need (`queue`, `catalog-s3`).
 - `catalog-s3`'s production library pulls no other workspace crate (dev-only dependency on `common`).
+- `icegate-query-grammar` depends on no workspace crate; visitors and AST builders stay in
+  `icegate-query`.
 - The job/task framework is **not** a workspace crate: it lives in
   [icegatetech/jobmanager](https://github.com/icegatetech/jobmanager) and enters the build as an
   external dependency, git-pinned once in `[workspace.dependencies]` as `jobmanager`.
