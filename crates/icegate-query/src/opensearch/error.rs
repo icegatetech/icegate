@@ -12,6 +12,8 @@
 //! query deadline and system-index write contention. A limit a request can avoid by asking for
 //! less is a `400`, or a `413` for a body or a snapshot that is too large.
 
+use std::collections::BTreeMap;
+
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use icegate_common::SHED_RETRY_AFTER_SECS;
@@ -224,6 +226,27 @@ impl OpenSearchError {
         ))
         .with_metadata("field", field)
         .with_metadata("indices", json!([first_index, other_index]))
+    }
+
+    /// The `fields` or `docvalue_fields` name `field` has a different type in the searched indices
+    /// (`400`), so no one rendering projects it; `indices_by_type` maps each type name to the
+    /// indices that give `field` that type. `field` and `indices` (that map, as an object of index
+    /// name arrays) are carried for a client.
+    pub(crate) fn field_projection_conflict(field: &str, indices_by_type: &BTreeMap<&'static str, Vec<&str>>) -> Self {
+        let listing: Vec<String> = indices_by_type
+            .iter()
+            .map(|(field_type, indices)| format!("[{field_type}] in [{}]", indices.join(",")))
+            .collect();
+        let indices: Map<String, Value> = indices_by_type
+            .iter()
+            .map(|(field_type, indices)| ((*field_type).to_string(), json!(indices)))
+            .collect();
+        Self::illegal_argument(format!(
+            "field [{field}] has conflicting types: {}; it cannot be projected through fields or docvalue_fields",
+            listing.join(", ")
+        ))
+        .with_metadata("field", field)
+        .with_metadata("indices", Value::Object(indices))
     }
 
     /// The request key `key` names a feature the system indices do not serve (`400`), which `key`

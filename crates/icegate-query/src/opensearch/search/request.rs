@@ -1,8 +1,9 @@
 //! The search request model every `_search` evaluator shares: the body keys and query-string
 //! parameters a search accepts, parsed once into [`SearchRequest`].
 //!
-//! A key IceGate does not apply is refused rather than ignored: an ignored `highlight` would hand
-//! the client an answer to a different request.
+//! A body key is either applied, validated and not applied (`stored_fields`, `timeout`,
+//! `highlight`, `terminate_after`), or refused: an unknown key is a `parsing_exception`, because
+//! ignoring it would answer a different request.
 
 use std::borrow::Cow;
 use std::iter;
@@ -10,6 +11,7 @@ use std::iter;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use super::hits::DateRenderFormat;
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::extract::{EndpointParameters, deserialize_flag};
 use crate::opensearch::system_index::documents::{parse_json_body, split_paths};
@@ -55,6 +57,28 @@ pub(crate) struct SearchRequest {
     pub(crate) aggregations: Option<Value>,
     /// The sort values a page continues after; `None` when the body has no `search_after`.
     pub(crate) search_after: Option<Vec<Value>>,
+    /// `fields`: values rendered under each hit's `fields`.
+    pub(crate) fields: Vec<DocValueField>,
+    /// `docvalue_fields`: rendered like `fields`; a name both carry keeps the `fields` value.
+    pub(crate) docvalue_fields: Vec<DocValueField>,
+    /// `terminate_after`: accepted and not applied; it adds `terminated_early: false`.
+    pub(crate) terminate_after: Option<u64>,
+}
+
+/// One `fields` or `docvalue_fields` entry: a field name or glob, and an optional date format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DocValueField {
+    /// The field name, or a pattern with `*` / `?`.
+    pub(crate) field: String,
+    /// The date format of its values; `None` renders dates as `strict_date_optional_time`.
+    pub(crate) format: Option<DateRenderFormat>,
+}
+
+impl DocValueField {
+    /// Whether `field` is a glob pattern rather than one name.
+    pub(crate) fn is_pattern(&self) -> bool {
+        self.field.contains(['*', '?'])
+    }
 }
 
 /// One sort clause.
@@ -183,8 +207,10 @@ impl EndpointParameters for SearchParameters {
 ///
 /// `parsing_exception` for malformed JSON, an unknown body key, a key of the wrong type, or a
 /// `sort` of more than [`MAX_SORT_CLAUSES`] clauses; the errors of [`parse_query`];
-/// `illegal_argument_exception` for an integer `track_total_hits` together with
-/// `rest_total_hits_as_int=true`, or a malformed `track_total_hits` parameter.
+/// `illegal_argument_exception` for a non-empty `script_fields`, an unsupported date format in
+/// `fields` or `docvalue_fields`, an integer `track_total_hits` together with
+/// `rest_total_hits_as_int=true` (see [`resolve_track_total_hits`]), or a malformed
+/// `track_total_hits` parameter.
 pub(crate) fn parse_search_request(
     body: &[u8],
     parameters: &SearchParameters,
@@ -234,6 +260,9 @@ fn parse_search_entries<'a, K: AsRef<str>>(
         version: false,
         aggregations: None,
         search_after: None,
+        fields: Vec::new(),
+        docvalue_fields: Vec::new(),
+        terminate_after: None,
     };
     let mut body_track_total_hits = None;
     for (key, value) in entries {
@@ -254,6 +283,21 @@ fn parse_search_entries<'a, K: AsRef<str>>(
                 };
                 request.search_after = Some(values);
             }
+            "fields" => request.fields = parse_doc_value_fields(&value, key)?,
+            "docvalue_fields" => request.docvalue_fields = parse_doc_value_fields(&value, key)?,
+            "terminate_after" => {
+                request.terminate_after = Some(
+                    value
+                        .as_u64()
+                        .ok_or_else(|| OpenSearchError::parsing("[terminate_after] must be a non-negative integer"))?,
+                );
+            }
+            "stored_fields" => validate_stored_fields(&value)?,
+            "script_fields" => refuse_script_fields(&value)?,
+            "timeout" if value.is_string() => {}
+            "timeout" => return Err(OpenSearchError::parsing("[timeout] must be a string such as 30000ms")),
+            "highlight" if value.is_object() => {}
+            "highlight" => return Err(OpenSearchError::parsing("[highlight] must be an object")),
             unknown_key => {
                 return Err(OpenSearchError::parsing(format!(
                     "request does not support [{unknown_key}]"
@@ -277,17 +321,117 @@ fn parse_search_entries<'a, K: AsRef<str>>(
         Some(text) => Some(parse_track_total_hits_parameter(text)?),
         None => body_track_total_hits,
     };
-    request.track_total_hits = match (requested_track_total_hits, request.rest_total_hits_as_int) {
-        (None, true) => TrackTotalHits::Exact,
-        (None, false) => TrackTotalHits::UpTo(DEFAULT_TOTAL_HITS_THRESHOLD),
-        (Some(TrackTotalHits::UpTo(_)), true) => {
-            return Err(OpenSearchError::illegal_argument(
-                "[rest_total_hits_as_int] cannot be used when the total hits are not tracked accurately",
-            ));
-        }
-        (Some(track_total_hits), _) => track_total_hits,
-    };
+    request.track_total_hits = resolve_track_total_hits(requested_track_total_hits, request.rest_total_hits_as_int)?;
     Ok(request)
+}
+
+/// The total-hit tracking of a request from its explicitly given `track_total_hits` (the query
+/// string's `track_total_hits` when given, else the body's) and `rest_total_hits_as_int`.
+///
+/// # Errors
+///
+/// Returns a 400 `illegal_argument_exception` for an integer threshold together with
+/// `rest_total_hits_as_int=true`: an integer total cannot say it is a lower bound.
+pub(crate) fn resolve_track_total_hits(
+    requested_track_total_hits: Option<TrackTotalHits>,
+    rest_total_hits_as_int: bool,
+) -> Result<TrackTotalHits, OpenSearchError> {
+    match (requested_track_total_hits, rest_total_hits_as_int) {
+        (None, true) => Ok(TrackTotalHits::Exact),
+        (None, false) => Ok(TrackTotalHits::UpTo(DEFAULT_TOTAL_HITS_THRESHOLD)),
+        (Some(TrackTotalHits::UpTo(threshold)), true) => Err(OpenSearchError::illegal_argument(format!(
+            "[rest_total_hits_as_int] cannot be used when the total is tracked only up to [{threshold}]; \
+             send track_total_hits=true"
+        ))),
+        (Some(track_total_hits), _) => Ok(track_total_hits),
+    }
+}
+
+/// Parse the array of `fields` or `docvalue_fields` (named `key` in errors): each entry a
+/// string or `{field, format}`.
+///
+/// # Errors
+///
+/// `parsing_exception` for a malformed entry, a non-string `field` or `format`, or an unknown
+/// entry key; the 400 of [`DateRenderFormat::parse`] for an unknown format.
+fn parse_doc_value_fields(value: &Value, key: &str) -> Result<Vec<DocValueField>, OpenSearchError> {
+    let Value::Array(entries) = value else {
+        return Err(OpenSearchError::parsing(format!("[{key}] must be an array")));
+    };
+    entries
+        .iter()
+        .map(|entry| match entry {
+            Value::String(field) => Ok(DocValueField {
+                field: field.clone(),
+                format: None,
+            }),
+            Value::Object(object) => {
+                let mut field = None;
+                let mut format = None;
+                for (name, item) in object {
+                    match (name.as_str(), item) {
+                        ("field", Value::String(text)) => field = Some(text.clone()),
+                        ("format", Value::String(text)) => format = Some(DateRenderFormat::parse(text)?),
+                        (entry_key @ ("field" | "format"), _) => {
+                            return Err(OpenSearchError::parsing(format!(
+                                "[{key}] entry key [{entry_key}] must be a string"
+                            )));
+                        }
+                        (unknown_entry_key, _) => {
+                            return Err(OpenSearchError::parsing(format!(
+                                "[{key}] entry key [{unknown_entry_key}] is not supported"
+                            )));
+                        }
+                    }
+                }
+                Ok(DocValueField {
+                    field: field.ok_or_else(|| OpenSearchError::parsing(format!("[{key}] entry needs a [field]")))?,
+                    format,
+                })
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => Err(OpenSearchError::parsing(
+                format!("[{key}] entries are field names or objects"),
+            )),
+        })
+        .collect()
+}
+
+/// `stored_fields`: a string or an array of strings, accepted and never applied.
+///
+/// # Errors
+///
+/// `parsing_exception` for any other shape.
+fn validate_stored_fields(value: &Value) -> Result<(), OpenSearchError> {
+    let is_well_formed = match value {
+        Value::String(_) => true,
+        Value::Array(names) => names.iter().all(Value::is_string),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Object(_) => false,
+    };
+    if is_well_formed {
+        Ok(())
+    } else {
+        Err(OpenSearchError::parsing(
+            "[stored_fields] must be a string or an array of strings",
+        ))
+    }
+}
+
+/// `script_fields`: accepted only when empty, because no script runs on the data path.
+///
+/// # Errors
+///
+/// `illegal_argument_exception` for an entry, `parsing_exception` for a value that is not an
+/// object.
+fn refuse_script_fields(value: &Value) -> Result<(), OpenSearchError> {
+    match value {
+        Value::Object(entries) if entries.is_empty() => Ok(()),
+        Value::Object(_) => Err(OpenSearchError::illegal_argument(
+            "[script_fields] is not supported: send it empty or leave it out",
+        )),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_) => {
+            Err(OpenSearchError::parsing("[script_fields] must be an object"))
+        }
+    }
 }
 
 /// The body as an object; an empty or blank body is an empty object.
@@ -537,8 +681,9 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_search_body_key_is_a_parsing_exception() {
         for body in [
-            json!({"query": {"match_all": {}}, "highlight": {"fields": {"*": {}}}}),
-            json!({"script_fields": {"x": {"script": "1"}}}),
+            json!({"query": {"match_all": {}}, "rescore": {"window_size": 10}}),
+            json!({"collapse": {"field": "x"}}),
+            json!({"suggest": {}}),
         ] {
             assert_refused(&body, "", "parsing_exception").await;
         }
@@ -853,6 +998,94 @@ mod tests {
         )
         .await;
         assert_refused(&json!({}), "track_total_hits=maybe", "illegal_argument_exception").await;
+    }
+
+    #[tokio::test]
+    async fn rendering_options_parse_and_an_integer_total_threshold_refuses_integer_totals() {
+        let no_parameters = parse_search_parameters("");
+        let request = parse_search_request(
+            br#"{"fields": ["*", {"field": "timestamp", "format": "strict_date_optional_time_nanos"}],
+                "docvalue_fields": [{"field": "timestamp", "format": "date_time"}],
+                "stored_fields": ["*"], "script_fields": {}, "timeout": "30000ms", "terminate_after": 100000,
+                "highlight": {"fields": {"*": {}}, "fragment_size": 2147483647}}"#,
+            &no_parameters,
+        )
+        .expect("a rendering-options body parses");
+        assert_eq!(
+            request.fields,
+            vec![
+                DocValueField {
+                    field: "*".to_string(),
+                    format: None
+                },
+                DocValueField {
+                    field: "timestamp".to_string(),
+                    format: Some(DateRenderFormat::StrictDateOptionalTimeNanos)
+                },
+            ]
+        );
+        assert_eq!(
+            request.docvalue_fields,
+            vec![DocValueField {
+                field: "timestamp".to_string(),
+                format: Some(DateRenderFormat::DateTime)
+            }]
+        );
+        assert_eq!(request.terminate_after, Some(100_000));
+        let single_stored_field_request =
+            parse_request(&json!({"stored_fields": "_none_"}), "").expect("one stored field parses");
+        assert_eq!(single_stored_field_request.fields, Vec::new());
+
+        for (body, error_type) in [
+            (
+                json!({"script_fields": {"x": {"script": "1"}}}),
+                "illegal_argument_exception",
+            ),
+            (json!({"script_fields": []}), "parsing_exception"),
+            (
+                json!({"fields": [{"field": "t", "format": "basic_date"}]}),
+                "illegal_argument_exception",
+            ),
+            (json!({"fields": "timestamp"}), "parsing_exception"),
+            (json!({"docvalue_fields": [1]}), "parsing_exception"),
+            (json!({"fields": [{"format": "date_time"}]}), "parsing_exception"),
+            (
+                json!({"fields": [{"field": "t", "include_unmapped": true}]}),
+                "parsing_exception",
+            ),
+            (json!({"fields": [{"field": 1}]}), "parsing_exception"),
+            (
+                json!({"docvalue_fields": [{"field": "t", "format": 1}]}),
+                "parsing_exception",
+            ),
+            (json!({"stored_fields": 1}), "parsing_exception"),
+            (json!({"stored_fields": ["*", 1]}), "parsing_exception"),
+            (json!({"timeout": 30}), "parsing_exception"),
+            (json!({"highlight": true}), "parsing_exception"),
+            (json!({"terminate_after": -1}), "parsing_exception"),
+            (json!({"terminate_after": "5"}), "parsing_exception"),
+        ] {
+            assert_refused(&body, "", error_type).await;
+        }
+
+        assert_eq!(resolve_track_total_hits(None, true), Ok(TrackTotalHits::Exact));
+        assert_eq!(
+            resolve_track_total_hits(None, false),
+            Ok(TrackTotalHits::UpTo(DEFAULT_TOTAL_HITS_THRESHOLD))
+        );
+        assert_eq!(
+            resolve_track_total_hits(Some(TrackTotalHits::Disabled), true),
+            Ok(TrackTotalHits::Disabled)
+        );
+        assert_eq!(
+            resolve_track_total_hits(Some(TrackTotalHits::UpTo(100)), false),
+            Ok(TrackTotalHits::UpTo(100))
+        );
+        let error = resolve_track_total_hits(Some(TrackTotalHits::UpTo(100)), true)
+            .expect_err("an integer threshold has no integer total");
+        let (status, answer) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(answer["error"]["type"], "illegal_argument_exception");
     }
 
     #[test]

@@ -11,16 +11,19 @@
 //! most `from + size` rows, so an index yields at most three times that many candidates. Each
 //! candidate is hashed in Rust for its `_id`. The pages of several indices merge by the full
 //! key, and a tie goes to the index first in name order. Hits never come from a union that
-//! DataFusion coerces: each hit renders its `_source` from its own index's row. Rendering is
-//! linear in the page, so it runs on the blocking pool.
+//! DataFusion coerces: each hit renders its `_source` from its own index's row. A hit's `sort`
+//! and `fields` values render with its candidate, because `fields` resolves names through the
+//! session; the rest of the answer is linear in the page, so it renders on the blocking pool.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
-use datafusion::arrow::array::{Array, AsArray, RecordBatch};
-use datafusion::arrow::datatypes::{DataType, Int64Type, TimeUnit};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StringArray};
+use datafusion::arrow::datatypes::{ArrowNativeType, DataType, Int64Type, TimeUnit};
 use datafusion::error::DataFusionError;
 use datafusion::functions::core::expr_fn::coalesce;
 use datafusion::functions_aggregate::expr_fn::count;
@@ -29,21 +32,24 @@ use datafusion::prelude::ident;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use icegate_common::schema::{COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::doc_id::{
     CanonicalEncoder, DOC_HASH_BITS, DOC_HASH_MASK, MICROS_PER_DAY, decode_time_and_doc, document_row_hash_udf,
     encode_doc_sort_value, encode_document_id, encode_span_document_id, hash_canonical_row, hash_span_key,
     is_span_keyed, read_document_timestamp_micros, span_key_hash_udf,
 };
-use super::hits::{SearchHit, render_search_response, render_sort_scalar};
-use super::request::{SearchRequest, SortClause, SortOrder, SourceFilter, TrackTotalHits};
+use super::hits::{
+    SearchHit, render_array_value, render_field_value, render_search_response, render_sort_scalar, summarize_total_hits,
+};
+use super::request::{DocValueField, SearchRequest, SortClause, SortOrder, TrackTotalHits};
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::error::QueryError;
 use crate::opensearch::SearchLimitsConfig;
-use crate::opensearch::catalog::{FieldType, FieldValue, IndexEntry, ResolvedField, TenantSession};
+use crate::opensearch::catalog::{FieldType, FieldValue, IndexEntry, ResolvedField, TenantSession, native_column_type};
 use crate::opensearch::context::RequestContext;
 use crate::opensearch::error::OpenSearchError;
+use crate::opensearch::glob::matches_glob;
 use crate::opensearch::system_index::run_blocking_work;
 use crate::query_dsl::literal::parse_java_double;
 use crate::query_dsl::lower::{LoweringScope, lower_query};
@@ -81,9 +87,11 @@ pub(crate) fn check_result_window(request: &SearchRequest, limits: SearchLimitsC
 /// `_doc`, so `search_after` anchored on one of them returns none of its identical copies.
 /// A row's microsecond is read from its `timestamp` column: a timestamp floored to the
 /// microsecond, a date at its first microsecond, and `0` for a NULL or a column of another type.
-/// `hits.total` is the exact count of matching rows
-/// and ignores `search_after`. The caller checks the result window first. The answer is rendered
-/// on the blocking pool, because it holds up to `from + size` hits of every column.
+/// `hits.total` counts the matching rows as `track_total_hits` asks, exactly or up to its
+/// threshold (see [`summarize_total_hits`]), and ignores `search_after`. `fields` and
+/// `docvalue_fields` resolve against each hit's own index. The caller checks the result window
+/// first. The answer is rendered on the blocking pool, because it holds up to `from + size` hits
+/// of every column.
 ///
 /// # Errors
 ///
@@ -92,9 +100,10 @@ pub(crate) fn check_result_window(request: &SearchRequest, limits: SearchLimitsC
 /// with different sort types across indices, an `unmapped_type` the data path does not sort as);
 /// the 400s of a `search_after` without a sort, with `from` above 0, with a value count other than
 /// the sort's or with a value that fits no sort key; the lowering errors of [`lower_query`]; the
-/// 400s of request keys the data path does not serve yet; planning or execution failures; and
-/// `500` when a row has no canonical encoding or no span key, a sort value has another type than
-/// its key, a value has no JSON rendering or the rendering does not finish.
+/// 400s of [`plan_field_requests`]; the 400s of request keys the data path does not serve yet;
+/// planning or execution failures; and `500` when a row has no canonical encoding or no span key,
+/// a sort value has another type than its key, a value has no JSON rendering, a field resolves to
+/// a column its hit's row does not hold, or the rendering does not finish.
 pub(crate) async fn search_data_indices(
     session: &TenantSession,
     entries: &[&IndexEntry],
@@ -107,6 +116,7 @@ pub(crate) async fn search_data_indices(
         require_document_identity(session, entry)?;
     }
     let sort = plan_sort(session, entries, &request.sort)?;
+    let field_requests = plan_field_requests(session, entries, request)?;
     let anchor = request
         .search_after
         .as_deref()
@@ -124,7 +134,10 @@ pub(crate) async fn search_data_indices(
         search_index(scope, request, context, window)
     }))
     .await?;
-    let total = pages.iter().map(|page| page.matching_rows).sum();
+    let total = summarize_total_hits(
+        pages.iter().map(|page| page.matching_rows).sum(),
+        &request.track_total_hits,
+    );
     let mut candidates: Vec<Candidate<'_>> = pages.into_iter().flat_map(|page| page.candidates).collect();
     sort_candidates(&mut candidates, &sort.keys)?;
     let is_sorted = !sort.keys.is_empty();
@@ -135,6 +148,9 @@ pub(crate) async fn search_data_indices(
         .map(|candidate| {
             Ok(PageHit {
                 sort_values: is_sorted.then(|| render_sort_values(&candidate)).transpose()?,
+                field_values: (!field_requests.is_empty())
+                    .then(|| render_field_values(session, &candidate, &field_requests))
+                    .transpose()?,
                 index_name: candidate.entry.name().to_string(),
                 batch: candidate.batch,
                 row: candidate.row,
@@ -155,12 +171,14 @@ pub(crate) async fn search_data_indices(
                      row,
                      document_id,
                      sort_values,
+                     field_values,
                  }| SearchHit {
                     index: index_name,
                     batch,
                     row: *row,
                     document_id,
                     sort_values: sort_values.take(),
+                    field_values: field_values.take(),
                 },
             )
             .collect();
@@ -182,6 +200,8 @@ struct PageHit {
     document_id: String,
     /// The hit's `sort` values; `None` when the request does not sort.
     sort_values: Option<Vec<Value>>,
+    /// The hit's `fields`; `None` when the request asks for none.
+    field_values: Option<Map<String, Value>>,
 }
 
 /// A DataFusion planning failure as the envelope `From<QueryError>` maps it to.
@@ -809,13 +829,16 @@ struct Candidate<'a> {
 
 /// One index's share of a search.
 struct IndexPage<'a> {
-    /// How many of the index's rows match the query (ignoring `search_after`).
+    /// How many of the index's rows match the query (ignoring `search_after`), counted as the
+    /// request tracks its total: exactly, up to one past the threshold, or not at all (`0`).
     matching_rows: u64,
     /// The index's rows that can be among the first `from + size` hits, in full sort order.
     candidates: Vec<Candidate<'a>>,
 }
 
-/// Count the index's matching rows and select its candidates, concurrently.
+/// Count the index's matching rows as the request tracks its total and select its candidates,
+/// concurrently. Under a threshold `n` the count stops at `n + 1` rows, so no index scans past
+/// what the threshold can report.
 ///
 /// # Errors
 ///
@@ -836,17 +859,37 @@ async fn search_index<'a>(
         .scan_index(scope.entry)?
         .filter(lower_query(&request.query, &lowering)?)
         .map_err(convert_plan_error)?;
-    let count_plan = matching_plan
-        .clone()
-        .aggregate(Vec::<Expr>::new(), vec![count(lit(1_i64)).alias(MATCHING_ROWS)])
-        .and_then(LogicalPlanBuilder::build)
-        .map_err(convert_plan_error)?;
-    let (counts, candidates) = futures::try_join!(
-        scope.session.collect(count_plan),
+    let count_plan = match request.track_total_hits {
+        TrackTotalHits::Disabled => None,
+        TrackTotalHits::Exact => Some(matching_plan.clone()),
+        TrackTotalHits::UpTo(threshold) => Some(
+            matching_plan
+                .clone()
+                .limit(
+                    0,
+                    Some(usize::try_from(threshold).unwrap_or(usize::MAX).saturating_add(1)),
+                )
+                .map_err(convert_plan_error)?,
+        ),
+    }
+    .map(|counted_plan| {
+        counted_plan
+            .aggregate(Vec::<Expr>::new(), vec![count(lit(1_i64)).alias(MATCHING_ROWS)])
+            .and_then(LogicalPlanBuilder::build)
+            .map_err(convert_plan_error)
+    })
+    .transpose()?;
+    let (matching_rows, candidates) = futures::try_join!(
+        async {
+            match count_plan {
+                Some(plan) => read_matching_rows(&scope.session.collect(plan).await?),
+                None => Ok(0),
+            }
+        },
         select_candidates(scope, &matching_plan, window)
     )?;
     Ok(IndexPage {
-        matching_rows: read_matching_rows(&counts)?,
+        matching_rows,
         candidates,
     })
 }
@@ -1404,19 +1447,227 @@ fn refuse_unserved_request_keys(request: &SearchRequest) -> Result<(), OpenSearc
             "[seq_no_primary_term] applies to system indices only",
         ));
     }
-    let unserved_keys = [
-        (request.aggregations.is_some(), "aggs"),
-        (!matches!(request.source, SourceFilter::All), "_source filtering"),
-        (request.version, "version"),
-        (
-            matches!(request.track_total_hits, TrackTotalHits::Disabled),
-            "track_total_hits: false",
-        ),
-    ];
-    if let Some((_, key)) = unserved_keys.iter().find(|(is_requested, _)| *is_requested) {
-        return Err(OpenSearchError::illegal_argument(format!(
-            "[{key}] on data indices is not supported yet"
-        )));
+    if request.aggregations.is_some() {
+        return Err(OpenSearchError::illegal_argument(
+            "[aggs] on data indices is not supported yet",
+        ));
+    }
+    Ok(())
+}
+
+/// The `docvalue_fields` then the `fields` of a request, checked against every index: a
+/// concrete name or a pattern-matched column typed differently across the indices is a 400
+/// naming the field and the indices of each type, and a format on a concrete non-date field is a
+/// 400.
+///
+/// # Errors
+///
+/// Returns [`OpenSearchError::field_projection_conflict`] for a name typed differently across
+/// `entries`, `illegal_argument_exception` for a format on a concrete field that is no date,
+/// the error an index's table failed to open with, and `500` for a column a pattern matches whose
+/// type no `OpenSearch` type represents.
+fn plan_field_requests<'r>(
+    session: &TenantSession,
+    entries: &[&IndexEntry],
+    request: &'r SearchRequest,
+) -> Result<Vec<&'r DocValueField>, OpenSearchError> {
+    let requests: Vec<&DocValueField> = request.docvalue_fields.iter().chain(&request.fields).collect();
+    for field_request in &requests {
+        // The type each index gives every name the request reaches, by name.
+        let mut types: BTreeMap<String, BTreeMap<&'static str, Vec<&str>>> = BTreeMap::new();
+        for entry in entries {
+            if field_request.is_pattern() {
+                let schema = session.table_schema(entry)?;
+                for field in schema.fields() {
+                    if !matches_glob(&field_request.field, field.name()) {
+                        continue;
+                    }
+                    let field_type = native_column_type(field)?;
+                    if field_type != FieldType::Object {
+                        types
+                            .entry(field.name().clone())
+                            .or_default()
+                            .entry(field_type.name())
+                            .or_default()
+                            .push(entry.name());
+                    }
+                }
+            } else if let Some(resolved_field) = session.resolve_field(entry, &field_request.field) {
+                if field_request.format.is_some() && resolved_field.field_type != FieldType::Date {
+                    return Err(OpenSearchError::illegal_argument(format!(
+                        "field [{}] of type [{}] in index [{}] does not support formats",
+                        field_request.field,
+                        resolved_field.field_type.name(),
+                        entry.name()
+                    )));
+                }
+                types
+                    .entry(field_request.field.clone())
+                    .or_default()
+                    .entry(resolved_field.field_type.name())
+                    .or_default()
+                    .push(entry.name());
+            }
+        }
+        if let Some((name, indices_by_type)) = types.iter().find(|(_, indices_by_type)| indices_by_type.len() > 1) {
+            return Err(OpenSearchError::field_projection_conflict(name, indices_by_type));
+        }
+    }
+    Ok(requests)
+}
+
+/// The `fields` of one hit: each requested name or pattern resolved against the hit's own index,
+/// each value a one-element array, a missing value no key; a later request for the same name
+/// replaces the earlier one.
+///
+/// # Errors
+///
+/// Returns `500` for a value [`render_field_value`] or [`render_array_value`] cannot render, a
+/// column of a type no `OpenSearch` type represents, a MAP column that is not a MAP of `Utf8`
+/// keys, and a resolved column the hit's batch does not hold: the batch holds every column of
+/// the index's table, so a missing one is a broken invariant, not a missing value.
+fn render_field_values(
+    session: &TenantSession,
+    candidate: &Candidate<'_>,
+    requests: &[&DocValueField],
+) -> Result<Map<String, Value>, OpenSearchError> {
+    let batch = candidate.batch.as_ref();
+    let row = candidate.row;
+    let mut values = Map::new();
+    for field_request in requests {
+        if field_request.is_pattern() {
+            render_pattern_field_values(batch, row, field_request, &mut values)?;
+            continue;
+        }
+        let Some(resolved_field) = session.resolve_field(candidate.entry, &field_request.field) else {
+            continue;
+        };
+        let value = match &resolved_field.value {
+            FieldValue::Column { column } | FieldValue::HexId { column, .. } => {
+                let array = read_resolved_column(batch, column)?;
+                if array.is_null(row) {
+                    continue;
+                }
+                Some(render_field_value(array.as_ref(), row, field_request.format)?)
+            }
+            FieldValue::MapKey { column, key } => {
+                let array = read_resolved_column(batch, column)?;
+                if array.is_null(row) {
+                    continue;
+                }
+                let MapEntries {
+                    keys,
+                    values: map_values,
+                    mut entries,
+                } = read_map_entries(array.as_ref(), row, column)?;
+                entries
+                    .find(|&entry| !keys.is_null(entry) && keys.value(entry) == key.as_str())
+                    .filter(|&entry| !map_values.is_null(entry))
+                    .map(|entry| render_array_value(map_values.as_ref(), entry))
+                    .transpose()?
+            }
+        };
+        if let Some(value) = value {
+            values.insert(field_request.field.clone(), json!([value]));
+        }
+    }
+    Ok(values)
+}
+
+/// The column `column` of a hit's `batch`, which a field of the hit's index resolved to.
+///
+/// # Errors
+///
+/// Returns `500` when `batch` has no such column.
+fn read_resolved_column<'b>(batch: &'b RecordBatch, column: &str) -> Result<&'b ArrayRef, OpenSearchError> {
+    batch
+        .column_by_name(column)
+        .ok_or_else(|| OpenSearchError::internal(format!("the resolved column `{column}` is not in the hit's batch")))
+}
+
+/// The entries of one MAP value, borrowed from its column. `keys` and `values` span the whole
+/// column; each index in `entries` addresses one entry of this value in both.
+#[derive(Debug, Clone)]
+struct MapEntries<'a> {
+    keys: &'a StringArray,
+    values: &'a ArrayRef,
+    entries: Range<usize>,
+}
+
+/// The entries of the MAP value at `row` of `array`, the column named `column`. Reads the
+/// column's own key and value arrays in place, so a row's entries cost no copy.
+///
+/// # Errors
+///
+/// Returns `500` when `array` is not a MAP or its keys are not `Utf8`.
+fn read_map_entries<'a>(array: &'a dyn Array, row: usize, column: &str) -> Result<MapEntries<'a>, OpenSearchError> {
+    let map = array
+        .as_map_opt()
+        .ok_or_else(|| OpenSearchError::internal(format!("column `{column}` is not a MAP")))?;
+    let keys = map
+        .keys()
+        .as_string_opt::<i32>()
+        .ok_or_else(|| OpenSearchError::internal(format!("the MAP column `{column}` has non-Utf8 keys")))?;
+    let offsets = map.value_offsets();
+    // Arrow validates a MAP's offsets as non-negative and ascending when the array is built, so
+    // `as_usize` (a plain widening for an `i32` offset) cannot wrap.
+    Ok(MapEntries {
+        keys,
+        values: map.values(),
+        entries: offsets[row].as_usize()..offsets[row + 1].as_usize(),
+    })
+}
+
+/// Insert into `values` the `fields` of `batch[row]` that the pattern of `field_request` matches:
+/// every non-null scalar column by its name, in `field_request`'s format, and every MAP entry with
+/// a value by its path `<column>.<stored key>`, the stored key never split.
+///
+/// # Errors
+///
+/// Returns `500` for a value that cannot be rendered, a matched column of a type no `OpenSearch`
+/// type represents, and a MAP column that is not a MAP of `Utf8` keys or holds a NULL key.
+fn render_pattern_field_values(
+    batch: &RecordBatch,
+    row: usize,
+    field_request: &DocValueField,
+    values: &mut Map<String, Value>,
+) -> Result<(), OpenSearchError> {
+    // One buffer for every entry's path, so an entry the pattern does not match allocates nothing.
+    let mut path = String::new();
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        if column.is_null(row) {
+            continue;
+        }
+        if let DataType::Map(_, _) = column.data_type() {
+            let MapEntries {
+                keys,
+                values: map_values,
+                entries,
+            } = read_map_entries(column.as_ref(), row, field.name())?;
+            for entry in entries {
+                if keys.is_null(entry) {
+                    return Err(OpenSearchError::internal(format!(
+                        "the MAP column `{}` has a NULL key",
+                        field.name()
+                    )));
+                }
+                if map_values.is_null(entry) {
+                    continue;
+                }
+                path.clear();
+                path.push_str(field.name());
+                path.push('.');
+                path.push_str(keys.value(entry));
+                if matches_glob(&field_request.field, &path) {
+                    values.insert(path.clone(), json!([render_array_value(map_values.as_ref(), entry)?]));
+                }
+            }
+        } else if matches_glob(&field_request.field, field.name()) && native_column_type(field)? != FieldType::Object {
+            values.insert(
+                field.name().clone(),
+                json!([render_field_value(column.as_ref(), row, field_request.format)?]),
+            );
+        }
     }
     Ok(())
 }

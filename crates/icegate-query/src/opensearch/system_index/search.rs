@@ -239,7 +239,8 @@ enum SortKey<'s> {
 ///
 /// # Errors
 ///
-/// - `illegal_argument_exception` for aggregations, `search_after`, a mapping type or an `unmapped_type` the
+/// - `illegal_argument_exception` for aggregations, `search_after`, a non-empty `fields` or
+///   `docvalue_fields`, `terminate_after`, a mapping type or an `unmapped_type` the
 ///   evaluator does not support, a sort field of different kinds across `indices`, two sort clauses
 ///   reading one source of an index, naming the first such index of `indices`, or a stored value
 ///   that does not read as its sort field's kind;
@@ -259,6 +260,14 @@ pub(crate) fn search_system_indices(
     }
     if request.search_after.is_some() {
         return Err(OpenSearchError::unsupported_on_system_indices("search_after"));
+    }
+    let unserved_keys = [
+        (!request.fields.is_empty(), "fields"),
+        (!request.docvalue_fields.is_empty(), "docvalue_fields"),
+        (request.terminate_after.is_some(), "terminate_after"),
+    ];
+    if let Some((_, key)) = unserved_keys.iter().find(|(is_requested, _)| *is_requested) {
+        return Err(OpenSearchError::unsupported_on_system_indices(key));
     }
     let concrete_indices = find_system_indices(snapshot, indices)?;
     let sort_plans = concrete_indices
@@ -1656,5 +1665,29 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "illegal_argument_exception");
         assert_eq!(body["error"]["key"], "search_after");
+    }
+
+    #[tokio::test]
+    async fn data_path_rendering_keys_on_a_system_index_are_a_400_naming_the_key() {
+        let snapshot = build_snapshot(&[("a", json!({"type": "dashboard"}))]);
+        let cases = [
+            (json!({"fields": ["type"]}), "fields"),
+            (json!({"docvalue_fields": [{"field": "updated_at"}]}), "docvalue_fields"),
+            (json!({"terminate_after": 100}), "terminate_after"),
+        ];
+
+        for (body, key) in cases {
+            let error = search_kibana_index(&snapshot, &body, "").expect_err("the key is refused");
+            let (status, answer) = render_envelope(error).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(answer["error"]["type"], "illegal_argument_exception", "{body}");
+            assert_eq!(answer["error"]["key"], key, "{body}");
+        }
+        let empty_lists_answer = search_kibana_index(&snapshot, &json!({"fields": [], "docvalue_fields": []}), "")
+            .expect("empty lists are served");
+        assert_eq!(
+            empty_lists_answer["hits"]["total"],
+            json!({"value": 1, "relation": "eq"})
+        );
     }
 }

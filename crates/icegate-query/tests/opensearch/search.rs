@@ -2272,3 +2272,544 @@ async fn the_id_of_a_row_with_a_date_or_a_null_timestamp_finds_that_row() {
     }
     server.shutdown().await;
 }
+
+/// Two tenant A log rows on 2025-10-09 (one with sub-millisecond digits), and a tenant B row.
+async fn seed_two_logs(catalog: &Arc<dyn iceberg::Catalog>) -> Result<(), RowWriteError> {
+    commit_rows(
+        catalog,
+        LOGS_TABLE,
+        &[
+            build_log_row(TENANT_A, 1_760_000_000_123_456, "first", "INFO"),
+            build_log_row(TENANT_A, 1_760_000_001_000_000, "second", "WARN"),
+            build_log_row(TENANT_B, 1_760_000_000_500_000, "tenant-b", "INFO"),
+        ],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_discover_style_request_renders_docvalue_fields_version_and_no_highlight() {
+    let (server, catalog) = TestServer::start().await;
+    seed_two_logs(&catalog).await.expect("seed");
+
+    let (status, answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search?ignore_unavailable=true&track_total_hits=true&timeout=30000ms&preference=1760000000000",
+        &json!({
+            "version": true,
+            "size": 500,
+            "sort": [{"timestamp": {"order": "desc", "unmapped_type": "boolean"}}],
+            "stored_fields": ["*"],
+            "script_fields": {},
+            "docvalue_fields": [{"field": "timestamp", "format": "date_time"}],
+            "_source": {"excludes": []},
+            "highlight": {
+                "pre_tags": ["@opensearch-dashboards-highlighted-field@"],
+                "post_tags": ["@/opensearch-dashboards-highlighted-field@"],
+                "fields": {"*": {}},
+                "fragment_size": 2_147_483_647
+            },
+            "query": {"bool": {
+                "must": [],
+                "filter": [{"range": {"timestamp": {
+                    "gte": "2025-10-09T00:00:00.000Z",
+                    "lte": "2025-10-09T23:59:59.999Z",
+                    "format": "strict_date_optional_time"
+                }}}],
+                "should": [],
+                "must_not": []
+            }}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["hits"]["total"], json!({"value": 2, "relation": "eq"}));
+    assert_eq!(answer["hits"]["max_score"], Value::Null);
+    let hits = answer["hits"]["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0]["_source"][COL_BODY], "second", "sorted by time, newest first");
+    assert_eq!(hits[0]["_version"], 1);
+    assert_eq!(hits[0]["_score"], Value::Null);
+    assert_eq!(
+        hits[0]["fields"],
+        json!({(COL_TIMESTAMP): ["2025-10-09T08:53:21.000Z"]})
+    );
+    assert_eq!(
+        hits[1]["fields"],
+        json!({(COL_TIMESTAMP): ["2025-10-09T08:53:20.123Z"]})
+    );
+    assert_eq!(hits[1]["sort"], json!([1_760_000_000_123_i64]));
+    for hit in hits {
+        assert!(hit.get("highlight").is_none(), "{hit}");
+        assert!(
+            hit["_source"][COL_SEVERITY_TEXT].is_string(),
+            "the whole source is kept: {hit}"
+        );
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_grafana_logs_style_request_carries_the_time_field_as_one_rfc3339_nano_string() {
+    let (server, catalog) = TestServer::start().await;
+    seed_two_logs(&catalog).await.expect("seed");
+
+    let (status, answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({
+            "size": 500,
+            "query": {"bool": {"filter": [{"range": {"timestamp": {
+                "gte": "1759968000000", "lte": "1760054399999", "format": "epoch_millis"
+            }}}]}},
+            "sort": [{"timestamp": {"order": "desc", "unmapped_type": "boolean"}}, {"_doc": {"order": "desc"}}],
+            "script_fields": {},
+            "fields": [{"field": "timestamp", "format": "strict_date_optional_time_nanos"}],
+            "docvalue_fields": ["timestamp"]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{answer}");
+    let hits = answer["hits"]["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(
+        hits[0]["fields"],
+        json!({(COL_TIMESTAMP): ["2025-10-09T08:53:21.000000Z"]})
+    );
+    assert_eq!(
+        hits[1]["fields"],
+        json!({(COL_TIMESTAMP): ["2025-10-09T08:53:20.123456Z"]})
+    );
+    server.shutdown().await;
+}
+
+/// A concrete `fields` name reaches a MAP key whose stored key holds dots (one no pattern of the
+/// request reaches), a promoted resource key and a hex id; a pattern reaches MAP entries by their
+/// `<column>.<stored key>` paths. A name that names nothing, and a row holding none of the
+/// values, add no key. The rows lie a millisecond apart, so the time sort orders them.
+#[tokio::test]
+async fn fields_render_map_keys_promoted_resource_keys_hex_ids_and_pattern_matched_map_entries() {
+    let (server, catalog) = TestServer::start().await;
+    commit_rows(
+        &catalog,
+        LOGS_TABLE,
+        &[
+            Row {
+                tenant: TENANT_A,
+                cells: vec![
+                    (COL_TIMESTAMP, Cell::Micros(T0 + 1_000)),
+                    (COL_SERVICE_NAME, Cell::Text("checkout")),
+                    (COL_TRACE_ID, Cell::Bytes(&TRACE_ID)),
+                    (COL_BODY, Cell::Text("with-attributes")),
+                    (COL_LOG_ATTRIBUTES, Cell::Map(&[("http.method", "GET"), ("http", "x")])),
+                    (COL_RESOURCE_ATTRIBUTES, Cell::Map(&[("host.name", "web-1")])),
+                ],
+            },
+            build_log_row(TENANT_A, T0, "plain", "INFO"),
+            Row {
+                tenant: TENANT_B,
+                cells: vec![
+                    (COL_TIMESTAMP, Cell::Micros(T0 + 2_000)),
+                    (COL_SERVICE_NAME, Cell::Text("tenant-b-service")),
+                    (COL_LOG_ATTRIBUTES, Cell::Map(&[("http.method", "POST")])),
+                ],
+            },
+        ],
+    )
+    .await
+    .expect("commit");
+
+    let (status, answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({
+            "sort": [{"timestamp": "desc"}],
+            "fields": [
+                "log_attributes.http.method",
+                "resource_attributes.host.name",
+                "resource_attributes.service.name",
+                "trace_id",
+                "log_attributes.*",
+                "log_attributes.absent"
+            ]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{answer}");
+    let hits = answer["hits"]["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 2, "{answer}");
+    assert_eq!(hits[0]["_source"][COL_BODY], "with-attributes");
+    assert_eq!(
+        hits[0]["fields"],
+        json!({
+            (format!("{COL_LOG_ATTRIBUTES}.http.method")): ["GET"],
+            (format!("{COL_LOG_ATTRIBUTES}.http")): ["x"],
+            (format!("{COL_RESOURCE_ATTRIBUTES}.host.name")): ["web-1"],
+            (format!("{COL_RESOURCE_ATTRIBUTES}.service.name")): ["checkout"],
+            (COL_TRACE_ID): ["0123456789abcdeffedcba9876543210"]
+        })
+    );
+    assert_eq!(hits[1]["_source"][COL_BODY], "plain");
+    assert!(hits[1].get("fields").is_none(), "{}", hits[1]);
+    server.shutdown().await;
+}
+
+/// A `fields` pattern renders every scalar column it matches, in the pattern's own format, and
+/// nothing for a column it does not match. A pattern reaching a MAP column renders only the
+/// column's entries by their paths, never the MAP column itself as one key.
+#[tokio::test]
+async fn field_patterns_render_matched_scalar_columns_in_their_format_and_maps_only_by_entry_paths() {
+    let (server, catalog) = TestServer::start().await;
+    seed_two_logs(&catalog).await.expect("seed");
+    commit_rows(
+        &catalog,
+        LOGS_TABLE,
+        &[Row {
+            tenant: TENANT_A,
+            cells: vec![
+                (COL_TIMESTAMP, Cell::Micros(T0)),
+                (COL_BODY, Cell::Text("with-attributes")),
+                (COL_SEVERITY_TEXT, Cell::Text("ERROR")),
+                (COL_LOG_ATTRIBUTES, Cell::Map(&[("http.method", "GET"), ("http", "x")])),
+                (COL_RESOURCE_ATTRIBUTES, Cell::Map(&[("host.name", "web-1")])),
+            ],
+        }],
+    )
+    .await
+    .expect("commit");
+
+    let (status, answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({
+            "sort": [{"timestamp": "desc"}],
+            "fields": [{"field": "time*", "format": "epoch_millis"}, "severity_*"]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{answer}");
+    let fields: Vec<&Value> = answer["hits"]["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|hit| &hit["fields"])
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            &json!({(COL_TIMESTAMP): ["1760000001000"], (COL_SEVERITY_TEXT): ["WARN"]}),
+            &json!({(COL_TIMESTAMP): ["1760000000123"], (COL_SEVERITY_TEXT): ["INFO"]}),
+            &json!({(COL_TIMESTAMP): ["1760000000000"], (COL_SEVERITY_TEXT): ["ERROR"]}),
+        ],
+        "{answer}"
+    );
+
+    let (status, answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({"sort": [{"timestamp": "asc"}], "size": 1, "fields": ["*"]}),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{answer}");
+    let hits = answer["hits"]["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 1, "{answer}");
+    let fields = hits[0]["fields"].as_object().expect("fields");
+    assert_eq!(fields.get(COL_BODY), Some(&json!(["with-attributes"])), "{answer}");
+    for (column, expected_paths) in [
+        (
+            COL_LOG_ATTRIBUTES,
+            vec![
+                format!("{COL_LOG_ATTRIBUTES}.http"),
+                format!("{COL_LOG_ATTRIBUTES}.http.method"),
+            ],
+        ),
+        (
+            COL_RESOURCE_ATTRIBUTES,
+            vec![format!("{COL_RESOURCE_ATTRIBUTES}.host.name")],
+        ),
+        (COL_SCOPE_ATTRIBUTES, Vec::new()),
+    ] {
+        let mut paths: Vec<&String> = fields.keys().filter(|key| key.starts_with(column)).collect();
+        paths.sort();
+        assert_eq!(paths, expected_paths.iter().collect::<Vec<_>>(), "{answer}");
+    }
+    assert_eq!(
+        fields.get(&format!("{COL_LOG_ATTRIBUTES}.http.method")),
+        Some(&json!(["GET"]))
+    );
+    assert_eq!(fields.get(&format!("{COL_LOG_ATTRIBUTES}.http")), Some(&json!(["x"])));
+    assert_eq!(
+        fields.get(&format!("{COL_RESOURCE_ATTRIBUTES}.host.name")),
+        Some(&json!(["web-1"]))
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn track_total_hits_integer_with_rest_total_hits_as_int_is_a_400() {
+    let (server, catalog) = TestServer::start().await;
+    seed_two_logs(&catalog).await.expect("seed");
+
+    for (path, body) in [
+        (
+            "/logs/_search?rest_total_hits_as_int=true&track_total_hits=100",
+            json!({}),
+        ),
+        (
+            "/logs/_search?rest_total_hits_as_int=true",
+            json!({"track_total_hits": 100}),
+        ),
+    ] {
+        let (status, refused) = post_json(&server, Some(TENANT_A), path, &body).await;
+        assert_eq!(status, 400, "{path} {body}: {refused}");
+        assert_eq!(refused["error"]["type"], "illegal_argument_exception");
+    }
+    let (status, integer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search?rest_total_hits_as_int=true",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{integer}");
+    assert_eq!(integer["hits"]["total"], json!(2));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn size_zero_still_answers_a_hits_array() {
+    let (server, catalog) = TestServer::start().await;
+    seed_two_logs(&catalog).await.expect("seed");
+
+    let (status, answer) = post_json(&server, Some(TENANT_A), "/logs/_search?size=0", &json!({})).await;
+
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["hits"]["hits"], json!([]));
+    assert_eq!(answer["hits"]["total"], json!({"value": 2, "relation": "eq"}));
+    assert_eq!(answer["hits"]["max_score"], Value::Null);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn script_fields_with_an_entry_is_a_400() {
+    let (server, catalog) = TestServer::start().await;
+    seed_two_logs(&catalog).await.expect("seed");
+
+    let (status, refused) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({"script_fields": {"doubled": {"script": {"source": "doc['x'].value * 2"}}}}),
+    )
+    .await;
+    assert_eq!(status, 400, "{refused}");
+    assert_eq!(refused["error"]["type"], "illegal_argument_exception");
+
+    let (status, accepted) = post_json(&server, Some(TENANT_A), "/logs/_search", &json!({"script_fields": {}})).await;
+    assert_eq!(status, 200, "{accepted}");
+    server.shutdown().await;
+}
+
+/// Tenant A has three committed and two WAL rows in `logs` and one span; tenant B's rows in the
+/// same append and the same segment are never counted. A total is `eq` only when it is exact.
+#[tokio::test]
+async fn hits_total_is_exact_whenever_reported_as_exact() {
+    let (server, catalog) = TestServer::start().await;
+    commit_rows(
+        &catalog,
+        LOGS_TABLE,
+        &[
+            build_log_row(TENANT_A, T0, "one", "INFO"),
+            build_log_row(TENANT_A, T0 + 1, "two", "INFO"),
+            build_log_row(TENANT_A, T0 + 2, "three", "INFO"),
+            build_log_row(TENANT_B, T0 + 3, "b-one", "INFO"),
+        ],
+    )
+    .await
+    .expect("commit logs");
+    write_wal_segment(
+        &server.wal_store,
+        &catalog,
+        LOGS_TABLE,
+        COMMITTED_WAL_OFFSET + 1,
+        &[
+            build_log_row(TENANT_A, T0 + 3, "four", "INFO"),
+            build_log_row(TENANT_B, T0 + 4, "b-two", "INFO"),
+            build_log_row(TENANT_A, T0 + 4, "five", "INFO"),
+        ],
+    )
+    .await
+    .expect("segment");
+    commit_rows(
+        &catalog,
+        SPANS_TABLE,
+        &[build_span_row(TENANT_A, T0, &TRACE_ID, "only-span")],
+    )
+    .await
+    .expect("commit spans");
+
+    let cases = [
+        (
+            "/logs/_search?track_total_hits=3",
+            Some(json!({"value": 3, "relation": "gte"})),
+        ),
+        (
+            "/logs/_search?track_total_hits=4",
+            Some(json!({"value": 4, "relation": "gte"})),
+        ),
+        (
+            "/logs/_search?track_total_hits=5",
+            Some(json!({"value": 5, "relation": "eq"})),
+        ),
+        (
+            "/logs/_search?track_total_hits=6",
+            Some(json!({"value": 5, "relation": "eq"})),
+        ),
+        (
+            "/logs/_search?track_total_hits=true",
+            Some(json!({"value": 5, "relation": "eq"})),
+        ),
+        ("/logs/_search", Some(json!({"value": 5, "relation": "eq"}))),
+        ("/logs/_search?track_total_hits=false", None),
+        (
+            "/logs/_search?track_total_hits=false&rest_total_hits_as_int=true",
+            Some(json!(-1)),
+        ),
+        (
+            "/logs,spans/_search?track_total_hits=5",
+            Some(json!({"value": 5, "relation": "gte"})),
+        ),
+        (
+            "/logs,spans/_search?track_total_hits=6",
+            Some(json!({"value": 6, "relation": "eq"})),
+        ),
+    ];
+    for (path, expected) in cases {
+        let (status, answer) = post_json(&server, Some(TENANT_A), path, &json!({})).await;
+        assert_eq!(status, 200, "{path}: {answer}");
+        assert_eq!(answer["hits"].get("total").cloned(), expected, "{path}");
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn score_and_max_score_are_null_when_sorting_on_a_field_and_one_otherwise() {
+    let (server, catalog) = TestServer::start().await;
+    seed_two_logs(&catalog).await.expect("seed");
+
+    for (sort, expected) in [
+        (None, json!(1.0)),
+        (Some(json!([{"_score": {"order": "desc"}}])), json!(1.0)),
+        (Some(json!([{"timestamp": "desc"}])), Value::Null),
+        (Some(json!([{"_score": "desc"}, {"timestamp": "desc"}])), Value::Null),
+        (Some(json!([{"_doc": "asc"}])), Value::Null),
+    ] {
+        let mut body = json!({});
+        if let Some(sort) = &sort {
+            body["sort"] = sort.clone();
+        }
+        let (status, answer) = post_json(&server, Some(TENANT_A), "/logs/_search", &body).await;
+        assert_eq!(status, 200, "{body}: {answer}");
+        assert_eq!(answer["hits"]["max_score"], expected, "{body}");
+        let scores: Vec<Value> = answer["hits"]["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .map(|hit| hit["_score"].clone())
+            .collect();
+        assert_eq!(scores, vec![expected.clone(), expected.clone()], "{body}");
+    }
+    // Unsorted hits come in no promised order, so they are compared as a set.
+    let (_, unsorted) = post_json(&server, Some(TENANT_A), "/logs/_search", &json!({})).await;
+    assert_eq!(read_sorted_source_texts(&unsorted, COL_BODY), vec!["first", "second"]);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn requesting_a_field_typed_differently_across_indices_in_fields_or_docvalue_fields_is_a_400() {
+    let (server, catalog) = TestServer::start().await;
+    // The table exists before the first request: the engine caches the catalog provider the
+    // first request builds.
+    create_exact_name_table(
+        &catalog,
+        "scans",
+        vec![
+            required_string(1, COL_TENANT_ID),
+            NestedField::required(2, COL_TIMESTAMP, Type::Primitive(PrimitiveType::Timestamp)),
+            NestedField::optional(3, COL_NAME, Type::Primitive(PrimitiveType::Long)),
+        ],
+    )
+    .await
+    .expect("create scans");
+
+    for body in [
+        json!({"fields": ["name"]}),
+        json!({"docvalue_fields": [{"field": "name"}]}),
+        json!({"fields": ["na*"]}),
+    ] {
+        let (status, refused) = post_json(&server, Some(TENANT_A), "/scans,spans/_search", &body).await;
+        assert_eq!(status, 400, "{body}: {refused}");
+        assert_eq!(refused["error"]["type"], "illegal_argument_exception", "{body}");
+        assert_eq!(refused["error"]["field"], COL_NAME, "{body}");
+        assert_eq!(
+            refused["error"]["indices"],
+            json!({"long": ["scans"], "keyword": ["spans"]}),
+            "{body}"
+        );
+    }
+    for body in [json!({"fields": ["timestamp"]}), json!({"_source": true})] {
+        let (status, answer) = post_json(&server, Some(TENANT_A), "/scans,spans/_search", &body).await;
+        assert_eq!(status, 200, "{body}: {answer}");
+    }
+    let (status, refused) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/spans/_search",
+        &json!({"fields": [{"field": "name", "format": "date_time"}]}),
+    )
+    .await;
+    assert_eq!(status, 400, "a format on a keyword field: {refused}");
+    assert_eq!(refused["error"]["type"], "illegal_argument_exception");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn terminate_after_reports_not_terminated_early_and_source_false_omits_source() {
+    let (server, catalog) = TestServer::start().await;
+    seed_two_logs(&catalog).await.expect("seed");
+
+    let (status, answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({"terminate_after": 100, "_source": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["terminated_early"], false);
+    assert_eq!(answer["hits"]["total"], json!({"value": 2, "relation": "eq"}));
+    let hits = answer["hits"]["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 2);
+    for hit in hits {
+        assert!(hit.get("_source").is_none(), "no _source key: {hit}");
+        assert!(hit["_id"].is_string(), "{hit}");
+    }
+
+    let (status, plain) = post_json(&server, Some(TENANT_A), "/logs/_search", &json!({})).await;
+    assert_eq!(status, 200, "{plain}");
+    assert!(
+        plain.get("terminated_early").is_none(),
+        "only terminate_after adds the key: {plain}"
+    );
+    server.shutdown().await;
+}
