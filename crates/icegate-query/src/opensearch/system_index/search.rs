@@ -309,7 +309,7 @@ pub(crate) fn search_system_indices(
     };
     hits_object.insert("max_score".to_string(), max_score);
     hits_object.insert("hits".to_string(), Value::Array(page));
-    let took = (Utc::now() - context.now).num_milliseconds().max(0);
+    let took = measure_took(context.now);
     Ok(json!({
         "took": took,
         "timed_out": false,
@@ -636,6 +636,11 @@ fn render_hit(hit: &SystemHit<'_>, keys: &[SortKey<'_>], request: &SearchRequest
         );
     }
     Value::Object(rendered_hit)
+}
+
+/// The `took` of an answer to the request received at `request_instant`, in milliseconds.
+pub(super) fn measure_took(request_instant: DateTime<Utc>) -> i64 {
+    (Utc::now() - request_instant).num_milliseconds().max(0)
 }
 
 /// `hits.total` per `track_total_hits` and `rest_total_hits_as_int`; `None` omits it.

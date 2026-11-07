@@ -25,6 +25,7 @@ use super::filter_path::apply_filter_path;
 use super::search;
 use super::state::OpenSearchState;
 use super::system_index;
+use super::system_index::scroll::{clear_scroll, continue_scroll};
 use super::system_index::{
     apply_aliases, bulk, create_system_index, delete_index_template, describe_system_index, documents, get_alias,
     get_index_aliases, refresh_index,
@@ -117,6 +118,14 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
         .route(
             "/{index}/_search",
             get(search::search_indices).post(search::search_indices),
+        )
+        .route(
+            "/_search/scroll",
+            get(continue_scroll).post(continue_scroll).delete(clear_scroll),
+        )
+        .route(
+            "/_search/scroll/{scroll_id}",
+            get(continue_scroll).post(continue_scroll).delete(clear_scroll),
         )
         .route("/_template/{name}", delete(delete_index_template))
         .route("/_cat/templates/{pattern}", get(cat::list_index_templates))

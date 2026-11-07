@@ -65,6 +65,7 @@ pub async fn run_with_port_tx(
             max_snapshot_bytes: config.system_indices.max_snapshot_bytes,
             cache_max_bytes: config.system_indices.cache_max_bytes,
             write_deadline: Duration::from_secs(runtime.engine.config().max_query_duration_secs),
+            max_scroll_lifetime: Duration::from_secs(config.system_indices.max_scroll_lifetime_secs),
         },
     ));
     let version = EmulatedVersion::parse(&config.version)?;

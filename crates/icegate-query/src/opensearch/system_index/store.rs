@@ -63,7 +63,7 @@ use super::snapshot::{SystemOperation, SystemOutcome, SystemSnapshot};
 use crate::opensearch::error::OpenSearchError;
 
 /// Prefix of every snapshot name: snapshot objects are `snap-<uuid>`.
-const SNAPSHOT_NAME_PREFIX: &str = "snap-";
+pub(super) const SNAPSHOT_NAME_PREFIX: &str = "snap-";
 /// Upper bound of the first retry's sleep; each later retry doubles it, up to [`MAX_BACKOFF`].
 const FIRST_BACKOFF: Duration = Duration::from_millis(10);
 /// Largest upper bound of one retry's sleep.
@@ -78,10 +78,13 @@ pub(crate) struct SystemIndexLimits {
     pub(crate) cache_max_bytes: usize,
     /// How long one batch of writes may retry before answering `503`: the query deadline.
     pub(crate) write_deadline: Duration,
+    /// The longest `scroll` keep-alive a search may ask for (`max_scroll_lifetime_secs`).
+    pub(crate) max_scroll_lifetime: Duration,
 }
 
-/// A tenant's system-index state as one read saw it.
-#[derive(Debug, Clone)]
+/// A tenant's system-index state as one read saw it. The default is the empty state of a tenant
+/// without a pointer.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct CurrentSnapshot {
     /// Snapshot name of the snapshot object the pointer named; `None` for the empty state of an
     /// absent pointer. A write records it as the next snapshot object's predecessor.
@@ -113,21 +116,37 @@ impl PointerState {
     fn from_absent_pointer() -> Self {
         Self {
             etag: None,
-            current_snapshot: CurrentSnapshot {
-                snapshot_name: None,
-                snapshot: Arc::new(SystemSnapshot::default()),
-            },
+            current_snapshot: CurrentSnapshot::default(),
             decoded_len: 0,
         }
     }
 }
 
+/// A snapshot a scroll read by name that this replica's pointer state did not hold (usually a
+/// superseded one), and the decoded length the cache charges for it.
+struct ScrolledSnapshot {
+    /// The decoded snapshot, shared with the pages that read it.
+    snapshot: Arc<SystemSnapshot>,
+    /// Decoded length of `snapshot`, which the cache is bounded by.
+    decoded_len: usize,
+}
+
+/// The cache key of the scrolled snapshot `snapshot_name` of `tenant`: a tenant id holds no `/`,
+/// so `<tenant>/<snapshot name>` is unambiguous and a name read under another tenant never finds
+/// this tenant's entry.
+fn build_scrolled_snapshot_key(tenant: &TenantId, snapshot_name: &str) -> String {
+    format!("{}/{snapshot_name}", tenant.as_ref())
+}
+
 /// The pointer states of the most recently used tenants, bounded by their total decoded length.
-/// An absent pointer is never cached: there is nothing to revalidate.
+/// An absent pointer is never cached: there is nothing to revalidate. The snapshots scrolls read by
+/// name that no pointer state held share the bound and are evicted before any pointer state.
 struct SnapshotCache {
     /// The cached states, by tenant, in recency order.
     entries: LruCache<String, PointerState>,
-    /// Sum of the cached states' decoded lengths.
+    /// The scrolled snapshots, by [`build_scrolled_snapshot_key`], in recency order.
+    scrolled_snapshots: LruCache<String, ScrolledSnapshot>,
+    /// Sum of the decoded lengths of the cached states and scrolled snapshots.
     total_bytes: usize,
     /// Bound of `total_bytes` once a store has evicted what it must.
     max_bytes: usize,
@@ -138,6 +157,7 @@ impl SnapshotCache {
     fn new(max_bytes: usize) -> Self {
         Self {
             entries: LruCache::unbounded(),
+            scrolled_snapshots: LruCache::unbounded(),
             total_bytes: 0,
             max_bytes,
         }
@@ -148,25 +168,75 @@ impl SnapshotCache {
         self.entries.get(tenant.as_ref()).cloned()
     }
 
-    /// Cache `state` for `tenant`, then evict the least recently used tenants until the total fits.
+    /// Cache `state` for `tenant`, then evict until the total fits.
     fn store_state(&mut self, tenant: &TenantId, state: PointerState) {
         let added_len = state.decoded_len;
         if let Some(replaced_state) = self.entries.put(tenant.as_ref().to_string(), state) {
             self.total_bytes = self.total_bytes.saturating_sub(replaced_state.decoded_len);
         }
         self.total_bytes = self.total_bytes.saturating_add(added_len);
-        while self.total_bytes > self.max_bytes {
-            let Some((_, evicted_state)) = self.entries.pop_lru() else {
-                break;
-            };
-            self.total_bytes = self.total_bytes.saturating_sub(evicted_state.decoded_len);
-        }
+        self.evict_to_bound();
     }
 
     /// Forget `tenant`, so its next read reloads the pointer.
     fn remove_state(&mut self, tenant: &TenantId) {
         if let Some(removed_state) = self.entries.pop(tenant.as_ref()) {
             self.total_bytes = self.total_bytes.saturating_sub(removed_state.decoded_len);
+        }
+    }
+
+    /// The snapshot the cached pointer state of `tenant` names, when its name is `snapshot_name`;
+    /// the state is marked most recently used.
+    fn find_current_snapshot_named(&mut self, tenant: &TenantId, snapshot_name: &str) -> Option<Arc<SystemSnapshot>> {
+        self.entries
+            .get(tenant.as_ref())
+            .filter(|state| state.current_snapshot.snapshot_name.as_deref() == Some(snapshot_name))
+            .map(|state| Arc::clone(&state.current_snapshot.snapshot))
+    }
+
+    /// The scrolled snapshot cached under `key` (see [`build_scrolled_snapshot_key`]), marked most
+    /// recently used.
+    fn find_scrolled_snapshot(&mut self, key: &str) -> Option<Arc<SystemSnapshot>> {
+        self.scrolled_snapshots.get(key).map(|entry| Arc::clone(&entry.snapshot))
+    }
+
+    /// Cache the scrolled snapshot `entry` under `key` (see [`build_scrolled_snapshot_key`]), then
+    /// evict until the total fits. A scrolled snapshot never evicts a pointer state: one that does
+    /// not fit beside them is dropped at once, and the next page fetches its object again.
+    fn store_scrolled_snapshot(&mut self, key: String, entry: ScrolledSnapshot) {
+        let added_len = entry.decoded_len;
+        if let Some(replaced_entry) = self.scrolled_snapshots.put(key, entry) {
+            self.total_bytes = self.total_bytes.saturating_sub(replaced_entry.decoded_len);
+        }
+        self.total_bytes = self.total_bytes.saturating_add(added_len);
+        self.evict_to_bound();
+    }
+
+    /// Remove and return the scrolled snapshot `snapshot_name` of `tenant`, so a pointer state that
+    /// comes to name it holds the one decoded copy instead of a second.
+    fn take_scrolled_snapshot(&mut self, tenant: &TenantId, snapshot_name: &str) -> Option<ScrolledSnapshot> {
+        if self.scrolled_snapshots.is_empty() {
+            return None;
+        }
+        let entry = self
+            .scrolled_snapshots
+            .pop(&build_scrolled_snapshot_key(tenant, snapshot_name))?;
+        self.total_bytes = self.total_bytes.saturating_sub(entry.decoded_len);
+        Some(entry)
+    }
+
+    /// Evict scrolled snapshots, then pointer states, least recently used first, until the total
+    /// fits the bound.
+    fn evict_to_bound(&mut self) {
+        while self.total_bytes > self.max_bytes {
+            let evicted_len = if let Some((_, evicted_entry)) = self.scrolled_snapshots.pop_lru() {
+                evicted_entry.decoded_len
+            } else if let Some((_, evicted_state)) = self.entries.pop_lru() {
+                evicted_state.decoded_len
+            } else {
+                break;
+            };
+            self.total_bytes = self.total_bytes.saturating_sub(evicted_len);
         }
     }
 }
@@ -339,6 +409,60 @@ impl SystemIndexStore {
         answer
             .await
             .map_err(|_| OpenSearchError::internal("the system-index write loop dropped an operation"))?
+    }
+
+    /// The longest `scroll` keep-alive a search may ask for.
+    pub(crate) fn max_scroll_lifetime(&self) -> Duration {
+        self.shared.limits.max_scroll_lifetime
+    }
+
+    /// How long one batch of writes may retry: the query deadline, which garbage collection adds
+    /// on top of the longest scroll keep-alive when it retains a superseded snapshot object.
+    pub(crate) fn write_deadline(&self) -> Duration {
+        self.shared.limits.write_deadline
+    }
+
+    /// The snapshot object `snapshot_name` of `tenant`, decoded; `None` when that object is gone
+    /// (garbage collected, or named under another tenant). What a scroll reads through this is the
+    /// snapshot it opened on, never a newer one.
+    ///
+    /// A snapshot object never changes, so a copy this replica holds is served without a request:
+    /// neither the pointer nor the copy is revalidated. Any other snapshot is fetched and decoded
+    /// once, then served from the decoded-snapshot cache, within `cache_max_bytes`, until evicted
+    /// or until a pointer state of this replica comes to name it and takes the copy over. A cached
+    /// copy outlives its object only past the expiry of every scroll on it, because garbage
+    /// collection waits that long, and the caller checks the expiry first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `500` when the object store fails or the snapshot object is corrupt.
+    pub(crate) async fn read_snapshot_by_name(
+        &self,
+        tenant: &TenantId,
+        snapshot_name: &str,
+    ) -> Result<Option<Arc<SystemSnapshot>>, OpenSearchError> {
+        // Each lookup is bound to a local, so the cache's guard is released before any await.
+        let current_snapshot = self.shared.lock_cache().find_current_snapshot_named(tenant, snapshot_name);
+        if current_snapshot.is_some() {
+            return Ok(current_snapshot);
+        }
+        let key = build_scrolled_snapshot_key(tenant, snapshot_name);
+        let scrolled_snapshot = self.shared.lock_cache().find_scrolled_snapshot(&key);
+        if scrolled_snapshot.is_some() {
+            return Ok(scrolled_snapshot);
+        }
+        let Some(decoded_object) = self.shared.fetch_snapshot_object(tenant, snapshot_name).await? else {
+            return Ok(None);
+        };
+        let snapshot = Arc::new(decoded_object.snapshot);
+        self.shared.lock_cache().store_scrolled_snapshot(
+            key,
+            ScrolledSnapshot {
+                snapshot: Arc::clone(&snapshot),
+                decoded_len: decoded_object.decoded_len,
+            },
+        );
+        Ok(Some(snapshot))
     }
 
     /// The sender of `tenant`'s open write queue, starting a write loop when it has none.
@@ -589,21 +713,28 @@ impl StoreShared {
             self.lock_cache().remove_state(tenant);
             return Ok(PointerState::from_absent_pointer());
         };
-        let decoded_object = self.load_snapshot_object(tenant, &snapshot_name).await?;
+        let scrolled_snapshot = self.lock_cache().take_scrolled_snapshot(tenant, &snapshot_name);
+        let (snapshot, decoded_len) = match scrolled_snapshot {
+            Some(entry) => (entry.snapshot, entry.decoded_len),
+            None => {
+                let decoded_object = self.load_snapshot_object(tenant, &snapshot_name).await?;
+                (Arc::new(decoded_object.snapshot), decoded_object.decoded_len)
+            }
+        };
         let state = PointerState {
             etag: Some(etag),
             current_snapshot: CurrentSnapshot {
                 snapshot_name: Some(Arc::from(snapshot_name)),
-                snapshot: Arc::new(decoded_object.snapshot),
+                snapshot,
             },
-            decoded_len: decoded_object.decoded_len,
+            decoded_len,
         };
         self.lock_cache().store_state(tenant, state.clone());
         Ok(state)
     }
 
-    /// The snapshot object `snapshot_name` of `tenant`, downloaded and decoded on the blocking
-    /// pool.
+    /// The snapshot object `snapshot_name` the pointer of `tenant` names, as
+    /// [`Self::fetch_snapshot_object`] reads it.
     ///
     /// # Errors
     ///
@@ -613,20 +744,43 @@ impl StoreShared {
         tenant: &TenantId,
         snapshot_name: &str,
     ) -> Result<DecodedSnapshotObject, OpenSearchError> {
-        let path = self.system_object_store.snapshot_path(tenant, snapshot_name);
-        let result = self.system_object_store.object_store().get(&path).await.map_err(|error| {
+        self.fetch_snapshot_object(tenant, snapshot_name).await?.ok_or_else(|| {
             OpenSearchError::internal(format!(
-                "cannot read the snapshot object {path} the pointer names: {error}"
+                "the pointer of {tenant} names the missing snapshot object {snapshot_name}"
             ))
-        })?;
+        })
+    }
+
+    /// The snapshot object `snapshot_name` of `tenant`, downloaded and decoded on the blocking
+    /// pool; `None` when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `500` when the object cannot be read or is corrupt.
+    async fn fetch_snapshot_object(
+        &self,
+        tenant: &TenantId,
+        snapshot_name: &str,
+    ) -> Result<Option<DecodedSnapshotObject>, OpenSearchError> {
+        let path = self.system_object_store.snapshot_path(tenant, snapshot_name);
+        let result = match self.system_object_store.object_store().get(&path).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(OpenSearchError::internal(format!(
+                    "cannot read the snapshot object {path}: {error}"
+                )));
+            }
+        };
         let bytes = result
             .bytes()
             .await
             .map_err(|error| OpenSearchError::internal(format!("cannot read the snapshot object {path}: {error}")))?;
-        run_blocking_work("decoding a system-index snapshot object", move || {
+        let decoded_object = run_blocking_work("decoding a system-index snapshot object", move || {
             decode_snapshot_object(&bytes)
         })
-        .await
+        .await?;
+        Ok(Some(decoded_object))
     }
 
     /// Swap the batch in, answering every operation. A batch too large as a whole is split, so
@@ -1095,6 +1249,8 @@ mod tests {
         snapshot_put_failures: Mutex<(SnapshotPutFailure, usize)>,
         /// How many snapshot-object puts the double received.
         snapshot_put_count: Mutex<usize>,
+        /// How many of the upcoming snapshot-object reads answer with a transient error.
+        snapshot_read_failure_count: Mutex<usize>,
         delayed_request: Mutex<Option<(Path, PutPayload, PutOptions)>>,
         reads: Mutex<Vec<RecordedRead>>,
         pointer_swaps: Mutex<Vec<&'static str>>,
@@ -1108,6 +1264,7 @@ mod tests {
                 read_faults: Mutex::new(VecDeque::new()),
                 snapshot_put_failures: Mutex::new((SnapshotPutFailure::Transient, 0)),
                 snapshot_put_count: Mutex::new(0),
+                snapshot_read_failure_count: Mutex::new(0),
                 delayed_request: Mutex::new(None),
                 reads: Mutex::new(Vec::new()),
                 pointer_swaps: Mutex::new(Vec::new()),
@@ -1124,6 +1281,18 @@ mod tests {
 
         fn fail_snapshot_puts(&self, failure: SnapshotPutFailure, failure_count: usize) {
             *self.snapshot_put_failures.lock().expect("put failures") = (failure, failure_count);
+        }
+
+        fn fail_snapshot_reads(&self, failure_count: usize) {
+            *self.snapshot_read_failure_count.lock().expect("snapshot read failures") = failure_count;
+        }
+
+        /// Whether the next snapshot-object read fails, counting it down when it does.
+        fn take_snapshot_read_failure(&self) -> bool {
+            let mut failure_count = self.snapshot_read_failure_count.lock().expect("snapshot read failures");
+            let has_failure = *failure_count > 0;
+            *failure_count = failure_count.saturating_sub(usize::from(has_failure));
+            has_failure
         }
 
         fn count_snapshot_puts(&self) -> usize {
@@ -1303,7 +1472,7 @@ mod tests {
             let read_fault = if location.filename() == Some("current") {
                 self.read_faults.lock().expect("read faults").pop_front().flatten()
             } else {
-                None
+                self.take_snapshot_read_failure().then_some(PointerReadFault::Fail)
             };
             let result = match read_fault {
                 None => self.memory_store.get_opts(location, options).await,
@@ -1349,6 +1518,7 @@ mod tests {
             max_snapshot_bytes: 1 << 20,
             cache_max_bytes: 4 << 20,
             write_deadline: Duration::from_secs(30),
+            max_scroll_lifetime: Duration::from_mins(15),
         }
     }
 
@@ -2292,6 +2462,282 @@ mod tests {
             reads.iter().all(|read| read.path.starts_with("opensearch-system/tenant-b/")),
             "{reads:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_superseded_snapshot_is_fetched_once_while_it_fits_the_cache() {
+        let (double, scripted_replica, _other_replica) = build_replicas(build_limits());
+        let tenant = build_tenant(TENANT_A);
+        scripted_replica
+            .write(&tenant, build_index_creation(".kibana_1"))
+            .await
+            .expect("first write");
+        let scrolled_name = scripted_replica
+            .read(&tenant)
+            .await
+            .expect("read")
+            .snapshot_name
+            .expect("the pointer exists");
+        scripted_replica
+            .write(&tenant, build_index_creation(".kibana_2"))
+            .await
+            .expect("second write");
+        double.clear_reads();
+
+        for page in 1..=2 {
+            let snapshot = scripted_replica
+                .read_snapshot_by_name(&tenant, &scrolled_name)
+                .await
+                .expect("read by name")
+                .expect("the superseded object exists");
+            assert!(snapshot.find_index(".kibana_1").is_some(), "page {page}");
+            assert!(snapshot.find_index(".kibana_2").is_none(), "page {page}");
+        }
+
+        // One read in all: the object once, and the pointer never, because an immutable object
+        // needs no revalidation.
+        assert_eq!(
+            double.list_reads(),
+            [RecordedRead {
+                path: format!("opensearch-system/tenant-a/{scrolled_name}"),
+                is_conditional: false,
+                is_range: false,
+                is_not_modified: false,
+            }]
+        );
+        let other_tenant = build_tenant(TENANT_B);
+        assert!(
+            scripted_replica
+                .read_snapshot_by_name(&other_tenant, &scrolled_name)
+                .await
+                .expect("read by name")
+                .is_none(),
+            "another tenant never reads the cached snapshot"
+        );
+    }
+
+    /// Whatever the object store still holds, the replica's own copy of the current snapshot serves
+    /// a page: an immutable object needs no request.
+    #[tokio::test]
+    async fn a_snapshot_the_pointer_state_holds_is_read_by_name_without_a_request() {
+        let (double, scripted_replica, _other_replica) = build_replicas(build_limits());
+        let tenant = build_tenant(TENANT_A);
+        scripted_replica
+            .write(&tenant, build_index_creation(".kibana_1"))
+            .await
+            .expect("write");
+        let current_snapshot = scripted_replica.read(&tenant).await.expect("read");
+        double.clear_reads();
+
+        let snapshot = scripted_replica
+            .read_snapshot_by_name(&tenant, current_snapshot.snapshot_name.as_deref().expect("a pointer"))
+            .await
+            .expect("read by name")
+            .expect("the current snapshot");
+
+        assert!(Arc::ptr_eq(&snapshot, &current_snapshot.snapshot));
+        assert_eq!(double.list_reads(), []);
+    }
+
+    /// A replica that never read the tenant serves a scroll page of its current snapshot, then reads
+    /// the pointer naming it: the pointer state takes the scrolled copy over, so the object is
+    /// fetched and decoded once.
+    #[tokio::test]
+    async fn a_pointer_state_takes_over_the_snapshot_a_scroll_read_by_name() {
+        let (double, scripted_replica, other_replica) = build_replicas(build_limits());
+        let tenant = build_tenant(TENANT_A);
+        other_replica
+            .write(&tenant, build_index_creation(".kibana_1"))
+            .await
+            .expect("write");
+        let current_name = other_replica
+            .read(&tenant)
+            .await
+            .expect("read")
+            .snapshot_name
+            .expect("the pointer exists");
+        double.clear_reads();
+
+        let scrolled_snapshot = scripted_replica
+            .read_snapshot_by_name(&tenant, &current_name)
+            .await
+            .expect("read by name")
+            .expect("the current object exists");
+        let current_snapshot = scripted_replica.read(&tenant).await.expect("read");
+
+        assert!(Arc::ptr_eq(&current_snapshot.snapshot, &scrolled_snapshot));
+        assert_eq!(
+            double.list_reads(),
+            [
+                RecordedRead {
+                    path: format!("opensearch-system/tenant-a/{current_name}"),
+                    is_conditional: false,
+                    is_range: false,
+                    is_not_modified: false,
+                },
+                RecordedRead {
+                    path: "opensearch-system/tenant-a/current".to_string(),
+                    is_conditional: false,
+                    is_range: false,
+                    is_not_modified: false,
+                },
+            ]
+        );
+    }
+
+    /// `.kibana_1` of `tenant` is the state the first swap installed, and the pointer has moved on to
+    /// a state that adds `.kibana_2`. Answers the first state's snapshot name.
+    async fn write_superseded_snapshot(replica: &SystemIndexStore, tenant: &TenantId) -> Arc<str> {
+        replica
+            .write(tenant, build_index_creation(".kibana_1"))
+            .await
+            .expect("first write");
+        let superseded_name = replica
+            .read(tenant)
+            .await
+            .expect("read")
+            .snapshot_name
+            .expect("the pointer exists");
+        replica
+            .write(tenant, build_index_creation(".kibana_2"))
+            .await
+            .expect("second write");
+        superseded_name
+    }
+
+    /// The cache holds the pointer state and nothing beside it, so the superseded snapshot is
+    /// dropped as soon as it is stored: every page fetches it, and the pointer state stays.
+    #[tokio::test]
+    async fn a_superseded_snapshot_that_does_not_fit_is_fetched_again_and_keeps_the_pointer_state() {
+        let two_index_size = measure_snapshot_with_indices(&[".kibana_1", ".kibana_2"]);
+        let limits = SystemIndexLimits {
+            max_snapshot_bytes: two_index_size,
+            cache_max_bytes: two_index_size,
+            ..build_limits()
+        };
+        let (double, scripted_replica, _other_replica) = build_replicas(limits);
+        let tenant = build_tenant(TENANT_A);
+        let superseded_name = write_superseded_snapshot(&scripted_replica, &tenant).await;
+        double.clear_reads();
+
+        for page in 1..=2 {
+            let snapshot = scripted_replica
+                .read_snapshot_by_name(&tenant, &superseded_name)
+                .await
+                .expect("read by name")
+                .expect("the superseded object exists");
+            assert!(snapshot.find_index(".kibana_2").is_none(), "page {page}");
+        }
+        scripted_replica.read(&tenant).await.expect("read");
+
+        let object_read = RecordedRead {
+            path: format!("opensearch-system/tenant-a/{superseded_name}"),
+            is_conditional: false,
+            is_range: false,
+            is_not_modified: false,
+        };
+        assert_eq!(
+            double.list_reads(),
+            [
+                object_read.clone(),
+                object_read,
+                RecordedRead {
+                    path: "opensearch-system/tenant-a/current".to_string(),
+                    is_conditional: true,
+                    is_range: false,
+                    is_not_modified: true,
+                },
+            ]
+        );
+    }
+
+    /// The bound holds tenant a's pointer state and its superseded snapshot exactly. Tenant b's
+    /// pointer state pushes the total past it, and the superseded snapshot leaves, not a's state.
+    #[tokio::test]
+    async fn a_new_pointer_state_evicts_a_superseded_snapshot_before_any_pointer_state() {
+        let one_index_size = measure_snapshot_with_indices(&[".kibana_1"]);
+        let two_index_size = measure_snapshot_with_indices(&[".kibana_1", ".kibana_2"]);
+        let limits = SystemIndexLimits {
+            max_snapshot_bytes: two_index_size,
+            cache_max_bytes: two_index_size + one_index_size,
+            ..build_limits()
+        };
+        let (double, scripted_replica, _other_replica) = build_replicas(limits);
+        let [tenant_a, tenant_b] = [TENANT_A, TENANT_B].map(build_tenant);
+        let superseded_name = write_superseded_snapshot(&scripted_replica, &tenant_a).await;
+        scripted_replica
+            .read_snapshot_by_name(&tenant_a, &superseded_name)
+            .await
+            .expect("read by name")
+            .expect("the superseded object exists");
+        double.clear_reads();
+        scripted_replica
+            .read_snapshot_by_name(&tenant_a, &superseded_name)
+            .await
+            .expect("read by name")
+            .expect("the superseded object exists");
+        assert_eq!(double.list_reads(), [], "the snapshot fits while nothing else arrives");
+
+        scripted_replica
+            .write(&tenant_b, build_index_creation(".kibana_1"))
+            .await
+            .expect("tenant b writes");
+        double.clear_reads();
+        scripted_replica.read(&tenant_a).await.expect("read a");
+        scripted_replica
+            .read_snapshot_by_name(&tenant_a, &superseded_name)
+            .await
+            .expect("read by name")
+            .expect("the superseded object exists");
+
+        assert_eq!(
+            double.list_reads(),
+            [
+                RecordedRead {
+                    path: "opensearch-system/tenant-a/current".to_string(),
+                    is_conditional: true,
+                    is_range: false,
+                    is_not_modified: true,
+                },
+                RecordedRead {
+                    path: format!("opensearch-system/tenant-a/{superseded_name}"),
+                    is_conditional: false,
+                    is_range: false,
+                    is_not_modified: false,
+                },
+            ]
+        );
+    }
+
+    /// A failed read and a corrupt object are `500`s: answering either as a gone object would tell
+    /// the client its scroll ended.
+    #[tokio::test]
+    async fn a_snapshot_object_that_cannot_be_read_by_name_is_a_500() {
+        let (double, scripted_replica, _other_replica) = build_replicas(build_limits());
+        let tenant = build_tenant(TENANT_A);
+        let superseded_name = write_superseded_snapshot(&scripted_replica, &tenant).await;
+        double.fail_snapshot_reads(1);
+
+        let read_error = scripted_replica
+            .read_snapshot_by_name(&tenant, &superseded_name)
+            .await
+            .expect_err("the read failed");
+
+        assert_error(read_error, StatusCode::INTERNAL_SERVER_ERROR, "exception").await;
+        double
+            .memory_store
+            .put_opts(
+                &Path::from(format!("opensearch-system/{TENANT_A}/{superseded_name}")),
+                PutPayload::from_static(b"not a snapshot object"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("a corrupt object");
+        let corrupt_error = scripted_replica
+            .read_snapshot_by_name(&tenant, &superseded_name)
+            .await
+            .expect_err("the object is corrupt");
+        assert_error(corrupt_error, StatusCode::INTERNAL_SERVER_ERROR, "exception").await;
     }
 
     /// A create or index of the document `id` of `.kibana_1` holding `{"title": title}`.

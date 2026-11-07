@@ -4,6 +4,9 @@
 //! A key IceGate does not apply is refused rather than ignored: an ignored `search_after` or
 //! `highlight` would hand the client an answer to a different request.
 
+use std::borrow::Cow;
+use std::iter;
+
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -149,6 +152,8 @@ pub(crate) struct SearchParameters {
     pub(crate) allow_no_indices: Option<bool>,
     /// Index option: what wildcards expand to.
     pub(crate) expand_wildcards: Option<String>,
+    /// Opens a scroll with this keep-alive (system indices only).
+    pub(crate) scroll: Option<String>,
 }
 
 impl EndpointParameters for SearchParameters {
@@ -176,6 +181,39 @@ pub(crate) fn parse_search_request(
     body: &[u8],
     parameters: &SearchParameters,
 ) -> Result<SearchRequest, OpenSearchError> {
+    let entries = parse_search_body(body)?
+        .into_iter()
+        .map(|(key, value)| (key, Cow::Owned(value)));
+    parse_search_entries(entries, parameters)
+}
+
+/// Parse a search body already read as JSON (`null` means `{}`) together with its query-string
+/// parameters. The body stays the caller's: only the `aggs` the request keeps are copied out of it.
+///
+/// # Errors
+///
+/// `parsing_exception` for a body that is neither `null` nor an object; past reading the JSON, the
+/// errors of [`parse_search_request`].
+pub(crate) fn parse_search_value(
+    body: &Value,
+    parameters: &SearchParameters,
+) -> Result<SearchRequest, OpenSearchError> {
+    match body {
+        Value::Null => parse_search_entries(iter::empty::<(&str, Cow<'_, Value>)>(), parameters),
+        Value::Object(object) => parse_search_entries(
+            object.iter().map(|(key, value)| (key, Cow::Borrowed(value))),
+            parameters,
+        ),
+        Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_) => Err(build_body_shape_error()),
+    }
+}
+
+/// The request the entries of a search body and its query-string parameters describe. An entry's
+/// value is owned or borrowed, so a borrowed body is copied only where the request keeps a value.
+fn parse_search_entries<'a, K: AsRef<str>>(
+    entries: impl IntoIterator<Item = (K, Cow<'a, Value>)>,
+    parameters: &SearchParameters,
+) -> Result<SearchRequest, OpenSearchError> {
     let mut request = SearchRequest {
         query: Query::MatchAll,
         from: 0,
@@ -189,17 +227,18 @@ pub(crate) fn parse_search_request(
         aggregations: None,
     };
     let mut body_track_total_hits = None;
-    for (key, value) in parse_search_body(body)? {
-        match key.as_str() {
+    for (key, value) in entries {
+        let key = key.as_ref();
+        match key {
             "query" => request.query = parse_query(&value)?,
-            "from" => request.from = read_count(&value, &key)?,
-            "size" => request.size = read_count(&value, &key)?,
+            "from" => request.from = read_count(&value, key)?,
+            "size" => request.size = read_count(&value, key)?,
             "sort" => request.sort = parse_sort(&value)?,
             "_source" => request.source = parse_body_source(&value)?,
             "track_total_hits" => body_track_total_hits = Some(parse_body_track_total_hits(&value)?),
-            "seq_no_primary_term" => request.seq_no_primary_term = read_flag(&value, &key)?,
-            "version" => request.version = read_flag(&value, &key)?,
-            "aggs" | "aggregations" => request.aggregations = Some(value),
+            "seq_no_primary_term" => request.seq_no_primary_term = read_flag(&value, key)?,
+            "version" => request.version = read_flag(&value, key)?,
+            "aggs" | "aggregations" => request.aggregations = Some(value.into_owned()),
             unknown_key => {
                 return Err(OpenSearchError::parsing(format!(
                     "request does not support [{unknown_key}]"
@@ -237,16 +276,25 @@ pub(crate) fn parse_search_request(
 }
 
 /// The body as an object; an empty or blank body is an empty object.
-fn parse_search_body(body: &[u8]) -> Result<Map<String, Value>, OpenSearchError> {
+///
+/// # Errors
+///
+/// `parsing_exception` for malformed JSON or a body that is not an object.
+pub(crate) fn parse_search_body(body: &[u8]) -> Result<Map<String, Value>, OpenSearchError> {
     if body.iter().all(u8::is_ascii_whitespace) {
         return Ok(Map::new());
     }
     match parse_json_body(body)? {
         Value::Object(object) => Ok(object),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_) => {
-            Err(OpenSearchError::parsing("a search body must be a JSON object"))
+            Err(build_body_shape_error())
         }
     }
+}
+
+/// The refusal of a search body that is valid JSON but not an object.
+fn build_body_shape_error() -> OpenSearchError {
+    OpenSearchError::parsing("a search body must be a JSON object")
 }
 
 /// A non-negative JSON integer; `size` and `from` take numbers only.
@@ -501,6 +549,35 @@ mod tests {
         assert!(!default_request.seq_no_primary_term && !default_request.version);
         assert_eq!(default_request.aggregations, None);
         assert_eq!(blank_body_request, default_request);
+    }
+
+    /// A scroll reads its body as JSON once and keeps it: the request borrows from it, `null`
+    /// stands for no body, and anything but an object is refused as the bytes would be.
+    #[tokio::test]
+    async fn a_body_read_as_json_parses_with_null_as_no_body() {
+        let parameters = parse_search_parameters("size=3");
+        let body = json!({"from": 1, "aggs": {"types": {"terms": {"field": "type"}}}});
+
+        let request = parse_search_value(&body, &parameters).expect("an object parses");
+        let null_request = parse_search_value(&Value::Null, &parameters).expect("null parses");
+
+        assert_eq!((request.size, request.from), (3, 1));
+        assert_eq!(
+            request.aggregations,
+            Some(json!({"types": {"terms": {"field": "type"}}}))
+        );
+        assert_eq!(
+            (null_request.size, null_request.from, null_request.query),
+            (3, 0, Query::MatchAll)
+        );
+        assert_eq!(null_request.aggregations, None);
+        for non_object_body in [json!([1]), json!("x"), json!(5), json!(true)] {
+            let error = parse_search_value(&non_object_body, &parameters).expect_err("refused");
+            let (status, answer) = render_envelope(error).await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{non_object_body}");
+            assert_eq!(answer["error"]["type"], "parsing_exception", "{non_object_body}");
+        }
     }
 
     #[test]

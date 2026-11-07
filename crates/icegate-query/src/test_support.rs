@@ -432,6 +432,7 @@ pub fn build_in_memory_system_index_store() -> Arc<SystemIndexStore> {
             max_snapshot_bytes: 1 << 20,
             cache_max_bytes: 1 << 20,
             write_deadline: Duration::from_secs(30),
+            max_scroll_lifetime: Duration::from_mins(15),
         },
     ))
 }

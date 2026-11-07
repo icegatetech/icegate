@@ -4,6 +4,7 @@
 //! order, so per-tenant figures see the identity partition of `tenant_id`; the WAL store is in
 //! memory and WAL reads are on. The listener binds port 0 under the `multi` tenant policy. Tests
 //! send literal requests through [`TestServer::request`] and state their expected answers.
+//! [`TestServer::start_replica`] adds a listener of the same deployment.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -92,6 +93,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// its own store.
 const IN_MEMORY_SYSTEM_LOCATION: &str = "s3://opensearch-test/opensearch-system";
 
+/// What the replicas of one deployment share.
+struct Deployment {
+    /// The catalog over the temporary warehouse.
+    catalog: Arc<dyn Catalog>,
+    /// The WAL store.
+    wal_store: Arc<dyn object_store::ObjectStore>,
+    /// The configuration every replica starts from, before its host and port are overridden.
+    config: OpenSearchConfig,
+    /// The object store holding the system indices.
+    system_store: SystemObjectStore,
+    /// Held for its `Drop`, which removes the warehouse directory once no replica uses it.
+    _warehouse: tempfile::TempDir,
+}
+
 /// A running `OpenSearch` listener over a temporary warehouse.
 pub struct TestServer {
     /// Client for the listener.
@@ -102,8 +117,8 @@ pub struct TestServer {
     cancel_token: CancellationToken,
     /// The task serving the listener, drained on shutdown and aborted on drop.
     server_handle: tokio::task::JoinHandle<()>,
-    /// Held for its `Drop`, which removes the warehouse directory.
-    _warehouse: tempfile::TempDir,
+    /// Holding it keeps the shared deployment, and with it the warehouse, alive.
+    deployment: Arc<Deployment>,
 }
 
 impl TestServer {
@@ -141,15 +156,38 @@ impl TestServer {
         Self::try_start_with_system_store(config, system_object_store).await
     }
 
-    /// [`TestServer::start_with_system_store`] with its failure returned. A listener already
-    /// spawned when a later step fails is stopped before the error returns. One whose startup
-    /// checks fail reports no port, and the drain re-raises its own failure, which names the
-    /// check.
+    /// Start another replica of this server's deployment: the same catalog, WAL store,
+    /// configuration and system object store, with its own engine, caches and write loops. A
+    /// replica that does not start fails the test here, with the step that failed.
+    pub async fn start_replica(&self) -> Self {
+        match Self::try_launch(Arc::clone(&self.deployment)).await {
+            Ok(replica) => replica,
+            Err(error) => panic!("the OpenSearch replica did not start: {error}"),
+        }
+    }
+
+    /// [`TestServer::start_with_system_store`] with its failure returned.
     async fn try_start_with_system_store(
         config: OpenSearchConfig,
         system_object_store: SystemObjectStore,
     ) -> Result<(Self, Arc<dyn Catalog>), SetupError> {
-        let (runtime, catalog, warehouse) = build_runtime().await?;
+        let (catalog, warehouse) = build_warehouse_catalog().await?;
+        let deployment = Arc::new(Deployment {
+            catalog: Arc::clone(&catalog),
+            wal_store: Arc::new(InMemory::new()),
+            config,
+            system_store: system_object_store,
+            _warehouse: warehouse,
+        });
+        Ok((Self::try_launch(deployment).await?, catalog))
+    }
+
+    /// Start one listener of `deployment` on a free port and wait until it answers. A listener
+    /// already spawned when a later step fails is stopped before the error returns. One whose
+    /// startup checks fail reports no port, and the drain re-raises its own failure, which names
+    /// the check.
+    async fn try_launch(deployment: Arc<Deployment>) -> Result<Self, SetupError> {
+        let runtime = build_replica_runtime(&deployment.catalog, &deployment.wal_store)?;
         // Built before the listener is spawned, so its failure leaves no task running.
         let client = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build()?;
         // Port 0: the OS assigns a free port and the listener reports it, so no probe races
@@ -158,8 +196,9 @@ impl TestServer {
             enabled: true,
             host: "127.0.0.1".to_string(),
             port: 0,
-            ..config
+            ..deployment.config.clone()
         };
+        let system_object_store = deployment.system_store.clone();
         let cancel_token = CancellationToken::new();
         let server_token = cancel_token.clone();
         let (port_tx, port_rx) = oneshot::channel::<u16>();
@@ -189,16 +228,13 @@ impl TestServer {
             drain_server_task(&mut server_handle, "OpenSearch").await;
             return Err(format!("it bound {base_url} but never answered").into());
         }
-        Ok((
-            Self {
-                client,
-                base_url,
-                cancel_token,
-                server_handle,
-                _warehouse: warehouse,
-            },
-            catalog,
-        ))
+        Ok(Self {
+            client,
+            base_url,
+            cancel_token,
+            server_handle,
+            deployment,
+        })
     }
 
     /// A request to `path_and_query` carrying `tenant` in `x-scope-orgid`, or no tenant header.
@@ -242,6 +278,15 @@ impl Drop for TestServer {
 /// policy. The returned directory removes the warehouse on drop, so the caller holds it for as
 /// long as the runtime is used.
 pub async fn build_runtime() -> Result<(QueryRuntime, Arc<dyn Catalog>, tempfile::TempDir), SetupError> {
+    let (catalog, warehouse) = build_warehouse_catalog().await?;
+    let wal_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let runtime = build_replica_runtime(&catalog, &wal_store)?;
+    Ok((runtime, catalog, warehouse))
+}
+
+/// A catalog over a temporary warehouse holding every table of [`PRODUCTION_TABLES`]. The returned
+/// directory removes the warehouse on drop.
+async fn build_warehouse_catalog() -> Result<(Arc<dyn Catalog>, tempfile::TempDir), SetupError> {
     let warehouse = tempfile::tempdir()?;
     let catalog_config = CatalogConfig {
         backend: CatalogBackend::Memory,
@@ -251,29 +296,31 @@ pub async fn build_runtime() -> Result<(QueryRuntime, Arc<dyn Catalog>, tempfile
     };
     let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop(), CancellationToken::new()).await?;
     create_production_tables(&catalog).await?;
+    Ok((catalog, warehouse))
+}
 
-    let wal_store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let wal_reader = Arc::new(icegate_queue::ParquetQueueReader::new(
-        "",
-        Arc::clone(&wal_store),
-        8192,
-    )?);
+/// The runtime of one replica over `catalog` and `wal_store`: its own engine with WAL reads on,
+/// and the `multi` tenant policy.
+fn build_replica_runtime(
+    catalog: &Arc<dyn Catalog>,
+    wal_store: &Arc<dyn object_store::ObjectStore>,
+) -> Result<QueryRuntime, SetupError> {
+    let wal_reader = Arc::new(icegate_queue::ParquetQueueReader::new("", Arc::clone(wal_store), 8192)?);
     let engine_config = QueryEngineConfig {
         wal_query_enabled: true,
         ..QueryEngineConfig::default()
     };
-    let runtime = QueryRuntime {
+    Ok(QueryRuntime {
         engine: Arc::new(QueryEngine::new(
-            Arc::clone(&catalog),
+            Arc::clone(catalog),
             engine_config,
-            wal_store,
+            Arc::clone(wal_store),
             wal_reader,
         )),
         metrics: Arc::new(QueryMetrics::new_disabled()),
         pressure: MemoryPressure::inert(),
         tenant_resolver: TenantResolver::Multi,
-    };
-    Ok((runtime, catalog, warehouse))
+    })
 }
 
 /// An in-memory system-index store that passes the listener's startup checks: `InMemory`

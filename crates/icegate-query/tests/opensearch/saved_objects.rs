@@ -5,6 +5,9 @@
 use std::error::Error;
 use std::fmt::Write as _;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use icegate_common::load_config_file;
 use icegate_query::opensearch::{OpenSearchConfig, SystemIndicesConfig};
@@ -2844,6 +2847,568 @@ async fn a_count_with_a_full_text_leaf_counts_the_matching_documents_of_its_tena
     assert_eq!(answer["count"], 2);
     assert_eq!(other_tenant_status, StatusCode::OK, "{other_tenant_answer}");
     assert_eq!(other_tenant_answer["count"], 1);
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Five `config` objects written in an order other than their ids'.
+async fn put_scroll_objects(server: &TestServer, tenant: &str) -> TestResult {
+    for id in ["config:b", "config:d", "config:a", "config:e", "config:c"] {
+        put_saved_object(
+            server,
+            tenant,
+            id,
+            &json!({"type": "config", "config": {"buildNum": id}}),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The ids of a search or scroll answer's hits, in answer order.
+fn read_hit_ids(answer: &Value) -> Result<Vec<&str>, Box<dyn Error>> {
+    answer["hits"]["hits"]
+        .as_array()
+        .ok_or("hits.hits is an array")?
+        .iter()
+        .map(|hit| hit["_id"].as_str().ok_or_else(|| "a hit without _id".into()))
+        .collect()
+}
+
+/// The scroll id of a search or scroll answer.
+fn read_scroll_id(answer: &Value) -> Result<&str, Box<dyn Error>> {
+    answer["_scroll_id"]
+        .as_str()
+        .ok_or_else(|| format!("no _scroll_id in {answer}").into())
+}
+
+/// Open a one-minute scroll of two documents per page over `.kibana`, and return its first page.
+async fn open_scroll(server: &TestServer, tenant: &str) -> Result<(StatusCode, Value), Box<dyn Error>> {
+    send_request(
+        server,
+        Method::POST,
+        tenant,
+        "/.kibana/_search?scroll=1m",
+        Some(&json!({"size": 2})),
+    )
+    .await
+}
+
+/// Continue the scroll `scroll_id` on `server` and return the answer.
+async fn continue_scroll(
+    server: &TestServer,
+    tenant: &str,
+    scroll_id: &str,
+) -> Result<(StatusCode, Value), Box<dyn Error>> {
+    send_request(
+        server,
+        Method::GET,
+        tenant,
+        &format!("/_search/scroll/{scroll_id}?scroll=1m"),
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_scroll_pages_every_document_once_in_id_order() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_scroll_objects(&server, TENANT_A).await?;
+
+    let (status, first_page) = open_scroll(&server, TENANT_A).await?;
+    assert_eq!(status, StatusCode::OK, "{first_page}");
+    assert_eq!(
+        first_page
+            .as_object()
+            .and_then(|answer| answer.keys().next())
+            .map(String::as_str),
+        Some("_scroll_id")
+    );
+    assert_eq!(first_page["hits"]["total"], json!({"value": 5, "relation": "eq"}));
+    let mut pages: Vec<Vec<String>> = vec![read_hit_ids(&first_page)?.into_iter().map(str::to_string).collect()];
+    let mut scroll_id = read_scroll_id(&first_page)?.to_string();
+    loop {
+        let (status, page) = continue_scroll(&server, TENANT_A, &scroll_id).await?;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["hits"]["total"], json!({"value": 5, "relation": "eq"}));
+        let ids: Vec<String> = read_hit_ids(&page)?.into_iter().map(str::to_string).collect();
+        scroll_id = read_scroll_id(&page)?.to_string();
+        let is_last_page = ids.is_empty();
+        pages.push(ids);
+        if is_last_page {
+            break;
+        }
+        assert!(pages.len() <= 5, "the scroll never ends: {pages:?}");
+    }
+
+    assert_eq!(
+        pages,
+        [
+            vec!["config:a", "config:b"],
+            vec!["config:c", "config:d"],
+            vec!["config:e"],
+            vec![]
+        ]
+    );
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_scroll_continues_on_another_replica() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    let replica = server.start_replica().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_scroll_objects(&server, TENANT_A).await?;
+
+    let (_, first_page) = open_scroll(&server, TENANT_A).await?;
+    let (status, second_page) = send_request(
+        &replica,
+        Method::POST,
+        TENANT_A,
+        "/_search/scroll",
+        Some(&json!({"scroll": "1m", "scroll_id": read_scroll_id(&first_page)?})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{second_page}");
+    let (status, third_page) = continue_scroll(&server, TENANT_A, read_scroll_id(&second_page)?).await?;
+    assert_eq!(status, StatusCode::OK, "{third_page}");
+
+    assert_eq!(read_hit_ids(&first_page)?, ["config:a", "config:b"]);
+    assert_eq!(read_hit_ids(&second_page)?, ["config:c", "config:d"]);
+    assert_eq!(read_hit_ids(&third_page)?, ["config:e"]);
+    replica.shutdown().await;
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_scroll_never_falls_back_to_a_newer_snapshot() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_scroll_objects(&server, TENANT_A).await?;
+    let (_, first_page) = open_scroll(&server, TENANT_A).await?;
+
+    // After the first page: a new id sorting before `config:c`, and `config:c` deleted.
+    let new_object = json!({"type": "config", "config": {"buildNum": "ab"}});
+    put_saved_object(&server, TENANT_A, "config:ab", &new_object).await?;
+    let (status, _) = send_request(
+        &server,
+        Method::DELETE,
+        TENANT_A,
+        "/.kibana/_doc/config:c?refresh=wait_for",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let (status, second_page) = continue_scroll(&server, TENANT_A, read_scroll_id(&first_page)?).await?;
+
+    assert_eq!(status, StatusCode::OK, "{second_page}");
+    assert_eq!(read_hit_ids(&second_page)?, ["config:c", "config:d"]);
+    assert_eq!(second_page["hits"]["total"], json!({"value": 5, "relation": "eq"}));
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_scroll_id_minted_for_tenant_a_is_missing_for_tenant_b() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    for tenant in [TENANT_A, TENANT_B] {
+        create_kibana_index(&server, tenant).await?;
+        put_scroll_objects(&server, tenant).await?;
+    }
+    let (_, first_page) = open_scroll(&server, TENANT_A).await?;
+    let scroll_id = read_scroll_id(&first_page)?;
+
+    let (status, refusal) = continue_scroll(&server, TENANT_B, scroll_id).await?;
+    let (owner_status, second_page) = continue_scroll(&server, TENANT_A, scroll_id).await?;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refusal}");
+    assert_eq!(refusal["error"]["type"], "search_context_missing_exception");
+    assert_eq!(owner_status, StatusCode::OK);
+    assert_eq!(read_hit_ids(&second_page)?, ["config:c", "config:d"]);
+    server.shutdown().await;
+    Ok(())
+}
+
+/// `scroll_id` with its window rewritten: the opening moved to `opened_at` and the keep-alive set
+/// to `lifetime_ms`. The id is the cursor, base64url JSON without padding, which a client may write
+/// as it likes.
+fn rewrite_scroll_window(
+    scroll_id: &str,
+    opened_at: DateTime<Utc>,
+    lifetime_ms: i64,
+) -> Result<String, Box<dyn Error>> {
+    let mut cursor: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(scroll_id)?)?;
+    let fields = cursor.as_object_mut().ok_or("a scroll id holds a JSON object")?;
+    fields
+        .insert("opened_at_ms".to_owned(), json!(opened_at.timestamp_millis()))
+        .ok_or("a scroll id holds opened_at_ms")?;
+    fields
+        .insert("lifetime_ms".to_owned(), json!(lifetime_ms))
+        .ok_or("a scroll id holds lifetime_ms")?;
+    Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor)?))
+}
+
+/// The continuation names a scroll that opened, by its id, at a fixed instant long before the
+/// request, with a keep-alive that ended long before the request too: only a handler that judges
+/// the expiry at the request's own instant, which the listener stamps with the clock, refuses it.
+#[tokio::test]
+async fn a_scroll_past_its_keep_alive_is_missing_on_the_wire() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_scroll_objects(&server, TENANT_A).await?;
+    let (status, first_page) = open_scroll(&server, TENANT_A).await?;
+    assert_eq!(status, StatusCode::OK, "{first_page}");
+    let expired_id = rewrite_scroll_window(read_scroll_id(&first_page)?, "2026-10-08T12:00:00Z".parse()?, 60_000)?;
+
+    let (status, refusal) = continue_scroll(&server, TENANT_A, &expired_id).await?;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refusal}");
+    assert_eq!(refusal["error"]["type"], "search_context_missing_exception");
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_scroll_acknowledges() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_scroll_objects(&server, TENANT_A).await?;
+    let (_, first_page) = open_scroll(&server, TENANT_A).await?;
+    let scroll_id = read_scroll_id(&first_page)?;
+
+    let path_clearance = send_request(
+        &server,
+        Method::DELETE,
+        TENANT_A,
+        &format!("/_search/scroll/{scroll_id}"),
+        None,
+    )
+    .await?;
+    let two_path_clearance = send_request(
+        &server,
+        Method::DELETE,
+        TENANT_A,
+        &format!("/_search/scroll/{scroll_id},{scroll_id}"),
+        None,
+    )
+    .await?;
+    let list_clearance = send_request(
+        &server,
+        Method::DELETE,
+        TENANT_A,
+        "/_search/scroll",
+        Some(&json!({"scroll_id": [scroll_id]})),
+    )
+    .await?;
+    let single_clearance = send_request(
+        &server,
+        Method::DELETE,
+        TENANT_A,
+        "/_search/scroll",
+        Some(&json!({"scroll_id": scroll_id})),
+    )
+    .await?;
+    let empty_list_clearance = send_request(
+        &server,
+        Method::DELETE,
+        TENANT_A,
+        "/_search/scroll",
+        Some(&json!({"scroll_id": []})),
+    )
+    .await?;
+    let all_clearance = send_request(&server, Method::DELETE, TENANT_A, "/_search/scroll/_all", None).await?;
+    let (malformed_status, malformed_refusal) = send_request(
+        &server,
+        Method::DELETE,
+        TENANT_A,
+        "/_search/scroll/not-a-scroll-id",
+        None,
+    )
+    .await?;
+
+    assert_eq!(
+        path_clearance,
+        (StatusCode::OK, json!({"succeeded": true, "num_freed": 1}))
+    );
+    assert_eq!(
+        two_path_clearance,
+        (StatusCode::OK, json!({"succeeded": true, "num_freed": 2}))
+    );
+    assert_eq!(
+        list_clearance,
+        (StatusCode::OK, json!({"succeeded": true, "num_freed": 1}))
+    );
+    assert_eq!(
+        single_clearance,
+        (StatusCode::OK, json!({"succeeded": true, "num_freed": 1}))
+    );
+    assert_eq!(
+        empty_list_clearance,
+        (StatusCode::OK, json!({"succeeded": true, "num_freed": 0}))
+    );
+    assert_eq!(
+        all_clearance,
+        (StatusCode::OK, json!({"succeeded": true, "num_freed": 0}))
+    );
+    assert_eq!(malformed_status, StatusCode::BAD_REQUEST);
+    assert_eq!(malformed_refusal["error"]["type"], "illegal_argument_exception");
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_scroll_clearance_without_an_id_or_with_an_unknown_parameter_is_a_400() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+
+    let (no_id_status, no_id_refusal) =
+        send_request(&server, Method::DELETE, TENANT_A, "/_search/scroll", None).await?;
+    let (parameter_status, parameter_refusal) = send_request(
+        &server,
+        Method::DELETE,
+        TENANT_A,
+        "/_search/scroll/_all?unknown=1",
+        None,
+    )
+    .await?;
+
+    assert_eq!(no_id_status, StatusCode::BAD_REQUEST);
+    assert_eq!(no_id_refusal["error"]["type"], "illegal_argument_exception");
+    assert_eq!(parameter_status, StatusCode::BAD_REQUEST);
+    assert_eq!(parameter_refusal["error"]["type"], "illegal_argument_exception");
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_scroll_with_a_sort_is_a_400() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_scroll_objects(&server, TENANT_A).await?;
+
+    let (status, body) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search?scroll=1m",
+        Some(&json!({"size": 2, "sort": [{"config.buildNum": "asc"}]})),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["type"], "illegal_argument_exception");
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_scroll_above_the_maximum_lifetime_is_a_400() -> TestResult {
+    let config = OpenSearchConfig {
+        system_indices: SystemIndicesConfig {
+            max_scroll_lifetime_secs: 900,
+            ..SystemIndicesConfig::default()
+        },
+        ..OpenSearchConfig::default()
+    };
+    let (server, _catalog) = TestServer::start_with_config(config).await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_scroll_objects(&server, TENANT_A).await?;
+    let body = json!({"size": 2});
+
+    let (at_maximum_status, at_maximum_page) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search?scroll=15m",
+        Some(&body),
+    )
+    .await?;
+    let (above_maximum_status, above_maximum_refusal) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search?scroll=901s",
+        Some(&body),
+    )
+    .await?;
+
+    assert_eq!(at_maximum_status, StatusCode::OK, "{at_maximum_page}");
+    assert_eq!(above_maximum_status, StatusCode::BAD_REQUEST, "{above_maximum_refusal}");
+    assert_eq!(above_maximum_refusal["error"]["type"], "illegal_argument_exception");
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Everything here reaches the same refusal for a different reason: a page with no offset to
+/// continue from, or a target that is not one system index. The wildcard selects nothing, which a
+/// plain search answers with no hits, and the data index is refused as any search of one is.
+#[tokio::test]
+async fn a_scroll_opening_that_cannot_page_one_index_is_a_400() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_scroll_objects(&server, TENANT_A).await?;
+    let (status, created_answer) = send_request(
+        &server,
+        Method::PUT,
+        TENANT_A,
+        "/.kibana_2",
+        Some(&json!({"mappings": build_kibana_mappings()})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{created_answer}");
+
+    for (path, body) in [
+        ("/.kibana/_search?scroll=1m", json!({"size": 2, "from": 1})),
+        ("/.kibana/_search?scroll=1m&from=1", json!({"size": 2})),
+        ("/.kibana/_search?scroll=1m", json!({"size": 0})),
+        ("/.kibana_1,.kibana_2/_search?scroll=1m", json!({"size": 2})),
+        ("/.nothing*/_search?scroll=1m", json!({"size": 2})),
+        ("/logs/_search?scroll=1m", json!({"size": 2})),
+    ] {
+        let (status, refusal) = send_request(&server, Method::POST, TENANT_A, path, Some(&body)).await?;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}: {refusal}");
+        assert_eq!(refusal["error"]["type"], "illegal_argument_exception", "{path} {body}");
+    }
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_scroll_opened_without_a_body_pages_by_its_query_string() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_scroll_objects(&server, TENANT_A).await?;
+
+    let (status, first_page) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        "/.kibana/_search?scroll=1m&size=4",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{first_page}");
+    let (status, second_page) = continue_scroll(&server, TENANT_A, read_scroll_id(&first_page)?).await?;
+
+    assert_eq!(status, StatusCode::OK, "{second_page}");
+    assert_eq!(
+        read_hit_ids(&first_page)?,
+        ["config:a", "config:b", "config:c", "config:d"]
+    );
+    assert_eq!(read_hit_ids(&second_page)?, ["config:e"]);
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_continuation_reads_its_id_from_the_query_string_and_ignores_the_totals_parameters() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_scroll_objects(&server, TENANT_A).await?;
+    let (_, first_page) = open_scroll(&server, TENANT_A).await?;
+    let scroll_id = read_scroll_id(&first_page)?;
+
+    let (status, second_page) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        &format!("/_search/scroll?scroll_id={scroll_id}&rest_total_hits_as_int=true&track_total_hits=false"),
+        None,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::OK, "{second_page}");
+    assert_eq!(read_hit_ids(&second_page)?, ["config:c", "config:d"]);
+    assert_eq!(second_page["hits"]["total"], json!({"value": 5, "relation": "eq"}));
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_continuation_it_cannot_serve_is_a_400() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_scroll_objects(&server, TENANT_A).await?;
+    let (_, first_page) = open_scroll(&server, TENANT_A).await?;
+    let scroll_id = read_scroll_id(&first_page)?;
+    let unknown_parameter_path = format!("/_search/scroll/{scroll_id}?unknown=1");
+    // Unexpired by its own window, but opened long after any replica's clock could stamp it.
+    let future_opening_id = rewrite_scroll_window(scroll_id, "2100-01-01T00:00:00Z".parse()?, 60_000)?;
+
+    for (path, body, expected_type) in [
+        ("/_search/scroll", None, "illegal_argument_exception"),
+        ("/_search/scroll", Some(json!({})), "illegal_argument_exception"),
+        ("/_search/scroll/not-a-scroll-id", None, "illegal_argument_exception"),
+        (unknown_parameter_path.as_str(), None, "illegal_argument_exception"),
+        (
+            "/_search/scroll",
+            Some(json!({"scroll": "16m", "scroll_id": scroll_id})),
+            "illegal_argument_exception",
+        ),
+        (
+            "/_search/scroll",
+            Some(json!({"keep_alive": "1m", "scroll_id": scroll_id})),
+            "parsing_exception",
+        ),
+        (
+            "/_search/scroll",
+            Some(json!({"scroll_id": future_opening_id})),
+            "illegal_argument_exception",
+        ),
+    ] {
+        let (status, refusal) = send_request(&server, Method::POST, TENANT_A, path, body.as_ref()).await?;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body:?}: {refusal}");
+        assert_eq!(refusal["error"]["type"], expected_type, "{path} {body:?}");
+    }
+    server.shutdown().await;
+    Ok(())
+}
+
+/// `_scroll_id` carries the request, so the padded `excludes` filter makes every page's id large
+/// enough that a page of the small `config:0` fits the bound, while a page holding a
+/// [`build_padded_config_source`] document, and an opening page of both, do not: the refusal comes
+/// on the page that passes the bound, whichever request serves it.
+#[tokio::test]
+async fn a_scroll_page_past_max_answer_bytes_is_refused_when_opened_and_when_continued() -> TestResult {
+    let server = start_server_with_answer_bound(6000).await?;
+    put_saved_object(&server, TENANT_A, "config:0", &json!({"type": "config"})).await?;
+    let padded_source_filter = json!({"excludes": ["x".repeat(3000)]});
+
+    let (opening_status, opening_refusal) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search?scroll=1m",
+        Some(&json!({"size": 2, "_source": padded_source_filter})),
+    )
+    .await?;
+    let (first_status, first_page) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search?scroll=1m",
+        Some(&json!({"size": 1, "_source": padded_source_filter})),
+    )
+    .await?;
+    assert_eq!(first_status, StatusCode::OK, "{first_page}");
+    let (continuation_status, continuation_refusal) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/_search/scroll",
+        Some(&json!({"scroll_id": read_scroll_id(&first_page)?})),
+    )
+    .await?;
+
+    assert_eq!(read_hit_ids(&first_page)?, ["config:0"]);
+    assert_eq!(opening_status, StatusCode::BAD_REQUEST, "{opening_refusal}");
+    assert_answer_bound_refusal(&opening_refusal["error"]);
+    assert_eq!(continuation_status, StatusCode::BAD_REQUEST, "{continuation_refusal}");
+    assert_answer_bound_refusal(&continuation_refusal["error"]);
     server.shutdown().await;
     Ok(())
 }

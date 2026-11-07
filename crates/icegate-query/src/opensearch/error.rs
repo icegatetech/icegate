@@ -205,6 +205,15 @@ impl OpenSearchError {
         .with_metadata("index", index)
     }
 
+    /// The scroll `scroll_id` expired, or the snapshot object it reads is gone (`404`).
+    pub(crate) fn search_context_missing(scroll_id: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "search_context_missing_exception",
+            format!("No search context found for id [{scroll_id}]"),
+        )
+    }
+
     /// The system index `index` already exists (`400`).
     pub(crate) fn resource_already_exists(index: &str) -> Self {
         Self::new(
