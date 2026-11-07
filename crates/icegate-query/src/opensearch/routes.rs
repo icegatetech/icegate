@@ -119,6 +119,8 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
             "/{index}/_search",
             get(search::search_indices).post(search::search_indices),
         )
+        .route("/_msearch", post(search::run_multi_search))
+        .route("/{index}/_msearch", post(search::run_multi_search_on_index))
         .route(
             "/_search/scroll",
             get(continue_scroll).post(continue_scroll).delete(clear_scroll),

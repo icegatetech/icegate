@@ -261,6 +261,14 @@ impl OpenSearchError {
         Self::illegal_argument(format!("[{key}] is not supported on system indices")).with_metadata("key", key)
     }
 
+    /// An `_msearch` header names the key `key`, which no search option answers to (`400`), and
+    /// `key` carries it for a client. It is refused rather than ignored, because ignoring it would
+    /// run a different search than the one the header asks for.
+    pub(crate) fn unsupported_header_key(key: &str) -> Self {
+        Self::illegal_argument(format!("key [{key}] is not supported in the metadata section"))
+            .with_metadata("key", key)
+    }
+
     /// The document `id` of `index` holds a value of the sort field `field` that does not read as
     /// the field's type (`400`), which `field`, `index` and `id` carry for a client.
     pub(crate) fn unreadable_sort_value(field: &str, index: &str, id: &str) -> Self {

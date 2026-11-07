@@ -2,11 +2,13 @@
 //! on what its index expression resolves to; each arm checks the result window before reading any
 //! document: system indices are searched in memory by the system evaluator, and data indices,
 //! none included, through [`execute::search_data_indices`], one plan per index. Either answer is
-//! serialized on the blocking pool within `max_answer_bytes`.
+//! serialized on the blocking pool within `max_answer_bytes`. `_msearch` ([`msearch`]) runs several
+//! such searches from one NDJSON body and answers each with its own status.
 
 pub(crate) mod doc_id;
 mod execute;
 mod hits;
+mod msearch;
 pub(crate) mod request;
 
 use axum::extract::{RawQuery, State};
@@ -14,6 +16,7 @@ use axum::response::Response;
 use serde_json::Value;
 
 use self::execute::{check_result_window, search_data_indices};
+pub(crate) use self::msearch::{run_multi_search, run_multi_search_on_index};
 use self::request::{SearchParameters, parse_search_request, parse_search_value};
 use super::catalog::{IndexExpression, IndexTarget, read_index_options};
 use super::context::RequestContext;
