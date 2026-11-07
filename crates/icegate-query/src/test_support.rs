@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use datafusion::arrow::array::{
     ArrayRef, MapBuilder, MapFieldNames, StringArray, StringBuilder, TimestampMicrosecondArray, new_null_array,
 };
-use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::stream::BoxStream;
 use futures::{StreamExt as _, TryStreamExt as _};
@@ -42,8 +42,16 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::{QueryEngine, QueryEngineConfig};
+use crate::infra::metrics::QueryMetrics;
 use crate::opensearch::SystemObjectStore;
+use crate::opensearch::catalog::{CatalogSettings, IndexCatalog, IndexEntry, TenantSession};
 use crate::opensearch::system_index::{SystemIndexLimits, SystemIndexStore};
+use crate::test_rows;
+/// The WAL offset every fixture commit records; a fixture writes the WAL segments of a table
+/// with a commit from `FIXTURE_COMMITTED_WAL_OFFSET + 1` on.
+pub use crate::test_rows::COMMITTED_WAL_OFFSET as FIXTURE_COMMITTED_WAL_OFFSET;
+/// The cells and rows a fixture writes, shared with the `OpenSearch` integration binary.
+pub use crate::test_rows::{Cell as TestCell, Row as TestRow};
 
 /// `UsageReader` whose usage sits above the default high watermark;
 /// [`build_pressured_memory`] asserts that it does.
@@ -700,4 +708,106 @@ impl ObjectStore for ClockedObjectStore {
         self.record_stamp(to);
         Ok(())
     }
+}
+
+/// An in-memory warehouse with every production table, an in-memory WAL and an `OpenSearch`
+/// catalog over both, for crate-internal component tests of the search path.
+pub struct SearchFixture {
+    /// The Iceberg catalog holding the tables.
+    pub catalog: Arc<dyn Catalog>,
+    /// The WAL object store the engine reads hot segments from.
+    pub wal_store: Arc<dyn ObjectStore>,
+    /// The engine, WAL reading enabled.
+    pub engine: Arc<QueryEngine>,
+    /// The catalog sessions are opened on.
+    index_catalog: IndexCatalog,
+    /// Held for its `Drop`, which removes the warehouse directory.
+    _warehouse: tempfile::TempDir,
+}
+
+impl SearchFixture {
+    /// Create the warehouse, every table [`test_rows::create_production_tables`] creates and the
+    /// engine.
+    pub async fn new() -> Self {
+        let (warehouse, catalog) = build_icegate_catalog().await;
+        test_rows::create_production_tables(&catalog)
+            .await
+            .expect("the production tables");
+
+        let wal_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal_reader =
+            Arc::new(icegate_queue::ParquetQueueReader::new("", Arc::clone(&wal_store), 8192).expect("WAL reader"));
+        let engine = Arc::new(QueryEngine::new(
+            Arc::clone(&catalog),
+            QueryEngineConfig {
+                wal_query_enabled: true,
+                ..QueryEngineConfig::default()
+            },
+            Arc::clone(&wal_store),
+            wal_reader,
+        ));
+        let index_catalog = IndexCatalog::new(
+            Arc::clone(&engine),
+            Arc::new(QueryMetrics::new_disabled()),
+            build_in_memory_system_index_store(),
+            CatalogSettings {
+                field_discovery_window: Duration::from_hours(24),
+            },
+        );
+        Self {
+            catalog,
+            wal_store,
+            engine,
+            index_catalog,
+            _warehouse: warehouse,
+        }
+    }
+
+    /// The Arrow schema of `table`'s current Iceberg schema, field ids included.
+    pub async fn read_arrow_schema(&self, table: &str) -> SchemaRef {
+        test_rows::read_arrow_schema(&self.catalog, table)
+            .await
+            .expect("the table's Arrow schema")
+    }
+
+    /// Write `rows` into `table` as one append; see [`test_rows::commit_rows`].
+    pub async fn commit_rows(&self, table: &str, rows: &[TestRow<'_>]) {
+        test_rows::commit_rows(&self.catalog, table, rows).await.expect("commit rows");
+    }
+
+    /// Write `batch`, built over [`Self::read_arrow_schema`] of `table`, as one append; see
+    /// [`test_rows::commit_batch`].
+    pub async fn commit_batch(&self, table: &str, batch: RecordBatch) {
+        test_rows::commit_batch(&self.catalog, table, batch)
+            .await
+            .expect("commit batch");
+    }
+
+    /// Write `rows` as the WAL segment `offset` of `table`'s topic; see
+    /// [`test_rows::write_wal_segment`].
+    pub async fn write_wal_segment(&self, table: &str, offset: u64, rows: &[TestRow<'_>]) {
+        test_rows::write_wal_segment(&self.wal_store, &self.catalog, table, offset, rows)
+            .await
+            .expect("write segment");
+    }
+
+    /// Open a session scoped to `tenant`. The first session builds the engine's catalog
+    /// provider and later sessions reuse it, so a test writes all its rows before it opens a
+    /// session.
+    pub async fn open_session(&self, tenant: &str) -> TenantSession {
+        self.index_catalog
+            .open_session(&build_tenant(tenant))
+            .await
+            .expect("open session")
+    }
+}
+
+/// The data index `name` of `session`.
+pub fn find_index_entry<'a>(session: &'a TenantSession, name: &str) -> &'a IndexEntry {
+    session
+        .indices()
+        .entries()
+        .iter()
+        .find(|entry| entry.name() == name)
+        .unwrap_or_else(|| panic!("index `{name}` is not listed"))
 }

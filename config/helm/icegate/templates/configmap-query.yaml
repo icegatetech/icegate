@@ -99,6 +99,8 @@ data:
         cache_max_bytes: {{ .Values.query.opensearch.systemIndices.cacheMaxBytes | int }}
         max_snapshot_bytes: {{ .Values.query.opensearch.systemIndices.maxSnapshotBytes | int }}
         max_answer_bytes: {{ .Values.query.opensearch.systemIndices.maxAnswerBytes | int }}
+      search:
+        max_result_window: {{ .Values.query.opensearch.search.maxResultWindow | int }}
     metrics:
       enabled: {{ .Values.query.metrics.enabled }}
       host: "0.0.0.0"

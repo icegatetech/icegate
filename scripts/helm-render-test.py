@@ -381,6 +381,7 @@ OPENSEARCH_VALUES = {
         "maxSnapshotBytes": 134217729,
         "maxAnswerBytes": 268435458,
     },
+    "search": {"maxResultWindow": 10001},
 }
 OPENSEARCH_SECTION = {
     "enabled": True,
@@ -397,6 +398,7 @@ OPENSEARCH_SECTION = {
         "max_snapshot_bytes": 134217729,
         "max_answer_bytes": 268435458,
     },
+    "search": {"max_result_window": 10001},
 }
 
 # The system_indices section an enabled release renders on the chart defaults: the

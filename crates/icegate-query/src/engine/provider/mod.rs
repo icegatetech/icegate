@@ -15,11 +15,12 @@
 //! ```
 //!
 //! Tables without a corresponding WAL topic (currently `events`) fall through
-//! to the standard `IcebergStaticTableProvider` and read from committed Iceberg
-//! snapshots only.
+//! to the standard `IcebergStaticTableProvider`, wrapped in
+//! `IcebergOnlyTableProvider`, and read from committed Iceberg snapshots only.
 
 mod catalog;
 mod expr_to_predicate;
+mod iceberg_only;
 mod iceberg_scan_metrics;
 mod metrics;
 mod scan;

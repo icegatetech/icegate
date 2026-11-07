@@ -1,14 +1,18 @@
-//! `_search`. A request is parsed once into the shared [`request::SearchRequest`], then
-//! dispatched on what its index expression resolves to: system indices are searched in memory
-//! by the system evaluator, an expression selecting nothing answers no hits, and an expression
-//! resolving to data indices is a 400 here.
+//! `_search`. A request is parsed once into the shared [`request::SearchRequest`], then dispatched
+//! on what its index expression resolves to; each arm checks the result window before reading any
+//! document: system indices are searched in memory by the system evaluator, and data indices,
+//! none included, through [`execute::search_data_indices`], one plan per index. Either answer is
+//! serialized on the blocking pool within `max_answer_bytes`.
 
+mod execute;
+mod hits;
 pub(crate) mod request;
 
 use axum::extract::{RawQuery, State};
 use axum::response::Response;
 use serde_json::Value;
 
+use self::execute::{check_result_window, search_data_indices};
 use self::request::{SearchParameters, parse_search_request, parse_search_value};
 use super::catalog::{IndexExpression, IndexTarget, read_index_options};
 use super::context::RequestContext;
@@ -16,24 +20,27 @@ use super::error::OpenSearchError;
 use super::extract::{Parameters, PathParameters, RequestBody};
 use super::state::OpenSearchState;
 use super::system_index::bulk::{build_json_response, serialize_bounded_answer};
+use super::system_index::run_blocking_work;
 use super::system_index::scroll::{ScrollOpening, open_system_scroll, parse_body_value};
 use super::system_index::search::search_system_indices;
-use super::system_index::{CurrentSnapshot, run_blocking_work};
 
 /// `GET|POST [/{index}]/_search`. An expression that selects nothing answers no hits, unless
 /// `allow_no_indices=false`, which answers 404. `scroll` on a system index opens a scroll (see
-/// [`open_system_scroll`]).
+/// [`open_system_scroll`]). Data indices are searched through [`search_data_indices`].
 ///
-/// The search and the serialization of its answer run on the blocking pool, because both are
-/// linear in the snapshot.
+/// A system search, the rendering of data hits and the serialization of either answer run on the
+/// blocking pool, because each is linear in the snapshot or the page. Either answer is bounded by
+/// `max_answer_bytes`.
 ///
 /// # Errors
 ///
 /// - the errors of [`parse_search_request`] (with `scroll`, of [`parse_body_value`] and
 ///   [`parse_search_value`]), [`IndexExpression::parse`], [`read_index_options`],
-///   [`search_system_indices`] and, with `scroll`, [`open_system_scroll`];
-/// - `400 illegal_argument_exception` for an expression selecting data indices, alone or together
-///   with system indices, or an answer past `max_answer_bytes`;
+///   [`search_system_indices`], [`search_data_indices`] and, with `scroll`, [`open_system_scroll`];
+/// - `400 search_phase_execution_exception` for a `from + size` past `search.max_result_window`,
+///   on data and system indices alike, a scroll's opening page included;
+/// - `400 illegal_argument_exception` for an expression selecting data and system indices
+///   together, `scroll` on data indices (none included), or an answer past `max_answer_bytes`;
 /// - `404 index_not_found_exception` for a concrete name that does not exist, unless
 ///   `ignore_unavailable` is set, and for an expression that selects nothing under
 ///   `allow_no_indices=false`;
@@ -64,14 +71,26 @@ pub(crate) async fn search_indices(
     let (current_snapshot, names) = match session.resolve_target(&expression, options).await? {
         // The session caches the snapshot resolution read, so the search and a scroll's snapshot
         // name both use the state the expression resolved against.
-        IndexTarget::System(names) => (session.read_system_snapshot().await?.clone(), names),
-        // An expression that selects nothing, when `allow_no_indices` allows that, reads no
-        // documents; the request is still validated, so it refuses what any search refuses.
-        IndexTarget::Data(entries) if entries.is_empty() => (CurrentSnapshot::default(), Vec::new()),
-        IndexTarget::Data(_) => {
-            return Err(OpenSearchError::illegal_argument(
-                "searching data indices is not available",
-            ));
+        IndexTarget::System(names) => {
+            check_result_window(&request, state.search_limits)?;
+            (session.read_system_snapshot().await?.clone(), names)
+        }
+        // Data indices; none when the expression selects nothing and `allow_no_indices` allows
+        // that, which is still validated, so it refuses what any data search refuses.
+        IndexTarget::Data(entries) => {
+            if parameters.scroll.is_some() {
+                return Err(OpenSearchError::illegal_argument(
+                    "a scroll reads exactly one system index",
+                ));
+            }
+            check_result_window(&request, state.search_limits)?;
+            let answer = search_data_indices(&session, &entries, &request, &context).await?;
+            let max_answer_bytes = state.max_answer_bytes;
+            let answer_body = run_blocking_work("serializing a data search answer", move || {
+                serialize_bounded_answer(&answer, max_answer_bytes)
+            })
+            .await?;
+            return Ok(build_json_response(answer_body));
         }
     };
     let maximum_lifetime = state.system_store.max_scroll_lifetime();

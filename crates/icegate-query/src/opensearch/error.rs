@@ -15,6 +15,7 @@
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use icegate_common::SHED_RETRY_AFTER_SECS;
+use icegate_common::schema::COL_TIMESTAMP;
 use serde_json::{Map, Value, json};
 
 use crate::error::QueryError;
@@ -150,18 +151,17 @@ impl OpenSearchError {
         .with_metadata("resource.type", "index_or_alias")
     }
 
-    /// A query that failed on the shard of `index` (`400`): a sort on a field the mapping lacks
-    /// without `unmapped_type`, or on a field that cannot be sorted on. Rendered as a
-    /// `search_phase_execution_exception` (phase `query`, grouped, one failed shard) whose root
-    /// cause is the `query_shard_exception`; the entry of `failed_shards` carries `shard`, `index`
-    /// and `reason`.
-    pub(crate) fn query_shard(index: &str, reason: &str) -> Self {
-        let mut shard_cause = Map::new();
-        shard_cause.insert("type".to_string(), json!("query_shard_exception"));
-        shard_cause.insert("reason".to_string(), json!(reason));
-        shard_cause.insert("index".to_string(), json!(index));
-        shard_cause.insert("index_uuid".to_string(), json!("_na_"));
-        let failed_shards = json!([{"shard": 0, "index": index, "reason": Value::Object(shard_cause.clone())}]);
+    /// A search-phase failure (`400`, phase `query`, grouped) of one shard whose cause is
+    /// `root_cause`. The cause renders as the failed shard's `reason` and as `root_cause[0]`; the
+    /// failed shard names `index` when one is given.
+    fn search_phase_failure(index: Option<&str>, root_cause: &Self) -> Self {
+        let shard_cause = root_cause.render_cause();
+        let mut failed_shard = Map::new();
+        failed_shard.insert("shard".to_string(), json!(0));
+        if let Some(index) = index {
+            failed_shard.insert("index".to_string(), json!(index));
+        }
+        failed_shard.insert("reason".to_string(), Value::Object(shard_cause.clone()));
         let mut error = Self::new(
             StatusCode::BAD_REQUEST,
             "search_phase_execution_exception",
@@ -169,9 +169,51 @@ impl OpenSearchError {
         )
         .with_metadata("phase", "query")
         .with_metadata("grouped", true)
-        .with_metadata("failed_shards", failed_shards);
+        .with_metadata("failed_shards", Value::Array(vec![Value::Object(failed_shard)]));
         error.root_cause = Some(Box::new(shard_cause));
         error
+    }
+
+    /// A query that failed on the shard of `index` (`400`): a sort on a field the mapping lacks
+    /// without `unmapped_type`, a sort on a field that cannot be sorted on, or a leaf on a field
+    /// of the wrong type. Rendered as a `search_phase_execution_exception` (phase `query`,
+    /// grouped, one failed shard) whose root cause is the `query_shard_exception`; the entry of
+    /// `failed_shards` carries `shard`, `index` and `reason`.
+    pub(crate) fn query_shard(index: &str, reason: &str) -> Self {
+        let shard_cause = Self::new(StatusCode::BAD_REQUEST, "query_shard_exception", reason)
+            .with_metadata("index", index)
+            .with_metadata("index_uuid", "_na_");
+        Self::search_phase_failure(Some(index), &shard_cause)
+    }
+
+    /// `from + size` exceeds `search.max_result_window` (`400`, a search-phase failure whose root
+    /// cause is an `illegal_argument_exception`). No index is named: the window is checked before
+    /// any index is read.
+    pub(crate) fn result_window_too_large(from: usize, size: usize, max: usize) -> Self {
+        let cause = Self::illegal_argument(format!(
+            "result window is too large: from + size must be less than or equal to [{max}] but was [{}]",
+            from.saturating_add(size)
+        ));
+        Self::search_phase_failure(None, &cause)
+    }
+
+    /// `_count` addressed to the data indices `index_names`, a comma-joined list (`400`), which
+    /// `index` carries for a client. Data indices are counted through `_search` with `size` 0.
+    pub(crate) fn count_on_data_indices(index_names: &str) -> Self {
+        Self::illegal_argument(format!(
+            "_count is not served on data indices [{index_names}]; send _search with size 0"
+        ))
+        .with_metadata("index", index_names)
+    }
+
+    /// A `_search` addressed to `index`, whose rows have no document id because its table has no
+    /// timestamp column (`400`), which `index` carries for a client.
+    pub(crate) fn missing_document_identity(index: &str) -> Self {
+        Self::illegal_argument(format!(
+            "index [{index}] has no [{COL_TIMESTAMP}] column, so its rows have no document id; \
+             query it through PPL instead of _search"
+        ))
+        .with_metadata("index", index)
     }
 
     /// The sort field `field` reads as different kinds in `first_index` and `other_index` (`400`),
@@ -577,6 +619,23 @@ mod tests {
         assert_eq!(missing["status"], 404);
         assert_eq!(missing["error"]["type"], "document_missing_exception");
         assert_eq!(missing["error"]["index"], ".kibana_1");
+    }
+
+    #[tokio::test]
+    async fn a_result_window_above_the_limit_is_a_search_phase_failure_with_an_illegal_argument_root_cause() {
+        let (status, body) = render_envelope(OpenSearchError::result_window_too_large(9_000, 1_001, 10_000)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        assert_eq!(body["error"]["type"], "search_phase_execution_exception");
+        assert_eq!(body["error"]["phase"], "query");
+        assert_eq!(body["error"]["grouped"], true);
+        assert_eq!(body["error"]["root_cause"][0]["type"], "illegal_argument_exception");
+        // No index is named: the window is checked before any index is read.
+        assert_eq!(
+            body["error"]["failed_shards"],
+            json!([{"shard": 0, "reason": body["error"]["root_cause"][0].clone()}])
+        );
     }
 
     #[tokio::test]

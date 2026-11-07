@@ -1,9 +1,10 @@
 //! Table rows for `OpenSearch` integration tests, written through the production Parquet writer
-//! with the production `logs` bloom-filter columns and column encodings and committed as one
-//! Iceberg append, so each tenant's rows land in their own identity partition exactly as ingest
-//! writes them. Every value a test relies on is passed in explicitly.
+//! and committed as one Iceberg append that records the WAL offset, so each tenant's rows land in
+//! their own identity partition exactly as ingest writes them and a merged WAL scan reads the
+//! table. [`LogRow`] writes `logs`; [`Row`] writes any table and [`write_wal_segment`] a WAL
+//! segment, both from the row helpers the crate's own tests share. Every value a test relies on
+//! is passed in explicitly.
 
-use std::error::Error;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -11,16 +12,16 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
-use iceberg::Catalog;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use icegate_common::iceberg_write::{CommonRecordBatchStream, WriteConfig, write_record_batches_to_parquet};
-use icegate_common::parquet_encoding::{LOGS_BLOOM_COLUMNS, LOGS_COLUMN_ENCODINGS};
+use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+use iceberg::{Catalog, NamespaceIdent, TableCreation};
 use icegate_common::schema::{
     COL_BODY, COL_INGESTED_TIMESTAMP, COL_LOG_ATTRIBUTES, COL_OBSERVED_TIMESTAMP, COL_RESOURCE_ATTRIBUTES,
     COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_TENANT_ID, COL_TIMESTAMP,
 };
-use icegate_common::{LOGS_TABLE, icegate_table_ident};
-use tokio_util::sync::CancellationToken;
+use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
+
+pub use super::test_rows::{Cell, Row, RowWriteError, commit_rows, write_wal_segment};
+use super::test_rows::{commit_batch, read_arrow_schema};
 
 /// One `logs` row. Every column not named here is null, except the observed and ingested
 /// timestamps, which equal `timestamp_micros`, and `scope_attributes`, which is empty.
@@ -41,42 +42,21 @@ pub struct LogRow<'a> {
     pub log_attributes: &'a [(&'a str, &'a str)],
 }
 
-/// The production `logs` bloom-filter columns and encodings; sizes far above what a test writes.
-const LOGS_TEST_WRITE_CONFIG: WriteConfig = WriteConfig {
-    row_group_size: 8192,
-    data_page_size_limit_bytes: 1024 * 1024,
-    max_file_size_bytes: 128 * 1024 * 1024,
-    bloom_filter_columns: LOGS_BLOOM_COLUMNS,
-    column_encodings: LOGS_COLUMN_ENCODINGS,
-};
-
-/// Write `rows` into `logs` and commit them as one append (one new snapshot).
-pub async fn commit_log_rows(catalog: &Arc<dyn Catalog>, rows: &[LogRow<'_>]) -> Result<(), Box<dyn Error>> {
-    let table = catalog.load_table(&icegate_table_ident(LOGS_TABLE)).await?;
-    let arrow_schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
-        table.metadata().current_schema(),
-    )?);
+/// Write `rows` into `logs` through the production writer as one append (one new snapshot); see
+/// [`commit_batch`].
+pub async fn commit_log_rows(catalog: &Arc<dyn Catalog>, rows: &[LogRow<'_>]) -> Result<(), RowWriteError> {
+    let arrow_schema = read_arrow_schema(catalog, LOGS_TABLE).await?;
     let columns = arrow_schema
         .fields()
         .iter()
         .map(|field| build_log_column(field, rows))
-        .collect::<Result<Vec<ArrayRef>, Box<dyn Error>>>()?;
-    let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), columns)?;
-    let batches: CommonRecordBatchStream = Box::pin(futures::stream::iter([Ok(batch)]));
-    let written_files = write_record_batches_to_parquet(
-        table.clone(),
-        LOGS_TEST_WRITE_CONFIG,
-        batches,
-        &CancellationToken::new(),
-    )
-    .await?;
-    let append_action = Transaction::new(&table).fast_append().add_data_files(written_files.data_files);
-    append_action.apply(Transaction::new(&table))?.commit(&**catalog).await?;
-    Ok(())
+        .collect::<Result<Vec<ArrayRef>, RowWriteError>>()?;
+    let batch = RecordBatch::try_new(arrow_schema, columns)?;
+    commit_batch(catalog, LOGS_TABLE, batch).await
 }
 
 /// The column `field` of `logs` for `rows`.
-fn build_log_column(field: &Field, rows: &[LogRow<'_>]) -> Result<ArrayRef, Box<dyn Error>> {
+fn build_log_column(field: &Field, rows: &[LogRow<'_>]) -> Result<ArrayRef, RowWriteError> {
     let column: ArrayRef = match field.name().as_str() {
         COL_TENANT_ID => Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.tenant_id))),
         COL_SERVICE_NAME => Arc::new(StringArray::from_iter(rows.iter().map(|row| row.service_name))),
@@ -104,7 +84,7 @@ fn build_log_column(field: &Field, rows: &[LogRow<'_>]) -> Result<ArrayRef, Box<
 fn build_map_column<'a>(
     field: &Field,
     rows: impl Iterator<Item = &'a [(&'a str, &'a str)]>,
-) -> Result<ArrayRef, Box<dyn Error>> {
+) -> Result<ArrayRef, RowWriteError> {
     let DataType::Map(entries, _) = field.data_type() else {
         return Err(format!("{} is not a MAP column", field.name()).into());
     };
@@ -130,4 +110,24 @@ fn build_map_column<'a>(
         builder.append(true)?;
     }
     Ok(Arc::new(builder.finish()))
+}
+
+/// Create the exact-name table `name` with the schema `fields`, unpartitioned. A table read
+/// through the tenant scope must carry a required `tenant_id` string column.
+pub async fn create_exact_name_table(
+    catalog: &Arc<dyn Catalog>,
+    name: &str,
+    fields: Vec<NestedField>,
+) -> Result<(), RowWriteError> {
+    let schema = IcebergSchema::builder().with_fields(fields.into_iter().map(Arc::new)).build()?;
+    let creation = TableCreation::builder().name(name.to_string()).schema(schema).build();
+    catalog
+        .create_table(&NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), creation)
+        .await?;
+    Ok(())
+}
+
+/// A required string column, for test-created exact-name tables.
+pub fn required_string(id: i32, name: &str) -> NestedField {
+    NestedField::required(id, name, Type::Primitive(PrimitiveType::String))
 }

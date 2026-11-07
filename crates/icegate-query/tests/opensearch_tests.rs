@@ -13,6 +13,7 @@
 //! - `requests`: JSON and NDJSON request helpers shared by the system-index modules
 //! - `rustfs_conditional`: the object-store guarantees the system-index store builds on
 //! - `saved_objects`: system-index document endpoints
+//! - `search`: data-index `_search`: lowering, hits, limits, tenant isolation
 //! - `system_indices`: index-level system-index endpoints and their tenant boundary
 //! - `system_store_rustfs`: the system-index store against RustFS through the production constructor
 

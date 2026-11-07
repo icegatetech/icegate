@@ -59,7 +59,8 @@ impl EndpointParameters for CountParameters {
 /// - `400 parsing_exception` for a malformed body, a body key other than `query`, or a query the
 ///   parser refuses;
 /// - `400 illegal_argument_exception` for a malformed index expression, a bad `expand_wildcards`,
-///   a target holding a data index, or a query the evaluator refuses;
+///   a target holding data indices (their comma-joined names under `index`), or a query the
+///   evaluator refuses;
 /// - `404 index_not_found_exception` for a concrete name that does not exist, unless
 ///   `ignore_unavailable` is set;
 /// - `500` when the session cannot be opened, the store cannot be read, or the blocking work does
@@ -86,10 +87,9 @@ pub(crate) async fn count_documents(
         IndexTarget::Data(entries) if entries.is_empty() => {
             return Ok(Json(json!({"count": 0, "_shards": render_search_shards()})));
         }
-        IndexTarget::Data(_) => {
-            return Err(OpenSearchError::illegal_argument(
-                "_count is served for system indices only",
-            ));
+        IndexTarget::Data(entries) => {
+            let index_names = entries.iter().map(|entry| entry.name()).collect::<Vec<_>>().join(",");
+            return Err(OpenSearchError::count_on_data_indices(&index_names));
         }
     };
     // The session caches the snapshot resolution read, so the count evaluates the same state.

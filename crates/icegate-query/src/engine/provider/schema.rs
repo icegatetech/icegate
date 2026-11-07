@@ -19,6 +19,7 @@ use icegate_common::schema::{COL_MAX_WEEK_MINUTE, COL_MIN_WEEK_MINUTE, COL_VALID
 use icegate_queue::ParquetQueueReader;
 
 use super::WalQueryConfig;
+use super::iceberg_only::IcebergOnlyTableProvider;
 use super::table::IcegateTableProvider;
 
 /// Tables that have a corresponding WAL topic and therefore use the merged
@@ -128,7 +129,7 @@ impl IcegateSchemaProvider {
     ///
     /// Tables listed in [`WAL_MERGED_TABLES`] are wrapped in
     /// [`IcegateTableProvider`] (merged Iceberg + WAL). All other tables use
-    /// `IcebergStaticTableProvider`.
+    /// `IcebergStaticTableProvider` inside [`IcebergOnlyTableProvider`].
     ///
     /// # Errors
     ///
@@ -165,7 +166,7 @@ impl IcegateSchemaProvider {
                         // Other tables: standard Iceberg static provider
                         let table = catalog.load_table(ident).await?;
                         let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
-                        Arc::new(provider)
+                        Arc::new(IcebergOnlyTableProvider::new(Arc::new(provider)))
                     };
                 Ok::<_, iceberg::Error>((name, provider))
             }

@@ -12,15 +12,20 @@ mod map_key_cache;
 mod native;
 mod registry;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use datafusion::arrow::datatypes::{DataType, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::SchemaProvider;
-use datafusion::logical_expr::TableType;
+use datafusion::common::TableReference;
+use datafusion::datasource::{TableProvider, provider_as_source};
+use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, TableType};
+use datafusion::prelude::SessionContext;
 use iceberg::expr::Predicate;
 use icegate_common::schema::{
     COL_DATA_POINT_ATTRIBUTES, COL_LOG_ATTRIBUTES, COL_METADATA, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES,
@@ -31,9 +36,10 @@ use tokio::sync::OnceCell;
 
 use self::expression::ExpressionPart;
 pub(crate) use self::expression::IndexExpression;
-pub(crate) use self::field::{FieldType, IndexField};
+pub(crate) use self::field::{FieldType, FieldValue, IndexField, ResolvedField};
 use self::map_key_cache::{MapKeyCache, MapKeys, MapKeysVersion};
-use self::native::list_native_fields;
+pub(crate) use self::native::native_column_type;
+use self::native::{list_native_fields, resolve_native_field};
 pub(crate) use self::registry::{IndexEntry, IndexOptions, IndexSet, IndexTarget, read_index_options};
 use self::registry::{Profile, choose_index_target, find_telemetry_table, select_system_names};
 use super::error::OpenSearchError;
@@ -153,7 +159,10 @@ impl IndexCatalog {
                 ))
             })?;
         let indices = IndexSet::from_table_names(namespace.table_names());
+        let tables = open_index_tables(namespace.as_ref(), &indices).await;
         Ok(TenantSession {
+            context,
+            tables,
             namespace,
             tenant: tenant.clone(),
             indices,
@@ -165,6 +174,29 @@ impl IndexCatalog {
             system_snapshot: OnceCell::new(),
         })
     }
+}
+
+/// Open the table of every data index in `indices` through the tenant-scoped `namespace`.
+async fn open_index_tables(
+    namespace: &dyn SchemaProvider,
+    indices: &IndexSet,
+) -> HashMap<String, Result<Arc<dyn TableProvider>, OpenSearchError>> {
+    let mut tables = HashMap::with_capacity(indices.entries().len());
+    for entry in indices.entries() {
+        if tables.contains_key(entry.table()) {
+            continue;
+        }
+        let opened_table = match namespace.table(entry.table()).await {
+            Ok(Some(provider)) => Ok(provider),
+            Ok(None) => Err(OpenSearchError::index_not_found(entry.name())),
+            Err(error) => Err(OpenSearchError::internal(format!(
+                "table `{}` cannot be opened: {error}",
+                entry.table()
+            ))),
+        };
+        tables.insert(entry.table().to_string(), opened_table);
+    }
+    tables
 }
 
 /// The system indices and aliases an index expression lists.
@@ -201,8 +233,19 @@ pub(crate) struct IndexListing<'a> {
 }
 
 /// A tenant-scoped view of the catalog for one request.
-#[derive(Debug)]
 pub(crate) struct TenantSession {
+    /// The tenant-scoped session every plan of this request executes in. Its runtime holds the
+    /// WAL object store, and its catalog is the tenant-scoped one `namespace` was taken from.
+    context: SessionContext,
+    /// The table provider of each listed data index, keyed by table name, opened with the
+    /// session.
+    ///
+    /// Opening a table of the tenant-scoped namespace does no I/O: the engine loaded every table
+    /// when it built its catalog provider, and opening only wraps one in the tenant filter.
+    /// Holding them here keeps field resolution and scan building synchronous for every front
+    /// end, so the recursive DSL lowering and the Lucene visitor never await per leaf. A table
+    /// that fails to open keeps its error here and fails only the requests that reach it.
+    tables: HashMap<String, Result<Arc<dyn TableProvider>, OpenSearchError>>,
     /// The tenant-scoped IceGate namespace: every table it yields is filtered to the tenant and
     /// hides `tenant_id`.
     namespace: Arc<dyn SchemaProvider>,
@@ -226,10 +269,89 @@ pub(crate) struct TenantSession {
     system_snapshot: OnceCell<CurrentSnapshot>,
 }
 
+impl fmt::Debug for TenantSession {
+    /// The session's identity: its tenant and the data indices it sees. The DataFusion context,
+    /// the opened tables and the shared handles have no useful rendering.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TenantSession")
+            .field("tenant", &self.tenant)
+            .field("indices", &self.indices)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TenantSession {
     /// The data indices the tenant sees.
     pub(crate) const fn indices(&self) -> &IndexSet {
         &self.indices
+    }
+
+    /// The opened table behind `entry`.
+    fn open_table(&self, entry: &IndexEntry) -> Result<Arc<dyn TableProvider>, OpenSearchError> {
+        match self.tables.get(entry.table()) {
+            Some(Ok(provider)) => Ok(Arc::clone(provider)),
+            Some(Err(error)) => Err(error.clone()),
+            None => Err(OpenSearchError::index_not_found(entry.name())),
+        }
+    }
+
+    /// Resolve the field `name` of `entry`.
+    ///
+    /// `None` means the name names nothing in this index: a query leaf on it matches nothing.
+    /// An index whose table failed to open also resolves nothing; its scan reports the failure,
+    /// and every search scans before it lowers.
+    pub(crate) fn resolve_field(&self, entry: &IndexEntry, name: &str) -> Option<ResolvedField> {
+        let provider = self.open_table(entry).ok()?;
+        match entry.profile() {
+            Profile::Native => resolve_native_field(&provider.schema(), entry.table(), name),
+        }
+    }
+
+    /// The Arrow type of `column` in `entry`'s tenant-scoped table, `None` when it has no such
+    /// column.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error the table failed to open with.
+    pub(crate) fn column_data_type(
+        &self,
+        entry: &IndexEntry,
+        column: &str,
+    ) -> Result<Option<DataType>, OpenSearchError> {
+        let provider = self.open_table(entry)?;
+        let schema = provider.schema();
+        Ok(schema.field_with_name(column).ok().map(|field| field.data_type().clone()))
+    }
+
+    /// A scan of `entry`'s table through the tenant scope.
+    ///
+    /// The table reference is built from its exact parts, never parsed, so the name passes no
+    /// identifier normalization. Every row the scan yields belongs to the session's tenant, and
+    /// `tenant_id` is not among its columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error the table failed to open with, or `500` when DataFusion refuses the scan.
+    pub(crate) fn scan_index(&self, entry: &IndexEntry) -> Result<LogicalPlanBuilder, OpenSearchError> {
+        let provider = self.open_table(entry)?;
+        let reference = TableReference::full(
+            self.engine.config().catalog_name.as_str(),
+            ICEGATE_NAMESPACE,
+            entry.table(),
+        );
+        LogicalPlanBuilder::scan(reference, provider_as_source(provider), None)
+            .map_err(|error| OpenSearchError::from(QueryError::from(error)))
+    }
+
+    /// Execute `plan` in the tenant-scoped session and collect its batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the planning or execution failure as the envelope `From<QueryError>` maps it to.
+    pub(crate) async fn collect(&self, plan: LogicalPlan) -> Result<Vec<RecordBatch>, OpenSearchError> {
+        let frame = self.context.execute_logical_plan(plan).await.map_err(QueryError::from)?;
+        Ok(frame.collect().await.map_err(QueryError::from)?)
     }
 
     /// The tenant's system-index state, read from the store on the first call of this session.

@@ -146,6 +146,14 @@
                 "maxSnapshotBytes": { "type": "integer", "minimum": 1, "description": "Largest decoded snapshot per tenant, in bytes." },
                 "maxAnswerBytes": { "type": "integer", "minimum": 1, "description": "Bytes of stored documents one answer may carry; at least maxSnapshotBytes." }
               }
+            },
+            "search": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "description": "Limits of _search on the OpenSearch listener.",
+              "properties": {
+                "maxResultWindow": { "type": "integer", "minimum": 1, "description": "Largest from + size a _search accepts, on data and system indices alike." }
+              }
             }
           }
         },

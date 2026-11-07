@@ -3,8 +3,19 @@
 `query_dsl` turns the `query` of a search or count request body into one AST
 (`ast.rs`, built by `parse.rs`) that every evaluator of the listener shares, and holds the
 standard analyzer that full-text matching uses. How each leaf parses and what it refuses is
-documented on `parse_query`; this file covers the analyzer, whose contract is a set of external
-rules rather than code.
+documented on `parse_query`; this file covers how the AST reaches data indices and the analyzer,
+whose contract is a set of external rules rather than code.
+
+## Lowering to a data-index predicate (`lower.rs`)
+
+A data-index search lowers the AST to a DataFusion predicate with `lower_query`, once per index
+it searches. A field typed differently in two indices is therefore read with each index's own
+type, and a field one index lacks matches nothing there instead of failing the search. Field
+names resolve through the index catalog, which looks a MAP key up by its exact stored key without
+enumerating the map, so a key that is both a leaf and a prefix (`http` and `http.method`) filters
+on the stored key it names. The predicate reads only the columns of the tenant-scoped scan, so it
+cannot widen the tenant scope. What each leaf lowers to, and what it refuses, is documented on
+`lower_query` and the function lowering that leaf.
 
 ## The standard analyzer (`analyzer/`)
 

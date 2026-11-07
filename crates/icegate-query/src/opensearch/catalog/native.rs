@@ -2,10 +2,11 @@
 
 use std::collections::BTreeSet;
 
-use datafusion::arrow::datatypes::{DataType, Schema};
-use icegate_common::schema::COL_BODY;
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use icegate_common::matches_wire_name;
+use icegate_common::schema::{COL_BODY, COL_RESOURCE_ATTRIBUTES, COL_TENANT_ID, promoted_resource_keys};
 
-use super::field::{FieldType, IndexField};
+use super::field::{FieldType, FieldValue, IndexField, ResolvedField};
 use super::map_key_cache::MapKeys;
 use crate::opensearch::error::OpenSearchError;
 
@@ -25,45 +26,112 @@ pub(crate) fn list_native_fields(schema: &Schema, map_keys: &MapKeys) -> Result<
     let mut fields = Vec::with_capacity(schema.fields().len() + key_count);
     for column in schema.fields() {
         let name = column.name();
-        match column.data_type() {
-            DataType::Map(_, _) => {
+        match native_column_type(column)? {
+            FieldType::Object => {
                 fields.push(IndexField::object(name.clone()));
-                fields.extend(
-                    map_keys
-                        .get(name)
-                        .into_iter()
-                        .flatten()
-                        .map(|key| IndexField::leaf(format!("{name}.{key}"), FieldType::Keyword, Some(name.clone()))),
-                );
+                if matches!(column.data_type(), DataType::Map(_, _)) {
+                    fields.extend(
+                        map_keys.get(name).into_iter().flatten().map(|key| {
+                            IndexField::leaf(format!("{name}.{key}"), FieldType::Keyword, Some(name.clone()))
+                        }),
+                    );
+                }
             }
-            DataType::List(_) | DataType::Struct(_) => fields.push(IndexField::object(name.clone())),
-            data_type => fields.push(IndexField::leaf(name.clone(), map_scalar_type(name, data_type)?, None)),
+            field_type => fields.push(IndexField::leaf(name.clone(), field_type, None)),
         }
     }
     Ok(fields)
 }
 
-/// The `OpenSearch` type of the scalar column `name`. Strings are `keyword` except `body`, the one
-/// full-text column; fixed-width binary columns are the hex-rendered ids, also `keyword`.
+/// The `OpenSearch` type of a native column, the one mapping every surface types columns by.
+///
+/// `body` is the only `text` column; every other string is `keyword`. Fixed-width ids are
+/// `keyword` (rendered as hex). Timestamps and dates are `date`. A MAP, a list and a struct are
+/// `object`.
 ///
 /// Exactly the listed Arrow types are typed: the forms in which table columns are read. Any other
 /// type is refused rather than typed by a guess; an unsigned 64-bit value, for one, does not fit
-/// `long`.
-fn map_scalar_type(name: &str, data_type: &DataType) -> Result<FieldType, OpenSearchError> {
-    match data_type {
-        DataType::Utf8 if name == COL_BODY => Ok(FieldType::Text),
-        DataType::Utf8 | DataType::FixedSizeBinary(_) => Ok(FieldType::Keyword),
-        DataType::Timestamp(_, _) | DataType::Date32 => Ok(FieldType::Date),
-        DataType::Int32 => Ok(FieldType::Integer),
-        DataType::Int64 => Ok(FieldType::Long),
-        DataType::Float32 | DataType::Float64 | DataType::Decimal128(_, _) => Ok(FieldType::Double),
-        DataType::Boolean => Ok(FieldType::Boolean),
+/// `long`, so an unsigned 64-bit column is refused instead of read as a wrapped `long`.
+///
+/// # Errors
+///
+/// Returns `500` naming the column when no `OpenSearch` type represents its Arrow type.
+pub(crate) fn native_column_type(field: &Field) -> Result<FieldType, OpenSearchError> {
+    Ok(match field.data_type() {
+        DataType::Utf8 if field.name() == COL_BODY => FieldType::Text,
+        DataType::Utf8 | DataType::FixedSizeBinary(_) => FieldType::Keyword,
+        DataType::Timestamp(_, _) | DataType::Date32 => FieldType::Date,
+        DataType::Int32 => FieldType::Integer,
+        DataType::Int64 => FieldType::Long,
+        DataType::Float32 | DataType::Float64 | DataType::Decimal128(_, _) => FieldType::Double,
+        DataType::Boolean => FieldType::Boolean,
+        DataType::Map(_, _) | DataType::List(_) | DataType::Struct(_) => FieldType::Object,
         // `DataType` has dozens of variants; the contract is "anything not listed above is an
         // error", so this one arm stays a catch-all.
-        other => Err(OpenSearchError::internal(format!(
-            "column `{name}` has Arrow type {other} that the OpenSearch API cannot represent"
-        ))),
+        other => {
+            return Err(OpenSearchError::internal(format!(
+                "column `{}` has Arrow type {other} that the OpenSearch API cannot represent",
+                field.name()
+            )));
+        }
+    })
+}
+
+/// Resolve `name` against a native table whose tenant-scoped schema is `schema`.
+///
+/// A column resolves under its own name, and a `Fixed(n)` column as a hex id of width `n`.
+/// `<map>.<key>` resolves to the stored key `<key>` of the MAP column `<map>` with no
+/// enumeration, so an unlisted key still filters. A `resource_attributes` key that `table`
+/// promotes to a column (dotted or underscored, the way ingest moves it) resolves to that column.
+/// `tenant_id`, an unknown name and an empty key resolve to nothing. A column of a type no
+/// `OpenSearch` type represents names no field either, so it resolves to nothing here; a query
+/// leaf tells it from an unknown name by the column's type and refuses it.
+pub(super) fn resolve_native_field(schema: &Schema, table: &str, name: &str) -> Option<ResolvedField> {
+    if name == COL_TENANT_ID {
+        return None;
     }
+    if let Ok(field) = schema.field_with_name(name) {
+        return resolve_column(field, name);
+    }
+    let (column, key) = name.split_once('.')?;
+    if key.is_empty() || !matches!(schema.field_with_name(column).ok()?.data_type(), DataType::Map(_, _)) {
+        return None;
+    }
+    if column == COL_RESOURCE_ATTRIBUTES
+        && let Some(promoted) = promoted_resource_keys(table)
+            .iter()
+            .find(|promoted| promoted.attribute_key == key || matches_wire_name(promoted.attribute_key, key))
+    {
+        let promoted_field = schema.field_with_name(promoted.column).ok()?;
+        return resolve_column(promoted_field, name);
+    }
+    Some(ResolvedField {
+        name: name.to_string(),
+        field_type: FieldType::Keyword,
+        value: FieldValue::MapKey {
+            column: column.to_string(),
+            key: key.to_string(),
+        },
+    })
+}
+
+/// The resolution of the column `field` under the requested `name`.
+fn resolve_column(field: &Field, name: &str) -> Option<ResolvedField> {
+    let field_type = native_column_type(field).ok()?;
+    let value = match field.data_type() {
+        DataType::FixedSizeBinary(width) => FieldValue::HexId {
+            column: field.name().clone(),
+            width: *width,
+        },
+        _ => FieldValue::Column {
+            column: field.name().clone(),
+        },
+    };
+    Some(ResolvedField {
+        name: name.to_string(),
+        field_type,
+        value,
+    })
 }
 
 #[cfg(test)]

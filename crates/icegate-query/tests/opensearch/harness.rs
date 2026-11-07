@@ -4,19 +4,22 @@
 //! order, so per-tenant figures see the identity partition of `tenant_id`; the WAL store is in
 //! memory and WAL reads are on. The listener binds port 0 under the `multi` tenant policy. Tests
 //! send literal requests through [`TestServer::request`] and state their expected answers.
-//! [`TestServer::start_replica`] adds a listener of the same deployment.
+//! [`TestServer::start_replica`] adds a listener of the same deployment. [`ServerOptions`] drive
+//! one failure path of every replica a deployment starts.
 
 use std::collections::HashMap;
+use std::future::pending;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use iceberg::spec::{PartitionSpec, Schema, SortOrder};
-use iceberg::{Catalog, NamespaceIdent, TableCreation};
+use async_trait::async_trait;
+use iceberg::table::Table;
+use iceberg::{Catalog, Namespace, NamespaceIdent, Result as IcebergResult, TableCommit, TableCreation, TableIdent};
 use icegate_common::testing::server_task::{DrainOutcome, PORT_BIND_TIMEOUT, SHUTDOWN_TIMEOUT, drain_server_task};
 use icegate_common::{
-    CatalogBackend, CatalogBuilder, CatalogConfig, EVENTS_TABLE, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE,
-    ListenerRuntime, METRICS_TABLE, MemoryPressure, OPERATIONS_TABLE, PRICES_TABLE, SPANS_TABLE, TENANT_ID_HEADER,
-    TenantResolver, schema,
+    CatalogBackend, CatalogBuilder, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, ListenerRuntime, MemoryPressure,
+    TENANT_ID_HEADER, TenantResolver,
 };
 use icegate_query::engine::{QueryEngine, QueryEngineConfig};
 use icegate_query::infra::metrics::QueryMetrics;
@@ -26,57 +29,10 @@ use object_store::memory::InMemory;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use super::test_rows::create_production_tables;
+
 /// Why the runtime or the listener of a test could not be set up.
 type SetupError = Box<dyn std::error::Error + Send + Sync>;
-
-/// One production table: its name and the schema, partition spec and sort order builders of
-/// `icegate_common::schema`.
-type ProductionTable = (
-    &'static str,
-    fn() -> icegate_common::Result<Schema>,
-    fn(&Schema) -> icegate_common::Result<PartitionSpec>,
-    fn(&Schema) -> icegate_common::Result<SortOrder>,
-);
-
-/// Every table of the IceGate namespace.
-const PRODUCTION_TABLES: [ProductionTable; 6] = [
-    (
-        LOGS_TABLE,
-        schema::logs_schema,
-        schema::logs_partition_spec,
-        schema::logs_sort_order,
-    ),
-    (
-        SPANS_TABLE,
-        schema::spans_schema,
-        schema::spans_partition_spec,
-        schema::spans_sort_order,
-    ),
-    (
-        EVENTS_TABLE,
-        schema::events_schema,
-        schema::events_partition_spec,
-        schema::events_sort_order,
-    ),
-    (
-        METRICS_TABLE,
-        schema::metrics_schema,
-        schema::metrics_partition_spec,
-        schema::metrics_sort_order,
-    ),
-    (
-        OPERATIONS_TABLE,
-        schema::operations_schema,
-        schema::operations_partition_spec,
-        schema::operations_sort_order,
-    ),
-    (
-        PRICES_TABLE,
-        schema::prices_schema,
-        schema::prices_partition_spec,
-        schema::prices_sort_order,
-    ),
-];
 
 /// Readiness poll budget for a freshly bound listener: generous, because the sanitizer builds
 /// run this harness at a fraction of normal speed.
@@ -93,6 +49,138 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// its own store.
 const IN_MEMORY_SYSTEM_LOCATION: &str = "s3://opensearch-test/opensearch-system";
 
+/// Server knobs a test sets to drive one failure path. Every replica of a deployment starts with
+/// the same options.
+#[derive(Clone)]
+pub struct ServerOptions {
+    /// The memory-pressure handle the shedding layer reads.
+    pub pressure: MemoryPressure,
+    /// `engine.max_query_duration_secs`, the deadline of every request.
+    pub max_query_duration_secs: u64,
+    /// When set, the engine reads its catalog through a [`StallSwitchCatalog`] that stops
+    /// answering once the test sets the switch, after the server has started.
+    pub catalog_stall_switch: Option<Arc<AtomicBool>>,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            pressure: MemoryPressure::inert(),
+            max_query_duration_secs: QueryEngineConfig::default().max_query_duration_secs,
+            catalog_stall_switch: None,
+        }
+    }
+}
+
+/// A catalog that answers like `inner` until `is_stalled` is set, and never answers after.
+///
+/// Startup reads the catalog (the system-index location check lists every table), so a catalog
+/// that never answers from the start would keep the server from binding. The switch lets the
+/// server start and then models the failure the deadline exists for: a catalog that went
+/// silent.
+#[derive(Debug)]
+pub struct StallSwitchCatalog {
+    /// The catalog answering while the switch is off.
+    inner: Arc<dyn Catalog>,
+    /// Set by the test once the server has started.
+    is_stalled: Arc<AtomicBool>,
+}
+
+impl StallSwitchCatalog {
+    /// Return at once while the switch is off; never return once it is on.
+    async fn wait_unless_stalled(&self) {
+        if self.is_stalled.load(Ordering::SeqCst) {
+            pending::<()>().await;
+        }
+    }
+}
+
+#[async_trait]
+impl Catalog for StallSwitchCatalog {
+    async fn list_namespaces(&self, parent: Option<&NamespaceIdent>) -> IcebergResult<Vec<NamespaceIdent>> {
+        self.wait_unless_stalled().await;
+        self.inner.list_namespaces(parent).await
+    }
+
+    async fn create_namespace(
+        &self,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
+    ) -> IcebergResult<Namespace> {
+        self.wait_unless_stalled().await;
+        self.inner.create_namespace(namespace, properties).await
+    }
+
+    async fn get_namespace(&self, namespace: &NamespaceIdent) -> IcebergResult<Namespace> {
+        self.wait_unless_stalled().await;
+        self.inner.get_namespace(namespace).await
+    }
+
+    async fn namespace_exists(&self, namespace: &NamespaceIdent) -> IcebergResult<bool> {
+        self.wait_unless_stalled().await;
+        self.inner.namespace_exists(namespace).await
+    }
+
+    async fn update_namespace(
+        &self,
+        namespace: &NamespaceIdent,
+        properties: HashMap<String, String>,
+    ) -> IcebergResult<()> {
+        self.wait_unless_stalled().await;
+        self.inner.update_namespace(namespace, properties).await
+    }
+
+    async fn drop_namespace(&self, namespace: &NamespaceIdent) -> IcebergResult<()> {
+        self.wait_unless_stalled().await;
+        self.inner.drop_namespace(namespace).await
+    }
+
+    async fn list_tables(&self, namespace: &NamespaceIdent) -> IcebergResult<Vec<TableIdent>> {
+        self.wait_unless_stalled().await;
+        self.inner.list_tables(namespace).await
+    }
+
+    async fn create_table(&self, namespace: &NamespaceIdent, creation: TableCreation) -> IcebergResult<Table> {
+        self.wait_unless_stalled().await;
+        self.inner.create_table(namespace, creation).await
+    }
+
+    async fn load_table(&self, table: &TableIdent) -> IcebergResult<Table> {
+        self.wait_unless_stalled().await;
+        self.inner.load_table(table).await
+    }
+
+    async fn drop_table(&self, table: &TableIdent) -> IcebergResult<()> {
+        self.wait_unless_stalled().await;
+        self.inner.drop_table(table).await
+    }
+
+    async fn purge_table(&self, table: &TableIdent) -> IcebergResult<()> {
+        self.wait_unless_stalled().await;
+        self.inner.purge_table(table).await
+    }
+
+    async fn table_exists(&self, table: &TableIdent) -> IcebergResult<bool> {
+        self.wait_unless_stalled().await;
+        self.inner.table_exists(table).await
+    }
+
+    async fn rename_table(&self, source: &TableIdent, destination: &TableIdent) -> IcebergResult<()> {
+        self.wait_unless_stalled().await;
+        self.inner.rename_table(source, destination).await
+    }
+
+    async fn register_table(&self, table: &TableIdent, metadata_location: String) -> IcebergResult<Table> {
+        self.wait_unless_stalled().await;
+        self.inner.register_table(table, metadata_location).await
+    }
+
+    async fn update_table(&self, commit: TableCommit) -> IcebergResult<Table> {
+        self.wait_unless_stalled().await;
+        self.inner.update_table(commit).await
+    }
+}
+
 /// What the replicas of one deployment share.
 struct Deployment {
     /// The catalog over the temporary warehouse.
@@ -103,6 +191,8 @@ struct Deployment {
     config: OpenSearchConfig,
     /// The object store holding the system indices.
     system_store: SystemObjectStore,
+    /// The server knobs every replica of the deployment starts with.
+    options: ServerOptions,
     /// Held for its `Drop`, which removes the warehouse directory once no replica uses it.
     _warehouse: tempfile::TempDir,
 }
@@ -113,6 +203,8 @@ pub struct TestServer {
     pub client: reqwest::Client,
     /// `http://127.0.0.1:<port>` of the listener.
     pub base_url: String,
+    /// The WAL store the engine reads hot segments from; tests write segments into it.
+    pub wal_store: Arc<dyn object_store::ObjectStore>,
     /// Cancels the listener: [`TestServer::shutdown`] and the `Drop` fire it.
     cancel_token: CancellationToken,
     /// The task serving the listener, drained on shutdown and aborted on drop.
@@ -131,8 +223,19 @@ impl TestServer {
     /// in-memory system-index store. A listener that does not start fails the test here, with the
     /// step that failed.
     pub async fn start_with_config(config: OpenSearchConfig) -> (Self, Arc<dyn Catalog>) {
-        match Self::try_start_with_config(config).await {
-            Ok(started) => started,
+        Self::start_with_options(config, ServerOptions::default()).await
+    }
+
+    /// Start like [`TestServer::start_with_config`], with `options` driving one failure path. The
+    /// warehouse catalog is returned to the test, which writes rows through it even when the
+    /// engine reads through a stall switch.
+    pub async fn start_with_options(config: OpenSearchConfig, options: ServerOptions) -> (Self, Arc<dyn Catalog>) {
+        let start_result = match build_in_memory_system_object_store() {
+            Ok(system_object_store) => Self::try_start_deployment(config, system_object_store, options).await,
+            Err(error) => Err(error),
+        };
+        match start_result {
+            Ok(started_deployment) => started_deployment,
             Err(error) => panic!("the OpenSearch listener did not start: {error}"),
         }
     }
@@ -144,21 +247,15 @@ impl TestServer {
         config: OpenSearchConfig,
         system_object_store: SystemObjectStore,
     ) -> (Self, Arc<dyn Catalog>) {
-        match Self::try_start_with_system_store(config, system_object_store).await {
+        match Self::try_start_deployment(config, system_object_store, ServerOptions::default()).await {
             Ok(started) => started,
             Err(error) => panic!("the OpenSearch listener did not start: {error}"),
         }
     }
 
-    /// [`TestServer::start_with_config`] with its failure returned.
-    async fn try_start_with_config(config: OpenSearchConfig) -> Result<(Self, Arc<dyn Catalog>), SetupError> {
-        let system_object_store = build_in_memory_system_object_store()?;
-        Self::try_start_with_system_store(config, system_object_store).await
-    }
-
     /// Start another replica of this server's deployment: the same catalog, WAL store,
-    /// configuration and system object store, with its own engine, caches and write loops. A
-    /// replica that does not start fails the test here, with the step that failed.
+    /// configuration, system object store and options, with its own engine, caches and write
+    /// loops. A replica that does not start fails the test here, with the step that failed.
     pub async fn start_replica(&self) -> Self {
         match Self::try_launch(Arc::clone(&self.deployment)).await {
             Ok(replica) => replica,
@@ -166,10 +263,12 @@ impl TestServer {
         }
     }
 
-    /// [`TestServer::start_with_system_store`] with its failure returned.
-    async fn try_start_with_system_store(
+    /// A new deployment with its own warehouse, its production tables created, and its first
+    /// replica started, with its failure returned.
+    async fn try_start_deployment(
         config: OpenSearchConfig,
         system_object_store: SystemObjectStore,
+        options: ServerOptions,
     ) -> Result<(Self, Arc<dyn Catalog>), SetupError> {
         let (catalog, warehouse) = build_warehouse_catalog().await?;
         let deployment = Arc::new(Deployment {
@@ -177,6 +276,7 @@ impl TestServer {
             wal_store: Arc::new(InMemory::new()),
             config,
             system_store: system_object_store,
+            options,
             _warehouse: warehouse,
         });
         Ok((Self::try_launch(deployment).await?, catalog))
@@ -187,7 +287,7 @@ impl TestServer {
     /// startup checks fail reports no port, and the drain re-raises its own failure, which names
     /// the check.
     async fn try_launch(deployment: Arc<Deployment>) -> Result<Self, SetupError> {
-        let runtime = build_replica_runtime(&deployment.catalog, &deployment.wal_store)?;
+        let runtime = build_replica_runtime(&deployment.catalog, &deployment.wal_store, &deployment.options)?;
         // Built before the listener is spawned, so its failure leaves no task running.
         let client = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build()?;
         // Port 0: the OS assigns a free port and the listener reports it, so no probe races
@@ -231,6 +331,7 @@ impl TestServer {
         Ok(Self {
             client,
             base_url,
+            wal_store: Arc::clone(&deployment.wal_store),
             cancel_token,
             server_handle,
             deployment,
@@ -273,19 +374,19 @@ impl Drop for TestServer {
     }
 }
 
-/// The runtime a listener serves: a catalog over a temporary warehouse holding every table of
-/// [`PRODUCTION_TABLES`], an in-memory WAL store with WAL reads on, and the `multi` tenant
-/// policy. The returned directory removes the warehouse on drop, so the caller holds it for as
-/// long as the runtime is used.
+/// The runtime a listener serves: a catalog over a temporary warehouse holding every table
+/// [`create_production_tables`] creates, an in-memory WAL store with WAL reads on, and the
+/// `multi` tenant policy. The returned directory removes the warehouse on drop,
+/// so the caller holds it for as long as the runtime is used.
 pub async fn build_runtime() -> Result<(QueryRuntime, Arc<dyn Catalog>, tempfile::TempDir), SetupError> {
     let (catalog, warehouse) = build_warehouse_catalog().await?;
     let wal_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let runtime = build_replica_runtime(&catalog, &wal_store)?;
+    let runtime = build_replica_runtime(&catalog, &wal_store, &ServerOptions::default())?;
     Ok((runtime, catalog, warehouse))
 }
 
-/// A catalog over a temporary warehouse holding every table of [`PRODUCTION_TABLES`]. The returned
-/// directory removes the warehouse on drop.
+/// A catalog over a temporary warehouse holding the IceGate namespace and every table
+/// [`create_production_tables`] creates. The returned directory removes the warehouse on drop.
 async fn build_warehouse_catalog() -> Result<(Arc<dyn Catalog>, tempfile::TempDir), SetupError> {
     let warehouse = tempfile::tempdir()?;
     let catalog_config = CatalogConfig {
@@ -295,30 +396,44 @@ async fn build_warehouse_catalog() -> Result<(Arc<dyn Catalog>, tempfile::TempDi
         cache: None,
     };
     let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop(), CancellationToken::new()).await?;
+    catalog
+        .create_namespace(&NamespaceIdent::new(ICEGATE_NAMESPACE.to_string()), HashMap::new())
+        .await?;
     create_production_tables(&catalog).await?;
     Ok((catalog, warehouse))
 }
 
 /// The runtime of one replica over `catalog` and `wal_store`: its own engine with WAL reads on,
-/// and the `multi` tenant policy.
+/// the `multi` tenant policy, and the deadline, memory pressure and catalog stall switch of
+/// `options`. With a stall switch the engine reads `catalog` through it, while the test keeps
+/// writing rows through `catalog` itself.
 fn build_replica_runtime(
     catalog: &Arc<dyn Catalog>,
     wal_store: &Arc<dyn object_store::ObjectStore>,
+    options: &ServerOptions,
 ) -> Result<QueryRuntime, SetupError> {
     let wal_reader = Arc::new(icegate_queue::ParquetQueueReader::new("", Arc::clone(wal_store), 8192)?);
     let engine_config = QueryEngineConfig {
         wal_query_enabled: true,
+        max_query_duration_secs: options.max_query_duration_secs,
         ..QueryEngineConfig::default()
+    };
+    let engine_catalog: Arc<dyn Catalog> = match &options.catalog_stall_switch {
+        Some(switch) => Arc::new(StallSwitchCatalog {
+            inner: Arc::clone(catalog),
+            is_stalled: Arc::clone(switch),
+        }),
+        None => Arc::clone(catalog),
     };
     Ok(QueryRuntime {
         engine: Arc::new(QueryEngine::new(
-            Arc::clone(catalog),
+            engine_catalog,
             engine_config,
             Arc::clone(wal_store),
             wal_reader,
         )),
         metrics: Arc::new(QueryMetrics::new_disabled()),
-        pressure: MemoryPressure::inert(),
+        pressure: options.pressure.clone(),
         tenant_resolver: TenantResolver::Multi,
     })
 }
@@ -345,21 +460,4 @@ async fn is_serving(client: &reqwest::Client, base_url: &str) -> bool {
         tokio::time::sleep(READY_POLL_INTERVAL).await;
     }
     false
-}
-
-/// Create every table of [`PRODUCTION_TABLES`] in the IceGate namespace.
-async fn create_production_tables(catalog: &Arc<dyn Catalog>) -> Result<(), SetupError> {
-    let namespace = NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
-    catalog.create_namespace(&namespace, HashMap::new()).await?;
-    for (name, build_schema, build_partition_spec, build_sort_order) in PRODUCTION_TABLES {
-        let table_schema = build_schema()?;
-        let creation = TableCreation::builder()
-            .name(name.to_string())
-            .partition_spec(build_partition_spec(&table_schema)?)
-            .sort_order(build_sort_order(&table_schema)?)
-            .schema(table_schema)
-            .build();
-        catalog.create_table(&namespace, creation).await?;
-    }
-    Ok(())
 }

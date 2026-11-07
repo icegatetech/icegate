@@ -292,6 +292,10 @@ query:
       maxSnapshotBytes: 134217728
       # -- Bytes of stored documents one answer may carry; at least maxSnapshotBytes. An _mget or _search past it is refused whole with 400, and _bulk update items past it fail one by one.
       maxAnswerBytes: 268435456
+    ## Limits of _search.
+    search:
+      # -- Largest from + size a _search accepts, on data and system indices alike, and the largest page a system-index scroll opens with. A larger window is answered 400, never truncated.
+      maxResultWindow: 10000
 
   ## Prometheus metrics endpoint
   metrics:

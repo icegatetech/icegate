@@ -43,4 +43,9 @@ pub(crate) mod query_dsl;
 #[cfg(test)]
 mod test_support;
 
+/// Table rows with explicit values, written the way production writes them; the `OpenSearch`
+/// integration binary includes the same file.
+#[cfg(test)]
+mod test_rows;
+
 pub use config::QueryConfig;

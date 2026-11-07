@@ -2278,16 +2278,24 @@ async fn search_without_an_index_in_the_path_reaches_the_handler_on_get_and_post
     Ok(())
 }
 
-/// The test catalog holds data tables and no system index, so the empty expression selects data
-/// indices, which the handler refuses once the body has parsed.
+/// The test catalog holds data tables and no system index, so the empty expression selects every
+/// wildcard-visible data index, each empty: the data path answers no hits.
 #[tokio::test]
-async fn a_valid_search_without_an_index_in_the_path_selects_the_data_indices_and_is_a_400() -> TestResult {
+async fn a_valid_search_without_an_index_in_the_path_searches_the_data_indices() -> TestResult {
     let (server, _catalog) = TestServer::start().await;
 
     let (status, answer) = send_request(&server, Method::POST, TENANT_A, "/_search", Some(&json!({}))).await?;
 
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["timed_out"], false);
+    assert_eq!(
+        answer["_shards"],
+        json!({"total": 1, "successful": 1, "skipped": 0, "failed": 0})
+    );
+    assert_eq!(
+        answer["hits"],
+        json!({"total": {"value": 0, "relation": "eq"}, "max_score": null, "hits": []})
+    );
     server.shutdown().await;
     Ok(())
 }
@@ -2422,16 +2430,21 @@ async fn aggregations_on_a_system_index_are_a_400() -> TestResult {
 }
 
 #[tokio::test]
-async fn a_search_resolving_to_data_indices_is_a_400() -> TestResult {
+async fn a_search_mixing_system_and_data_indices_is_a_400() -> TestResult {
     let (server, _catalog) = TestServer::start().await;
     create_kibana_index(&server, TENANT_A).await?;
 
-    for path in ["/logs/_search", "/.kibana_1,logs/_search"] {
-        let (status, answer) = send_request(&server, Method::POST, TENANT_A, path, Some(&json!({}))).await?;
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana_1,logs/_search",
+        Some(&json!({})),
+    )
+    .await?;
 
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
-        assert_eq!(answer["error"]["type"], "illegal_argument_exception", "{path}");
-    }
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["error"]["type"], "illegal_argument_exception");
     server.shutdown().await;
     Ok(())
 }
@@ -3188,7 +3201,8 @@ async fn a_scroll_above_the_maximum_lifetime_is_a_400() -> TestResult {
 
 /// Everything here reaches the same refusal for a different reason: a page with no offset to
 /// continue from, or a target that is not one system index. The wildcard selects nothing, which a
-/// plain search answers with no hits, and the data index is refused as any search of one is.
+/// plain search answers with no hits, and a scroll on a data index is refused because only a
+/// system index is scrolled.
 #[tokio::test]
 async fn a_scroll_opening_that_cannot_page_one_index_is_a_400() -> TestResult {
     let (server, _catalog) = TestServer::start().await;

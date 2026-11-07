@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use super::catalog::IndexCatalog;
+use super::config::SearchLimitsConfig;
 use super::node::NodeIdentity;
 use super::system_index::SystemIndexStore;
 
@@ -20,4 +21,7 @@ pub(crate) struct OpenSearchState {
     /// serializing, and `_bulk` carries it to the snapshot on each operation through
     /// `ReturnedSources`, so it is not one of `SystemIndexLimits`.
     pub(crate) max_answer_bytes: usize,
+    /// `opensearch.search`: the result window every `_search` and system scroll opening is
+    /// checked against.
+    pub(crate) search_limits: SearchLimitsConfig,
 }

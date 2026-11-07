@@ -559,6 +559,7 @@ mod tests {
             ),
             system_store,
             max_answer_bytes: config.system_indices.max_answer_bytes,
+            search_limits: config.search,
         };
         let tenant = Extension(TenantId::new("tenant-a").expect("a valid tenant"));
         let mapping_parameters = MappingParameters {

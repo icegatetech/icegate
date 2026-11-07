@@ -9,7 +9,7 @@
 //! tenant: MAP-key enumeration for field discovery, and the per-tenant footprint of
 //! `_cat/indices`.
 
-mod catalog;
+pub(crate) mod catalog;
 mod cluster;
 mod config;
 mod context;
@@ -26,7 +26,7 @@ mod server;
 mod state;
 pub(crate) mod system_index;
 
-pub use config::{OpenSearchConfig, SystemIndicesConfig};
+pub use config::{OpenSearchConfig, SearchLimitsConfig, SystemIndicesConfig};
 pub use server::{run, run_with_port_tx};
 pub use system_index::{SystemObjectStore, build_system_object_store};
 pub(crate) use system_index::{refuse_overlapping_locations, resolve_system_indices_location};

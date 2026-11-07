@@ -29,6 +29,8 @@ const DEFAULT_MAX_SCROLL_LIFETIME_SECS: u64 = 900;
 const DEFAULT_MAX_SNAPSHOT_BYTES: usize = 4 * DEFAULT_MAX_REQUEST_BODY_BYTES;
 /// Default bound of the decoded-snapshot cache: two snapshots at the default bound.
 const DEFAULT_SYSTEM_CACHE_MAX_BYTES: usize = 2 * DEFAULT_MAX_SNAPSHOT_BYTES;
+/// Default largest `from + size` of a `_search`.
+const DEFAULT_MAX_RESULT_WINDOW: usize = 10_000;
 /// Default bound of one answer: an answer naming every stored document once fits, with room for
 /// the metadata of each entry.
 const DEFAULT_MAX_ANSWER_BYTES: usize = 2 * DEFAULT_MAX_SNAPSHOT_BYTES;
@@ -62,6 +64,8 @@ pub struct OpenSearchConfig {
     pub field_discovery_window_secs: u64,
     /// The per-tenant store of dot-prefixed system indices.
     pub system_indices: SystemIndicesConfig,
+    /// Search limits (`search.max_result_window`).
+    pub search: SearchLimitsConfig,
 }
 
 impl OpenSearchConfig {
@@ -73,7 +77,7 @@ impl OpenSearchConfig {
     /// Returns [`QueryError::Config`] for a blank host or cluster name, a zero
     /// `max_request_body_bytes` or `field_discovery_window_secs`, or a
     /// [`version`](Self::version) outside its documented form, and every error of
-    /// [`SystemIndicesConfig::validate`].
+    /// [`SearchLimitsConfig::validate`] and [`SystemIndicesConfig::validate`].
     pub fn validate(&self) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -95,6 +99,7 @@ impl OpenSearchConfig {
             ));
         }
         EmulatedVersion::parse(&self.version)?;
+        self.search.validate()?;
         self.system_indices.validate()
     }
 }
@@ -110,6 +115,7 @@ impl Default for OpenSearchConfig {
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             field_discovery_window_secs: DEFAULT_FIELD_DISCOVERY_WINDOW_SECS,
             system_indices: SystemIndicesConfig::default(),
+            search: SearchLimitsConfig::default(),
         }
     }
 }
@@ -125,6 +131,40 @@ impl ServerConfig for OpenSearchConfig {
 
     fn port(&self) -> u16 {
         self.port
+    }
+}
+
+/// Limits of `_search` (`opensearch.search`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchLimitsConfig {
+    /// Largest `from + size` a `_search` accepts, on data and on system indices alike, and the
+    /// largest page a system-index scroll opens with. A larger window is answered with a 400
+    /// `search_phase_execution_exception`, never truncated.
+    pub max_result_window: usize,
+}
+
+impl Default for SearchLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_result_window: DEFAULT_MAX_RESULT_WINDOW,
+        }
+    }
+}
+
+impl SearchLimitsConfig {
+    /// Check the limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryError::Config`] when `max_result_window` is zero.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_result_window == 0 {
+            return Err(QueryError::Config(
+                "opensearch.search.max_result_window must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -603,5 +643,18 @@ mod tests {
         };
 
         assert!(matches!(config.validate(), Err(QueryError::Config(_))));
+    }
+
+    #[test]
+    fn search_limits_default_to_a_window_of_ten_thousand_and_refuse_zero() {
+        assert_eq!(OpenSearchConfig::default().search.max_result_window, 10_000);
+        let mut config = OpenSearchConfig {
+            enabled: true,
+            ..OpenSearchConfig::default()
+        };
+        config.search.max_result_window = 0;
+        assert!(matches!(config.validate(), Err(QueryError::Config(_))));
+        config.search.max_result_window = 1;
+        assert!(config.validate().is_ok());
     }
 }

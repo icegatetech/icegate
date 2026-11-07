@@ -84,6 +84,7 @@ pub async fn run_with_port_tx(
         ),
         system_store: system_index_store,
         max_answer_bytes: config.system_indices.max_answer_bytes,
+        search_limits: config.search,
     };
     let app = super::routes::build_router(state, &runtime, &config);
     tracing::info!("OpenSearch API server listening on {}", local_address);
