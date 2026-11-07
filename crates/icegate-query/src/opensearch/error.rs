@@ -100,6 +100,58 @@ impl OpenSearchError {
         Self::parsing(reason).with_metadata("construct", construct)
     }
 
+    /// An aggregation of the request this listener refuses to answer, such as a nesting it does
+    /// not plan (`400`, `illegal_argument_exception`); `aggregation` carries the request's name
+    /// for it.
+    pub(crate) fn unsupported_aggregation(aggregation: &str, reason: impl Into<String>) -> Self {
+        Self::illegal_argument(reason).with_metadata("aggregation", aggregation)
+    }
+
+    /// An aggregation type of IceGate's surface that this listener does not plan yet (`400`,
+    /// `illegal_argument_exception`); `aggregation` carries the request's name for it and
+    /// `aggregation_type` the type.
+    pub(crate) fn unplanned_aggregation_type(aggregation: &str, aggregation_type: &str) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!("aggregation [{aggregation_type}] of [{aggregation}] is not supported yet"),
+        )
+        .with_metadata("aggregation_type", aggregation_type)
+    }
+
+    /// A field an aggregation cannot read in one index (`400`, `illegal_argument_exception`):
+    /// `field`, its `field_type`, the `index` mapping it so, the `aggregation` and its
+    /// `aggregation_type` are carried for a client.
+    pub(crate) fn unsupported_aggregation_field(
+        field: &str,
+        field_type: &str,
+        index: &str,
+        aggregation: &str,
+        aggregation_type: &str,
+    ) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!(
+                "field [{field}] of type [{field_type}] in [{index}] is not supported for aggregation \
+                 [{aggregation_type}] [{aggregation}]"
+            ),
+        )
+        .with_metadata("aggregation_type", aggregation_type)
+        .with_metadata("field", field)
+        .with_metadata("field_type", field_type)
+        .with_metadata("index", index)
+    }
+
+    /// An aggregation whose chain of nested bucket aggregations is deeper than this listener
+    /// plans (`400`, `illegal_argument_exception`); `aggregation` carries the request's name for
+    /// the outermost one and `limit` the most levels one chain may nest.
+    pub(crate) fn aggregation_depth_exceeded(aggregation: &str, limit: usize) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!("[{aggregation}] nests more than {limit} bucket levels"),
+        )
+        .with_metadata("limit", limit)
+    }
+
     /// A query text past a limit of its parser (`400`, `parsing_exception`), whose value `limit`
     /// carries for a client.
     pub(crate) fn query_limit_exceeded(reason: impl Into<String>, limit: impl Into<Value>) -> Self {
@@ -202,6 +254,27 @@ impl OpenSearchError {
             from.saturating_add(size)
         ));
         Self::search_phase_failure(None, &cause)
+    }
+
+    /// One search's aggregations would answer more than `max` buckets (`400`).
+    ///
+    /// `actual` is the count reached when the limit was crossed: counting stops there, so it is
+    /// at least `max + 1` and not the size a complete answer would have. The status is `400`
+    /// rather than `503` because retrying cannot shrink the answer.
+    pub(crate) fn too_many_buckets(max: usize, actual: usize) -> Self {
+        Self::search_phase_failure(
+            None,
+            &Self::new(
+                StatusCode::BAD_REQUEST,
+                "too_many_buckets_exception",
+                format!(
+                    "Trying to create too many buckets. Must be less than or equal to: [{max}] but this \
+                     search reached [{actual}]. Narrow the time range or the interval, or raise \
+                     opensearch.search.max_buckets."
+                ),
+            )
+            .with_metadata("max_buckets", max),
+        )
     }
 
     /// `_count` addressed to the data indices `index_names`, a comma-joined list (`400`), which
@@ -710,6 +783,26 @@ mod tests {
                 },
                 "status": 400
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn too_many_buckets_is_a_search_phase_400_with_the_bucket_cause_in_root_cause() {
+        let (status, body) = render_envelope(OpenSearchError::too_many_buckets(3, 4)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        assert_eq!(body["error"]["type"], "search_phase_execution_exception");
+        assert_eq!(body["error"]["phase"], "query");
+        assert_eq!(body["error"]["grouped"], true);
+        let cause = &body["error"]["root_cause"][0];
+        assert_eq!(cause["type"], "too_many_buckets_exception");
+        assert_eq!(cause["max_buckets"], 3);
+        assert_eq!(
+            cause["reason"],
+            "Trying to create too many buckets. Must be less than or equal to: [3] but this search \
+             reached [4]. Narrow the time range or the interval, or raise \
+             opensearch.search.max_buckets."
         );
     }
 }

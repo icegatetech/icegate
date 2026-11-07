@@ -101,6 +101,7 @@ data:
         max_answer_bytes: {{ .Values.query.opensearch.systemIndices.maxAnswerBytes | int }}
       search:
         max_result_window: {{ .Values.query.opensearch.search.maxResultWindow | int }}
+        max_buckets: {{ .Values.query.opensearch.search.maxBuckets | int }}
     metrics:
       enabled: {{ .Values.query.metrics.enabled }}
       host: "0.0.0.0"

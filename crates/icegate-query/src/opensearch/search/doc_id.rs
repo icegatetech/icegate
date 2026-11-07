@@ -32,6 +32,14 @@ use crate::opensearch::error::OpenSearchError;
 pub(crate) const DOC_HASH_BITS: u32 = 43;
 /// The mask of the row-hash bits a `_doc` sort value keeps.
 pub(crate) const DOC_HASH_MASK: u64 = (1 << DOC_HASH_BITS) - 1;
+/// Microseconds in a millisecond.
+pub(crate) const MICROS_PER_MILLISECOND: i64 = 1_000;
+/// Microseconds in a second.
+pub(crate) const MICROS_PER_SECOND: i64 = 1_000 * MICROS_PER_MILLISECOND;
+/// Microseconds in a minute.
+pub(crate) const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SECOND;
+/// Microseconds in an hour.
+pub(crate) const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MINUTE;
 /// Microseconds in a day, the unit step of a `Date32` value.
 pub(crate) const MICROS_PER_DAY: i64 = 86_400_000_000;
 

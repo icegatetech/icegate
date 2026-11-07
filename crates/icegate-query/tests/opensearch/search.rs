@@ -331,7 +331,10 @@ async fn a_search_over_two_indices_unions_their_rows_and_a_missing_field_matches
 #[tokio::test]
 async fn a_size_at_the_result_window_is_accepted_and_one_above_is_a_search_phase_400() {
     let config = OpenSearchConfig {
-        search: SearchLimitsConfig { max_result_window: 3 },
+        search: SearchLimitsConfig {
+            max_result_window: 3,
+            ..SearchLimitsConfig::default()
+        },
         ..OpenSearchConfig::default()
     };
     let (server, catalog) = TestServer::start_with_config(config).await;
@@ -382,7 +385,10 @@ async fn a_size_at_the_result_window_is_accepted_and_one_above_is_a_search_phase
 #[tokio::test]
 async fn a_system_search_or_scroll_past_the_result_window_is_the_same_search_phase_400() {
     let config = OpenSearchConfig {
-        search: SearchLimitsConfig { max_result_window: 3 },
+        search: SearchLimitsConfig {
+            max_result_window: 3,
+            ..SearchLimitsConfig::default()
+        },
         ..OpenSearchConfig::default()
     };
     let (server, _catalog) = TestServer::start_with_config(config).await;

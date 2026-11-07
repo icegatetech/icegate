@@ -64,7 +64,7 @@ pub struct OpenSearchConfig {
     pub field_discovery_window_secs: u64,
     /// The per-tenant store of dot-prefixed system indices.
     pub system_indices: SystemIndicesConfig,
-    /// Search limits (`search.max_result_window`).
+    /// Search limits (`search.max_result_window`, `search.max_buckets`).
     pub search: SearchLimitsConfig,
 }
 
@@ -134,6 +134,9 @@ impl ServerConfig for OpenSearchConfig {
     }
 }
 
+/// Default of [`SearchLimitsConfig::max_buckets`].
+const DEFAULT_MAX_BUCKETS: usize = 65_535;
+
 /// Limits of `_search` (`opensearch.search`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -142,12 +145,17 @@ pub struct SearchLimitsConfig {
     /// largest page a system-index scroll opens with. A larger window is answered with a 400
     /// `search_phase_execution_exception`, never truncated.
     pub max_result_window: usize,
+    /// The most buckets one search's aggregations may answer, every level of every aggregation
+    /// counted. A search that would answer more is refused with `too_many_buckets_exception`
+    /// (`400`), never truncated.
+    pub max_buckets: usize,
 }
 
 impl Default for SearchLimitsConfig {
     fn default() -> Self {
         Self {
             max_result_window: DEFAULT_MAX_RESULT_WINDOW,
+            max_buckets: DEFAULT_MAX_BUCKETS,
         }
     }
 }
@@ -157,11 +165,16 @@ impl SearchLimitsConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`QueryError::Config`] when `max_result_window` is zero.
+    /// Returns [`QueryError::Config`] when `max_result_window` or `max_buckets` is zero.
     pub fn validate(&self) -> Result<()> {
         if self.max_result_window == 0 {
             return Err(QueryError::Config(
                 "opensearch.search.max_result_window must be greater than 0".to_string(),
+            ));
+        }
+        if self.max_buckets == 0 {
+            return Err(QueryError::Config(
+                "opensearch.search.max_buckets must be greater than 0".to_string(),
             ));
         }
         Ok(())
@@ -460,6 +473,10 @@ mod tests {
                 "max_snapshot_bytes": 134_217_729,
                 "max_answer_bytes": 268_435_458,
             },
+            "search": {
+                "max_result_window": 7,
+                "max_buckets": 9,
+            },
         }))
         .expect("a section naming every key deserializes");
 
@@ -478,6 +495,8 @@ mod tests {
         assert_eq!(config.system_indices.cache_max_bytes, 268_435_457);
         assert_eq!(config.system_indices.max_snapshot_bytes, 134_217_729);
         assert_eq!(config.system_indices.max_answer_bytes, 268_435_458);
+        assert_eq!(config.search.max_result_window, 7);
+        assert_eq!(config.search.max_buckets, 9);
     }
 
     #[test]
@@ -655,6 +674,20 @@ mod tests {
         config.search.max_result_window = 0;
         assert!(matches!(config.validate(), Err(QueryError::Config(_))));
         config.search.max_result_window = 1;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn search_limits_default_to_65535_buckets_and_refuse_zero() {
+        assert_eq!(OpenSearchConfig::default().search.max_buckets, 65_535);
+
+        let mut config = OpenSearchConfig {
+            enabled: true,
+            ..OpenSearchConfig::default()
+        };
+        config.search.max_buckets = 0;
+        assert!(matches!(config.validate(), Err(QueryError::Config(_))));
+        config.search.max_buckets = 1;
         assert!(config.validate().is_ok());
     }
 }

@@ -2329,12 +2329,12 @@ async fn a_search_applies_the_index_options_of_its_query_string() -> TestResult 
         None,
     )
     .await?;
-    let (empty_aggregations_status, empty_aggregations_answer) = send_request(
+    let (refused_aggregation_status, refused_aggregation_answer) = send_request(
         &server,
         Method::POST,
         TENANT_A,
         "/.kibana_*/_search",
-        Some(&json!({"aggs": {}})),
+        Some(&json!({"aggs": {"2": {"significant_terms": {"field": "type"}}}})),
     )
     .await?;
     create_kibana_index(&server, TENANT_A).await?;
@@ -2372,8 +2372,9 @@ async fn a_search_applies_the_index_options_of_its_query_string() -> TestResult 
     assert_eq!(skipped_name_answer["hits"], expected_empty_hits);
     assert_eq!(disallowed_status, StatusCode::NOT_FOUND);
     assert_eq!(disallowed_answer["error"]["type"], "index_not_found_exception");
-    assert_eq!(empty_aggregations_status, StatusCode::BAD_REQUEST);
-    assert_eq!(empty_aggregations_answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(refused_aggregation_status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused_aggregation_answer["error"]["type"], "parsing_exception");
+    assert_eq!(refused_aggregation_answer["error"]["construct"], "significant_terms");
     let expected_total = json!({"value": 1, "relation": "eq"});
     assert_eq!(wildcard_status, StatusCode::OK, "{wildcard_answer}");
     assert_eq!(wildcard_answer["hits"]["total"], expected_total);

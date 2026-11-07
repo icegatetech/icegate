@@ -1,0 +1,195 @@
+//! Aggregations over real HTTP. Each request is a literal, the rows are written by the test, and
+//! every expected bucket is stated here.
+#![allow(clippy::expect_used)]
+
+use icegate_common::LOGS_TABLE;
+use icegate_query::opensearch::OpenSearchConfig;
+use reqwest::{Method, StatusCode};
+use serde_json::{Value, json};
+
+use super::data::{build_log_row_at_minute, build_wal_log_row_at_minute, commit_log_rows, write_wal_segment};
+use super::harness::TestServer;
+use super::requests::send_request;
+use super::test_rows::COMMITTED_WAL_OFFSET;
+
+const TENANT_A: &str = "tenant-a";
+const TENANT_B: &str = "tenant-b";
+
+/// An hourly histogram from 10:00Z with `extended_bounds.max` at `max` epoch milliseconds.
+fn build_hourly_histogram_request(min_doc_count: u64, max: i64) -> Value {
+    json!({
+        "size": 0,
+        "aggs": {"hours": {"date_histogram": {
+            "field": "timestamp", "fixed_interval": "1h", "min_doc_count": min_doc_count,
+            "extended_bounds": {"min": 1_791_453_600_000_i64, "max": max}
+        }}}
+    })
+}
+
+#[tokio::test]
+async fn buckets_at_max_buckets_are_answered_and_one_more_is_a_400() {
+    let mut config = OpenSearchConfig::default();
+    config.search.max_buckets = 3;
+    let (server, catalog) = TestServer::start_with_config(config).await;
+    commit_log_rows(
+        &catalog,
+        &[
+            build_log_row_at_minute(TENANT_A, 15, "INFO", "tenant-a first"),
+            build_log_row_at_minute(TENANT_A, 135, "INFO", "tenant-a second"),
+        ],
+    )
+    .await
+    .expect("commit logs");
+
+    // Below: two data buckets; the bounds apply only with `min_doc_count: 0`.
+    let (below_status, below) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/logs/_search",
+        Some(&build_hourly_histogram_request(1, 1_791_460_800_000)),
+    )
+    .await
+    .expect("search request");
+    // At: 10:00, 11:00 (empty) and 12:00.
+    let (at_status, at) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/logs/_search",
+        Some(&build_hourly_histogram_request(0, 1_791_460_800_000)),
+    )
+    .await
+    .expect("search request");
+    // Above: the bounds reach 13:00, a fourth bucket.
+    let (above_status, above) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/logs/_search",
+        Some(&build_hourly_histogram_request(0, 1_791_464_400_000)),
+    )
+    .await
+    .expect("search request");
+
+    assert_eq!(below_status, StatusCode::OK);
+    assert_eq!(
+        below["aggregations"]["hours"]["buckets"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(at_status, StatusCode::OK);
+    assert_eq!(
+        at["aggregations"]["hours"]["buckets"],
+        json!([
+            {"key_as_string": "2026-10-08T10:00:00.000Z", "key": 1_791_453_600_000_i64, "doc_count": 1},
+            {"key_as_string": "2026-10-08T11:00:00.000Z", "key": 1_791_457_200_000_i64, "doc_count": 0},
+            {"key_as_string": "2026-10-08T12:00:00.000Z", "key": 1_791_460_800_000_i64, "doc_count": 1}
+        ])
+    );
+    assert_eq!(above_status, StatusCode::BAD_REQUEST);
+    assert_eq!(above["error"]["type"], "search_phase_execution_exception");
+    assert_eq!(above["error"]["root_cause"][0]["type"], "too_many_buckets_exception");
+    assert_eq!(above["error"]["root_cause"][0]["max_buckets"], 3);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_discover_style_histogram_request_answers_keys_and_counts() {
+    let (server, catalog) = TestServer::start().await;
+    commit_log_rows(
+        &catalog,
+        &[
+            build_log_row_at_minute(TENANT_A, 5, "ERROR", "tenant-a parquet 10:05"),
+            build_log_row_at_minute(TENANT_B, 10, "ERROR", "tenant-b parquet 10:10"),
+            build_log_row_at_minute(TENANT_A, 20, "INFO", "tenant-a parquet 10:20"),
+            build_log_row_at_minute(TENANT_A, 70, "INFO", "tenant-a parquet 11:10"),
+        ],
+    )
+    .await
+    .expect("commit logs");
+    // The segment follows the WAL offset the Parquet commit records.
+    write_wal_segment(
+        &server.wal_store,
+        &catalog,
+        LOGS_TABLE,
+        COMMITTED_WAL_OFFSET + 1,
+        &[
+            build_wal_log_row_at_minute(TENANT_A, 40, "WARN", "tenant-a wal 10:40"),
+            build_wal_log_row_at_minute(TENANT_B, 50, "WARN", "tenant-b wal 10:50"),
+        ],
+    )
+    .await
+    .expect("write WAL segment");
+    let body = json!({
+        "size": 0,
+        "query": {"bool": {
+            "must": [],
+            "filter": [{"range": {"timestamp": {
+                "gte": "2026-10-08T10:00:00.000Z", "lte": "2026-10-08T11:59:59.999Z", "format": "strict_date_optional_time"
+            }}}],
+            "should": [],
+            "must_not": []
+        }},
+        "aggs": {"2": {"date_histogram": {
+            "field": "timestamp", "fixed_interval": "30m", "time_zone": "Europe/Berlin", "min_doc_count": 1
+        }}}
+    });
+    let path = "/logs/_search?ignore_unavailable=true&track_total_hits=true&timeout=30000ms&preference=1760000000000";
+
+    let (status_a, answer_a) = send_request(&server, Method::POST, TENANT_A, path, Some(&body))
+        .await
+        .expect("search request");
+    let (status_b, answer_b) = send_request(&server, Method::POST, TENANT_B, path, Some(&body))
+        .await
+        .expect("search request");
+
+    assert_eq!(status_a, StatusCode::OK);
+    assert_eq!(answer_a["hits"]["total"], json!({"value": 4, "relation": "eq"}));
+    assert_eq!(
+        answer_a["aggregations"],
+        json!({"2": {"buckets": [
+            {"key_as_string": "2026-10-08T12:00:00.000+02:00", "key": 1_791_453_600_000_i64, "doc_count": 2},
+            {"key_as_string": "2026-10-08T12:30:00.000+02:00", "key": 1_791_455_400_000_i64, "doc_count": 1},
+            {"key_as_string": "2026-10-08T13:00:00.000+02:00", "key": 1_791_457_200_000_i64, "doc_count": 1}
+        ]}})
+    );
+    assert_eq!(status_b, StatusCode::OK);
+    assert_eq!(answer_b["hits"]["total"], json!({"value": 2, "relation": "eq"}));
+    assert_eq!(
+        answer_b["aggregations"],
+        json!({"2": {"buckets": [
+            {"key_as_string": "2026-10-08T12:00:00.000+02:00", "key": 1_791_453_600_000_i64, "doc_count": 1},
+            {"key_as_string": "2026-10-08T12:30:00.000+02:00", "key": 1_791_455_400_000_i64, "doc_count": 1}
+        ]}})
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_histogram_over_a_keyword_field_is_a_400_naming_it() {
+    let (server, catalog) = TestServer::start().await;
+    commit_log_rows(&catalog, &[build_log_row_at_minute(TENANT_A, 5, "INFO", "tenant-a")])
+        .await
+        .expect("commit logs");
+
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/logs/_search",
+        Some(
+            &json!({"size": 0, "aggs": {"2": {"date_histogram": {"field": "severity_text", "fixed_interval": "1h"}}}}),
+        ),
+    )
+    .await
+    .expect("search request");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(answer["error"]["field"], "severity_text");
+    assert_eq!(answer["error"]["field_type"], "keyword");
+    assert_eq!(answer["error"]["index"], "logs");
+    assert_eq!(answer["error"]["aggregation"], "2");
+    assert_eq!(answer["error"]["aggregation_type"], "date_histogram");
+    server.shutdown().await;
+}

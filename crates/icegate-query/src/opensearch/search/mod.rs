@@ -5,6 +5,7 @@
 //! serialized on the blocking pool within `max_answer_bytes`. `_msearch` ([`msearch`]) runs several
 //! such searches from one NDJSON body and answers each with its own status.
 
+mod aggs;
 pub(crate) mod doc_id;
 mod execute;
 mod hits;
@@ -88,7 +89,7 @@ pub(crate) async fn search_indices(
                 ));
             }
             check_result_window(&request, state.search_limits)?;
-            let answer = search_data_indices(&session, &entries, &request, &context).await?;
+            let answer = search_data_indices(&session, &entries, &request, &context, &state.search_limits).await?;
             let max_answer_bytes = state.max_answer_bytes;
             let answer_body = run_blocking_work("serializing a data search answer", move || {
                 serialize_bounded_answer(&answer, max_answer_bytes)

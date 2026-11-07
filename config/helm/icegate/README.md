@@ -448,6 +448,7 @@ an image pinned by digest (`icegate-ingest@sha256:...`) verifies the same way.
 | query.opensearch.fieldDiscoveryWindowSecs | int | `86400` | How far back, in seconds, field discovery (_field_caps, _mapping) looks for attribute-map keys. |
 | query.opensearch.maxRequestBodyBytes | int | `33554432` | Largest request body the listener accepts, in bytes. It also bounds how much of a refused request's body is drained. |
 | query.opensearch.port | int | `9200` | Listener port. |
+| query.opensearch.search.maxBuckets | int | `65535` | Most buckets one search's aggregations may answer, every level counted; a search over it is refused with a 400, never truncated. |
 | query.opensearch.search.maxResultWindow | int | `10000` | Largest from + size a _search accepts, on data and system indices alike, and the largest page a system-index scroll opens with. A larger window is answered 400, never truncated. |
 | query.opensearch.systemIndices.cacheMaxBytes | int | `268435456` | Bound of the decoded-snapshot cache, in bytes; at least maxSnapshotBytes. |
 | query.opensearch.systemIndices.location | string | `""` | s3:// or s3a:// URL the store writes under. Empty resolves to the default prefix under the storage bucket (SystemIndicesConfig::DEFAULT_LOCATION_PREFIX in crates/icegate-query/src/opensearch/config.rs). It must not overlap a table location or the WAL base path; the listener refuses to start otherwise. |

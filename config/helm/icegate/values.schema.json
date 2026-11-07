@@ -152,7 +152,8 @@
               "additionalProperties": false,
               "description": "Limits of _search on the OpenSearch listener.",
               "properties": {
-                "maxResultWindow": { "type": "integer", "minimum": 1, "description": "Largest from + size a _search accepts, on data and system indices alike." }
+                "maxResultWindow": { "type": "integer", "minimum": 1, "description": "Largest from + size a _search accepts, on data and system indices alike." },
+                "maxBuckets": { "type": "integer", "minimum": 1, "description": "Most buckets one search's aggregations may answer." }
               }
             }
           }

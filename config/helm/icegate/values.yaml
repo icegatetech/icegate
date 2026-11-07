@@ -296,6 +296,8 @@ query:
     search:
       # -- Largest from + size a _search accepts, on data and system indices alike, and the largest page a system-index scroll opens with. A larger window is answered 400, never truncated.
       maxResultWindow: 10000
+      # -- Most buckets one search's aggregations may answer, every level counted; a search over it is refused with a 400, never truncated.
+      maxBuckets: 65535
 
   ## Prometheus metrics endpoint
   metrics:

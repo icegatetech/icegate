@@ -34,6 +34,7 @@ use futures::future::try_join_all;
 use icegate_common::schema::{COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID};
 use serde_json::{Map, Value, json};
 
+use super::aggs::{AggregationScope, execute_aggregations, parse_aggregations, plan_aggregation_rows};
 use super::doc_id::{
     CanonicalEncoder, DOC_HASH_BITS, DOC_HASH_MASK, MICROS_PER_DAY, decode_time_and_doc, document_row_hash_udf,
     encode_doc_sort_value, encode_document_id, encode_span_document_id, hash_canonical_row, hash_span_key,
@@ -75,7 +76,55 @@ pub(crate) fn check_result_window(request: &SearchRequest, limits: SearchLimitsC
     Ok(())
 }
 
-/// Search the data indices `entries` of `session` with `request`.
+/// Search `entries` (the data indices a request resolved to) and answer the request's
+/// aggregations beside its hits.
+///
+/// The aggregations are parsed and their fields resolved before any scan, so an aggregation the
+/// indices cannot answer never costs a scan. They read the same matching rows as the hits: every
+/// searched index, the query lowered per index. `aggregations` follows the response's other
+/// keys.
+///
+/// # Errors
+///
+/// The errors of the hits search; the aggregation errors of `parse_aggregations`,
+/// `plan_aggregation_rows` and `execute_aggregations`, among them `400
+/// too_many_buckets_exception` past `limits.max_buckets`.
+pub(crate) async fn search_data_indices(
+    session: &TenantSession,
+    entries: &[&IndexEntry],
+    request: &SearchRequest,
+    context: &RequestContext,
+    limits: &SearchLimitsConfig,
+) -> Result<Value, OpenSearchError> {
+    let aggregation_tree = request.aggregations.as_ref().map(parse_aggregations).transpose()?;
+    let aggregation_rows = match &aggregation_tree {
+        Some(tree) => Some(plan_aggregation_rows(
+            session,
+            entries,
+            &request.query,
+            context.now,
+            tree,
+        )?),
+        None => None,
+    };
+    let mut response = search_hits(session, entries, request, context).await?;
+    let (Some(tree), Some(rows)) = (aggregation_tree, aggregation_rows) else {
+        return Ok(response);
+    };
+    let scope = AggregationScope {
+        session,
+        max_buckets: limits.max_buckets,
+    };
+    let aggregations = execute_aggregations(rows, &tree, &scope).await?;
+    let Value::Object(body) = &mut response else {
+        return Err(OpenSearchError::internal("a search response is a JSON object"));
+    };
+    body.insert("aggregations".to_string(), Value::Object(aggregations));
+    Ok(response)
+}
+
+/// The hits part of a data search: everything `search_data_indices` answers except
+/// `aggregations`.
 ///
 /// Every index is checked for a document-id rule before any scan: `spans` and `operations` are
 /// keyed by `trace_id`‖`span_id`, and any other table must have a `timestamp` column. Hits come
@@ -100,11 +149,11 @@ pub(crate) fn check_result_window(request: &SearchRequest, limits: SearchLimitsC
 /// with different sort types across indices, an `unmapped_type` the data path does not sort as);
 /// the 400s of a `search_after` without a sort, with `from` above 0, with a value count other than
 /// the sort's or with a value that fits no sort key; the lowering errors of [`lower_query`]; the
-/// 400s of [`plan_field_requests`]; the 400s of request keys the data path does not serve yet;
+/// 400s of [`plan_field_requests`]; the 400s of request keys the data path does not serve;
 /// planning or execution failures; and `500` when a row has no canonical encoding or no span key,
 /// a sort value has another type than its key, a value has no JSON rendering, a field resolves to
 /// a column its hit's row does not hold, or the rendering does not finish.
-pub(crate) async fn search_data_indices(
+async fn search_hits(
     session: &TenantSession,
     entries: &[&IndexEntry],
     request: &SearchRequest,
@@ -205,7 +254,7 @@ struct PageHit {
 }
 
 /// A DataFusion planning failure as the envelope `From<QueryError>` maps it to.
-fn convert_plan_error(error: DataFusionError) -> OpenSearchError {
+pub(super) fn convert_plan_error(error: DataFusionError) -> OpenSearchError {
     OpenSearchError::from(QueryError::from(error))
 }
 
@@ -1445,11 +1494,6 @@ fn refuse_unserved_request_keys(request: &SearchRequest) -> Result<(), OpenSearc
     if request.seq_no_primary_term {
         return Err(OpenSearchError::illegal_argument(
             "[seq_no_primary_term] applies to system indices only",
-        ));
-    }
-    if request.aggregations.is_some() {
-        return Err(OpenSearchError::illegal_argument(
-            "[aggs] on data indices is not supported yet",
         ));
     }
     Ok(())

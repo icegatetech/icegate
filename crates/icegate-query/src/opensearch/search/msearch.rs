@@ -383,7 +383,7 @@ async fn run_item(
     let item_answer = match session.resolve_target(expression, item.header.options).await? {
         IndexTarget::Data(entries) => {
             check_result_window(&request, limits)?;
-            let answer = search_data_indices(session, &entries, &request, context).await?;
+            let answer = search_data_indices(session, &entries, &request, context, &limits).await?;
             run_blocking_work("serializing an msearch data item", move || {
                 serialize_item_answer(answer, max_answer_bytes)
             })

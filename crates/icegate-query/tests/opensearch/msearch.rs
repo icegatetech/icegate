@@ -7,55 +7,28 @@ use std::sync::Arc;
 
 use iceberg::Catalog;
 use icegate_common::LOGS_TABLE;
-use icegate_common::schema::{COL_BODY, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_TIMESTAMP};
+use icegate_common::schema::COL_BODY;
 use icegate_query::opensearch::{OpenSearchConfig, SearchLimitsConfig, SystemIndicesConfig};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use super::data::{Cell, LogRow, Row, RowWriteError, commit_log_rows, write_wal_segment};
+use super::data::{
+    RowWriteError, build_log_row_at_minute, build_wal_log_row_at_minute, commit_log_rows, write_wal_segment,
+};
 use super::harness::TestServer;
 use super::requests::{send_ndjson, send_request};
 
 const TENANT_A: &str = "tenant-a";
 const TENANT_B: &str = "tenant-b";
 
-/// 2026-10-08T10:00:00Z in microseconds.
-const TEN_O_CLOCK_MICROS: i64 = 1_791_453_600_000_000;
-const MINUTE_MICROS: i64 = 60_000_000;
-
-const fn build_log_row<'a>(tenant_id: &'a str, minute: i64, severity_text: &'a str, body: &'a str) -> LogRow<'a> {
-    LogRow {
-        tenant_id,
-        timestamp_micros: TEN_O_CLOCK_MICROS + minute * MINUTE_MICROS,
-        service_name: Some("checkout"),
-        severity_text: Some(severity_text),
-        body: Some(body),
-        resource_attributes: &[],
-        log_attributes: &[],
-    }
-}
-
-/// The same log as [`build_log_row`], as a row of a WAL segment.
-fn build_wal_log_row<'a>(tenant: &'a str, minute: i64, severity_text: &'a str, body: &'a str) -> Row<'a> {
-    Row {
-        tenant,
-        cells: vec![
-            (COL_TIMESTAMP, Cell::Micros(TEN_O_CLOCK_MICROS + minute * MINUTE_MICROS)),
-            (COL_SERVICE_NAME, Cell::Text("checkout")),
-            (COL_SEVERITY_TEXT, Cell::Text(severity_text)),
-            (COL_BODY, Cell::Text(body)),
-        ],
-    }
-}
-
 /// Tenant A's three logs: one `ERROR`, two `INFO`.
 async fn commit_three_logs(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteError> {
     commit_log_rows(
         catalog,
         &[
-            build_log_row(TENANT_A, 5, "ERROR", "tenant-a payment declined"),
-            build_log_row(TENANT_A, 20, "INFO", "tenant-a payment accepted"),
-            build_log_row(TENANT_A, 40, "INFO", "tenant-a order shipped"),
+            build_log_row_at_minute(TENANT_A, 5, "ERROR", "tenant-a payment declined"),
+            build_log_row_at_minute(TENANT_A, 20, "INFO", "tenant-a payment accepted"),
+            build_log_row_at_minute(TENANT_A, 40, "INFO", "tenant-a order shipped"),
         ],
     )
     .await
@@ -464,7 +437,10 @@ async fn the_url_track_total_hits_overrides_every_items_key() {
 #[tokio::test]
 async fn msearch_items_past_the_result_window_fail_alone() {
     let (server, catalog) = TestServer::start_with_config(OpenSearchConfig {
-        search: SearchLimitsConfig { max_result_window: 3 },
+        search: SearchLimitsConfig {
+            max_result_window: 3,
+            ..SearchLimitsConfig::default()
+        },
         ..OpenSearchConfig::default()
     })
     .await;
@@ -538,7 +514,7 @@ async fn msearch_items_past_max_answer_bytes_fail_alone() {
     })
     .await;
     let long_body = "x".repeat(7000);
-    commit_log_rows(&catalog, &[build_log_row(TENANT_A, 5, "INFO", &long_body)])
+    commit_log_rows(&catalog, &[build_log_row_at_minute(TENANT_A, 5, "INFO", &long_body)])
         .await
         .expect("commit logs");
     let long_type = "9".repeat(2000);
@@ -624,9 +600,9 @@ async fn msearch_never_returns_another_tenants_rows() {
     commit_log_rows(
         &catalog,
         &[
-            build_log_row(TENANT_A, 5, "INFO", "tenant-a first parquet row"),
-            build_log_row(TENANT_B, 6, "INFO", "tenant-b parquet row"),
-            build_log_row(TENANT_A, 7, "INFO", "tenant-a second parquet row"),
+            build_log_row_at_minute(TENANT_A, 5, "INFO", "tenant-a first parquet row"),
+            build_log_row_at_minute(TENANT_B, 6, "INFO", "tenant-b parquet row"),
+            build_log_row_at_minute(TENANT_A, 7, "INFO", "tenant-a second parquet row"),
         ],
     )
     .await
@@ -638,8 +614,8 @@ async fn msearch_never_returns_another_tenants_rows() {
         LOGS_TABLE,
         1,
         &[
-            build_wal_log_row(TENANT_A, 8, "INFO", "tenant-a wal row"),
-            build_wal_log_row(TENANT_B, 9, "INFO", "tenant-b wal row"),
+            build_wal_log_row_at_minute(TENANT_A, 8, "INFO", "tenant-a wal row"),
+            build_wal_log_row_at_minute(TENANT_B, 9, "INFO", "tenant-b wal row"),
         ],
     )
     .await

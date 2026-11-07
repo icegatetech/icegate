@@ -23,6 +23,41 @@ use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
 pub use super::test_rows::{Cell, Row, RowWriteError, commit_rows, write_wal_segment};
 use super::test_rows::{commit_batch, read_arrow_schema};
 
+/// 2026-10-08T10:00:00Z in microseconds, the instant [`build_log_row_at_minute`] counts from.
+const TEN_O_CLOCK_MICROS: i64 = 1_791_453_600_000_000;
+const MINUTE_MICROS: i64 = 60_000_000;
+
+/// A `checkout` log of `tenant_id` at `minute` minutes past 2026-10-08T10:00:00Z.
+pub const fn build_log_row_at_minute<'a>(
+    tenant_id: &'a str,
+    minute: i64,
+    severity_text: &'a str,
+    body: &'a str,
+) -> LogRow<'a> {
+    LogRow {
+        tenant_id,
+        timestamp_micros: TEN_O_CLOCK_MICROS + minute * MINUTE_MICROS,
+        service_name: Some("checkout"),
+        severity_text: Some(severity_text),
+        body: Some(body),
+        resource_attributes: &[],
+        log_attributes: &[],
+    }
+}
+
+/// The same log as [`build_log_row_at_minute`], as a row of a WAL segment.
+pub fn build_wal_log_row_at_minute<'a>(tenant: &'a str, minute: i64, severity_text: &'a str, body: &'a str) -> Row<'a> {
+    Row {
+        tenant,
+        cells: vec![
+            (COL_TIMESTAMP, Cell::Micros(TEN_O_CLOCK_MICROS + minute * MINUTE_MICROS)),
+            (COL_SERVICE_NAME, Cell::Text("checkout")),
+            (COL_SEVERITY_TEXT, Cell::Text(severity_text)),
+            (COL_BODY, Cell::Text(body)),
+        ],
+    }
+}
+
 /// One `logs` row. Every column not named here is null, except the observed and ingested
 /// timestamps, which equal `timestamp_micros`, and `scope_attributes`, which is empty.
 pub struct LogRow<'a> {

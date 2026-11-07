@@ -1,3 +1,4 @@
+mod aggregations;
 mod cat;
 mod cluster;
 mod dashboards_migration;
