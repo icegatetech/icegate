@@ -52,8 +52,8 @@ const QUERY_STRING_KEYS: &[&str] = &[
 ///
 /// `parsing_exception` for any other key (`_name` included), a value of the wrong
 /// type, a missing `query`, both `fields` and `default_field`, a non-zero `fuzziness`
-/// or `phrase_slop` and fuzzy, proximity or regular expression syntax (each naming the
-/// refused construct as `construct`), and groups nested deeper than
+/// or `phrase_slop` and fuzzy or proximity syntax (each naming the refused construct as
+/// `construct`), and groups nested deeper than
 /// [`MAX_QUERY_STRING_DEPTH`] (naming it as `limit`); `500` when the thread that parses a
 /// deeply nested string cannot start or panics. A syntax error is no error here: it is kept
 /// as [`QueryStringClauses::Invalid`] and answered by each searched index.

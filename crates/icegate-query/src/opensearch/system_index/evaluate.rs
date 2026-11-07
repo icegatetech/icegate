@@ -58,12 +58,13 @@ use crate::opensearch::glob::matches_glob;
 use crate::query_dsl::analyzer::{Token, contains_token_phrase, normalize_standard, tokenize_standard};
 use crate::query_dsl::ast::{
     BoolQuery, MatchQuery, MultiMatchQuery, MultiMatchType, NestedQuery, Operator, Query, QueryStringClauses,
-    RangeBound, RangeQuery, SimpleQueryStringQuery, TokenPhraseQuery, ZeroTermsQuery,
+    RangeBound, RangeQuery, RegexpQuery, SimpleQueryStringQuery, TokenPhraseQuery, ZeroTermsQuery,
 };
 use crate::query_dsl::date_math::{BoundSide, parse_stored_date_millis, resolve_date_bound};
 use crate::query_dsl::full_text::{
     FieldSelector, FullTextFields, FullTextQuery, SearchField, SearchKind, resolve_full_text, selects_all_fields,
 };
+use crate::query_dsl::regex::translate_lucene_regex;
 use crate::query_dsl::simple_query::SimpleQuery;
 
 /// The metadata field naming a document's id.
@@ -338,6 +339,7 @@ impl<'a> DocumentView<'a> {
                     matches_wildcard(pattern, text, wildcard.case_insensitive)
                 })
             }
+            Query::Regexp(query) => self.matches_regexp(query),
             Query::ConstantScore(inner) => self.matches_query(inner),
             Query::Nested(nested) => self.matches_nested(nested),
             Query::Match(query) => self.matches_match(query),
@@ -661,27 +663,61 @@ impl<'a> DocumentView<'a> {
         matcher: impl Fn(&str, &str) -> bool,
     ) -> Result<bool, OpenSearchError> {
         let field_values = self.resolve_field(field)?;
+        // Normalized once, and only when a text value is reached.
+        let normalized_pattern = OnceCell::new();
+        self.match_string_field(
+            &field_values,
+            |text| matcher(text, pattern),
+            |token| matcher(token, normalized_pattern.get_or_init(|| normalize_standard(pattern))),
+            || OpenSearchError::illegal_argument(format!("[{leaf}] applies to string fields and [{field}] is not one")),
+        )
+    }
+
+    /// A `regexp` leaf on this document, its field resolved like every other leaf's (a
+    /// multi-field such as `title.keyword` reads its parent's values): each token of a text field,
+    /// the whole value of a keyword field or of the id, with the pattern as given; a query-shard
+    /// 400 on a date, numeric or boolean field. The pattern is translated before the field is
+    /// resolved, so a malformed one fails the query whatever the document and its mappings hold.
+    fn matches_regexp(&self, query: &RegexpQuery) -> Result<bool, OpenSearchError> {
+        let pattern = translate_lucene_regex(&query.pattern, query.flags, query.case_insensitive)?;
+        let field_values = self.resolve_field(&query.field)?;
+        let is_pattern_match = |text: &str| pattern.is_match(text);
+        self.match_string_field(&field_values, is_pattern_match, is_pattern_match, || {
+            OpenSearchError::query_shard(
+                self.index,
+                &format!(
+                    "regular expressions need a keyword or text field, and [{}] is not one",
+                    query.field
+                ),
+            )
+        })
+    }
+
+    /// Whether a string leaf holds for one of `field_values`: `whole_value_matcher` on the id or
+    /// on a keyword value, `token_matcher` on each token of a `text` value; nothing on a missing,
+    /// object or nested field. A date, numeric or boolean field is the error
+    /// `refuse_typed_field` builds.
+    fn match_string_field(
+        &self,
+        field_values: &DocumentFieldValues<'_>,
+        whole_value_matcher: impl Fn(&str) -> bool,
+        token_matcher: impl Fn(&str) -> bool,
+        refuse_typed_field: impl FnOnce() -> OpenSearchError,
+    ) -> Result<bool, OpenSearchError> {
         let Some(kind) = field_values.kind else {
             return Ok(false);
         };
         match kind {
             FieldKind::Object | FieldKind::Nested => Ok(false),
-            FieldKind::Identifier => Ok(matcher(self.id, pattern)),
+            FieldKind::Identifier => Ok(whole_value_matcher(self.id)),
             FieldKind::Keyword => Ok(field_values
                 .values
                 .iter()
-                .any(|stored_value| render_text(stored_value).is_some_and(|text| matcher(&text, pattern)))),
-            FieldKind::Text => {
-                let normalized_pattern = normalize_standard(pattern);
-                self.analyzed_values.matches_any_token(&field_values.values, |token| {
-                    Ok(matcher(&token.text, &normalized_pattern))
-                })
-            }
-            FieldKind::Date | FieldKind::Integer | FieldKind::Float | FieldKind::Boolean => {
-                Err(OpenSearchError::illegal_argument(format!(
-                    "[{leaf}] applies to string fields and [{field}] is not one"
-                )))
-            }
+                .any(|stored_value| render_text(stored_value).is_some_and(|text| whole_value_matcher(&text)))),
+            FieldKind::Text => self
+                .analyzed_values
+                .matches_any_token(&field_values.values, |token| Ok(token_matcher(&token.text))),
+            FieldKind::Date | FieldKind::Integer | FieldKind::Float | FieldKind::Boolean => Err(refuse_typed_field()),
         }
     }
 
@@ -1015,7 +1051,74 @@ fn collect_leaf_fields(node: &Value, mapping_node: Option<&Value>, path: &str, f
             if !is_option_disabled(mapping, "index") {
                 fields.push(path.to_string());
             }
-            fields.extend(list_multi_fields(mapping).map(|name| format!("{path}.{name}")));
+            fields.extend(list_multi_fields(mapping).map(|(name, _)| format!("{path}.{name}")));
+        }
+    }
+}
+
+/// The fields `mappings` declares that a field pattern selects from any document holding them,
+/// with their declared kinds: the declared leaves [`DocumentView::list_leaf_fields`] lists, under
+/// the same rules, and their multi-fields. Inside a `nested` query on `nested_path` these are the
+/// leaves under that path; outside one, the leaves outside every `nested` field. A field the
+/// mapping does not declare is not listed: whether a pattern selects it, and its kind, depend on
+/// the documents.
+pub(crate) fn list_mapped_pattern_fields(mappings: &Value, nested_path: Option<&str>) -> Vec<(String, FieldKind)> {
+    let mut fields = Vec::new();
+    let Some(path) = nested_path else {
+        collect_mapped_leaf_fields(mappings, "", &mut fields);
+        return fields;
+    };
+    if let (MemberVisibility::Visible | MemberVisibility::NestedOnly, Some(mapping_node)) =
+        follow_mapping_path(mappings, path)
+    {
+        collect_mapped_leaf_fields(mapping_node, path, &mut fields);
+    }
+    fields
+}
+
+/// Appends to `fields` the leaves the object `mapping_node`, declared at `path`, declares below it,
+/// as [`list_mapped_pattern_fields`] states them. It walks the mapping as [`collect_leaf_fields`]
+/// walks a document, without the document.
+fn collect_mapped_leaf_fields(mapping_node: &Value, path: &str, fields: &mut Vec<(String, FieldKind)>) {
+    let Some(properties) = mapping_node.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    for (key, member_mapping) in properties {
+        if read_member_visibility(mapping_node, key, Some(member_mapping)) != MemberVisibility::Visible {
+            continue;
+        }
+        let member_path = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        let declared_type = member_mapping.get("type").and_then(Value::as_str);
+        // A visible member's type is supported and not `nested`, so the error and `Nested` arms
+        // cannot be reached; they are listed because the match is exhaustive.
+        match declared_type.map(|type_name| FieldKind::from_mapping_type(type_name, key)) {
+            None | Some(Ok(FieldKind::Object)) => collect_mapped_leaf_fields(member_mapping, &member_path, fields),
+            Some(Ok(
+                kind @ (FieldKind::Identifier
+                | FieldKind::Keyword
+                | FieldKind::Text
+                | FieldKind::Date
+                | FieldKind::Integer
+                | FieldKind::Float
+                | FieldKind::Boolean),
+            )) => {
+                for (name, subfield) in list_multi_fields(member_mapping) {
+                    let subfield_type = subfield.get("type").and_then(Value::as_str);
+                    if let Some(Ok(subfield_kind)) =
+                        subfield_type.map(|type_name| FieldKind::from_mapping_type(type_name, name))
+                    {
+                        fields.push((format!("{member_path}.{name}"), subfield_kind));
+                    }
+                }
+                if !is_option_disabled(member_mapping, "index") {
+                    fields.push((member_path, kind));
+                }
+            }
+            Some(Ok(FieldKind::Nested) | Err(_)) => {}
         }
     }
 }
@@ -1318,9 +1421,9 @@ fn is_option_disabled(node: &Value, key: &str) -> bool {
         .is_some_and(|option| matches!(option, Value::Bool(false)) || option.as_str() == Some("false"))
 }
 
-/// The multi-field names (`fields`) `mapping_node` declares, without those it does not index and
-/// those of a type the evaluator does not support.
-fn list_multi_fields(mapping_node: &Value) -> impl Iterator<Item = &String> {
+/// The multi-fields (`fields`) `mapping_node` declares, by name with their mappings, without those
+/// it does not index and those of a type the evaluator does not support.
+fn list_multi_fields(mapping_node: &Value) -> impl Iterator<Item = (&String, &Value)> {
     mapping_node
         .get("fields")
         .and_then(Value::as_object)
@@ -1329,7 +1432,6 @@ fn list_multi_fields(mapping_node: &Value) -> impl Iterator<Item = &String> {
         .filter(|(name, subfield)| {
             !is_option_disabled(subfield, "index") && read_type_visibility(subfield, name) != MemberVisibility::Hidden
         })
-        .map(|(name, _)| name)
 }
 
 /// The `illegal_argument_exception` for `value`, which does not fit the type of `field`.
@@ -3413,5 +3515,60 @@ mod tests {
         assert_eq!(body["error"]["type"], "search_phase_execution_exception");
         assert_eq!(body["error"]["root_cause"][0]["type"], "query_shard_exception");
         assert_eq!(body["error"]["root_cause"][0]["index"], ".kibana_7");
+    }
+
+    /// The text field `title` analyzes to the tokens [logs, overview]; a `regexp` reads them as
+    /// written, never normalizing the pattern.
+    #[tokio::test]
+    async fn a_regexp_on_a_system_document_matches_text_per_token_and_keywords_whole() {
+        let mappings = json!({"properties": {
+            "title": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+            "updated_at": {"type": "date"},
+            "count": {"type": "integer"},
+            "ratio": {"type": "float"},
+            "enabled": {"type": "boolean"}
+        }});
+        let document = json!({
+            "title": "Logs Overview",
+            "updated_at": "2026-10-08T12:00:00Z",
+            "meta": {"owner": "ops"},
+            "size": 3
+        });
+        assert_matches(
+            &[
+                (json!({"regexp": {"title": "log.*"}}), true),
+                (json!({"regexp": {"title": "Log.*"}}), false),
+                (json!({"regexp": {"title": "over.*"}}), true),
+                (json!({"regexp": {"title": "logs .*"}}), false),
+                (
+                    json!({"regexp": {"title": {"value": "LOG.*", "case_insensitive": true}}}),
+                    true,
+                ),
+                (json!({"regexp": {"title.keyword": "Logs .*"}}), true),
+                (json!({"regexp": {"title.keyword": "logs.*"}}), false),
+                (json!({"regexp": {"meta.owner": "op."}}), true),
+                (json!({"regexp": {"meta": ".*"}}), false),
+                (json!({"regexp": {"_id": "doc-.*"}}), true),
+                (json!({"regexp": {"_id": "dashboard.*"}}), false),
+                (json!({"regexp": {"missing": ".*"}}), false),
+            ],
+            &document,
+            &mappings,
+        );
+        for field in ["updated_at", "count", "ratio", "enabled", "size"] {
+            assert_query_shard_refused(&json!({"regexp": {field: "1.*"}}), &document, &mappings).await;
+        }
+    }
+
+    /// The pattern is translated before the field is resolved, so a malformed one fails the query
+    /// whatever the document and its mappings hold.
+    #[tokio::test]
+    async fn a_malformed_regexp_on_an_absent_field_is_refused() {
+        assert_refused(
+            &json!({"regexp": {"absent": "(a"}}),
+            &json!({}),
+            &json!({"properties": {}}),
+        )
+        .await;
     }
 }

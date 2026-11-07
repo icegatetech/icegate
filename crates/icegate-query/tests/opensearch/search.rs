@@ -3519,3 +3519,296 @@ async fn query_string_on_a_system_index_matches_the_stated_documents() {
     }
     server.shutdown().await;
 }
+
+/// A system index answers a malformed pattern before reading any document: the refusal does not
+/// depend on which `bool` clause a document fails first, nor on whether the index holds any. A
+/// `/re/` term on a mapped field is checked in the form that field matches it.
+#[tokio::test]
+async fn a_malformed_regexp_on_a_system_index_is_a_400_whatever_the_clause_order_or_documents() {
+    let (server, _catalog) = TestServer::start().await;
+    let mappings = json!({
+        "properties": {"title": {"type": "text", "fields": {"keyword": {"type": "keyword"}}}}
+    });
+    for index in ["/.kibana_1", "/.kibana_2"] {
+        let response = server
+            .request(Method::PUT, Some(TENANT_A), index)
+            .json(&json!({"mappings": mappings.clone()}))
+            .send()
+            .await
+            .expect("the index creation answers");
+        assert_eq!(response.status().as_u16(), 200, "{index}");
+    }
+    // `.kibana_1` holds one document, which the `term` clause does not match; `.kibana_2` none.
+    let response = server
+        .request(Method::PUT, Some(TENANT_A), "/.kibana_1/_doc/dashboard%3A1")
+        .json(&json!({"title": "abc"}))
+        .send()
+        .await
+        .expect("the document write answers");
+    assert_eq!(response.status().as_u16(), 201);
+    let (status, body) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/.kibana_1/_count",
+        &json!({"query": {"match_all": {}}}),
+    )
+    .await;
+    assert_eq!((status, body["count"].clone()), (200, json!(1)), "{body}");
+    let term_clause = json!({"term": {"title.keyword": "nope"}});
+    let regexp_clause = json!({"regexp": {"title": "(a"}});
+    let queries = [
+        json!({"bool": {"must": [term_clause.clone(), regexp_clause.clone()]}}),
+        json!({"bool": {"must": [regexp_clause, term_clause]}}),
+        json!({"query_string": {"query": "title:/(a/"}}),
+    ];
+    for path in [
+        "/.kibana_1/_search",
+        "/.kibana_2/_search",
+        "/.kibana_1/_count",
+        "/.kibana_2/_count",
+    ] {
+        for query in &queries {
+            let (status, body) = post_json(&server, Some(TENANT_A), path, &json!({"query": query})).await;
+            assert_eq!(status, 400, "{path} {query}: {body}");
+            assert_eq!(body["error"]["type"], "illegal_argument_exception", "{path} {query}");
+        }
+    }
+    // A `/re/` term is lowercased on the text field `title` and read as written on the keyword
+    // `title.keyword`: `[a-Z]` is valid only lowercased (`[a-z]`), `[Z-a]` only as written. The
+    // count is `.kibana_1`'s (`abc`); `.kibana_2` holds no document, and refuses alike. A term with
+    // no field prefix selects `*`, which matches both declared fields, so it is refused in either
+    // invalid form even where `title` matches `abc` first.
+    let case_rows = [
+        ("title:/[a-Z]+/", Some(1)),
+        ("title:/[Z-a]/", None),
+        ("title.keyword:/[a-Z]+/", None),
+        ("title.keyword:/[Z-a]+/", Some(0)),
+        ("/[a-Z]+/", None),
+        ("/[Z-a]+/", None),
+    ];
+    for (query_text, kibana_1_count) in case_rows {
+        let query = json!({"query_string": {"query": query_text}});
+        for (index, expected_count) in [(".kibana_1", kibana_1_count), (".kibana_2", kibana_1_count.map(|_| 0))] {
+            let (search_status, search_body) = post_json(
+                &server,
+                Some(TENANT_A),
+                &format!("/{index}/_search"),
+                &json!({"query": query}),
+            )
+            .await;
+            let (count_status, count_body) = post_json(
+                &server,
+                Some(TENANT_A),
+                &format!("/{index}/_count"),
+                &json!({"query": query}),
+            )
+            .await;
+            match expected_count {
+                Some(count) => {
+                    assert_eq!(
+                        (search_status, search_body["hits"]["total"]["value"].clone()),
+                        (200, json!(count)),
+                        "{index} {query_text}: {search_body}"
+                    );
+                    assert_eq!(
+                        (count_status, count_body["count"].clone()),
+                        (200, json!(count)),
+                        "{index} {query_text}: {count_body}"
+                    );
+                }
+                None => {
+                    for (status, body) in [(search_status, &search_body), (count_status, &count_body)] {
+                        assert_eq!(status, 400, "{index} {query_text}: {body}");
+                        assert_eq!(
+                            body["error"]["type"], "illegal_argument_exception",
+                            "{index} {query_text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    server.shutdown().await;
+}
+
+/// Three rows of tenant A and two of tenant B sharing their values: rows 1, 2 and b1 in one
+/// Iceberg commit, rows 3 and b2 in the WAL segment after it.
+async fn seed_regex_rows(server: &TestServer, catalog: &Arc<dyn iceberg::Catalog>) -> Result<(), RowWriteError> {
+    let iceberg_rows = [
+        build_full_text_log_row(TENANT_A, 1, Some("Connection Refused"), "ERROR", &[("row", "1")]),
+        build_full_text_log_row(TENANT_A, 2, Some("retrying connection"), "error", &[("row", "2")]),
+        build_full_text_log_row(TENANT_B, 1, Some("Connection Refused"), "ERROR", &[("row", "b1")]),
+    ];
+    let wal_rows = [
+        build_full_text_log_row(TENANT_A, 3, Some("Error budget"), "WARN", &[("row", "3")]),
+        build_full_text_log_row(TENANT_B, 3, Some("retrying connection"), "error", &[("row", "b2")]),
+    ];
+    commit_rows(catalog, LOGS_TABLE, &iceberg_rows).await?;
+    write_wal_segment(
+        &server.wal_store,
+        catalog,
+        LOGS_TABLE,
+        COMMITTED_WAL_OFFSET + 1,
+        &wal_rows,
+    )
+    .await
+}
+
+/// Searches tenant A's `logs` with `query` and checks the rows each answer names.
+async fn assert_regex_rows(server: &TestServer, table: &[(Value, &[&str])]) {
+    for (query, expected_rows) in table {
+        let (status, body) = post_json(
+            server,
+            Some(TENANT_A),
+            "/logs/_search",
+            &json!({"query": query, "size": 100}),
+        )
+        .await;
+        assert_eq!(status, 200, "{query}: {body}");
+        assert_eq!(read_full_text_hit_rows(&body), build_row_ids(expected_rows), "{query}");
+    }
+}
+
+#[tokio::test]
+async fn a_query_string_regex_on_a_keyword_field_matches_verbatim() {
+    let (server, catalog) = TestServer::start().await;
+    seed_regex_rows(&server, &catalog).await.expect("the regex rows");
+    // Severity: row 1 ERROR, row 2 error, row 3 WARN; rows: 1, 2, 3 as `log_attributes.row`.
+    assert_regex_rows(
+        &server,
+        &[
+            (json!({"query_string": {"query": "severity_text:/ERR.*/"}}), &["1"]),
+            (json!({"query_string": {"query": "severity_text:/err.*/"}}), &["2"]),
+            (json!({"regexp": {"severity_text": "ERR.*"}}), &["1"]),
+            (
+                json!({"regexp": {"severity_text": {"value": "err.*", "case_insensitive": true}}}),
+                &["1", "2"],
+            ),
+            (json!({"regexp": {"log_attributes.row": "[12]"}}), &["1", "2"]),
+            (
+                json!({"query_string": {"query": "log_attributes.\\*:/[23]/"}}),
+                &["2", "3"],
+            ),
+        ],
+    )
+    .await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_regexp_on_a_text_field_matches_per_token_without_normalizing_the_pattern() {
+    let (server, catalog) = TestServer::start().await;
+    seed_regex_rows(&server, &catalog).await.expect("the regex rows");
+    // Tokens: row 1 [connection, refused], row 2 [retrying, connection], row 3 [error, budget].
+    assert_regex_rows(
+        &server,
+        &[
+            (json!({"regexp": {"body": "conn.*"}}), &["1", "2"]),
+            (json!({"regexp": {"body": "Conn.*"}}), &[]),
+            (
+                json!({"regexp": {"body": {"value": "Conn.*", "case_insensitive": true}}}),
+                &["1", "2"],
+            ),
+            (json!({"regexp": {"body": "err.*"}}), &["3"]),
+            (json!({"regexp": {"body": "connection refused"}}), &[]),
+            (json!({"query_string": {"query": "body:/Conn.*/"}}), &["1", "2"]),
+        ],
+    )
+    .await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_regexp_on_an_id_or_numeric_field_is_refused_and_skipped_under_lenient() {
+    let (server, catalog) = TestServer::start().await;
+    seed_regex_rows(&server, &catalog).await.expect("the regex rows");
+    // The logs table has no numeric column; `duration_micros` of `spans` is a long. One span
+    // of each tenant, its trace id `11` repeated, so its hex form matches `11.*` as text, and
+    // its duration 0, so its decimal form matches `0.*` as text.
+    let trace_id = [0x11_u8; 16];
+    let span_rows: Vec<Row<'_>> = [TENANT_A, TENANT_B]
+        .into_iter()
+        .map(|tenant| {
+            let mut row = build_span_row(tenant, FULL_TEXT_BASE_MICROS, &trace_id, "GET /orders");
+            row.cells.push((COL_DURATION_MICROS, Cell::Long(0)));
+            row
+        })
+        .collect();
+    commit_rows(&catalog, SPANS_TABLE, &span_rows).await.expect("the spans commit");
+    let strict_rows = [
+        ("/logs/_search", json!({"regexp": {"trace_id": "11.*"}})),
+        (
+            "/logs/_search",
+            json!({"query_string": {"query": "trace_id:/11.*/", "default_field": "body"}}),
+        ),
+        ("/spans/_search", json!({"regexp": {"duration_micros": "0.*"}})),
+        (
+            "/spans/_search",
+            json!({"query_string": {"query": "duration_micros:/0.*/", "default_field": "name"}}),
+        ),
+    ];
+    for (path, strict_query) in strict_rows {
+        let (status, body) = post_json(&server, Some(TENANT_A), path, &json!({"query": strict_query.clone()})).await;
+        assert_eq!(status, 400, "{strict_query}: {body}");
+        assert_eq!(
+            body["error"]["type"], "search_phase_execution_exception",
+            "{strict_query}"
+        );
+        assert_eq!(
+            body["error"]["root_cause"][0]["type"], "query_shard_exception",
+            "{strict_query}"
+        );
+    }
+    // Under the all-fields default the query string is lenient: the id and the numeric field
+    // add nothing, while the span itself is visible to tenant A.
+    let lenient_rows = [
+        (json!({"query_string": {"query": "trace_id:/11.*/"}}), 0),
+        (json!({"query_string": {"query": "duration_micros:/0.*/"}}), 0),
+        (json!({"match_all": {}}), 1),
+    ];
+    for (lenient_query, expected_total) in lenient_rows {
+        let (status, body) = post_json(
+            &server,
+            Some(TENANT_A),
+            "/spans/_search",
+            &json!({"query": lenient_query.clone(), "size": 100}),
+        )
+        .await;
+        assert_eq!(status, 200, "{lenient_query}: {body}");
+        assert_eq!(body["hits"]["total"]["value"], json!(expected_total), "{lenient_query}");
+    }
+    server.shutdown().await;
+}
+
+/// The pattern is translated before the field is resolved, so a malformed one is a 400 even on
+/// a field the index lacks; an enabled operator the dialect does not translate is named.
+#[tokio::test]
+async fn a_malformed_or_untranslatable_regexp_is_a_400_whatever_field_it_names() {
+    let (server, catalog) = TestServer::start().await;
+    seed_regex_rows(&server, &catalog).await.expect("the regex rows");
+    for (query, expected_type, construct) in [
+        (
+            json!({"regexp": {"no_such_field": "(a"}}),
+            "illegal_argument_exception",
+            Value::Null,
+        ),
+        (json!({"regexp": {"body": "a&b"}}), "parsing_exception", json!("&")),
+        (
+            json!({"query_string": {"query": "severity_text:/~a/"}}),
+            "parsing_exception",
+            json!("~"),
+        ),
+    ] {
+        let (status, body) = post_json(
+            &server,
+            Some(TENANT_A),
+            "/logs/_search",
+            &json!({"query": query.clone()}),
+        )
+        .await;
+        assert_eq!(status, 400, "{query}: {body}");
+        assert_eq!(body["error"]["type"], expected_type, "{query}");
+        assert_eq!(body["error"]["construct"], construct, "{query}");
+    }
+    server.shutdown().await;
+}

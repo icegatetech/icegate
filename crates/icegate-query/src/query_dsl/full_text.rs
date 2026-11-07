@@ -11,8 +11,8 @@
 //!   there contributes nothing, and a leaf whose every field contributes nothing
 //!   is dropped (`Ok(None)`), so the caller decides what a dropped query matches;
 //! - every other field compares the whole text as one value of its type; a value
-//!   that does not parse, and a wildcard, prefix or range a field type does not
-//!   support, match nothing when the leaf is lenient and are a query-shard 400
+//!   that does not parse, and a wildcard, prefix, regular expression or range a
+//!   field type does not support, match nothing when the leaf is lenient and are a query-shard 400
 //!   otherwise;
 //! - a selection that names no field matches nothing (an unmapped field is not
 //!   an error);
@@ -32,12 +32,13 @@ use super::{
     analyzer::{normalize_standard, tokenize_standard},
     ast::{
         ALL_FIELDS, BoolQuery, ExistsQuery, KeywordBound, KeywordRange, MapValuePredicate, MapValuesQuery, Operator,
-        PrefixQuery, Query, RangeBound, RangeQuery, TermQuery, TokenPhraseQuery, WildcardQuery,
+        PrefixQuery, Query, RangeBound, RangeQuery, RegexpQuery, TermQuery, TokenPhraseQuery, WildcardQuery,
     },
     date_math::{BoundSide, DateFormat, TimeZoneSpec, resolve_date_bound},
     literal::{NumericTerm, parse_boolean_literal, parse_java_double, parse_numeric_term, resolve_date_term},
+    regex::{RegexFlags, translate_lucene_regex},
     simple_query::SimpleQuery,
-    udf::translate_wildcard,
+    udf::{MatchRegex, translate_wildcard},
 };
 use crate::{
     engine::fixed_binary::decode_fixed_binary_literal,
@@ -161,6 +162,10 @@ pub(crate) enum FullTextTerm {
     },
     /// The field has a value.
     Exists,
+    /// A Lucene regular expression: per token on a text field with the pattern
+    /// normalized, the whole value on a keyword with the pattern verbatim; refused
+    /// on the other field types.
+    Regexp(String),
 }
 
 /// One bound of a full-text range.
@@ -588,6 +593,13 @@ impl LeafContext<'_> {
             (FullTextTerm::Wildcard(_), _) => self.refuse_malformed_value(&format!(
                 "wildcard queries need a keyword or text field, and [{name}] is not one"
             )),
+            (FullTextTerm::Regexp(pattern), SearchKind::Text) => {
+                Ok(Some(build_regexp_query(name, normalize_standard(pattern))))
+            }
+            (FullTextTerm::Regexp(pattern), SearchKind::Keyword) => Ok(Some(build_regexp_query(name, pattern.clone()))),
+            (FullTextTerm::Regexp(_), _) => self.refuse_malformed_value(&format!(
+                "regular expressions need a keyword or text field, and [{name}] is not one"
+            )),
             (FullTextTerm::Range { lower, upper }, _) => {
                 self.build_value_range_query(name, kind, lower.as_ref(), upper.as_ref())
             }
@@ -601,6 +613,9 @@ impl LeafContext<'_> {
             FullTextTerm::Text(text) | FullTextTerm::Phrase(text) => MapValuePredicate::Equals(text.clone()),
             FullTextTerm::Prefix { prefix, .. } => MapValuePredicate::StartsWith(prefix.clone()),
             FullTextTerm::Wildcard(pattern) => MapValuePredicate::Matches(translate_wildcard(pattern, false)?),
+            FullTextTerm::Regexp(pattern) => MapValuePredicate::Matches(MatchRegex::from_regex(
+                translate_lucene_regex(pattern, RegexFlags::ALL, false)?,
+            )),
             FullTextTerm::Range { lower, upper } => MapValuePredicate::InRange(KeywordRange {
                 lower: lower.as_ref().map(build_keyword_bound),
                 upper: upper.as_ref().map(build_keyword_bound),
@@ -1010,6 +1025,16 @@ fn build_prefix_query(name: &str, value: String) -> Query {
     })
 }
 
+/// A `regexp` leaf of a query-string term: every operator enabled, letter case as written.
+fn build_regexp_query(name: &str, pattern: String) -> Query {
+    Query::Regexp(RegexpQuery {
+        field: name.to_owned(),
+        pattern,
+        flags: RegexFlags::ALL,
+        case_insensitive: false,
+    })
+}
+
 fn build_exists_query(name: &str) -> Query {
     Query::Exists(ExistsQuery { field: name.to_owned() })
 }
@@ -1031,11 +1056,13 @@ mod tests {
         query_dsl::{
             ast::{
                 BoolQuery, ExistsQuery, KeywordBound, KeywordRange, MapValuePredicate, MapValuesQuery, Operator,
-                PrefixQuery, Query, QueryStringQuery, RangeBound, RangeQuery, TermQuery, TokenPhraseQuery,
+                PrefixQuery, Query, QueryStringQuery, RangeBound, RangeQuery, RegexpQuery, TermQuery, TokenPhraseQuery,
             },
             date_math::{DateFormat, TimeZoneSpec},
             lucene::{QueryStringError, translate_query_string},
+            regex::RegexFlags,
             simple_query::{SimpleQuery, SimpleQueryFlags, parse_simple_query_string},
+            udf::MatchRegex,
         },
     };
 
@@ -2133,6 +2160,71 @@ mod tests {
     #[tokio::test]
     async fn wildcard_and_prefix_terms_on_an_id_field_are_a_400_and_match_nothing_under_lenient() {
         for text in ["trace_id:ab*", "trace_id:a?c"] {
+            assert_eq!(
+                resolve_query_string(text, None, Operator::Or),
+                Some(Query::MatchNone),
+                "[{text}] under leniency"
+            );
+            assert_query_shard_400(try_resolve_query_string(&build_query_string_options(
+                text,
+                Some("body"),
+                Operator::Or,
+            )))
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn regexp_terms_resolve_per_field_type() {
+        let build_regexp = |field: &str, pattern: &str| {
+            Query::Regexp(RegexpQuery {
+                field: field.to_owned(),
+                pattern: pattern.to_owned(),
+                flags: RegexFlags::ALL,
+                case_insensitive: false,
+            })
+        };
+        // On a text field the pattern is lowercased by the analyzer's normalizer.
+        assert_eq!(
+            resolve_query_string("body:/Conn.*/", None, Operator::Or),
+            Some(build_regexp("body", "conn.*"))
+        );
+        // On a keyword, a MAP key among them, it is kept verbatim.
+        assert_eq!(
+            resolve_query_string("severity_text:/ERR.*/", None, Operator::Or),
+            Some(build_regexp("severity_text", "ERR.*"))
+        );
+        assert_eq!(
+            resolve_query_string("log_attributes.http.method:/GE./", None, Operator::Or),
+            Some(build_regexp("log_attributes.http.method", "GE."))
+        );
+        // On every MAP value it is matched whole, verbatim.
+        assert_eq!(
+            resolve_query_string("log_attributes.\\*:/GE./", None, Operator::Or),
+            Some(build_map_values_query(MapValuePredicate::Matches(
+                MatchRegex::from_regex(::regex::Regex::new("^(?s:GE.)$").expect("compiles"))
+            )))
+        );
+        // A malformed pattern on the MAP values is the dialect's 400, lenient or not.
+        let error = try_resolve_query_string(&build_query_string_options(
+            "log_attributes.\\*:/(a/",
+            None,
+            Operator::Or,
+        ))
+        .expect_err("a malformed pattern is refused");
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        // On an id, a number, a date or a boolean: nothing under leniency, a query-shard 400
+        // otherwise.
+        for text in [
+            "trace_id:/ab.*/",
+            "count:/1.*/",
+            "ratio:/1.*/",
+            "status:/1.*/",
+            "timestamp:/2026.*/",
+            "flag:/tr.*/",
+        ] {
             assert_eq!(
                 resolve_query_string(text, None, Operator::Or),
                 Some(Query::MatchNone),

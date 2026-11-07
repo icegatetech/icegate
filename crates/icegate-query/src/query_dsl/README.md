@@ -34,12 +34,19 @@ clause lists once per request, and the resolver applies the occurrence rules per
 clauses that survive analysis. What the leaf accepts and refuses, and the nesting limit, are
 documented on `lucene::parse_query_string` and `lucene::translate_query_string`.
 
+## Regular expressions (`regex.rs`)
+
+A `regexp` leaf and a `query_string` `/re/` term share one dialect: `translate_lucene_regex`
+translates the Lucene regular-expression syntax into a Rust pattern anchored over the whole
+input, and refuses what it does not translate. The patterns it accepts, its flags and its
+refusals are documented on that function and on `RegexFlags`.
+
 ## The standard analyzer (`analyzer/`)
 
 The analyzer splits text into tokens and lowercases them; no stop words are removed.
 `tokenize_standard` is used wherever a leaf is compared with the tokens of a `text` field, and
 `normalize_standard` (lowercasing without splitting) wherever a `prefix` or `wildcard` pattern,
-or a `query_string` range bound, meets a `text` field.
+or a `query_string` range bound or `/re/` pattern, meets a `text` field.
 
 ### Parity target
 

@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use super::date_math::{DateFormat, TimeZoneSpec};
 use super::full_text::FullTextQuery;
+use super::regex::RegexFlags;
 use super::simple_query::SimpleQuery;
 use super::udf::MatchRegex;
 
@@ -31,6 +32,9 @@ pub(crate) enum Query {
     Prefix(PrefixQuery),
     /// A value matching a wildcard pattern.
     Wildcard(WildcardQuery),
+    /// `regexp`: a Lucene regular expression over the whole value of a keyword, or each token
+    /// of a text field.
+    Regexp(RegexpQuery),
     /// The inner query, with its score ignored.
     ConstantScore(Box<Self>),
     /// The inner query, evaluated within one element of a nested array.
@@ -150,6 +154,21 @@ pub(crate) struct WildcardQuery {
     /// The pattern.
     pub(crate) pattern: String,
     /// Fold ASCII letter case.
+    pub(crate) case_insensitive: bool,
+}
+
+/// A `regexp` leaf, its pattern matched as given: lowering never normalizes it, so on a text
+/// field it is matched against each lower-case token as written. A query-string `/re/` term
+/// arrives here with its pattern already normalized for a text field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegexpQuery {
+    /// The field.
+    pub(crate) field: String,
+    /// The Lucene pattern.
+    pub(crate) pattern: String,
+    /// The enabled optional operators.
+    pub(crate) flags: RegexFlags,
+    /// Whether ASCII letters match in either case.
     pub(crate) case_insensitive: bool,
 }
 

@@ -18,8 +18,8 @@ use serde_json::{Map, Value, json};
 
 use super::documents::{filter_source, parse_json_body};
 use super::evaluate::{
-    FieldKind, ID_FIELD, collect_source_values, find_mapped_field, matches_document, read_boolean, read_date_micros,
-    read_numeric, render_text,
+    FieldKind, ID_FIELD, collect_source_values, find_mapped_field, list_mapped_pattern_fields, matches_document,
+    read_boolean, read_date_micros, read_numeric, render_text,
 };
 use super::snapshot::{PRIMARY_TERM, StoredDocument, SystemIndex, SystemSnapshot};
 use super::store::run_blocking_work;
@@ -27,10 +27,14 @@ use crate::opensearch::catalog::{IndexExpression, IndexTarget, read_index_option
 use crate::opensearch::context::RequestContext;
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::extract::{EndpointParameters, Parameters, PathParameters, RequestBody, deserialize_flag};
+use crate::opensearch::glob::matches_glob;
 use crate::opensearch::search::request::{SearchRequest, SortClause, SortOrder, SourceFilter, TrackTotalHits};
 use crate::opensearch::state::OpenSearchState;
+use crate::query_dsl::analyzer::normalize_standard;
 use crate::query_dsl::ast::{Query, QueryStringClauses};
+use crate::query_dsl::full_text::{ClassicEntry, FieldSelector, FullTextLeaf, FullTextQuery, FullTextTerm};
 use crate::query_dsl::parse::parse_query;
+use crate::query_dsl::regex::{RegexFlags, translate_lucene_regex};
 
 /// Parameters of `_count`.
 #[derive(Debug, Deserialize)]
@@ -174,6 +178,7 @@ fn find_query_string_error(query: &Query) -> Option<&str> {
         | Query::Exists(_)
         | Query::Prefix(_)
         | Query::Wildcard(_)
+        | Query::Regexp(_)
         | Query::Match(_)
         | Query::MatchPhrase(_)
         | Query::MatchPhrasePrefix(_)
@@ -184,22 +189,148 @@ fn find_query_string_error(query: &Query) -> Option<&str> {
     }
 }
 
+/// Translates every regular expression in `query` that `indices` can be shown to use, and answers
+/// the first refusal. A search runs it before reading any document, so a refused pattern fails the
+/// request whatever the indices hold and whichever clause a document matched first.
+///
+/// A `regexp` leaf is matched as written on every field, so its pattern is always translated. A
+/// `/re/` term of a translated `query_string` is matched as written on a keyword field or `_id`
+/// and lowercased on a text field, and lowercasing can turn a valid pattern into an invalid one
+/// (`[Z-a]`) or the reverse (`[a-Z]`). So such a term is refused here when both forms are invalid,
+/// or when the one invalid form is the form a field it selects uses: `_id`, a field an index's
+/// mapping declares, or a declared field its pattern selector matches
+/// ([`list_mapped_pattern_fields`], inside a `nested` query the fields under its path). Only an
+/// unmapped field defers to the documents: whether it exists and its kind come from them, so a
+/// term that reaches only unmapped fields is refused, if at all, by the document that reaches it.
+/// `nested_path` is the path of the innermost `nested` query holding `query`, `None` outside one.
+///
+/// # Errors
+///
+/// - the 400 refusals of [`translate_lucene_regex`], typed as that function documents;
+/// - `illegal_argument_exception` for a mapping type the evaluator does not support on a field a
+///   `/re/` term names, when the term has one invalid form.
+fn verify_regex_patterns(
+    query: &Query,
+    indices: &[(&str, &SystemIndex)],
+    nested_path: Option<&str>,
+) -> Result<(), OpenSearchError> {
+    match query {
+        Query::Regexp(regexp) => {
+            translate_lucene_regex(&regexp.pattern, regexp.flags, regexp.case_insensitive).map(drop)
+        }
+        Query::LuceneQueryString(QueryStringClauses::Translated(full_text_query)) => {
+            verify_full_text_regex_patterns(full_text_query, indices, nested_path)
+        }
+        Query::Bool(bool_query) => bool_query
+            .must
+            .iter()
+            .chain(&bool_query.filter)
+            .chain(&bool_query.should)
+            .chain(&bool_query.must_not)
+            .try_for_each(|clause| verify_regex_patterns(clause, indices, nested_path)),
+        Query::ConstantScore(inner) => verify_regex_patterns(inner, indices, nested_path),
+        Query::Nested(nested) => verify_regex_patterns(&nested.query, indices, Some(&nested.path)),
+        Query::LuceneQueryString(QueryStringClauses::Invalid { .. })
+        | Query::MatchAll
+        | Query::MatchNone
+        | Query::Term(_)
+        | Query::Terms(_)
+        | Query::Ids(_)
+        | Query::Range(_)
+        | Query::Exists(_)
+        | Query::Prefix(_)
+        | Query::Wildcard(_)
+        | Query::Match(_)
+        | Query::MatchPhrase(_)
+        | Query::MatchPhrasePrefix(_)
+        | Query::MultiMatch(_)
+        | Query::SimpleQueryString(_)
+        | Query::MapValues(_)
+        | Query::TokenPhrase(_) => Ok(()),
+    }
+}
+
+/// [`verify_regex_patterns`] over the clause tree of a translated `query_string`.
+fn verify_full_text_regex_patterns(
+    query: &FullTextQuery,
+    indices: &[(&str, &SystemIndex)],
+    nested_path: Option<&str>,
+) -> Result<(), OpenSearchError> {
+    match query {
+        FullTextQuery::MatchAll => Ok(()),
+        FullTextQuery::Leaf(leaf) => verify_leaf_regex_pattern(leaf, indices, nested_path),
+        FullTextQuery::Bool(clauses) => clauses
+            .iter()
+            .try_for_each(|clause| verify_full_text_regex_patterns(&clause.query, indices, nested_path)),
+        FullTextQuery::Classic(classic) => classic.entries.iter().try_for_each(|entry| match entry {
+            ClassicEntry::Clause { query, .. } => verify_full_text_regex_patterns(query, indices, nested_path),
+            ClassicEntry::MultiTerm(leaf) => verify_leaf_regex_pattern(leaf, indices, nested_path),
+        }),
+    }
+}
+
+/// Translates the pattern of a `/re/` leaf in each form a field uses it, with the options the
+/// query-string resolver gives it, and refuses it as [`verify_regex_patterns`] states.
+fn verify_leaf_regex_pattern(
+    leaf: &FullTextLeaf,
+    indices: &[(&str, &SystemIndex)],
+    nested_path: Option<&str>,
+) -> Result<(), OpenSearchError> {
+    let FullTextTerm::Regexp(pattern) = &leaf.term else {
+        return Ok(());
+    };
+    let verbatim_translation = translate_lucene_regex(pattern, RegexFlags::ALL, false);
+    let lowercased_pattern = normalize_standard(pattern);
+    // A pattern lowercasing leaves unchanged has one form, already translated.
+    if lowercased_pattern == *pattern {
+        return verbatim_translation.map(drop);
+    }
+    let lowercased_translation = translate_lucene_regex(&lowercased_pattern, RegexFlags::ALL, false);
+    let (error, refused_kinds): (OpenSearchError, &[FieldKind]) = match (verbatim_translation, lowercased_translation) {
+        (Ok(_), Ok(_)) => return Ok(()),
+        (Err(error), Err(_)) => return Err(error),
+        (Err(error), Ok(_)) => (error, &[FieldKind::Identifier, FieldKind::Keyword]),
+        (Ok(_), Err(error)) => (error, &[FieldKind::Text]),
+    };
+    for (_, index) in indices {
+        // Listed once per index, and only for a leaf with a pattern selector.
+        let mut pattern_fields: Option<Vec<(String, FieldKind)>> = None;
+        for selector in &leaf.fields {
+            let is_refused = match selector {
+                FieldSelector::Name(name) if name == ID_FIELD => refused_kinds.contains(&FieldKind::Identifier),
+                FieldSelector::Name(name) => find_mapped_field(&index.mappings, name)?
+                    .is_some_and(|declared| refused_kinds.contains(&declared.kind)),
+                FieldSelector::Pattern(pattern) => pattern_fields
+                    .get_or_insert_with(|| list_mapped_pattern_fields(&index.mappings, nested_path))
+                    .iter()
+                    .any(|(name, kind)| refused_kinds.contains(kind) && matches_glob(pattern, name)),
+            };
+            if is_refused {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// How many documents of `indices` match `query` at `now`.
 ///
 /// # Errors
 ///
 /// The query-shard failure of the first index for a `query_string` whose translation failed (a
 /// syntax error or a refused leading wildcard), whatever the index holds, and the errors of
-/// [`find_system_indices`] and of [`matches_document`].
+/// [`find_system_indices`], [`verify_regex_patterns`] and [`matches_document`].
 pub(crate) fn count_system_documents(
     snapshot: &SystemSnapshot,
     indices: &[String],
     query: &Query,
     now: DateTime<Utc>,
 ) -> Result<u64, OpenSearchError> {
+    let concrete_indices = find_system_indices(snapshot, indices)?;
+    verify_regex_patterns(query, &concrete_indices, None)?;
     let query_string_error = find_query_string_error(query);
     let mut count = 0_u64;
-    for (index_name, index) in find_system_indices(snapshot, indices)? {
+    for (index_name, index) in concrete_indices {
         if let Some(reason) = query_string_error {
             return Err(OpenSearchError::query_shard(index_name, reason));
         }
@@ -289,7 +420,7 @@ enum SortKey<'s> {
 /// - `query_shard` for a sort on a field the mapping lacks without `unmapped_type`, or on a text,
 ///   object or nested field, and, on the first index, for a `query_string` whose translation
 ///   failed (a syntax error or a refused leading wildcard), whatever the index holds;
-/// - the errors of [`find_system_indices`] and [`matches_document`].
+/// - the errors of [`find_system_indices`], [`verify_regex_patterns`] and [`matches_document`].
 pub(crate) fn search_system_indices(
     snapshot: &SystemSnapshot,
     indices: &[String],
@@ -318,6 +449,7 @@ pub(crate) fn search_system_indices(
         .map(|&(index_name, index)| plan_sort(&index.mappings, index_name, &request.sort))
         .collect::<Result<Vec<Vec<SortPlan<'_>>>, OpenSearchError>>()?;
     verify_sort_field_kinds(&concrete_indices, &sort_plans, &request.sort)?;
+    verify_regex_patterns(&request.query, &concrete_indices, None)?;
     let query_string_error = find_query_string_error(&request.query);
     let mut keyed_hits = Vec::new();
     for (&(index_name, index), clause_plans) in concrete_indices.iter().zip(&sort_plans) {
@@ -1764,6 +1896,76 @@ mod tests {
                     "{query}"
                 );
                 assert_eq!(body["error"]["root_cause"][0]["index"], ".kibana_1", "{query}");
+            }
+        }
+    }
+
+    /// A `/re/` term with one invalid form is refused before any document is read when a pattern
+    /// selector matches a declared field using that form: `[a-Z]+` is invalid as written (keyword),
+    /// `[Z-a]+` only lowercased (text). A field patterns never select (`index: false`, under
+    /// `enabled: false`, of a type the evaluator does not support, or `nested` outside a `nested`
+    /// query) does not refuse it; inside a `nested` query the selector reaches the fields under its
+    /// path only. The index holds no document, so an accepted query counts 0.
+    #[tokio::test]
+    async fn a_pattern_selector_refuses_the_invalid_regex_form_of_a_declared_field_it_matches() {
+        let mut snapshot = SystemSnapshot::default();
+        create_index(
+            &mut snapshot,
+            ".kibana_1",
+            json!({"properties": {
+                "title": {"type": "text"},
+                "code": {"type": "keyword"},
+                "secret": {"type": "keyword", "index": false},
+                "note": {"type": "text", "index": false, "fields": {"raw": {"type": "keyword"}}},
+                "meta": {"properties": {"key": {"type": "keyword"}}},
+                "owner": {"type": "object", "properties": {"id": {"type": "keyword"}}},
+                "blob": {"type": "object", "enabled": false, "properties": {"inner": {"type": "keyword"}}},
+                "address": {"type": "ip"},
+                "panels": {"type": "nested", "properties": {"name": {"type": "keyword"}}}
+            }}),
+        );
+        let build_query = |fields: &str, pattern: &str| json!({"query_string": {"query": format!("/{pattern}/"), "fields": [fields]}});
+        let build_nested_query =
+            |path: &str, fields: &str| json!({"nested": {"path": path, "query": build_query(fields, "[a-Z]+")}});
+        let rows = [
+            (build_query("co*", "[a-Z]+"), true),
+            (build_query("ti*", "[a-Z]+"), false),
+            (build_query("ti*", "[Z-a]+"), true),
+            (build_query("co*", "[Z-a]+"), false),
+            (build_query("secret*", "[a-Z]+"), false),
+            (build_query("note.*", "[a-Z]+"), true),
+            (build_query("meta.*", "[a-Z]+"), true),
+            (build_query("owner.*", "[a-Z]+"), true),
+            (build_query("blob.*", "[a-Z]+"), false),
+            (build_query("addr*", "[a-Z]+"), false),
+            (build_query("panels.*", "[a-Z]+"), false),
+            (build_nested_query("panels", "panels.*"), true),
+            (build_nested_query("panels", "co*"), false),
+            (build_nested_query("blob", "blob.*"), false),
+            (build_nested_query("undeclared", "*"), false),
+        ];
+        let names = [String::from(".kibana_1")];
+        let now = build_context().now;
+        for (query, is_refused) in rows {
+            let searched = search_kibana_index(&snapshot, &json!({"query": query}), "");
+            let parsed_query = parse_query(&query).expect("the query parses");
+            let counted = count_system_documents(&snapshot, &names, &parsed_query, now);
+            if is_refused {
+                for error in [
+                    searched.expect_err("the search is refused"),
+                    counted.expect_err("the count is refused"),
+                ] {
+                    let (status, body) = render_envelope(error).await;
+                    assert_eq!(
+                        (status, body["error"]["type"].clone()),
+                        (StatusCode::BAD_REQUEST, json!("illegal_argument_exception")),
+                        "{query} {body}"
+                    );
+                }
+            } else {
+                let answer = searched.expect("the search is answered");
+                assert_eq!(answer["hits"]["total"]["value"], 0, "{query}");
+                assert_eq!(counted.expect("the count is answered"), 0, "{query}");
             }
         }
     }

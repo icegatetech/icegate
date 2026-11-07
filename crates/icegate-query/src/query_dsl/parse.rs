@@ -16,10 +16,11 @@ use serde_json::{Map, Value};
 
 use super::ast::{
     ALL_FIELDS, BoolQuery, ExistsQuery, IdsQuery, MatchPhrasePrefixQuery, MatchPhraseQuery, MatchQuery,
-    MultiMatchQuery, MultiMatchType, NestedQuery, Operator, PrefixQuery, Query, RangeBound, RangeQuery,
+    MultiMatchQuery, MultiMatchType, NestedQuery, Operator, PrefixQuery, Query, RangeBound, RangeQuery, RegexpQuery,
     SimpleQueryStringQuery, TermQuery, TermsQuery, WildcardQuery, ZeroTermsQuery,
 };
 use super::date_math::{DateFormat, parse_time_zone};
+use super::regex::RegexFlags;
 use super::simple_query::{SimpleQueryFlags, parse_simple_query_string};
 use crate::opensearch::error::OpenSearchError;
 
@@ -42,9 +43,10 @@ pub(super) const SLOP_REFUSAL: &str = "sloppy phrases are not evaluated";
 /// of the wrong JSON type, a `wildcard` that states its value under both of its keys, a non-zero
 /// `fuzziness`, `slop` or `phrase_slop`, a `simple_query_string` that
 /// [`parse_simple_query_string`] refuses, or a `query_string` that
-/// [`parse_query_string`](super::lucene::parse_query_string) refuses (fuzzy, proximity or
-/// regular expression syntax, both `fields` and `default_field`, groups nested past its limit).
-/// A `query_string` syntax error is not refused here: each searched index answers it.
+/// [`parse_query_string`](super::lucene::parse_query_string) refuses (fuzzy or proximity syntax,
+/// both `fields` and `default_field`, groups nested past its limit);
+/// `illegal_argument_exception` for an unknown `regexp` flag. A `query_string` syntax error and a
+/// regular expression are not refused here: each searched index answers them.
 pub(crate) fn parse_query(value: &Value) -> Result<Query, OpenSearchError> {
     let (leaf, body) = read_single_entry(value, "query")?;
     match leaf {
@@ -98,6 +100,7 @@ pub(crate) fn parse_query(value: &Value) -> Result<Query, OpenSearchError> {
         "multi_match" => parse_multi_match(body).map(Query::MultiMatch),
         "simple_query_string" => parse_simple_query_string_leaf(body).map(Query::SimpleQueryString),
         "query_string" => super::lucene::parse_query_string(body),
+        "regexp" => parse_regexp_query(body),
         other => Err(OpenSearchError::parsing(format!("unknown query [{other}]"))),
     }
 }
@@ -415,10 +418,53 @@ fn parse_pattern_leaf(
                 read_flag(options, "case_insensitive", leaf)?,
             ))
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => Err(OpenSearchError::parsing(format!(
-            "[{leaf}] [{field}] must be a string or an object"
-        ))),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => Err(refuse_field_body(leaf, field)),
     }
+}
+
+/// The `parsing_exception` for the body of `field` in a `leaf` that takes a string or an object.
+fn refuse_field_body(leaf: &str, field: &str) -> OpenSearchError {
+    OpenSearchError::parsing(format!("[{leaf}] [{field}] must be a string or an object"))
+}
+
+/// Parses a `regexp` leaf: `{"<field>": "<pattern>"}` or `{"<field>": {"value": .., "flags": ..,
+/// "case_insensitive": .., "max_determinized_states": .., "boost": ..}}`.
+/// `max_determinized_states` and `boost` are accepted and not applied.
+///
+/// # Errors
+///
+/// `parsing_exception` for a leaf that does not name exactly one field, an unknown key, a value of
+/// the wrong type and a missing `value`; `illegal_argument_exception` for an unknown flag.
+pub(crate) fn parse_regexp_query(body: &Value) -> Result<Query, OpenSearchError> {
+    const LEAF: &str = "regexp";
+    let (field, field_body) = read_single_entry(body, LEAF)?;
+    let query = match field_body {
+        Value::String(pattern) => RegexpQuery {
+            field: field.to_owned(),
+            pattern: pattern.clone(),
+            flags: RegexFlags::ALL,
+            case_insensitive: false,
+        },
+        Value::Object(_) => {
+            let options = read_leaf_object(
+                field_body,
+                LEAF,
+                &["value", "flags", "case_insensitive", "max_determinized_states"],
+            )?;
+            refuse_wrong_option_types(options, &["max_determinized_states"], &[], LEAF)?;
+            let flags = options.get("flags").map(|_| read_text(options, "flags", LEAF)).transpose()?;
+            RegexpQuery {
+                field: field.to_owned(),
+                pattern: read_text(options, "value", LEAF)?.to_owned(),
+                flags: RegexFlags::parse(flags)?,
+                case_insensitive: read_flag(options, "case_insensitive", LEAF)?,
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => {
+            return Err(refuse_field_body(LEAF, field));
+        }
+    };
+    Ok(Query::Regexp(query))
 }
 
 /// `nested`: a `path`, a `query` and an optional `score_mode`.
@@ -716,10 +762,11 @@ mod tests {
     use crate::opensearch::error::render_envelope;
     use crate::query_dsl::ast::{
         BoolQuery, ExistsQuery, IdsQuery, MatchPhrasePrefixQuery, MatchPhraseQuery, MatchQuery, MultiMatchQuery,
-        MultiMatchType, NestedQuery, Operator, PrefixQuery, RangeBound, RangeQuery, SimpleQueryStringQuery, TermQuery,
-        TermsQuery, WildcardQuery, ZeroTermsQuery,
+        MultiMatchType, NestedQuery, Operator, PrefixQuery, RangeBound, RangeQuery, RegexpQuery,
+        SimpleQueryStringQuery, TermQuery, TermsQuery, WildcardQuery, ZeroTermsQuery,
     };
     use crate::query_dsl::date_math::{DateFormat, TimeZoneSpec};
+    use crate::query_dsl::regex::{RegexFlags, translate_lucene_regex};
     use crate::query_dsl::simple_query::SimpleQuery;
 
     fn parse(value: impl Into<Value>) -> Query {
@@ -1342,5 +1389,90 @@ mod tests {
                 "{unsupported_query}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn regexp_parses_its_short_and_long_forms_and_refuses_unknown_keys() {
+        assert_eq!(
+            parse_regexp_query(&json!({"severity_text": "ERR.*"})).expect("the short form parses"),
+            Query::Regexp(RegexpQuery {
+                field: String::from("severity_text"),
+                pattern: String::from("ERR.*"),
+                flags: RegexFlags::ALL,
+                case_insensitive: false,
+            })
+        );
+        let long_form = json!({"body": {
+            "value": "conn.*", "flags": "INTERVAL|ANYSTRING", "case_insensitive": true,
+            "max_determinized_states": 10000, "boost": 1.0
+        }});
+        let Query::Regexp(long_form_query) = parse_regexp_query(&long_form).expect("the long form parses") else {
+            panic!("the long form is a regexp leaf");
+        };
+        assert_eq!(
+            (
+                long_form_query.field.as_str(),
+                long_form_query.pattern.as_str(),
+                long_form_query.case_insensitive
+            ),
+            ("body", "conn.*", true)
+        );
+        // The parsed flags are read by their effect: `@` and `<1-2>` are operators (ANYSTRING and
+        // INTERVAL on), while `#`, `&` and `~` stay literal (EMPTY, INTERSECTION, COMPLEMENT off).
+        for (pattern, expected) in [
+            ("@", "^(?s:.*)$"),
+            ("<1-2>", "^(?s:[1-2])$"),
+            ("#", "^(?s:\\#)$"),
+            ("a&b", "^(?s:a\\&b)$"),
+            ("~a", "^(?s:\\~a)$"),
+        ] {
+            assert_eq!(
+                translate_lucene_regex(pattern, long_form_query.flags, false)
+                    .expect("the pattern translates")
+                    .as_str(),
+                expected,
+                "[{pattern}]"
+            );
+        }
+        let refused_rows = [
+            (
+                json!({"body": {"value": "a", "rewrite": "constant_score"}}),
+                "parsing_exception",
+            ),
+            (json!({"body": {"flags": "ALL"}}), "parsing_exception"),
+            (json!({"body": {"value": 1}}), "parsing_exception"),
+            (json!({"body": {"value": "a", "flags": 1}}), "parsing_exception"),
+            (
+                json!({"body": {"value": "a", "case_insensitive": "yes"}}),
+                "parsing_exception",
+            ),
+            (
+                json!({"body": {"value": "a", "max_determinized_states": "10"}}),
+                "parsing_exception",
+            ),
+            (json!({"body": {"value": "a", "boost": "1"}}), "parsing_exception"),
+            (
+                json!({"body": {"value": "a", "flags": "NOPE"}}),
+                "illegal_argument_exception",
+            ),
+            (json!({"a": "x", "b": "y"}), "parsing_exception"),
+            (json!({}), "parsing_exception"),
+            (json!({"body": 7}), "parsing_exception"),
+        ];
+        for (refused_body, expected_type) in refused_rows {
+            let error = parse_regexp_query(&refused_body).expect_err("the leaf is refused");
+            let (status, body) = render_envelope(error).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused_body}");
+            assert_eq!(body["error"]["type"], expected_type, "{refused_body}");
+        }
+        assert_eq!(
+            parse_query(&json!({"regexp": {"body": "a.*"}})).expect("the dispatched leaf parses"),
+            Query::Regexp(RegexpQuery {
+                field: String::from("body"),
+                pattern: String::from("a.*"),
+                flags: RegexFlags::ALL,
+                case_insensitive: false,
+            })
+        );
     }
 }

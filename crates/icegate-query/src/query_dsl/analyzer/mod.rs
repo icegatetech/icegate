@@ -82,8 +82,8 @@ pub(crate) fn tokenize_standard(text: &str) -> Vec<Token> {
 
 /// Lowercases `text` per code point with the analyzer's simple mapping, without tokenizing.
 ///
-/// This is the normalization `prefix` and `wildcard` patterns, and `query_string` range bounds,
-/// receive on `text` fields.
+/// This is the normalization `prefix` and `wildcard` patterns, and `query_string` range bounds
+/// and `/re/` patterns, receive on `text` fields.
 pub(crate) fn normalize_standard(text: &str) -> String {
     text.chars().map(lowercase_character).collect()
 }

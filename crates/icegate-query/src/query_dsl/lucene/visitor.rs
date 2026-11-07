@@ -57,8 +57,8 @@ pub(crate) enum QueryStringError {
 /// # Errors
 ///
 /// [`QueryStringError::Refused`] with a `parsing_exception` for fuzzy (`construct`
-/// `fuzzy`), proximity (`slop`) and regular expression (`regexp`) syntax, for both
-/// `fields` and `default_field`, and for groups nested deeper than
+/// `fuzzy`) and proximity (`slop`) syntax, for both `fields` and `default_field`, and
+/// for groups nested deeper than
 /// [`MAX_QUERY_STRING_DEPTH`] (`limit`), and with a `500` when the thread that parses a
 /// deeply nested string cannot start or panics; [`QueryStringError::Invalid`] for a
 /// syntax error and a refused leading wildcard.
@@ -324,10 +324,13 @@ impl QueryStringTranslation {
             }
             TermContextAll::RegexpTermContext(regexp) => {
                 let image = read_token_text(regexp.REGEXPTERM())?;
-                Err(QueryStringError::Refused(OpenSearchError::unsupported_construct(
-                    "regexp",
-                    format!("regular expression [{image}] in a query string is not supported"),
-                )))
+                refuse_fuzzy(regexp.termModifiers().as_deref(), &image)?;
+                // The pattern between the slashes keeps its escapes (`\/` included): the regex
+                // dialect reads them.
+                let pattern = image.strip_prefix('/').and_then(|rest| rest.strip_suffix('/')).ok_or_else(|| {
+                    QueryStringError::Invalid(format!("regular expression term [{image}] is not slash-delimited"))
+                })?;
+                Ok(self.build_leaf_query(target, FullTextTerm::Regexp(pattern.to_owned())))
             }
             TermContextAll::QuotedTermContext(quoted) => {
                 let image = read_token_text(quoted.QUOTED())?;
@@ -1127,14 +1130,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_regular_expression_term_is_refused_until_the_regex_dialect_exists() {
-        let Err(QueryStringError::Refused(error)) = translate_query_string(&build_options("level:/ERR.*/")) else {
-            panic!("a regular expression term is not refused");
+    async fn a_regular_expression_term_is_kept_verbatim_for_the_resolver() {
+        for (query, pattern) in [
+            ("level:/ERR.*/", "ERR.*"),
+            ("level:/a\\/b/", "a\\/b"),
+            ("/Conn.*/", "Conn.*"),
+        ] {
+            let target = if query.starts_with('/') {
+                build_all_fields_selectors()
+            } else {
+                build_named_selectors("level")
+            };
+            assert_eq!(
+                translate_options(&build_options(query)),
+                build_single_clause(build_leaf(
+                    target,
+                    FullTextTerm::Regexp(pattern.to_owned()),
+                    Operator::Or,
+                    true
+                )),
+                "[{query}]"
+            );
+        }
+        // A `~` after the closing slash asks for fuzzy matching, refused like after any term.
+        let Err(QueryStringError::Refused(error)) = translate_query_string(&build_options("level:/ERR.*/~2")) else {
+            panic!("a fuzzy regular expression term is not refused");
         };
         let (status, body) = render_envelope(error).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "parsing_exception");
-        assert_eq!(body["error"]["construct"], "regexp");
+        assert_eq!(body["error"]["construct"], "fuzzy");
     }
 
     /// Every leaf of `query`, at any depth of clause lists and groups.

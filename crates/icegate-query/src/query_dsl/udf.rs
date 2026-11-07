@@ -1,4 +1,5 @@
-//! Full-text scalar functions over the standard analyzer, and MAP-value matching.
+//! Full-text scalar functions over the standard analyzer, whole-value regex matching, and
+//! MAP-value matching.
 //!
 //! A text column is matched per token of [`tokenize_standard`], the tokenizer the
 //! system-index evaluator also uses, so a data index and a system index agree on
@@ -34,6 +35,12 @@ use crate::opensearch::error::OpenSearchError;
 pub(crate) struct MatchRegex(Regex);
 
 impl MatchRegex {
+    /// Wraps a pattern compiled anchored over the whole input, as
+    /// [`translate_lucene_regex`](super::regex::translate_lucene_regex) answers it.
+    pub(crate) const fn from_regex(regex: Regex) -> Self {
+        Self(regex)
+    }
+
     /// Whether the whole of `text` matches the anchored pattern.
     pub(crate) fn matches(&self, text: &str) -> bool {
         self.0.is_match(text)
@@ -83,6 +90,12 @@ pub(crate) fn build_text_regex_match_udf(pattern: MatchRegex) -> ScalarUDF {
     ScalarUDF::new_from_impl(TextMatch::new(TextMatchKind::Regex(pattern)))
 }
 
+/// `keyword_regex_match(value)`: the whole value matches the anchored pattern. The pattern
+/// is compiled once, when the expression is built, not per batch.
+pub(crate) fn build_keyword_regex_match_udf(pattern: MatchRegex) -> ScalarUDF {
+    ScalarUDF::new_from_impl(TextMatch::new(TextMatchKind::WholeValueRegex(pattern)))
+}
+
 /// `map_value_match(map)`: an entry of the MAP has a non-NULL value satisfying
 /// the predicate; an empty map matches nothing and a NULL map answers NULL.
 pub(crate) fn build_map_value_match_udf(predicate: MapValuePredicate) -> ScalarUDF {
@@ -95,7 +108,7 @@ pub(crate) fn build_map_value_match_udf(predicate: MapValuePredicate) -> ScalarU
 /// Appends one character to a Rust pattern as a literal outside a class: an
 /// ASCII letter becomes the class of both its cases when matching ignores ASCII
 /// case (the only case folding a `case_insensitive` leaf asks for).
-fn push_regex_literal(output: &mut String, character: char, is_ascii_case_insensitive: bool) {
+pub(super) fn push_regex_literal(output: &mut String, character: char, is_ascii_case_insensitive: bool) {
     if is_ascii_case_insensitive && character.is_ascii_alphabetic() {
         output.push('[');
         output.push(character.to_ascii_lowercase());
@@ -135,7 +148,7 @@ pub(crate) fn translate_wildcard(
         }
     }
     output.push_str(")$");
-    compile_anchored_pattern(pattern, &output)
+    compile_anchored_pattern(pattern, &output).map(MatchRegex)
 }
 
 /// Escapes `*`, `?` and `\` so a literal reads as itself in a wildcard pattern.
@@ -156,8 +169,8 @@ pub(crate) fn escape_wildcard(literal: &str) -> String {
 ///
 /// `illegal_argument` (400) when the translation does not compile, e.g. when it
 /// exceeds the regex engine's size limit.
-fn compile_anchored_pattern(source: &str, translated: &str) -> Result<MatchRegex, OpenSearchError> {
-    RegexBuilder::new(translated).build().map(MatchRegex).map_err(|error| {
+pub(super) fn compile_anchored_pattern(source: &str, translated: &str) -> Result<Regex, OpenSearchError> {
+    RegexBuilder::new(translated).build().map_err(|error| {
         OpenSearchError::illegal_argument(format!("the pattern [{source}] cannot be compiled: {error}"))
     })
 }
@@ -175,9 +188,11 @@ enum TextMatchKind {
     Range,
     /// A token matches the pattern.
     Regex(MatchRegex),
+    /// The whole value matches the pattern.
+    WholeValueRegex(MatchRegex),
 }
 
-/// One implementation for every per-token text predicate: the kind picks the
+/// One implementation for every per-token or whole-value text predicate: the kind picks the
 /// predicate, the function name and its arity.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct TextMatch {
@@ -188,7 +203,7 @@ struct TextMatch {
 impl TextMatch {
     fn new(kind: TextMatchKind) -> Self {
         let arity = match kind {
-            TextMatchKind::Regex(_) => 1,
+            TextMatchKind::Regex(_) | TextMatchKind::WholeValueRegex(_) => 1,
             TextMatchKind::Term | TextMatchKind::Prefix => 2,
             TextMatchKind::Phrase => 3,
             TextMatchKind::Range => 5,
@@ -208,6 +223,7 @@ impl ScalarUDFImpl for TextMatch {
             TextMatchKind::Phrase => "text_phrase_match",
             TextMatchKind::Range => "text_range_match",
             TextMatchKind::Regex(_) => "text_regex_match",
+            TextMatchKind::WholeValueRegex(_) => "keyword_regex_match",
         }
     }
 
@@ -258,6 +274,7 @@ impl ScalarUDFImpl for TextMatch {
             TextMatchKind::Regex(pattern) => match_each_text(&texts, name, |text| {
                 tokenize_standard(text).iter().any(|token| pattern.matches(&token.text))
             })?,
+            TextMatchKind::WholeValueRegex(pattern) => match_each_text(&texts, name, |text| pattern.matches(text))?,
         };
         Ok(ColumnarValue::Array(Arc::new(match_flags)))
     }
@@ -406,9 +423,9 @@ mod tests {
     use rand::{Rng as _, SeedableRng as _};
 
     use super::{
-        build_map_value_match_udf, build_text_phrase_match_udf, build_text_prefix_match_udf,
-        build_text_range_match_udf, build_text_regex_match_udf, build_text_term_match_udf, escape_wildcard,
-        translate_wildcard,
+        build_keyword_regex_match_udf, build_map_value_match_udf, build_text_phrase_match_udf,
+        build_text_prefix_match_udf, build_text_range_match_udf, build_text_regex_match_udf, build_text_term_match_udf,
+        escape_wildcard, translate_wildcard,
     };
     use crate::query_dsl::ast::MapValuePredicate;
 
@@ -624,6 +641,17 @@ mod tests {
         assert_eq!(
             invoke_match_udf(&build_text_regex_match_udf(pattern), build_body_array(), vec![]),
             vec![Some(true), Some(true), None, Some(false)]
+        );
+    }
+
+    /// The whole value, not a token: only row 0 starts with `Conn`, case as written, and a
+    /// NULL value stays NULL.
+    #[test]
+    fn the_keyword_regex_udf_matches_the_whole_value() {
+        let pattern = translate_wildcard("Conn*", false).expect("the wildcard translates");
+        assert_eq!(
+            invoke_match_udf(&build_keyword_regex_match_udf(pattern), build_body_array(), vec![]),
+            vec![Some(true), Some(false), None, Some(false)]
         );
     }
 

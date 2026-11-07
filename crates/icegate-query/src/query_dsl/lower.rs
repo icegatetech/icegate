@@ -29,7 +29,7 @@ use crate::query_dsl::analyzer::normalize_standard;
 use crate::query_dsl::ast::{
     BoolQuery, ExistsQuery, IdsQuery, MapValuesQuery, MatchPhrasePrefixQuery, MatchPhraseQuery, MatchQuery,
     MultiMatchQuery, MultiMatchType, Operator, PrefixQuery, Query, QueryStringClauses, RangeBound, RangeQuery,
-    SimpleQueryStringQuery, TermQuery, TermsQuery, TokenPhraseQuery, WildcardQuery, ZeroTermsQuery,
+    RegexpQuery, SimpleQueryStringQuery, TermQuery, TermsQuery, TokenPhraseQuery, WildcardQuery, ZeroTermsQuery,
 };
 use crate::query_dsl::date_math::{BoundSide, resolve_date_bound};
 use crate::query_dsl::full_text::{
@@ -40,9 +40,11 @@ use crate::query_dsl::literal::{
     IntegerBound, LiteralError, NumericTerm, parse_boolean_literal, parse_java_double, parse_numeric_term,
     resolve_date_term, resolve_integer_bound, step_exclusive_double,
 };
+use crate::query_dsl::regex::translate_lucene_regex;
 use crate::query_dsl::udf::{
-    build_map_value_match_udf, build_text_phrase_match_udf, build_text_prefix_match_udf, build_text_range_match_udf,
-    build_text_regex_match_udf, build_text_term_match_udf, escape_wildcard, translate_wildcard,
+    MatchRegex, build_keyword_regex_match_udf, build_map_value_match_udf, build_text_phrase_match_udf,
+    build_text_prefix_match_udf, build_text_range_match_udf, build_text_regex_match_udf, build_text_term_match_udf,
+    escape_wildcard, translate_wildcard,
 };
 
 /// What a query is lowered against: one index of one tenant-scoped session, at the request
@@ -67,14 +69,15 @@ pub(crate) struct LoweringScope<'a> {
 /// Returns the 400 `search_phase_execution_exception` with a `query_shard_exception` root cause
 /// for a literal of the wrong form for its field (an invalid hex id; a malformed, non-finite or
 /// out-of-range number; a boolean other than `true` or `false`; text that is no date) and for
-/// `prefix` or `wildcard` on an id, numeric, date or boolean field, for a strict full-text leaf
-/// whose text does not parse for a typed field, for a phrase prefix on a field that is not
-/// text, and for a `query_string` whose translation failed (a syntax error or a refused leading
-/// wildcard); `parsing_exception` for `nested` on a data index; `illegal_argument_exception` for
-/// a field pattern that selects only some keys of a MAP column and for a pattern that does not
-/// compile; `500` for a leaf on a column no `OpenSearch` type represents or for an `ids` value
-/// of an index with hashed ids and no timestamp column; and the error the index's table failed
-/// to open with.
+/// `prefix`, `wildcard` or `regexp` on an id, numeric, date or boolean field, for a strict
+/// full-text leaf whose text does not parse for a typed field, for a phrase prefix on a field
+/// that is not text, and for a `query_string` whose translation failed (a syntax error or a
+/// refused leading wildcard); `parsing_exception` for `nested` on a data index;
+/// `illegal_argument_exception` for a field pattern that selects only some keys of a MAP column
+/// and for a pattern that does not compile; the 400 refusals of [`translate_lucene_regex`] for a
+/// `regexp` pattern, typed as that function documents; `500` for a leaf on a column no
+/// `OpenSearch` type represents or for an `ids` value of an index with hashed ids and no
+/// timestamp column; and the error the index's table failed to open with.
 pub(crate) fn lower_query(query: &Query, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
     match query {
         Query::MatchAll => Ok(lit(true)),
@@ -87,6 +90,7 @@ pub(crate) fn lower_query(query: &Query, scope: &LoweringScope<'_>) -> Result<Ex
         Query::Exists(exists) => lower_exists(exists, scope),
         Query::Prefix(prefix) => lower_prefix(prefix, scope),
         Query::Wildcard(wildcard) => lower_wildcard(wildcard, scope),
+        Query::Regexp(query) => lower_regexp(query, scope),
         Query::Ids(ids) => lower_ids(ids, scope),
         Query::Nested(_) => Err(OpenSearchError::parsing(
             "[nested] queries are supported on system indices only",
@@ -450,8 +454,8 @@ fn decode_hex_literal(
         })
 }
 
-/// The final query-shard 400 for a term pattern (`prefix`, `wildcard`) on a field that only
-/// matches whole parsed values.
+/// The final query-shard 400 for a term pattern (`prefix`, `wildcard`, `regexp`) on a field that
+/// only matches whole parsed values.
 fn refuse_term_pattern(field: &ResolvedField, leaf: &str, scope: &LoweringScope<'_>) -> OpenSearchError {
     OpenSearchError::query_shard(
         scope.entry.name(),
@@ -1082,6 +1086,32 @@ fn lower_wildcard(query: &WildcardQuery, scope: &LoweringScope<'_>) -> Result<Ex
         (FieldType::Keyword, FieldValue::HexId { .. })
         | (FieldType::Date | FieldType::Integer | FieldType::Long | FieldType::Double | FieldType::Boolean, _) => {
             Err(refuse_term_pattern(&field, "wildcard", scope))
+        }
+    }
+}
+
+/// A `regexp` over a whole keyword value (a MAP key's included) or one token of a text field,
+/// with the pattern as given; the final query-shard 400 on an id, numeric, date or boolean field.
+fn lower_regexp(query: &RegexpQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
+    // Translated before the field is resolved, so a malformed pattern fails the query whatever
+    // fields the index holds.
+    let pattern = MatchRegex::from_regex(translate_lucene_regex(
+        &query.pattern,
+        query.flags,
+        query.case_insensitive,
+    )?);
+    let Some(field) = resolve_leaf_field(scope, &query.field)? else {
+        return Ok(lit(false));
+    };
+    match (field.field_type, &field.value) {
+        (FieldType::Keyword, FieldValue::Column { .. } | FieldValue::MapKey { .. }) => {
+            Ok(build_keyword_regex_match_udf(pattern).call(vec![field.value.build_read_expr()]))
+        }
+        (FieldType::Object, _) => Ok(lit(false)),
+        (FieldType::Text, _) => Ok(build_text_regex_match_udf(pattern).call(vec![field.value.build_read_expr()])),
+        (FieldType::Keyword, FieldValue::HexId { .. })
+        | (FieldType::Date | FieldType::Integer | FieldType::Long | FieldType::Double | FieldType::Boolean, _) => {
+            Err(refuse_term_pattern(&field, "regexp", scope))
         }
     }
 }
