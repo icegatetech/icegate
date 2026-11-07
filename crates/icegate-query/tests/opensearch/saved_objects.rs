@@ -1953,7 +1953,7 @@ async fn count_with_a_body_key_other_than_query_is_a_parsing_exception() -> Test
     for body in [
         json!({"query": {"match_all": {}}, "size": 0}),
         json!({"aggs": {}}),
-        json!({"query": {"match": {"type": "x"}}}),
+        json!({"query": {"more_like_this": {"like": "x"}}}),
     ] {
         let (status, answer) = send_request(&server, Method::POST, TENANT_A, "/.kibana/_count", Some(&body)).await?;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -2551,6 +2551,182 @@ async fn tenant_b_search_returns_none_of_tenant_a_documents() -> TestResult {
         other_tenant_answer["hits"],
         json!({"total": 0, "max_score": null, "hits": []})
     );
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_saved_objects_find_with_search_and_has_reference_returns_the_stated_objects() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    create_kibana_index(&server, TENANT_B).await?;
+    let logs_reference =
+        json!([{"name": "kibanaSavedObjectMeta.searchSourceJSON.index", "type": "index-pattern", "id": "logs"}]);
+    let other_reference =
+        json!([{"name": "kibanaSavedObjectMeta.searchSourceJSON.index", "type": "index-pattern", "id": "other"}]);
+    for (id, source) in [
+        (
+            "visualization:a",
+            json!({"type": "visualization", "visualization": {"title": "Error rate"}, "references": logs_reference.clone()}),
+        ),
+        (
+            "visualization:b",
+            json!({"type": "visualization", "visualization": {"title": "Errors by service"}, "references": logs_reference.clone()}),
+        ),
+        (
+            "visualization:c",
+            json!({"type": "visualization", "visualization": {"title": "Error budget"}, "references": other_reference}),
+        ),
+        (
+            "visualization:d",
+            json!({"type": "visualization", "visualization": {"title": "Latency"}, "references": logs_reference.clone()}),
+        ),
+        (
+            "dashboard:e",
+            json!({"type": "dashboard", "dashboard": {"title": "Error overview"}, "references": logs_reference.clone()}),
+        ),
+    ] {
+        put_saved_object(&server, TENANT_A, id, &source).await?;
+    }
+    // The same object under the other tenant must never appear in tenant A's answer.
+    put_saved_object(
+        &server,
+        TENANT_B,
+        "visualization:z",
+        &json!({"type": "visualization", "visualization": {"title": "Error rate"}, "references": logs_reference}),
+    )
+    .await?;
+    // A find-style search: one type, one reference, and the text `error` both as a
+    // `simple_query_string` prefix term and as a `match_phrase_prefix` clause.
+    let find = json!({
+        "seq_no_primary_term": true,
+        "query": {"bool": {
+            "filter": [
+                {"bool": {"must": [{"nested": {"path": "references", "query": {"bool": {"must": [
+                    {"term": {"references.id": "logs"}},
+                    {"term": {"references.type": "index-pattern"}}
+                ]}}}}]}},
+                {"bool": {
+                    "should": [{"bool": {"must": [{"term": {"type": "visualization"}}], "must_not": [{"exists": {"field": "namespaces"}}]}}],
+                    "minimum_should_match": 1
+                }}
+            ],
+            "must": [{"bool": {
+                "should": [
+                    {"simple_query_string": {"query": "error*", "fields": ["visualization.title"], "lenient": true, "default_operator": "OR"}},
+                    {"match_phrase_prefix": {"visualization.title": {"query": "error", "boost": 10}}}
+                ],
+                "minimum_should_match": 1
+            }}]
+        }}
+    });
+
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search?size=20&from=0&rest_total_hits_as_int=true",
+        Some(&find),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["hits"]["total"], 2);
+    let ids: Vec<&Value> = answer["hits"]["hits"]
+        .as_array()
+        .ok_or("hits is an array")?
+        .iter()
+        .map(|hit| &hit["_id"])
+        .collect();
+    assert_eq!(ids, [&json!("visualization:a"), &json!("visualization:b")]);
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_query_shard_refusal_names_the_index_behind_the_alias() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_saved_object(
+        &server,
+        TENANT_A,
+        "dashboard:a",
+        &json!({"type": "dashboard", "updated_at": "2026-10-05T00:00:00.000Z"}),
+    )
+    .await?;
+
+    for body in [
+        json!({"query": {"match": {"updated_at": "not a date"}}}),
+        json!({"query": {"term": {"updated_at": "not a date"}}}),
+        json!({"query": {"match_phrase_prefix": {"type": "dash"}}}),
+    ] {
+        for path in ["/.kibana/_search", "/.kibana/_count"] {
+            let (status, answer) = send_request(&server, Method::POST, TENANT_A, path, Some(&body)).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}");
+            assert_eq!(
+                answer["error"]["type"], "search_phase_execution_exception",
+                "{path} {body}"
+            );
+            let root_cause = &answer["error"]["root_cause"][0];
+            assert_eq!(root_cause["type"], "query_shard_exception", "{path} {body}");
+            assert_eq!(root_cause["index"], ".kibana_1", "{path} {body}");
+        }
+    }
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_simple_query_string_the_parser_refuses_is_a_parsing_exception() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    // One level past the nesting limit, which the literal states because the constant is private.
+    let nested_text = format!("{}a{}", "(".repeat(129), ")".repeat(129));
+
+    for (text, key, expected_value) in [
+        (nested_text.as_str(), "limit", json!(128)),
+        ("eror~1", "construct", json!("fuzzy")),
+        ("\"error rate\"~2", "construct", json!("slop")),
+    ] {
+        let body = json!({"query": {"simple_query_string": {"query": text}}});
+        for path in ["/.kibana/_search", "/.kibana/_count"] {
+            let (status, answer) = send_request(&server, Method::POST, TENANT_A, path, Some(&body)).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {text}");
+            assert_eq!(answer["error"]["type"], "parsing_exception", "{path} {text}");
+            assert_eq!(answer["error"][key], expected_value, "{path} {text}");
+        }
+    }
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_count_with_a_full_text_leaf_counts_the_matching_documents_of_its_tenant() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    create_kibana_index(&server, TENANT_B).await?;
+    for (id, title) in [
+        ("visualization:a", "Error rate"),
+        ("visualization:b", "Errors by service"),
+        ("visualization:c", "Error budget"),
+        ("visualization:d", "Latency"),
+    ] {
+        let source = json!({"type": "visualization", "visualization": {"title": title}});
+        put_saved_object(&server, TENANT_A, id, &source).await?;
+    }
+    let other_tenant_source = json!({"type": "visualization", "visualization": {"title": "Error rate"}});
+    put_saved_object(&server, TENANT_B, "visualization:z", &other_tenant_source).await?;
+    // `errors` analyzes to its own token, so `error` selects two of tenant A's four titles.
+    let body = json!({"query": {"match": {"visualization.title": "error"}}});
+
+    let (status, answer) = send_request(&server, Method::POST, TENANT_A, "/.kibana/_count", Some(&body)).await?;
+    let (other_tenant_status, other_tenant_answer) =
+        send_request(&server, Method::POST, TENANT_B, "/.kibana/_count", Some(&body)).await?;
+
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["count"], 2);
+    assert_eq!(other_tenant_status, StatusCode::OK, "{other_tenant_answer}");
+    assert_eq!(other_tenant_answer["count"], 1);
     server.shutdown().await;
     Ok(())
 }

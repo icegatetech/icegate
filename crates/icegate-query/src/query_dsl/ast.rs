@@ -4,6 +4,7 @@
 use serde_json::Value;
 
 use super::date_math::{DateFormat, TimeZoneSpec};
+use super::simple_query::SimpleQuery;
 
 /// One query node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,16 @@ pub(crate) enum Query {
     ConstantScore(Box<Self>),
     /// The inner query, evaluated within one element of a nested array.
     Nested(NestedQuery),
+    /// `match`.
+    Match(MatchQuery),
+    /// `match_phrase`.
+    MatchPhrase(MatchPhraseQuery),
+    /// `match_phrase_prefix`.
+    MatchPhrasePrefix(MatchPhrasePrefixQuery),
+    /// `multi_match`.
+    MultiMatch(MultiMatchQuery),
+    /// `simple_query_string`.
+    SimpleQueryString(SimpleQueryStringQuery),
 }
 
 /// `bool`: every `must` and `filter` clause matches, no `must_not` clause matches, and at least
@@ -138,4 +149,90 @@ pub(crate) struct NestedQuery {
     pub(crate) path: String,
     /// The query every clause of which must hold within the same array element.
     pub(crate) query: Box<Query>,
+}
+
+/// How the tokens of a full-text query combine, and how unconnected `simple_query_string`
+/// clauses join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Operator {
+    /// One token or clause suffices.
+    Or,
+    /// Every token or clause must match.
+    And,
+}
+
+/// The field pattern naming every field: the default of `multi_match` and
+/// `simple_query_string`.
+pub(crate) const ALL_FIELDS: &str = "*";
+
+/// What a `match` whose text yields no token matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZeroTermsQuery {
+    /// No document (the default).
+    None,
+    /// Every document.
+    All,
+}
+
+/// How `multi_match` matches; either way one field must satisfy the whole query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MultiMatchType {
+    /// The query's tokens combined with its operator.
+    BestFields,
+    /// The query as a phrase.
+    Phrase,
+}
+
+/// `match`: the query text analyzed by the field's kind and combined with `operator`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MatchQuery {
+    pub(crate) field: String,
+    /// A string, number or boolean.
+    pub(crate) query: Value,
+    pub(crate) operator: Operator,
+    /// Whether a text that does not parse for the field's type matches nothing instead of
+    /// failing; `None` is `false`.
+    pub(crate) lenient: Option<bool>,
+    pub(crate) zero_terms_query: ZeroTermsQuery,
+}
+
+/// `match_phrase`: the query's tokens at consecutive positions of one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MatchPhraseQuery {
+    pub(crate) field: String,
+    pub(crate) query: String,
+}
+
+/// `match_phrase_prefix`: a phrase whose last token prefixes its token. Every token with that
+/// prefix counts: `max_expansions` is accepted and not applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MatchPhrasePrefixQuery {
+    pub(crate) field: String,
+    /// The phrase, its last token a prefix.
+    pub(crate) query: String,
+}
+
+/// `multi_match` over field patterns (already stripped of `^boost`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MultiMatchQuery {
+    pub(crate) fields: Vec<String>,
+    pub(crate) query: String,
+    pub(crate) match_type: MultiMatchType,
+    /// How the query's tokens combine under [`MultiMatchType::BestFields`].
+    pub(crate) operator: Operator,
+    /// `None` defaults to `true` for the fields `*` and to `false` otherwise.
+    pub(crate) lenient: Option<bool>,
+}
+
+/// `simple_query_string`, its query parsed with the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SimpleQueryStringQuery {
+    /// The parsed query; every document reuses this tree.
+    pub(crate) query: SimpleQuery,
+    /// Field patterns (already stripped of `^boost`).
+    pub(crate) fields: Vec<String>,
+    /// Joins the tokens one term analyzes into; the clauses were joined when parsing.
+    pub(crate) default_operator: Operator,
+    /// `None` defaults to `true` for the fields `*` and to `false` otherwise.
+    pub(crate) lenient: Option<bool>,
 }

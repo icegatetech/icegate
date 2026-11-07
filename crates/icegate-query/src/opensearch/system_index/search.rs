@@ -159,9 +159,9 @@ pub(crate) fn count_system_documents(
     now: DateTime<Utc>,
 ) -> Result<u64, OpenSearchError> {
     let mut count = 0_u64;
-    for (_, index) in find_system_indices(snapshot, indices)? {
+    for (index_name, index) in find_system_indices(snapshot, indices)? {
         for (id, document) in index.documents() {
-            if matches_document(query, id, &document.source, &index.mappings, now)? {
+            if matches_document(query, index_name, id, &document.source, &index.mappings, now)? {
                 count += 1;
             }
         }
@@ -263,7 +263,14 @@ pub(crate) fn search_system_indices(
     let mut keyed_hits = Vec::new();
     for (&(index_name, index), sort_plan) in concrete_indices.iter().zip(&sort_plans) {
         for (id, document) in index.documents() {
-            if matches_document(&request.query, id, &document.source, &index.mappings, context.now)? {
+            if matches_document(
+                &request.query,
+                index_name,
+                id,
+                &document.source,
+                &index.mappings,
+                context.now,
+            )? {
                 let hit = SystemHit {
                     index: index_name,
                     id,

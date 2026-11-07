@@ -91,6 +91,18 @@ impl OpenSearchError {
         Self::new(StatusCode::BAD_REQUEST, "parsing_exception", reason)
     }
 
+    /// A query construct IceGate does not evaluate (`400`, `parsing_exception`), which `construct`
+    /// carries for a client.
+    pub(crate) fn unsupported_construct(construct: &str, reason: impl Into<String>) -> Self {
+        Self::parsing(reason).with_metadata("construct", construct)
+    }
+
+    /// A query text past a limit of its parser (`400`, `parsing_exception`), whose value `limit`
+    /// carries for a client.
+    pub(crate) fn query_limit_exceeded(reason: impl Into<String>, limit: impl Into<Value>) -> Self {
+        Self::parsing(reason).with_metadata("limit", limit)
+    }
+
     /// The request body exceeds `opensearch.max_request_body_bytes` (`413`).
     pub(crate) fn payload_too_large() -> Self {
         Self::new(

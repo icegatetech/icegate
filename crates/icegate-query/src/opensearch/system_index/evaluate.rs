@@ -20,20 +20,48 @@
 //! `wildcard` pattern is lowercased the way the analyzer lowercases, without splitting, and
 //! matches when one token matches it; a `range` matches when one token lies within it, compared
 //! as strings; `exists` holds for any present value, the empty string included.
+//!
+//! The full-text leaves evaluate each field by its kind. On a `text` field the query text is
+//! analyzed: a `match` needs one of its tokens (`or`) or all of them (`and`) in one stored value; a
+//! phrase needs its tokens at consecutive positions of one stored value; a phrase prefix also lets
+//! its last token prefix the stored token, and every token with that prefix counts; a trailing-`*`
+//! term of `simple_query_string` is a prefix of one token, lowercased like the analyzer. On a
+//! `keyword` field and on `_id` the whole text equals (or, for a prefix term, starts) one stored
+//! value. On a number, date or boolean field the whole text is a typed term, and a text that does
+//! not parse, or a prefix term, fails the query on its index unless `lenient`, then it matches
+//! nothing. `match_phrase_prefix` fails the same way on all of these but `text`, whatever `lenient`
+//! says.
+//!
+//! A text that yields no token contributes no clause: a `match` then follows `zero_terms_query`, a
+//! phrase matches nothing, and inside `simple_query_string` the clause drops out of its group (a
+//! group left with nothing drops out too). `multi_match` and `simple_query_string` match when one
+//! field matches, and with the fields `*` (or absent) `lenient` defaults to true. `*` and other
+//! patterns name the document's leaf paths outside `nested` fields, outside what the mapping does not
+//! index (`index: false`, or under an object with `enabled: false`) and outside fields of a type the
+//! evaluator does not support; the multi-fields the mapping declares on them (unless themselves
+//! `index: false` or of such a type); and the `keyword` subfield of an undeclared string. Inside a
+//! `nested` query they name the paths of the current element instead of the document's, and nothing
+//! when a step of the query's path is under `enabled: false` or of such a type.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::opensearch::error::OpenSearchError;
+use crate::opensearch::glob::matches_glob;
 use crate::query_dsl::analyzer::{Token, normalize_standard, tokenize_standard};
-use crate::query_dsl::ast::{BoolQuery, NestedQuery, Query, RangeBound, RangeQuery};
+use crate::query_dsl::ast::{
+    ALL_FIELDS, BoolQuery, MatchQuery, MultiMatchQuery, MultiMatchType, NestedQuery, Operator, Query, RangeBound,
+    RangeQuery, SimpleQueryStringQuery, ZeroTermsQuery,
+};
 use crate::query_dsl::date_math::{BoundSide, parse_stored_date_millis, resolve_date_bound};
+use crate::query_dsl::simple_query::SimpleQuery;
 
 /// The metadata field naming a document's id.
 pub(crate) const ID_FIELD: &str = "_id";
@@ -108,15 +136,21 @@ impl DeclaredFieldType {
     }
 }
 
-/// Whether the document `id` with `source` matches `query` under `mappings`, with `now` the
-/// request's instant for date math.
+/// Whether the document `id` of `index` with `source` matches `query` under `mappings`, with
+/// `now` the request's instant for date math.
 ///
 /// # Errors
 ///
-/// `illegal_argument_exception` for a value that does not parse for its field's type, a string
-/// leaf on a non-string field, or a mapping type the evaluator does not support.
+/// - `search_phase_execution_exception` wrapping a `query_shard_exception` on `index` for a `term`
+///   or `terms` value that does not parse for its field's type; for a full-text text that does not,
+///   or a `simple_query_string` prefix term on a number, date or boolean field, without `lenient`;
+///   and for a `match_phrase_prefix` on a keyword, `_id`, number, date or boolean field.
+/// - `illegal_argument_exception` for a `range` value that does not parse for its field's type, a
+///   `prefix` or `wildcard` on a non-string field, or a mapping type the evaluator does not
+///   support.
 pub(crate) fn matches_document(
     query: &Query,
+    index: &str,
     id: &str,
     source: &Value,
     mappings: &Value,
@@ -124,6 +158,7 @@ pub(crate) fn matches_document(
 ) -> Result<bool, OpenSearchError> {
     let analyzed_values = AnalyzedValues::default();
     DocumentView {
+        index,
         id,
         source,
         mappings,
@@ -244,9 +279,19 @@ struct DocumentFieldValues<'a> {
     values: Vec<&'a Value>,
 }
 
+/// A field a full-text query reads, resolved once for the evaluation.
+struct SearchedField<'a> {
+    /// The field the query names, or a field a pattern expanded to.
+    name: String,
+    /// What the document holds there.
+    field_values: DocumentFieldValues<'a>,
+}
+
 /// One document under evaluation.
 #[derive(Clone, Copy)]
 struct DocumentView<'a> {
+    /// The concrete index the document belongs to, named by query-shard errors.
+    index: &'a str,
     /// The document id, which is not part of `source`.
     id: &'a str,
     /// The stored document.
@@ -271,8 +316,10 @@ impl<'a> DocumentView<'a> {
             Query::Term(term) => self.matches_term(&term.field, &term.value, term.case_insensitive),
             Query::Terms(terms) => {
                 let field_values = self.resolve_field(&terms.field)?;
-                matches_any_item(&terms.values, |value| {
-                    self.matches_field_values(&terms.field, &field_values, value, false)
+                // Every value is read, so whether the query fails does not depend on what the
+                // document holds.
+                terms.values.iter().try_fold(false, |has_match, value| {
+                    Ok(self.matches_term_value(&terms.field, &field_values, value, false)? || has_match)
                 })
             }
             Query::Ids(ids) => Ok(ids.values.iter().any(|value| value == self.id)),
@@ -288,6 +335,13 @@ impl<'a> DocumentView<'a> {
             }
             Query::ConstantScore(inner) => self.matches_query(inner),
             Query::Nested(nested) => self.matches_nested(nested),
+            Query::Match(query) => self.matches_match(query),
+            Query::MatchPhrase(query) => self.matches_phrase(&query.field, &query.query, FullTextForm::Phrase),
+            Query::MatchPhrasePrefix(query) => {
+                self.matches_phrase(&query.field, &query.query, FullTextForm::PhrasePrefix)
+            }
+            Query::MultiMatch(query) => self.matches_multi_match(query),
+            Query::SimpleQueryString(query) => self.matches_simple_query_string(query),
         }
     }
 
@@ -390,7 +444,28 @@ impl<'a> DocumentView<'a> {
 
     /// Whether `field` holds `value`, compared by the field's kind.
     fn matches_term(&self, field: &str, value: &Value, is_case_insensitive: bool) -> Result<bool, OpenSearchError> {
-        self.matches_field_values(field, &self.resolve_field(field)?, value, is_case_insensitive)
+        self.matches_term_value(field, &self.resolve_field(field)?, value, is_case_insensitive)
+    }
+
+    /// [`Self::matches_field_values`] for a value of a `term` or `terms`. Every error that method
+    /// returns is a value that does not parse for the field, which fails the query on this index.
+    fn matches_term_value(
+        &self,
+        field: &str,
+        field_values: &DocumentFieldValues<'a>,
+        value: &Value,
+        is_case_insensitive: bool,
+    ) -> Result<bool, OpenSearchError> {
+        self.matches_field_values(field, field_values, value, is_case_insensitive)
+            .map_err(|_| self.refuse_invalid_value(field, value))
+    }
+
+    /// The query-shard failure for `value`, which does not parse for `field`.
+    fn refuse_invalid_value(&self, field: &str, value: impl Display) -> OpenSearchError {
+        OpenSearchError::query_shard(
+            self.index,
+            &format!("[{value}] is not a valid value for the field [{field}]"),
+        )
     }
 
     /// Whether `field_values`, resolved from `field`, hold `value`. A `terms` compares several
@@ -569,6 +644,344 @@ impl<'a> DocumentView<'a> {
             }
         }
     }
+
+    /// Whether this document satisfies a `match`.
+    fn matches_match(&self, query: &MatchQuery) -> Result<bool, OpenSearchError> {
+        let text = render_text(&query.query).ok_or_else(|| refuse_value(&query.field, &query.query))?;
+        let field_values = self.resolve_field(&query.field)?;
+        let match_result = self.match_full_text(
+            &query.field,
+            &field_values,
+            &QueryText::new(&text, FullTextForm::Tokens(query.operator)),
+            query.lenient.unwrap_or(false),
+        )?;
+        Ok(match_result.unwrap_or(query.zero_terms_query == ZeroTermsQuery::All))
+    }
+
+    /// Whether `field` holds the phrase `text`; a text without tokens matches nothing.
+    fn matches_phrase(&self, field: &str, text: &str, form: FullTextForm) -> Result<bool, OpenSearchError> {
+        let field_values = self.resolve_field(field)?;
+        let match_result = self.match_full_text(field, &field_values, &QueryText::new(text, form), false)?;
+        Ok(match_result.unwrap_or(false))
+    }
+
+    /// Whether one field satisfies a `multi_match` on its own.
+    fn matches_multi_match(&self, query: &MultiMatchQuery) -> Result<bool, OpenSearchError> {
+        let form = match query.match_type {
+            MultiMatchType::BestFields => FullTextForm::Tokens(query.operator),
+            MultiMatchType::Phrase => FullTextForm::Phrase,
+        };
+        let is_lenient = query.lenient.unwrap_or_else(|| is_all_fields(&query.fields));
+        let fields = self.resolve_searched_fields(&query.fields)?;
+        let match_result = self.match_any_field(&fields, &QueryText::new(&query.query, form), is_lenient)?;
+        Ok(match_result.unwrap_or(false))
+    }
+
+    /// Whether this document satisfies a `simple_query_string`.
+    fn matches_simple_query_string(&self, query: &SimpleQueryStringQuery) -> Result<bool, OpenSearchError> {
+        let is_lenient = query.lenient.unwrap_or_else(|| is_all_fields(&query.fields));
+        let fields = self.resolve_searched_fields(&query.fields)?;
+        let match_result = self.evaluate_simple_query(&query.query, &fields, query.default_operator, is_lenient)?;
+        Ok(match_result.unwrap_or(false))
+    }
+
+    /// The fields `patterns` name for this document, each resolved once for all the query's texts.
+    fn resolve_searched_fields(&self, patterns: &[String]) -> Result<Vec<SearchedField<'a>>, OpenSearchError> {
+        self.expand_field_patterns(patterns)
+            .into_iter()
+            .map(|name| {
+                let field_values = self.resolve_field(&name)?;
+                Ok(SearchedField { name, field_values })
+            })
+            .collect()
+    }
+
+    /// A `simple_query_string` node over `fields`; `None` when it contributes no clause. Every
+    /// clause is evaluated, so whether a query fails does not depend on the order of its clauses.
+    fn evaluate_simple_query(
+        &self,
+        node: &SimpleQuery,
+        fields: &[SearchedField<'a>],
+        operator: Operator,
+        is_lenient: bool,
+    ) -> Result<Option<bool>, OpenSearchError> {
+        match node {
+            SimpleQuery::MatchAll => Ok(Some(true)),
+            SimpleQuery::MatchNone => Ok(Some(false)),
+            SimpleQuery::Term { text, is_prefix } => {
+                let form = if *is_prefix {
+                    FullTextForm::Prefix
+                } else {
+                    FullTextForm::Tokens(operator)
+                };
+                self.match_any_field(fields, &QueryText::new(text, form), is_lenient)
+            }
+            SimpleQuery::Phrase { text } => {
+                self.match_any_field(fields, &QueryText::new(text, FullTextForm::Phrase), is_lenient)
+            }
+            SimpleQuery::Bool { must, should, must_not } => {
+                let evaluate_clauses = |clauses: &[SimpleQuery]| {
+                    clauses
+                        .iter()
+                        .map(|clause| self.evaluate_simple_query(clause, fields, operator, is_lenient))
+                        .collect::<Result<Vec<Option<bool>>, OpenSearchError>>()
+                };
+                let (must_values, should_values, must_not_values) = (
+                    evaluate_clauses(must)?,
+                    evaluate_clauses(should)?,
+                    evaluate_clauses(must_not)?,
+                );
+                // A group whose clauses all drop out, apart from the match-all a negation adds,
+                // drops out itself.
+                let is_contributing = must_values.iter().chain(&must_not_values).any(Option::is_some)
+                    || should
+                        .iter()
+                        .zip(&should_values)
+                        .any(|(clause, value)| value.is_some() && !matches!(clause, SimpleQuery::MatchAll));
+                if !is_contributing {
+                    return Ok(None);
+                }
+                if must_not_values.into_iter().flatten().any(|is_match| is_match) {
+                    return Ok(Some(false));
+                }
+                let mut must_results = must_values.into_iter().flatten().peekable();
+                if must_results.peek().is_some() {
+                    return Ok(Some(must_results.all(|is_match| is_match)));
+                }
+                Ok(Some(should_values.into_iter().flatten().any(|is_match| is_match)))
+            }
+        }
+    }
+
+    /// `query_text` against each of `fields`: a match in one field is a match; `None` when no field
+    /// contributes a clause. Every field is read, so whether a query fails does not depend on which
+    /// field holds a match.
+    fn match_any_field(
+        &self,
+        fields: &[SearchedField<'a>],
+        query_text: &QueryText<'_>,
+        is_lenient: bool,
+    ) -> Result<Option<bool>, OpenSearchError> {
+        let mut has_match = false;
+        let mut is_contributing = false;
+        for field in fields {
+            if let Some(is_match) = self.match_full_text(&field.name, &field.field_values, query_text, is_lenient)? {
+                has_match |= is_match;
+                is_contributing = true;
+            }
+        }
+        Ok(is_contributing.then_some(has_match))
+    }
+
+    /// `query_text` against one field by its kind; `None` when the text yields no token on a `text`
+    /// field and so contributes no clause.
+    fn match_full_text(
+        &self,
+        field: &str,
+        field_values: &DocumentFieldValues<'a>,
+        query_text: &QueryText<'_>,
+        is_lenient: bool,
+    ) -> Result<Option<bool>, OpenSearchError> {
+        let Some(kind) = field_values.kind else {
+            return Ok(Some(false));
+        };
+        match kind {
+            FieldKind::Object | FieldKind::Nested => Ok(Some(false)),
+            FieldKind::Text => Ok(match_analyzed_values(
+                &field_values.values,
+                self.analyzed_values,
+                query_text.analyze_text(),
+                query_text.form,
+            )),
+            FieldKind::Identifier => {
+                self.match_whole_values(field, std::iter::once(Cow::Borrowed(self.id)), query_text)
+            }
+            FieldKind::Keyword => {
+                let values = field_values.values.iter().filter_map(|value| render_text(value));
+                self.match_whole_values(field, values, query_text)
+            }
+            FieldKind::Date | FieldKind::Integer | FieldKind::Float | FieldKind::Boolean => match query_text.form {
+                FullTextForm::PhrasePrefix => Err(self.refuse_phrase_prefix(field)),
+                FullTextForm::Prefix if is_lenient => Ok(Some(false)),
+                FullTextForm::Prefix => Err(OpenSearchError::query_shard(
+                    self.index,
+                    &format!("a prefix applies to text and keyword fields and [{field}] is neither"),
+                )),
+                FullTextForm::Tokens(_) | FullTextForm::Phrase => {
+                    match self.matches_field_values(field, field_values, query_text.read_term_value(), false) {
+                        Ok(is_match) => Ok(Some(is_match)),
+                        Err(_) if is_lenient => Ok(Some(false)),
+                        Err(_) => Err(self.refuse_invalid_value(field, query_text.text)),
+                    }
+                }
+            },
+        }
+    }
+
+    /// `query_text` against whole values (a keyword field or the id): equal, or a prefix of one for
+    /// a prefix term.
+    fn match_whole_values<'v>(
+        &self,
+        field: &str,
+        mut values: impl Iterator<Item = Cow<'v, str>>,
+        query_text: &QueryText<'_>,
+    ) -> Result<Option<bool>, OpenSearchError> {
+        let text = query_text.text;
+        match query_text.form {
+            FullTextForm::PhrasePrefix => Err(self.refuse_phrase_prefix(field)),
+            FullTextForm::Prefix => Ok(Some(values.any(|value| value.starts_with(text)))),
+            FullTextForm::Tokens(_) | FullTextForm::Phrase => Ok(Some(values.any(|value| value == text))),
+        }
+    }
+
+    /// The query-shard failure for a `match_phrase_prefix` on `field`, which is not `text`.
+    fn refuse_phrase_prefix(&self, field: &str) -> OpenSearchError {
+        OpenSearchError::query_shard(
+            self.index,
+            &format!("[match_phrase_prefix] applies to text fields and [{field}] is not one"),
+        )
+    }
+
+    /// The concrete fields `patterns` name for this document: a pattern without `*` or `?` names
+    /// itself; any other pattern names the [`Self::list_leaf_fields`] it matches.
+    fn expand_field_patterns(&self, patterns: &[String]) -> Vec<String> {
+        let mut leaf_fields: Option<Vec<String>> = None;
+        let mut fields = Vec::new();
+        for pattern in patterns {
+            if !pattern.contains(['*', '?']) {
+                fields.push(pattern.clone());
+                continue;
+            }
+            let leaves = leaf_fields.get_or_insert_with(|| self.list_leaf_fields());
+            fields.extend(leaves.iter().filter(|field| matches_glob(pattern, field)).cloned());
+        }
+        fields.sort_unstable();
+        fields.dedup();
+        fields
+    }
+
+    /// The fields a document offers to `*`: its leaf paths with a value, outside `nested` fields
+    /// (those are queried through `nested`), outside what the mapping does not index
+    /// (`index: false`, or under an object with `enabled: false`) and outside fields of a type the
+    /// evaluator does not support, plus the multi-fields the mapping declares on them (unless
+    /// themselves `index: false` or of such a type) and the `keyword` subfield of an undeclared
+    /// string. Inside a `nested` query the walk starts at the current element, which is where
+    /// [`Self::collect_values`] reads the paths under it, and each step of the query's path passes
+    /// the walk's own checks first: `nested` accepts a path that is not a nested field, and a step
+    /// that is `nested` is one the query opened.
+    fn list_leaf_fields(&self) -> Vec<String> {
+        let mut fields = Vec::new();
+        let Some(scope) = self.nested else {
+            collect_leaf_fields(self.source, Some(self.mappings), "", &mut fields);
+            return fields;
+        };
+        let (visibility, mapping_node) = follow_mapping_path(self.mappings, scope.path);
+        if visibility != MemberVisibility::Hidden {
+            collect_leaf_fields(scope.element, mapping_node, scope.path, &mut fields);
+        }
+        fields
+    }
+}
+
+/// Appends the leaf fields of `node`, which sits at `path`, to `fields`, as
+/// [`DocumentView::list_leaf_fields`] states them. `mapping_node` is what the mapping declares for
+/// `path`, handed down the walk so that a leaf costs no lookup from the mapping's root.
+fn collect_leaf_fields(node: &Value, mapping_node: Option<&Value>, path: &str, fields: &mut Vec<String>) {
+    match node {
+        Value::Null => {}
+        Value::Array(elements) => {
+            for element in elements {
+                collect_leaf_fields(element, mapping_node, path, fields);
+            }
+        }
+        Value::Object(object) => {
+            for (key, child) in object {
+                let (visibility, child_mapping) = mapping_node.map_or((MemberVisibility::Visible, None), |mapping| {
+                    follow_mapping_path(mapping, key)
+                });
+                if visibility == MemberVisibility::Visible {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    collect_leaf_fields(child, child_mapping, &child_path, fields);
+                }
+            }
+        }
+        Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            if path.is_empty() {
+                return;
+            }
+            let Some(mapping) = mapping_node else {
+                fields.push(path.to_string());
+                if node.is_string() {
+                    fields.push(format!("{path}{KEYWORD_SUBFIELD_SUFFIX}"));
+                }
+                return;
+            };
+            if !is_option_disabled(mapping, "index") {
+                fields.push(path.to_string());
+            }
+            fields.extend(list_multi_fields(mapping).map(|name| format!("{path}.{name}")));
+        }
+    }
+}
+
+/// What the mapping lets a pattern read of an object's member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberVisibility {
+    /// Patterns read the member and walk on through it.
+    Visible,
+    /// A `nested` field, which patterns read only from inside a `nested` query on it.
+    NestedOnly,
+    /// Patterns never read it: it sets `enabled` false, or its type is not one the evaluator
+    /// supports.
+    Hidden,
+}
+
+/// How visible the dotted `path` under `mapping_node` is to patterns, which is how visible its least
+/// visible step is, with the node the mapping declares at its end. Both a `nested` query's path and
+/// a document's key can hold dots. A step past what the mapping declares is visible and has no node.
+fn follow_mapping_path<'m>(mapping_node: &'m Value, path: &str) -> (MemberVisibility, Option<&'m Value>) {
+    let mut visibility = MemberVisibility::Visible;
+    let mut end_mapping = Some(mapping_node);
+    for segment in path.split('.') {
+        let Some(parent_mapping) = end_mapping else {
+            break;
+        };
+        end_mapping = find_mapping_node(parent_mapping, segment);
+        match read_member_visibility(parent_mapping, segment, end_mapping) {
+            MemberVisibility::Hidden => return (MemberVisibility::Hidden, None),
+            MemberVisibility::NestedOnly => visibility = MemberVisibility::NestedOnly,
+            MemberVisibility::Visible => {}
+        }
+    }
+    (visibility, end_mapping)
+}
+
+/// How the member `key` of an object `mapping_node` maps is visible to patterns. `key` is one path
+/// segment, and `member_mapping` is what `properties` declares for it; a member it does not declare
+/// can still name a multi-field, which `properties` does not hold. `enabled` is read only from
+/// `properties`: on a multi-field it closes nothing.
+fn read_member_visibility(mapping_node: &Value, key: &str, member_mapping: Option<&Value>) -> MemberVisibility {
+    if member_mapping.is_some_and(|mapping| is_option_disabled(mapping, "enabled")) {
+        return MemberVisibility::Hidden;
+    }
+    member_mapping
+        .or_else(|| mapping_node.get("fields")?.get(key))
+        .map_or(MemberVisibility::Visible, |mapping| read_type_visibility(mapping, key))
+}
+
+/// How the type `member_mapping` declares for `key` is visible to patterns. A node without a type
+/// is an object, which is visible.
+fn read_type_visibility(member_mapping: &Value, key: &str) -> MemberVisibility {
+    let declared_type = member_mapping.get("type").and_then(Value::as_str);
+    match declared_type.map(|type_name| FieldKind::from_mapping_type(type_name, key)) {
+        Some(Ok(FieldKind::Nested)) => MemberVisibility::NestedOnly,
+        Some(Ok(_)) | None => MemberVisibility::Visible,
+        Some(Err(_)) => MemberVisibility::Hidden,
+    }
 }
 
 /// Whether `predicate` holds for any item; the first error ends the search.
@@ -701,6 +1114,166 @@ fn matches_text_term(
     analyzed_values.matches_any_token(stored_values, |token| {
         Ok(equals_text(&token.text, &expected_text, is_case_insensitive))
     })
+}
+
+/// How a full-text query text meets one field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullTextForm {
+    /// The tokens combined with an operator (`match`, a `simple_query_string` term).
+    Tokens(Operator),
+    /// The tokens at consecutive positions.
+    Phrase,
+    /// The tokens at consecutive positions, the last one a prefix of its token.
+    PhrasePrefix,
+    /// The text, lowercased, a prefix of one token (a `simple_query_string` term ending in `*`).
+    Prefix,
+}
+
+/// What a query text is on a `text` field.
+enum QueryAnalysis {
+    /// The analyzer's tokens of the text.
+    Tokens(Vec<Token>),
+    /// The text lowercased by the analyzer's rule, unsplit.
+    Prefix(String),
+}
+
+/// One query text on its way over the fields of one node. What a field needs from it is computed
+/// by the first field that needs it and reused by the rest, so its cost per evaluation does not
+/// grow with the number of fields.
+struct QueryText<'t> {
+    /// The text as the query states it.
+    text: &'t str,
+    /// How the text meets a field.
+    form: FullTextForm,
+    /// The analysis, once a `text` field has asked for it.
+    analysis: OnceCell<QueryAnalysis>,
+    /// The text as a typed term, once a number, date or boolean field has asked for it.
+    term_value: OnceCell<Value>,
+}
+
+impl<'t> QueryText<'t> {
+    /// A text not read by any field yet.
+    const fn new(text: &'t str, form: FullTextForm) -> Self {
+        Self {
+            text,
+            form,
+            analysis: OnceCell::new(),
+            term_value: OnceCell::new(),
+        }
+    }
+
+    /// The analysis of the text: the normalized prefix for a prefix term, the tokens otherwise.
+    fn analyze_text(&self) -> &QueryAnalysis {
+        self.analysis.get_or_init(|| match self.form {
+            FullTextForm::Prefix => QueryAnalysis::Prefix(normalize_standard(self.text)),
+            FullTextForm::Tokens(_) | FullTextForm::Phrase | FullTextForm::PhrasePrefix => {
+                QueryAnalysis::Tokens(tokenize_standard(self.text))
+            }
+        })
+    }
+
+    /// The text as a term value, which a typed field parses.
+    fn read_term_value(&self) -> &Value {
+        self.term_value.get_or_init(|| Value::String(self.text.to_string()))
+    }
+}
+
+/// Whether `patterns` hold the all-fields pattern, under which `lenient` defaults to true.
+fn is_all_fields(patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| pattern == ALL_FIELDS)
+}
+
+/// Full-text matching on the values of a `text` field, each analyzed on its own (through
+/// `analyzed_values`, so once per document and query); `None` when the query text yields no token.
+fn match_analyzed_values(
+    values: &[&Value],
+    analyzed_values: &AnalyzedValues,
+    analysis: &QueryAnalysis,
+    form: FullTextForm,
+) -> Option<bool> {
+    let query_tokens = match analysis {
+        QueryAnalysis::Prefix(prefix) => {
+            let has_prefixed_token =
+                analyzed_values.matches_any_token(values, |token| Ok(token.text.starts_with(prefix.as_str())));
+            // The predicate cannot fail, so this is always `Some`: a prefix term contributes.
+            return has_prefixed_token.ok();
+        }
+        QueryAnalysis::Tokens(query_tokens) => query_tokens,
+    };
+    if query_tokens.is_empty() {
+        return None;
+    }
+    let contains_token =
+        |tokens: &[Token], query_token: &Token| tokens.iter().any(|token| token.text == query_token.text);
+    let mut value_tokens = values.iter().filter_map(|value| analyzed_values.tokenize_value(value));
+    Some(value_tokens.any(|tokens| match form {
+        FullTextForm::Tokens(Operator::Or) => {
+            query_tokens.iter().any(|query_token| contains_token(&tokens, query_token))
+        }
+        FullTextForm::Tokens(Operator::And) => {
+            query_tokens.iter().all(|query_token| contains_token(&tokens, query_token))
+        }
+        FullTextForm::Phrase => contains_phrase(&tokens, query_tokens, false),
+        // A `Prefix` text has no tokens and returned above; it is listed because the match is exhaustive.
+        FullTextForm::PhrasePrefix | FullTextForm::Prefix => contains_phrase(&tokens, query_tokens, true),
+    }))
+}
+
+/// Whether `phrase` occurs in `tokens` at consecutive positions; with `is_prefix`, its last token
+/// need only prefix the token at its position.
+fn contains_phrase(tokens: &[Token], phrase: &[Token], is_prefix: bool) -> bool {
+    let Some((last_token, leading_tokens)) = phrase.split_last() else {
+        return false;
+    };
+    tokens.windows(phrase.len()).any(|window| {
+        // `Token::position` is what a phrase is defined over. The standard analyzer numbers tokens
+        // one by one, so neighbours in the slice hold it today; the check is what keeps a phrase
+        // from spanning a gap if a token stream ever leaves one.
+        let is_consecutive = || {
+            window
+                .iter()
+                .zip(0_u32..)
+                .all(|(token, offset)| window[0].position.checked_add(offset) == Some(token.position))
+        };
+        window
+            .iter()
+            .zip(leading_tokens)
+            .all(|(token, query_token)| token.text == query_token.text)
+            && window.last().is_some_and(|token| {
+                if is_prefix {
+                    token.text.starts_with(&last_token.text)
+                } else {
+                    token.text == last_token.text
+                }
+            })
+            && is_consecutive()
+    })
+}
+
+/// The node `mapping_node` declares through `properties` for one path `segment`; `None` for a
+/// segment it does not declare that way, a multi-field among them.
+fn find_mapping_node<'m>(mapping_node: &'m Value, segment: &str) -> Option<&'m Value> {
+    mapping_node.get("properties")?.get(segment)
+}
+
+/// Whether the mapping `node` sets its option `key` to false, as a JSON boolean or as a string.
+fn is_option_disabled(node: &Value, key: &str) -> bool {
+    node.get(key)
+        .is_some_and(|option| matches!(option, Value::Bool(false)) || option.as_str() == Some("false"))
+}
+
+/// The multi-field names (`fields`) `mapping_node` declares, without those it does not index and
+/// those of a type the evaluator does not support.
+fn list_multi_fields(mapping_node: &Value) -> impl Iterator<Item = &String> {
+    mapping_node
+        .get("fields")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(name, subfield)| {
+            !is_option_disabled(subfield, "index") && read_type_visibility(subfield, name) != MemberVisibility::Hidden
+        })
+        .map(|(name, _)| name)
 }
 
 /// The `illegal_argument_exception` for `value`, which does not fit the type of `field`.
@@ -893,6 +1466,7 @@ mod tests {
     fn evaluate(query: &Value, source: &Value, mappings: &Value) -> Result<bool, OpenSearchError> {
         matches_document(
             &parse_query(query).expect("the query parses"),
+            ".kibana_1",
             "doc-1",
             source,
             mappings,
@@ -912,6 +1486,18 @@ mod tests {
         let (status, body) = render_envelope(error).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
         assert_eq!(body["error"]["type"], "illegal_argument_exception", "{query}");
+    }
+
+    async fn assert_query_shard_refused(query: &Value, source: &Value, mappings: &Value) {
+        let error = evaluate(query, source, mappings).expect_err("the query is refused");
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        assert_eq!(body["error"]["type"], "search_phase_execution_exception", "{query}");
+        assert_eq!(
+            body["error"]["root_cause"][0]["type"], "query_shard_exception",
+            "{query}"
+        );
+        assert_eq!(body["error"]["root_cause"][0]["index"], ".kibana_1", "{query}");
     }
 
     #[test]
@@ -1011,11 +1597,14 @@ mod tests {
             &json!({"count": "3", "enabled": "true"}),
             &mappings,
         );
-        assert_refused(&json!({"term": {"count": "zero"}}), &source, &mappings).await;
+        assert_query_shard_refused(&json!({"term": {"count": "zero"}}), &source, &mappings).await;
+        assert_query_shard_refused(&json!({"terms": {"count": [1, "zero"]}}), &source, &mappings).await;
+        // `0` matches first, and the value after it still fails the query.
+        assert_query_shard_refused(&json!({"terms": {"count": [0, "zero"]}}), &source, &mappings).await;
         // Both parse as floats, and neither is a number a stored value can equal.
-        assert_refused(&json!({"term": {"count": "NaN"}}), &source, &mappings).await;
-        assert_refused(&json!({"term": {"count": "inf"}}), &source, &mappings).await;
-        assert_refused(&json!({"term": {"enabled": "yes"}}), &source, &mappings).await;
+        assert_query_shard_refused(&json!({"term": {"count": "NaN"}}), &source, &mappings).await;
+        assert_query_shard_refused(&json!({"term": {"count": "inf"}}), &source, &mappings).await;
+        assert_query_shard_refused(&json!({"term": {"enabled": "yes"}}), &source, &mappings).await;
         assert_refused(&json!({"range": {"count": {"gte": "zero"}}}), &source, &mappings).await;
         assert_refused(&json!({"range": {"enabled": {"gte": "yes"}}}), &source, &mappings).await;
     }
@@ -1848,5 +2437,852 @@ mod tests {
             WILDCARD_CASE_COUNT - matched_count >= WILDCARD_CASE_COUNT / 4,
             "{matched_count} matches"
         );
+    }
+
+    #[tokio::test]
+    async fn a_date_term_that_does_not_parse_is_a_query_shard_400() {
+        let mappings = json!({"properties": {"updated_at": {"type": "date"}}});
+        let source = json!({"updated_at": "2026-07-10T12:34:56.788Z"});
+
+        assert_query_shard_refused(&json!({"term": {"updated_at": "not a date"}}), &source, &mappings).await;
+        assert_query_shard_refused(&json!({"terms": {"updated_at": ["not a date"]}}), &source, &mappings).await;
+    }
+
+    /// A saved-objects mapping: one object per type and `nested` references.
+    fn build_find_mappings() -> Value {
+        json!({"dynamic": "strict", "properties": {
+            "type": {"type": "keyword"},
+            "dashboard": {"properties": {"title": {"type": "text"}}},
+            "visualization": {"properties": {"title": {"type": "text"}}},
+            "index-pattern": {"properties": {"title": {"type": "text"}}},
+            "references": {"type": "nested", "properties": {"id": {"type": "keyword"}, "type": {"type": "keyword"}}}
+        }})
+    }
+
+    /// Saved objects; titles analyze to: "errors", "by", "service" | "error", "rate" | "logs" |
+    /// "error", "budget".
+    fn build_find_sources() -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "dashboard:errors",
+                json!({"type": "dashboard", "dashboard": {"title": "Errors by service"}, "references": [{"id": "rate", "type": "visualization"}]}),
+            ),
+            (
+                "visualization:rate",
+                json!({"type": "visualization", "visualization": {"title": "Error rate"}}),
+            ),
+            (
+                "index-pattern:logs",
+                json!({"type": "index-pattern", "index-pattern": {"title": "logs-*"}}),
+            ),
+            (
+                "dashboard:budget",
+                json!({"type": "dashboard", "dashboard": {"title": "error budget"}}),
+            ),
+        ]
+    }
+
+    /// The ids of the sources `query` matches, in the order of [`build_find_sources`].
+    fn find_matching_ids(query: &Value) -> Vec<&'static str> {
+        let query = parse_query(query).expect("the query parses");
+        build_find_sources()
+            .into_iter()
+            .filter(|(id, source)| {
+                matches_document(
+                    &query,
+                    ".kibana_1",
+                    id,
+                    source,
+                    &build_find_mappings(),
+                    parse_request_instant(),
+                )
+                .expect("the query evaluates")
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn a_find_style_simple_query_string_over_all_fields_matches_the_stated_documents() {
+        let build_query = |text: &str, operator: &str| json!({"simple_query_string": {"query": text, "fields": ["*"], "default_operator": operator}});
+
+        assert_eq!(
+            find_matching_ids(&build_query("error*", "or")),
+            ["dashboard:errors", "visualization:rate", "dashboard:budget"]
+        );
+        assert_eq!(find_matching_ids(&build_query("errors", "or")), ["dashboard:errors"]);
+        // `type` is a keyword field: the whole value matches.
+        assert_eq!(
+            find_matching_ids(&build_query("dashboard", "or")),
+            ["dashboard:errors", "dashboard:budget"]
+        );
+        assert_eq!(
+            find_matching_ids(&build_query("dash*", "or")),
+            ["dashboard:errors", "dashboard:budget"]
+        );
+        // `-rate` is "everything without rate", so with `or` every object lacking the token
+        // matches; `rate` inside the nested references is not a field of `*`.
+        assert_eq!(
+            find_matching_ids(&build_query("error -rate", "or")),
+            [
+                "dashboard:errors",
+                "visualization:rate",
+                "index-pattern:logs",
+                "dashboard:budget"
+            ]
+        );
+        assert_eq!(
+            find_matching_ids(&build_query("error -rate", "and")),
+            ["dashboard:budget"]
+        );
+        assert_eq!(
+            find_matching_ids(&build_query("\"error rate\"", "or")),
+            ["visualization:rate"]
+        );
+        // `!!!` yields no token on the text fields and equals no keyword value.
+        assert!(find_matching_ids(&build_query("!!!", "or")).is_empty());
+        assert!(find_matching_ids(&build_query("", "or")).is_empty());
+    }
+
+    #[test]
+    fn simple_query_string_over_a_type_field_matches_only_that_field() {
+        let build_query = |fields: Value| json!({"simple_query_string": {"query": "error", "fields": fields}});
+
+        assert_eq!(
+            find_matching_ids(&build_query(json!(["visualization.title"]))),
+            ["visualization:rate"]
+        );
+        assert_eq!(
+            find_matching_ids(&build_query(json!(["dashboard.title^2"]))),
+            ["dashboard:budget"]
+        );
+        assert_eq!(
+            find_matching_ids(&build_query(json!(["*.title"]))),
+            ["visualization:rate", "dashboard:budget"]
+        );
+    }
+
+    #[test]
+    fn a_clause_without_tokens_drops_out_of_its_group() {
+        let build_query = |text: &str, operator: &str| {
+            json!({"simple_query_string": {
+                "query": text,
+                "fields": ["visualization.title"],
+                "default_operator": operator
+            }})
+        };
+
+        // With `and`, a clause that stayed in its group would fail every document.
+        assert_eq!(
+            find_matching_ids(&build_query("error !!!", "and")),
+            ["visualization:rate"]
+        );
+        // The negated clause drops out, and the match-all it brought drops out with it.
+        assert!(find_matching_ids(&build_query("-!!!", "or")).is_empty());
+        // `(!!! ???)` is a group left with nothing, so it drops out as one clause.
+        assert_eq!(
+            find_matching_ids(&build_query("error (!!! ???)", "and")),
+            ["visualization:rate"]
+        );
+        assert!(find_matching_ids(&build_query("!!! ???", "or")).is_empty());
+        // A prefix term always contributes: `!!!*` is a prefix of no token.
+        assert!(find_matching_ids(&build_query("error !!!*", "and")).is_empty());
+    }
+
+    #[test]
+    fn the_tokens_of_one_simple_query_string_term_join_with_the_default_operator() {
+        let mappings = json!({"properties": {"title": {"type": "text"}}});
+        let source = json!({"title": "error rate"});
+        let build_query = |text: &str, operator: &str| json!({"simple_query_string": {"query": text, "fields": ["title"], "default_operator": operator}});
+
+        // `\ ` keeps the space inside one term, which the analyzer then splits.
+        assert_matches(
+            &[
+                (build_query("error\\ budget", "or"), true),
+                (build_query("error\\ budget", "and"), false),
+                (build_query("error\\ rate", "and"), true),
+            ],
+            &source,
+            &mappings,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prefix_term_on_a_typed_field_is_a_query_shard_400_unless_lenient() {
+        let mappings = json!({"properties": {
+            "count": {"type": "integer"},
+            "updated_at": {"type": "date"},
+            "enabled": {"type": "boolean"}
+        }});
+        let source = json!({"count": 1, "updated_at": "2026-07-10T12:34:56.788Z", "enabled": true});
+
+        for field in ["count", "updated_at", "enabled"] {
+            assert_query_shard_refused(
+                &json!({"simple_query_string": {"query": "1*", "fields": [field]}}),
+                &source,
+                &mappings,
+            )
+            .await;
+            assert_matches(
+                &[(
+                    json!({"simple_query_string": {"query": "1*", "fields": [field], "lenient": true}}),
+                    false,
+                )],
+                &source,
+                &mappings,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_typed_field_takes_the_whole_text_as_a_term() {
+        let mappings = json!({"properties": {
+            "updated_at": {"type": "date"},
+            "enabled": {"type": "boolean"},
+            "rating": {"type": "double"}
+        }});
+        let source = json!({"updated_at": "2026-07-10T12:34:56.788Z", "enabled": false, "rating": 2.5});
+
+        assert_matches(
+            &[
+                (json!({"match": {"updated_at": "2026-07-10"}}), true),
+                (json!({"match": {"updated_at": "2026-07-11"}}), false),
+                (json!({"match": {"enabled": false}}), true),
+                (json!({"match": {"enabled": "true"}}), false),
+                (json!({"match_phrase": {"rating": "2.50"}}), true),
+                (
+                    json!({"simple_query_string": {"query": "2.5", "fields": ["rating"]}}),
+                    true,
+                ),
+                (
+                    json!({"multi_match": {"query": "maybe", "fields": ["enabled"], "lenient": true}}),
+                    false,
+                ),
+            ],
+            &source,
+            &mappings,
+        );
+        for refused_query in [
+            json!({"match": {"updated_at": "not a date"}}),
+            json!({"match": {"enabled": "yes"}}),
+            json!({"multi_match": {"query": "maybe", "fields": ["enabled"]}}),
+            json!({"simple_query_string": {"query": "maybe", "fields": ["rating"]}}),
+        ] {
+            assert_query_shard_refused(&refused_query, &source, &mappings).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn lenient_defaults_to_true_only_when_the_fields_hold_the_all_fields_pattern() {
+        let mappings = json!({"properties": {"count": {"type": "integer"}, "title": {"type": "text"}}});
+        let source = json!({"count": 1, "title": "zero"});
+
+        // `zero` is no integer, so only the leniency decides whether `count` refuses it.
+        assert_matches(
+            &[
+                (json!({"multi_match": {"query": "zero"}}), true),
+                (json!({"multi_match": {"query": "zero", "fields": ["*"]}}), true),
+                (
+                    json!({"multi_match": {"query": "zero", "fields": ["*", "count"]}}),
+                    true,
+                ),
+                (json!({"simple_query_string": {"query": "zero"}}), true),
+                (
+                    json!({"simple_query_string": {"query": "zero", "fields": ["count", "*"]}}),
+                    true,
+                ),
+            ],
+            &source,
+            &mappings,
+        );
+        for refused_query in [
+            json!({"multi_match": {"query": "zero", "fields": ["*"], "lenient": false}}),
+            json!({"multi_match": {"query": "zero", "fields": ["count", "title"]}}),
+            json!({"simple_query_string": {"query": "zero", "fields": ["*"], "lenient": false}}),
+        ] {
+            assert_query_shard_refused(&refused_query, &source, &mappings).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_text_that_does_not_parse_refuses_even_when_another_field_matches() {
+        let mappings = json!({"properties": {"a_title": {"type": "text"}, "count": {"type": "integer"}}});
+        let source = json!({"a_title": "zero", "count": 0});
+
+        // `a_title` holds the text and sorts before `count`, so a search that ended at its first
+        // match would answer without reading `count`, and the answer would depend on the document.
+        for refused_query in [
+            json!({"multi_match": {"query": "zero", "fields": ["count", "a_title"]}}),
+            json!({"simple_query_string": {"query": "zero", "fields": ["count", "a_title"]}}),
+        ] {
+            assert_query_shard_refused(&refused_query, &source, &mappings).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn full_text_on_an_object_an_unknown_path_or_an_unsupported_type_follows_the_field() {
+        let mappings = json!({"properties": {
+            "dashboard": {"properties": {"title": {"type": "text"}}},
+            "references": {"type": "nested", "properties": {"id": {"type": "keyword"}}},
+            "geo": {"type": "geo_point"},
+            "filters": {"type": "object", "enabled": false}
+        }});
+        let source = json!({
+            "dashboard": {"title": "Logs"},
+            "references": [{"id": "rate"}],
+            "geo": "x",
+            "filters": {"query": "error"}
+        });
+
+        assert_matches(
+            &[
+                (json!({"match": {"dashboard": "logs"}}), false),
+                (json!({"match": {"references": "rate"}}), false),
+                (json!({"match": {"absent": "logs"}}), false),
+                (json!({"match_phrase": {"absent": "logs"}}), false),
+                (json!({"match_phrase_prefix": {"dashboard": "logs"}}), false),
+                (json!({"multi_match": {"query": "logs", "fields": ["absent"]}}), false),
+                (
+                    json!({"simple_query_string": {"query": "logs", "fields": ["absent"]}}),
+                    false,
+                ),
+                // Inside `nested` a field reads the current element.
+                (
+                    json!({"nested": {"path": "references", "query": {"match": {"references.id": "rate"}}}}),
+                    true,
+                ),
+                // A pattern inside `nested` names the element's paths, not the document's.
+                (
+                    json!({"nested": {"path": "references", "query": {"multi_match": {"query": "rate"}}}}),
+                    true,
+                ),
+                (
+                    json!({"nested": {"path": "references", "query": {"simple_query_string": {"query": "rate"}}}}),
+                    true,
+                ),
+                (
+                    json!({"nested": {"path": "references", "query": {"multi_match": {"query": "rate", "fields": ["references.*"]}}}}),
+                    true,
+                ),
+                (
+                    json!({"nested": {"path": "references", "query": {"multi_match": {"query": "logs"}}}}),
+                    false,
+                ),
+                // `*` passes over the field whose type the evaluator cannot read.
+                (json!({"multi_match": {"query": "logs"}}), true),
+                // `nested` accepts a path that is not a nested field, and patterns stay outside it
+                // all the same: resolving `geo` would be a 400 that `lenient` could not lift.
+                (
+                    json!({"nested": {"path": "filters", "query": {"multi_match": {"query": "error"}}}}),
+                    false,
+                ),
+                (
+                    json!({"nested": {"path": "geo", "query": {"multi_match": {"query": "x"}}}}),
+                    false,
+                ),
+                (
+                    json!({"nested": {"path": "geo", "query": {"multi_match": {"query": "x", "lenient": false}}}}),
+                    false,
+                ),
+                // A field named outright is not a pattern.
+                (
+                    json!({"nested": {"path": "filters", "query": {"match": {"filters.query": "error"}}}}),
+                    true,
+                ),
+            ],
+            &source,
+            &mappings,
+        );
+        assert_matches(
+            &[(
+                json!({"nested": {"path": "geo", "query": {"multi_match": {"query": "1"}}}}),
+                false,
+            )],
+            &json!({"geo": {"lat": 1}}),
+            &mappings,
+        );
+        assert_refused(&json!({"match": {"geo": "x"}}), &source, &mappings).await;
+        assert_refused(&json!({"match_phrase": {"geo": "x"}}), &source, &mappings).await;
+        assert_refused(
+            &json!({"multi_match": {"query": "x", "fields": ["geo"]}}),
+            &source,
+            &mappings,
+        )
+        .await;
+        assert_refused(
+            &json!({"simple_query_string": {"query": "x", "fields": ["geo"]}}),
+            &source,
+            &mappings,
+        )
+        .await;
+    }
+
+    #[test]
+    fn patterns_inside_nested_stop_at_any_step_of_the_path_the_mapping_closes() {
+        let build_query =
+            |path: &str, text: &str| json!({"nested": {"path": path, "query": {"multi_match": {"query": text}}}});
+        let mappings = json!({"properties": {
+            "dashboard": {"properties": {"title": {"type": "text"}}},
+            "filters": {"type": "object", "enabled": false},
+            "panels": {"enabled": false, "properties": {"grid": {"type": "object"}}},
+            "geo": {"type": "geo_point"},
+            "title": {"type": "text", "fields": {"geo": {"type": "geo_point"}}},
+            "references": {"type": "nested", "properties": {
+                "parts": {"type": "nested", "properties": {"id": {"type": "keyword"}}}
+            }}
+        }});
+
+        // Each of these reads as an undeclared path past the step that closes it.
+        assert_matches(
+            &[
+                (build_query("filters.sub", "error"), false),
+                (build_query("panels.grid", "error"), false),
+                (build_query("geo.lat", "1"), false),
+                (build_query("title.geo", "1"), false),
+                (build_query("title.geo.x", "1"), false),
+            ],
+            &json!({
+                "filters": {"sub": {"query": "error"}},
+                "panels": {"grid": {"query": "error"}},
+                "geo": {"lat": {"x": 1}},
+                "title": {"geo": {"x": 1}}
+            }),
+            &mappings,
+        );
+        // A step that closes nothing leaves the walk open: a `nested` step the query went through,
+        // and a step past what the mapping declares.
+        assert_matches(
+            &[
+                (
+                    json!({"nested": {"path": "references", "query": {
+                        "nested": {"path": "references.parts", "query": {"multi_match": {"query": "rate"}}}
+                    }}}),
+                    true,
+                ),
+                (build_query("dashboard.extra", "logs"), true),
+                (build_query("extra", "logs"), true),
+            ],
+            &json!({
+                "references": [{"parts": [{"id": "rate"}]}],
+                "dashboard": {"extra": {"note": "logs"}},
+                "extra": {"note": "logs"}
+            }),
+            &mappings,
+        );
+    }
+
+    #[test]
+    fn match_phrase_prefix_matches_every_value_sharing_the_prefix() {
+        let mappings = json!({"properties": {"title": {"type": "text"}}});
+        let query = json!({"match_phrase_prefix": {"title": "service se"}});
+
+        // 80 values whose second token starts with `se`: no cap on how many tokens a prefix
+        // reaches.
+        for number in 0..80 {
+            let source = json!({"title": format!("Service serv{number:02}x")});
+            assert!(evaluate(&query, &source, &mappings).expect("evaluates"), "{source}");
+        }
+        assert_matches(&[(query.clone(), false)], &json!({"title": "service other"}), &mappings);
+        assert_matches(&[(query, false)], &json!({"title": "serv01x service"}), &mappings);
+    }
+
+    #[tokio::test]
+    async fn match_phrase_prefix_on_a_keyword_field_is_a_query_shard_400() {
+        let mappings = json!({"properties": {"type": {"type": "keyword"}, "count": {"type": "integer"}}});
+        let source = json!({"type": "dashboard", "count": 1});
+
+        for query in [
+            json!({"match_phrase_prefix": {"type": "dash"}}),
+            json!({"match_phrase_prefix": {"count": "1"}}),
+            json!({"match_phrase_prefix": {"_id": "doc"}}),
+        ] {
+            assert_query_shard_refused(&query, &source, &mappings).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn match_with_zero_on_an_integer_field_compares_numerically() {
+        let mappings = json!({"properties": {"count": {"type": "integer"}}});
+
+        assert_matches(
+            &[
+                (json!({"match": {"count": 0}}), true),
+                (json!({"match": {"count": "0"}}), true),
+                (json!({"match": {"count": {"query": "0.0"}}}), true),
+                (json!({"match": {"count": 1}}), false),
+                (json!({"match": {"count": {"query": "zero", "lenient": true}}}), false),
+                (json!({"match_phrase": {"count": "0"}}), true),
+            ],
+            &json!({"count": 0}),
+            &mappings,
+        );
+        assert_matches(
+            &[(json!({"match": {"count": 0}}), true)],
+            &json!({"count": "0"}),
+            &mappings,
+        );
+        assert_query_shard_refused(&json!({"match": {"count": "zero"}}), &json!({"count": 0}), &mappings).await;
+    }
+
+    #[test]
+    fn match_follows_zero_terms_query_when_the_text_yields_no_token() {
+        let mappings = json!({"properties": {"title": {"type": "text"}}});
+        let source = json!({"title": "error rate"});
+
+        assert_matches(
+            &[
+                (json!({"match": {"title": "!!!"}}), false),
+                (
+                    json!({"match": {"title": {"query": "!!!", "zero_terms_query": "all"}}}),
+                    true,
+                ),
+                (
+                    json!({"match": {"title": {"query": "error budget", "operator": "and"}}}),
+                    false,
+                ),
+                (
+                    json!({"match": {"title": {"query": "error budget", "operator": "or"}}}),
+                    true,
+                ),
+                (json!({"match": {"title": "ERROR"}}), true),
+                (json!({"match_phrase": {"title": "!!!"}}), false),
+            ],
+            &source,
+            &mappings,
+        );
+    }
+
+    #[test]
+    fn a_match_phrase_matches_consecutive_tokens_only() {
+        let mappings = json!({"properties": {"title": {"type": "text"}}});
+        let source = json!({"title": ["error rate by service", "Rate Error"]});
+
+        assert_matches(
+            &[
+                (json!({"match_phrase": {"title": "Error Rate"}}), true),
+                (json!({"match_phrase": {"title": "rate error"}}), true),
+                (json!({"match_phrase": {"title": "error service"}}), false),
+                (json!({"match_phrase": {"title": "service rate"}}), false),
+                (json!({"match_phrase_prefix": {"title": "by serv"}}), true),
+                (json!({"match_phrase_prefix": {"title": "rate serv"}}), false),
+            ],
+            &source,
+            &mappings,
+        );
+    }
+
+    #[test]
+    fn a_match_phrase_prefix_with_boost_and_an_empty_query_is_accepted() {
+        let mappings = json!({"properties": {"index-pattern": {"properties": {"title": {"type": "text"}}}}});
+
+        // The empty query parses (its `boost` is ignored) and yields no token: it matches nothing.
+        assert_matches(
+            &[(
+                json!({"match_phrase_prefix": {"index-pattern.title": {"query": "", "boost": 1}}}),
+                false,
+            )],
+            &json!({"index-pattern": {"title": "logs-*"}}),
+            &mappings,
+        );
+    }
+
+    #[test]
+    fn multi_match_best_fields_requires_one_field_to_satisfy_the_operator() {
+        let mappings = json!({"properties": {"title": {"type": "text"}, "description": {"type": "text"}}});
+        let source = json!({"title": "alpha beta", "description": "gamma delta"});
+        let build_multi_match = |query: &str, operator: &str, match_type: &str| json!({"multi_match": {"query": query, "fields": ["title", "description"], "operator": operator, "type": match_type}});
+
+        assert_matches(
+            &[
+                (build_multi_match("alpha gamma", "and", "best_fields"), false),
+                (build_multi_match("alpha gamma", "or", "best_fields"), true),
+                (build_multi_match("alpha beta", "and", "best_fields"), true),
+                (build_multi_match("beta alpha", "or", "phrase"), false),
+                (build_multi_match("gamma delta", "or", "phrase"), true),
+                (json!({"multi_match": {"query": "delta"}}), true),
+                (json!({"multi_match": {"query": "!!!"}}), false),
+            ],
+            &source,
+            &mappings,
+        );
+    }
+
+    #[test]
+    fn all_fields_skip_what_the_mapping_does_not_index() {
+        let mappings = json!({"properties": {
+            "title": {"type": "text"},
+            "summary": {"type": "text", "index": false, "fields": {"keyword": {"type": "keyword"}}},
+            "panelsJSON": {"type": "text", "index": false},
+            "timeRestore": {"type": "boolean", "index": false},
+            "filters": {"type": "object", "enabled": false}
+        }});
+        let source = json!({
+            "title": "Latency",
+            "summary": "budget",
+            "panelsJSON": "error",
+            "timeRestore": true,
+            "filters": {"query": "error"}
+        });
+        let build_query = |text: &str, fields: Value| json!({"simple_query_string": {"query": text, "fields": fields}});
+
+        assert_matches(
+            &[
+                (build_query("latency", json!(["*"])), true),
+                (build_query("error", json!(["*"])), false),
+                (build_query("true", json!(["*"])), false),
+                (build_query("Budget", json!(["*"])), false),
+                // Through `summary.keyword`, which the mapping indexes although `summary` it does not.
+                (build_query("budget", json!(["*"])), true),
+                (build_query("error", json!(["panels*"])), false),
+                // A field named explicitly is read whatever the mapping says of it.
+                (build_query("error", json!(["panelsJSON"])), true),
+                (build_query("error", json!(["filters.query"])), true),
+            ],
+            &source,
+            &mappings,
+        );
+        // The options as strings, and a multi-field the mapping does not index either.
+        assert_matches(
+            &[(build_query("error", json!(["*"])), false)],
+            &json!({"body": "error", "meta": {"note": "error"}}),
+            &json!({"properties": {
+                "body": {"type": "text", "index": "false"},
+                "meta": {"type": "object", "enabled": "false"}
+            }}),
+        );
+        assert_matches(
+            &[(build_query("!!!", json!(["*"])), false)],
+            &json!({"title": "!!!"}),
+            &json!({"properties": {
+                "title": {"type": "text", "fields": {"raw": {"type": "keyword", "index": false}}}
+            }}),
+        );
+    }
+
+    #[test]
+    fn enabled_on_a_multi_field_closes_nothing_to_patterns() {
+        let mappings = json!({"properties": {
+            "summary": {"type": "text", "index": false, "fields": {"raw": {"type": "keyword", "enabled": false}}}
+        }});
+        let build_multi_match = |text: &str| json!({"multi_match": {"query": text}});
+
+        // `summary` is not indexed, so only its multi-field can answer.
+        assert_matches(
+            &[(build_multi_match("budget"), true), (build_multi_match("rate"), false)],
+            &json!({"summary": "budget"}),
+            &mappings,
+        );
+        // The other route to the same node: a step of a path, which reads `fields` when `properties`
+        // misses. Both routes have to agree on what `enabled` means here.
+        assert_matches(
+            &[(
+                json!({"nested": {"path": "summary.raw", "query": {"multi_match": {"query": "logs"}}}}),
+                true,
+            )],
+            &json!({"summary": {"raw": {"note": "logs"}}}),
+            &mappings,
+        );
+    }
+
+    #[test]
+    fn all_fields_reach_declared_multi_fields_and_the_keyword_of_an_undeclared_string() {
+        let mappings = json!({"properties": {
+            "title": {"type": "text", "fields": {"raw": {"type": "keyword"}}}
+        }});
+        // Neither value yields a token, so only a whole-value subfield can match them.
+        let source = json!({"title": "!!!", "note": "???"});
+        let build_query = |text: &str| json!({"simple_query_string": {"query": text}});
+
+        assert_matches(
+            &[
+                (build_query("!!!"), true),
+                (build_query("???"), true),
+                (build_query("!!"), false),
+                (build_query("??"), false),
+                (build_query("!!*"), true),
+                (build_query("??*"), true),
+            ],
+            &source,
+            &mappings,
+        );
+    }
+
+    #[test]
+    fn all_fields_pass_over_a_field_of_an_unsupported_type() {
+        let build_multi_match = |text: &str| json!({"multi_match": {"query": text}});
+
+        // A multi-field of such a type, which every document holding its parent would offer. The
+        // refusal would come from resolving the field, so `lenient` could not lift it.
+        assert_matches(
+            &[
+                (build_multi_match("logs"), true),
+                (json!({"multi_match": {"query": "logs", "lenient": false}}), true),
+                (build_multi_match("maps"), false),
+            ],
+            &json!({"title": "logs"}),
+            &json!({"properties": {"title": {"type": "text", "fields": {"geo": {"type": "geo_point"}}}}}),
+        );
+        // An object at such a field: `geo.lat` must not read as an undeclared number under it.
+        assert_matches(
+            &[(build_multi_match("1"), false)],
+            &json!({"geo": {"lat": 1}}),
+            &json!({"properties": {"geo": {"type": "geo_point"}}}),
+        );
+        // An object at a `text` field, whose keys name its multi-fields. Those read the parent's
+        // values, so neither key matches, and `geo` must not refuse.
+        assert_matches(
+            &[(build_multi_match("x"), false), (build_multi_match("1"), false)],
+            &json!({"title": {"raw": "x", "geo": 1}}),
+            &json!({"properties": {"title": {"type": "text", "fields": {
+                "raw": {"type": "keyword"},
+                "geo": {"type": "geo_point"}
+            }}}}),
+        );
+    }
+
+    #[test]
+    fn all_fields_read_a_dotted_key_as_the_path_it_spells() {
+        let mappings = json!({"properties": {
+            "dashboard": {"properties": {"title": {"type": "text"}}},
+            "filters": {"type": "object", "enabled": false},
+            "panels": {"enabled": false, "properties": {"grid": {"type": "text"}}},
+            "geo": {"type": "geo_point"},
+            "title": {"type": "text", "fields": {"geo": {"type": "geo_point"}}},
+            "references": {"type": "nested", "properties": {"id": {"type": "keyword"}}}
+        }});
+
+        for (text, source, should_match) in [
+            ("logs", json!({"dashboard.title": "logs"}), true),
+            ("logs", json!({"dashboard.extra": "logs"}), true),
+            ("error", json!({"filters.query": "error"}), false),
+            ("error", json!({"panels.grid": "error"}), false),
+            ("1", json!({"geo.lat": 1}), false),
+            ("1", json!({"title.geo": 1}), false),
+            ("rate", json!({"references.id": "rate"}), false),
+        ] {
+            assert_matches(
+                &[(json!({"multi_match": {"query": text}}), should_match)],
+                &source,
+                &mappings,
+            );
+        }
+    }
+
+    #[test]
+    fn all_fields_read_arrays_nulls_and_undeclared_scalars() {
+        let mappings = json!({"properties": {"title": {"type": "text"}}});
+        let source = json!({"tags": ["alpha", null, "beta"], "size": 5, "flag": true, "empty": null});
+        let build_query = |text: &str, fields: Value| json!({"simple_query_string": {"query": text, "fields": fields}});
+
+        assert_matches(
+            &[
+                (build_query("alpha", json!(["*"])), true),
+                (build_query("beta", json!(["*"])), true),
+                (build_query("5", json!(["*"])), true),
+                (build_query("true", json!(["*"])), true),
+                // `size` and `flag` cannot read `zero`, and `*` makes that no match, not a refusal.
+                (build_query("zero", json!(["*"])), false),
+                (build_query("alpha", json!(["ta?s"])), true),
+                (build_query("alpha", json!(["t?s"])), false),
+                // `empty` offers no field, so the negated clause has nothing to read and drops out;
+                // a field offered with no value would contribute, and the negation would match.
+                (build_query("-alpha", json!(["empty*"])), false),
+            ],
+            &source,
+            &mappings,
+        );
+        // A stored source is always an object: this holds the walk's guard on an empty path.
+        assert_matches(&[(build_query("logs", json!(["*"])), false)], &json!("logs"), &mappings);
+    }
+
+    #[test]
+    fn the_id_field_matches_full_text_as_a_whole_value() {
+        let mappings = json!({"properties": {"type": {"type": "keyword"}}});
+        let source = json!({"type": "dashboard"});
+        let build_query = |text: &str| json!({"simple_query_string": {"query": text, "fields": ["_id"]}});
+
+        assert_matches(
+            &[
+                (build_query("doc-1"), true),
+                (build_query("doc-*"), true),
+                (build_query("doc-2"), false),
+                (build_query("DOC-1"), false),
+                (build_query("DOC*"), false),
+                (json!({"match": {"_id": "doc-1"}}), true),
+                (json!({"match_phrase": {"_id": "doc-1"}}), true),
+            ],
+            &source,
+            &mappings,
+        );
+    }
+
+    #[test]
+    fn a_keyword_field_matches_full_text_as_a_whole_value() {
+        let mappings = json!({"properties": {"title": {"type": "keyword"}}});
+        let source = json!({"title": ["Error rate", 7]});
+
+        assert_matches(
+            &[
+                (json!({"match": {"title": "Error rate"}}), true),
+                (json!({"match": {"title": "error rate"}}), false),
+                (json!({"match": {"title": "Error"}}), false),
+                (json!({"match": {"title": 7}}), true),
+                (json!({"match_phrase": {"title": "Error rate"}}), true),
+                (
+                    json!({"simple_query_string": {"query": "\"Error rate\"", "fields": ["title"]}}),
+                    true,
+                ),
+                (
+                    json!({"simple_query_string": {"query": "Err*", "fields": ["title"]}}),
+                    true,
+                ),
+                (
+                    json!({"simple_query_string": {"query": "err*", "fields": ["title"]}}),
+                    false,
+                ),
+            ],
+            &source,
+            &mappings,
+        );
+    }
+
+    #[test]
+    fn a_text_field_prefix_term_is_lowercased_and_prefixes_one_token() {
+        let mappings = json!({"properties": {"title": {"type": "text"}}});
+        let source = json!({"title": ["Error rate", {"not": "text"}]});
+        let build_query = |text: &str| json!({"simple_query_string": {"query": text, "fields": ["title"]}});
+
+        assert_matches(
+            &[
+                (build_query("ERR*"), true),
+                (build_query("RA*"), true),
+                (build_query("rror*"), false),
+                (build_query("not*"), false),
+            ],
+            &source,
+            &mappings,
+        );
+    }
+
+    #[tokio::test]
+    async fn the_deepest_accepted_simple_query_string_evaluates() {
+        let build_text = |operator_count: usize| {
+            (0..operator_count).fold("error".to_string(), |text, level| {
+                let operator = if level % 2 == 0 { '+' } else { '|' };
+                format!("{text}{operator}error")
+            })
+        };
+        let build_query = |text: String| json!({"simple_query_string": {"query": text, "fields": ["title"]}});
+        let mappings = json!({"properties": {"title": {"type": "text"}}});
+
+        // Each operator differs from the last, so 128 of them nest 128 levels and one more is refused.
+        let refusal = parse_query(&build_query(build_text(129))).expect_err("refused");
+        let (status, body) = render_envelope(refusal).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "parsing_exception");
+        assert_eq!(body["error"]["limit"], 128);
+        let deepest_query = build_query(build_text(128));
+        assert_matches(&[(deepest_query.clone(), true)], &json!({"title": "error"}), &mappings);
+        assert_matches(&[(deepest_query, false)], &json!({"title": "rate"}), &mappings);
     }
 }

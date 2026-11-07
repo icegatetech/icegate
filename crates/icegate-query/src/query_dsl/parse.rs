@@ -3,19 +3,34 @@
 //! The parser is strict: an unknown leaf, an unknown key inside a known leaf and `_name` are
 //! `400 parsing_exception` naming them, because ignoring part of a query would return wrong
 //! data. Every leaf accepts a numeric `boost` and ignores it: IceGate does not score.
+//!
+//! Full-text leaves (`match`, `match_phrase`, `match_phrase_prefix`, `multi_match`,
+//! `simple_query_string`) refuse a non-zero `fuzziness` or `slop`, and a fuzzy term or sloppy
+//! phrase inside a `simple_query_string`: IceGate matches exactly. `max_expansions`,
+//! `prefix_length`, `fuzzy_transpositions`, `auto_generate_synonyms_phrase_query` and `tie_breaker`
+//! are accepted when they carry their type, and not applied. A field pattern may carry `^boost`,
+//! which is dropped; `fields` absent or empty is every field.
 
 use serde_json::{Map, Value};
 
 use super::ast::{
-    BoolQuery, ExistsQuery, IdsQuery, NestedQuery, PrefixQuery, Query, RangeBound, RangeQuery, TermQuery, TermsQuery,
-    WildcardQuery,
+    ALL_FIELDS, BoolQuery, ExistsQuery, IdsQuery, MatchPhrasePrefixQuery, MatchPhraseQuery, MatchQuery,
+    MultiMatchQuery, MultiMatchType, NestedQuery, Operator, PrefixQuery, Query, RangeBound, RangeQuery,
+    SimpleQueryStringQuery, TermQuery, TermsQuery, WildcardQuery, ZeroTermsQuery,
 };
 use super::date_math::{DateFormat, parse_time_zone};
+use super::simple_query::{SimpleQueryFlags, parse_simple_query_string};
 use crate::opensearch::error::OpenSearchError;
 
 /// The `score_mode` values `nested` accepts; IceGate does not score, so each is accepted and
 /// has no effect.
 const NESTED_SCORE_MODES: [&str; 5] = ["avg", "sum", "min", "max", "none"];
+
+/// Why a `fuzziness` above zero is refused.
+const FUZZINESS_REFUSAL: &str = "fuzzy matching is not evaluated";
+
+/// Why a `slop` above zero is refused.
+const SLOP_REFUSAL: &str = "sloppy phrases are not evaluated";
 
 /// Parse one query object.
 ///
@@ -23,7 +38,8 @@ const NESTED_SCORE_MODES: [&str; 5] = ["avg", "sum", "min", "max", "none"];
 ///
 /// `parsing_exception` naming the offending leaf or key: a value that is not an object with
 /// exactly one leaf, an unknown leaf, an unknown key in a known leaf (`_name` included), a value
-/// of the wrong JSON type, or a `wildcard` that states its value under both of its keys.
+/// of the wrong JSON type, a `wildcard` that states its value under both of its keys, a non-zero
+/// `fuzziness` or `slop`, or a `simple_query_string` that [`parse_simple_query_string`] refuses.
 pub(crate) fn parse_query(value: &Value) -> Result<Query, OpenSearchError> {
     let (leaf, body) = read_single_entry(value, "query")?;
     match leaf {
@@ -65,6 +81,17 @@ pub(crate) fn parse_query(value: &Value) -> Result<Query, OpenSearchError> {
             Ok(Query::ConstantScore(Box::new(parse_query(filter)?)))
         }
         "nested" => parse_nested(body).map(Query::Nested),
+        "match" => parse_match(body).map(Query::Match),
+        "match_phrase" => {
+            let (field, query) = parse_phrase(body, leaf, &["query", "slop"])?;
+            Ok(Query::MatchPhrase(MatchPhraseQuery { field, query }))
+        }
+        "match_phrase_prefix" => {
+            let (field, query) = parse_phrase(body, leaf, &["query", "slop", "max_expansions"])?;
+            Ok(Query::MatchPhrasePrefix(MatchPhrasePrefixQuery { field, query }))
+        }
+        "multi_match" => parse_multi_match(body).map(Query::MultiMatch),
+        "simple_query_string" => parse_simple_query_string_leaf(body).map(Query::SimpleQueryString),
         other => Err(OpenSearchError::parsing(format!("unknown query [{other}]"))),
     }
 }
@@ -131,11 +158,7 @@ fn read_scalar(value: &Value, leaf: &str) -> Result<Value, OpenSearchError> {
 
 /// The boolean option `key`, `false` when it is absent.
 fn read_flag(options: &Map<String, Value>, key: &str, leaf: &str) -> Result<bool, OpenSearchError> {
-    match options.get(key) {
-        None => Ok(false),
-        Some(Value::Bool(flag)) => Ok(*flag),
-        Some(_) => Err(OpenSearchError::parsing(format!("[{leaf}] [{key}] must be a boolean"))),
-    }
+    Ok(read_optional_flag(options, key, leaf)?.unwrap_or(false))
 }
 
 /// The required string option `key`.
@@ -407,6 +430,264 @@ fn parse_nested(body: &Value) -> Result<NestedQuery, OpenSearchError> {
     })
 }
 
+/// `match`: `{field: value}` or `{field: {query, …}}`.
+fn parse_match(body: &Value) -> Result<MatchQuery, OpenSearchError> {
+    let (field, field_body) = read_single_entry(body, "match")?;
+    if !field_body.is_object() {
+        return Ok(MatchQuery {
+            field: field.to_string(),
+            query: read_scalar(field_body, "match")?,
+            operator: Operator::Or,
+            lenient: None,
+            zero_terms_query: ZeroTermsQuery::None,
+        });
+    }
+    let options = read_leaf_object(
+        field_body,
+        "match",
+        &[
+            "query",
+            "operator",
+            "lenient",
+            "zero_terms_query",
+            "fuzziness",
+            "max_expansions",
+            "prefix_length",
+            "fuzzy_transpositions",
+            "auto_generate_synonyms_phrase_query",
+        ],
+    )?;
+    refuse_nonzero_option(options, "fuzziness", FUZZINESS_REFUSAL, "match")?;
+    refuse_wrong_option_types(
+        options,
+        &["max_expansions", "prefix_length"],
+        &["fuzzy_transpositions", "auto_generate_synonyms_phrase_query"],
+        "match",
+    )?;
+    let query = options
+        .get("query")
+        .ok_or_else(|| OpenSearchError::parsing("[match] needs a [query]"))?;
+    Ok(MatchQuery {
+        field: field.to_string(),
+        query: read_scalar(query, "match")?,
+        operator: read_operator(options, "operator", "match")?,
+        lenient: read_optional_flag(options, "lenient", "match")?,
+        zero_terms_query: read_zero_terms_query(options)?,
+    })
+}
+
+/// A phrase leaf, `{field: "text"}` or `{field: {query, slop, …}}`, as `(field, query)`.
+fn parse_phrase(body: &Value, leaf: &str, allowed: &[&str]) -> Result<(String, String), OpenSearchError> {
+    let (field, field_body) = read_single_entry(body, leaf)?;
+    let query = if field_body.is_object() {
+        let options = read_leaf_object(field_body, leaf, allowed)?;
+        refuse_nonzero_option(options, "slop", SLOP_REFUSAL, leaf)?;
+        refuse_wrong_option_types(options, &["max_expansions"], &[], leaf)?;
+        let query = options
+            .get("query")
+            .ok_or_else(|| OpenSearchError::parsing(format!("[{leaf}] needs a [query]")))?;
+        read_query_text(query, leaf)?
+    } else {
+        read_query_text(field_body, leaf)?
+    };
+    Ok((field.to_string(), query))
+}
+
+/// `multi_match`: `{query, fields, type, …}` with `type` `best_fields` (the default) or `phrase`.
+fn parse_multi_match(body: &Value) -> Result<MultiMatchQuery, OpenSearchError> {
+    let leaf = "multi_match";
+    let options = read_leaf_object(
+        body,
+        leaf,
+        &[
+            "query",
+            "fields",
+            "type",
+            "operator",
+            "lenient",
+            "slop",
+            "fuzziness",
+            "max_expansions",
+            "prefix_length",
+            "fuzzy_transpositions",
+            "tie_breaker",
+            "auto_generate_synonyms_phrase_query",
+        ],
+    )?;
+    refuse_nonzero_option(options, "fuzziness", FUZZINESS_REFUSAL, leaf)?;
+    refuse_nonzero_option(options, "slop", SLOP_REFUSAL, leaf)?;
+    refuse_wrong_option_types(
+        options,
+        &["max_expansions", "prefix_length", "tie_breaker"],
+        &["fuzzy_transpositions", "auto_generate_synonyms_phrase_query"],
+        leaf,
+    )?;
+    let match_type = match options.get("type") {
+        None => MultiMatchType::BestFields,
+        Some(Value::String(name)) if name == "best_fields" => MultiMatchType::BestFields,
+        Some(Value::String(name)) if name == "phrase" => MultiMatchType::Phrase,
+        Some(other) => {
+            return Err(OpenSearchError::parsing(format!(
+                "[multi_match] [type] {other} is not supported: best_fields and phrase are"
+            )));
+        }
+    };
+    let query = options
+        .get("query")
+        .ok_or_else(|| OpenSearchError::parsing("[multi_match] needs a [query]"))?;
+    Ok(MultiMatchQuery {
+        fields: read_field_patterns(options, leaf)?,
+        query: read_query_text(query, leaf)?,
+        match_type,
+        operator: read_operator(options, "operator", leaf)?,
+        lenient: read_optional_flag(options, "lenient", leaf)?,
+    })
+}
+
+/// `simple_query_string`, its query parsed here so that every document reuses the tree.
+fn parse_simple_query_string_leaf(body: &Value) -> Result<SimpleQueryStringQuery, OpenSearchError> {
+    let leaf = "simple_query_string";
+    let options = read_leaf_object(body, leaf, &["query", "fields", "default_operator", "flags", "lenient"])?;
+    let flags = match options.get("flags") {
+        None => SimpleQueryFlags::ALL,
+        Some(Value::String(names)) => SimpleQueryFlags::parse(names)?,
+        Some(_) => {
+            return Err(OpenSearchError::parsing(
+                "[simple_query_string] [flags] is a string of flag names joined by |",
+            ));
+        }
+    };
+    let default_operator = read_operator(options, "default_operator", leaf)?;
+    Ok(SimpleQueryStringQuery {
+        query: parse_simple_query_string(read_text(options, "query", leaf)?, flags, default_operator)?,
+        fields: read_field_patterns(options, leaf)?,
+        default_operator,
+        lenient: read_optional_flag(options, "lenient", leaf)?,
+    })
+}
+
+/// A query text: a string as it is, a number or a boolean in its JSON spelling.
+fn read_query_text(value: &Value, leaf: &str) -> Result<String, OpenSearchError> {
+    match value {
+        Value::String(text) => Ok(text.clone()),
+        Value::Number(_) | Value::Bool(_) => Ok(value.to_string()),
+        Value::Null | Value::Array(_) | Value::Object(_) => Err(OpenSearchError::parsing(format!(
+            "[{leaf}] takes a string, number or boolean query"
+        ))),
+    }
+}
+
+/// `fields`: field patterns without their `^boost`; absent or empty is every field.
+fn read_field_patterns(options: &Map<String, Value>, leaf: &str) -> Result<Vec<String>, OpenSearchError> {
+    let patterns: Vec<&str> = match options.get("fields") {
+        None => Vec::new(),
+        Some(Value::String(pattern)) => vec![pattern.as_str()],
+        Some(Value::Array(patterns)) => patterns
+            .iter()
+            .map(|pattern| {
+                pattern
+                    .as_str()
+                    .ok_or_else(|| OpenSearchError::parsing(format!("[{leaf}] [fields] holds strings")))
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => {
+            return Err(OpenSearchError::parsing(format!(
+                "[{leaf}] [fields] is a list of fields"
+            )));
+        }
+    };
+    if patterns.is_empty() {
+        return Ok(vec![ALL_FIELDS.to_string()]);
+    }
+    patterns.into_iter().map(|pattern| strip_field_boost(pattern, leaf)).collect()
+}
+
+/// `title^3` → `title`; the boost must be a number and is otherwise ignored.
+fn strip_field_boost(pattern: &str, leaf: &str) -> Result<String, OpenSearchError> {
+    match pattern.rsplit_once('^') {
+        None => Ok(pattern.to_string()),
+        Some((field, boost)) if boost.parse::<f64>().is_ok_and(f64::is_finite) => Ok(field.to_string()),
+        Some(_) => Err(OpenSearchError::parsing(format!(
+            "[{leaf}] field [{pattern}] has a malformed boost"
+        ))),
+    }
+}
+
+/// `or` (the default) or `and`, in any case.
+fn read_operator(options: &Map<String, Value>, key: &str, leaf: &str) -> Result<Operator, OpenSearchError> {
+    match options.get(key) {
+        None => Ok(Operator::Or),
+        Some(Value::String(name)) if name.eq_ignore_ascii_case("or") => Ok(Operator::Or),
+        Some(Value::String(name)) if name.eq_ignore_ascii_case("and") => Ok(Operator::And),
+        Some(other) => Err(OpenSearchError::parsing(format!(
+            "[{leaf}] [{key}] {other} is neither or nor and"
+        ))),
+    }
+}
+
+/// The boolean option `key`, `None` when it is absent.
+fn read_optional_flag(options: &Map<String, Value>, key: &str, leaf: &str) -> Result<Option<bool>, OpenSearchError> {
+    options.get(key).map_or(Ok(None), |value| {
+        value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| OpenSearchError::parsing(format!("[{leaf}] [{key}] must be a boolean")))
+    })
+}
+
+/// `none` (the default) or `all`, in any case.
+fn read_zero_terms_query(options: &Map<String, Value>) -> Result<ZeroTermsQuery, OpenSearchError> {
+    match options.get("zero_terms_query") {
+        None => Ok(ZeroTermsQuery::None),
+        Some(Value::String(name)) if name.eq_ignore_ascii_case("none") => Ok(ZeroTermsQuery::None),
+        Some(Value::String(name)) if name.eq_ignore_ascii_case("all") => Ok(ZeroTermsQuery::All),
+        Some(other) => Err(OpenSearchError::parsing(format!(
+            "[match] [zero_terms_query] {other} is neither none nor all"
+        ))),
+    }
+}
+
+/// Zero as a JSON number or a string.
+fn is_zero(value: &Value) -> bool {
+    value.as_u64() == Some(0) || value.as_str() == Some("0")
+}
+
+/// Refuses the option `key` unless it is absent or zero, which is all IceGate accepts of an option
+/// asking for inexact matching: `reason` says what it does not evaluate.
+fn refuse_nonzero_option(
+    options: &Map<String, Value>,
+    key: &str,
+    reason: &str,
+    leaf: &str,
+) -> Result<(), OpenSearchError> {
+    match options.get(key) {
+        Some(value) if !is_zero(value) => Err(OpenSearchError::unsupported_construct(
+            key,
+            format!("[{leaf}] [{key}] {value} is not supported: {reason}"),
+        )),
+        Some(_) | None => Ok(()),
+    }
+}
+
+/// Options accepted and not applied still have to carry their type: `number_keys` must hold JSON
+/// numbers and `boolean_keys` JSON booleans.
+fn refuse_wrong_option_types(
+    options: &Map<String, Value>,
+    number_keys: &[&str],
+    boolean_keys: &[&str],
+    leaf: &str,
+) -> Result<(), OpenSearchError> {
+    for key in number_keys {
+        if options.get(*key).is_some_and(|value| !value.is_number()) {
+            return Err(OpenSearchError::parsing(format!("[{leaf}] [{key}] must be a number")));
+        }
+    }
+    for key in boolean_keys {
+        read_optional_flag(options, key, leaf)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! A bounded case matrix: every leaf's accepted forms and one refusal per refusal branch.
@@ -420,10 +701,12 @@ mod tests {
     use super::*;
     use crate::opensearch::error::render_envelope;
     use crate::query_dsl::ast::{
-        BoolQuery, ExistsQuery, IdsQuery, NestedQuery, PrefixQuery, RangeBound, RangeQuery, TermQuery, TermsQuery,
-        WildcardQuery,
+        BoolQuery, ExistsQuery, IdsQuery, MatchPhrasePrefixQuery, MatchPhraseQuery, MatchQuery, MultiMatchQuery,
+        MultiMatchType, NestedQuery, Operator, PrefixQuery, RangeBound, RangeQuery, SimpleQueryStringQuery, TermQuery,
+        TermsQuery, WildcardQuery, ZeroTermsQuery,
     };
     use crate::query_dsl::date_math::{DateFormat, TimeZoneSpec};
+    use crate::query_dsl::simple_query::SimpleQuery;
 
     fn parse(value: impl Into<Value>) -> Query {
         parse_query(&value.into()).expect("the query parses")
@@ -803,5 +1086,247 @@ mod tests {
             reason.contains("[value], [wildcard]"),
             "the refusal names both keys: {reason}"
         );
+    }
+
+    #[test]
+    fn the_full_text_leaves_parse_into_their_nodes() {
+        assert_eq!(
+            parse(json!({"match": {"title": "error rate"}})),
+            Query::Match(MatchQuery {
+                field: "title".to_string(),
+                query: json!("error rate"),
+                operator: Operator::Or,
+                lenient: None,
+                zero_terms_query: ZeroTermsQuery::None,
+            })
+        );
+        assert_eq!(
+            parse(
+                json!({"match": {"count": {"query": 0, "operator": "AND", "lenient": true, "zero_terms_query": "all", "fuzziness": "0", "max_expansions": 50, "boost": 2}}})
+            ),
+            Query::Match(MatchQuery {
+                field: "count".to_string(),
+                query: json!(0),
+                operator: Operator::And,
+                lenient: Some(true),
+                zero_terms_query: ZeroTermsQuery::All,
+            })
+        );
+        assert_eq!(
+            parse(json!({"match": {"title": {"query": "error", "operator": "or", "zero_terms_query": "NONE"}}})),
+            Query::Match(MatchQuery {
+                field: "title".to_string(),
+                query: json!("error"),
+                operator: Operator::Or,
+                lenient: None,
+                zero_terms_query: ZeroTermsQuery::None,
+            })
+        );
+        assert_eq!(
+            parse(json!({"match_phrase": {"title": {"query": "error rate", "slop": 0}}})),
+            Query::MatchPhrase(MatchPhraseQuery {
+                field: "title".to_string(),
+                query: "error rate".to_string()
+            })
+        );
+        assert_eq!(
+            parse(json!({"match_phrase": {"title": "error rate"}})),
+            Query::MatchPhrase(MatchPhraseQuery {
+                field: "title".to_string(),
+                query: "error rate".to_string()
+            })
+        );
+        assert_eq!(
+            parse(json!({"match_phrase": {"count": 0}})),
+            Query::MatchPhrase(MatchPhraseQuery {
+                field: "count".to_string(),
+                query: "0".to_string()
+            })
+        );
+        assert_eq!(
+            parse(json!({"match_phrase": {"enabled": {"query": true}}})),
+            Query::MatchPhrase(MatchPhraseQuery {
+                field: "enabled".to_string(),
+                query: "true".to_string()
+            })
+        );
+        assert_eq!(
+            parse(json!({"match_phrase_prefix": {"title": {"query": "err", "max_expansions": 10}}})),
+            Query::MatchPhrasePrefix(MatchPhrasePrefixQuery {
+                field: "title".to_string(),
+                query: "err".to_string()
+            })
+        );
+        assert_eq!(
+            parse(
+                json!({"multi_match": {"query": "error", "fields": ["title^3", "description"], "type": "phrase", "tie_breaker": 0.3}})
+            ),
+            Query::MultiMatch(MultiMatchQuery {
+                fields: vec!["title".to_string(), "description".to_string()],
+                query: "error".to_string(),
+                match_type: MultiMatchType::Phrase,
+                operator: Operator::Or,
+                lenient: None,
+            })
+        );
+        assert_eq!(
+            parse(json!({"multi_match": {"query": "error"}})),
+            Query::MultiMatch(MultiMatchQuery {
+                fields: vec!["*".to_string()],
+                query: "error".to_string(),
+                match_type: MultiMatchType::BestFields,
+                operator: Operator::Or,
+                lenient: None,
+            })
+        );
+        assert_eq!(
+            parse(
+                json!({"multi_match": {"query": 7, "fields": "title^1.5", "type": "best_fields", "operator": "and", "lenient": false}})
+            ),
+            Query::MultiMatch(MultiMatchQuery {
+                fields: vec!["title".to_string()],
+                query: "7".to_string(),
+                match_type: MultiMatchType::BestFields,
+                operator: Operator::And,
+                lenient: Some(false),
+            })
+        );
+        assert_eq!(
+            parse(
+                json!({"simple_query_string": {"query": "error* -rate", "fields": ["visualization.title"], "default_operator": "and", "flags": "PREFIX|NOT|WHITESPACE", "lenient": true}})
+            ),
+            Query::SimpleQueryString(SimpleQueryStringQuery {
+                query: SimpleQuery::Bool {
+                    must: vec![
+                        SimpleQuery::Term {
+                            text: "error".to_string(),
+                            is_prefix: true
+                        },
+                        SimpleQuery::Bool {
+                            must: Vec::new(),
+                            should: vec![SimpleQuery::MatchAll],
+                            must_not: vec![SimpleQuery::Term {
+                                text: "rate".to_string(),
+                                is_prefix: false
+                            }],
+                        },
+                    ],
+                    should: Vec::new(),
+                    must_not: Vec::new(),
+                },
+                fields: vec!["visualization.title".to_string()],
+                default_operator: Operator::And,
+                lenient: Some(true),
+            })
+        );
+        assert_eq!(
+            parse(json!({"match_phrase_prefix": {"index-pattern.title": {"query": "", "boost": 1}}})),
+            Query::MatchPhrasePrefix(MatchPhrasePrefixQuery {
+                field: "index-pattern.title".to_string(),
+                query: String::new()
+            })
+        );
+        assert_eq!(
+            parse(json!({"simple_query_string": {"query": "error", "fields": []}})),
+            Query::SimpleQueryString(SimpleQueryStringQuery {
+                query: SimpleQuery::Term {
+                    text: "error".to_string(),
+                    is_prefix: false
+                },
+                fields: vec!["*".to_string()],
+                default_operator: Operator::Or,
+                lenient: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn fuzziness_and_slop_above_zero_are_refused_naming_the_construct() {
+        for (query, construct) in [
+            (
+                json!({"match": {"title": {"query": "error", "fuzziness": "AUTO"}}}),
+                "fuzziness",
+            ),
+            (
+                json!({"match": {"title": {"query": "error", "fuzziness": 1}}}),
+                "fuzziness",
+            ),
+            (
+                json!({"match_phrase": {"title": {"query": "error rate", "slop": 2}}}),
+                "slop",
+            ),
+            (
+                json!({"match_phrase_prefix": {"title": {"query": "error ra", "slop": 1}}}),
+                "slop",
+            ),
+            (json!({"multi_match": {"query": "error", "fuzziness": 2}}), "fuzziness"),
+            (
+                json!({"multi_match": {"query": "error rate", "type": "phrase", "slop": 1}}),
+                "slop",
+            ),
+            (json!({"simple_query_string": {"query": "eror~1"}}), "fuzzy"),
+            (json!({"simple_query_string": {"query": "\"error rate\"~2"}}), "slop"),
+        ] {
+            let (status, body) = render_refusal(query.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+            assert_eq!(body["error"]["type"], "parsing_exception", "{query}");
+            assert_eq!(body["error"]["construct"], construct, "{query}");
+        }
+        for accepted_query in [
+            json!({"match": {"title": {"query": "error", "fuzziness": 0}}}),
+            json!({"match": {"title": {"query": "error", "fuzziness": "0"}}}),
+            json!({"match_phrase": {"title": {"query": "error rate", "slop": 0}}}),
+            json!({"multi_match": {"query": "error rate", "fuzziness": "0", "slop": 0}}),
+            json!({"simple_query_string": {"query": "eror~0 \"error rate\"~0"}}),
+        ] {
+            assert!(parse_query(&accepted_query).is_ok(), "{accepted_query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_full_text_options_are_parsing_exceptions() {
+        for unsupported_query in [
+            json!({"multi_match": {"query": "error", "type": "most_fields"}}),
+            json!({"multi_match": {"query": "error", "type": 1}}),
+            json!({"match": {"title": {"query": "error", "analyzer": "standard"}}}),
+            json!({"simple_query_string": {"query": "error", "flags": "AND|SPELLING"}}),
+            json!({"simple_query_string": {"query": "error", "flags": 1}}),
+            json!({"simple_query_string": {"query": "error", "quote_field_suffix": ".exact"}}),
+            json!({"match": {"title": {"query": "error", "_name": "named"}}}),
+            json!({"multi_match": {"query": "error", "fields": [1]}}),
+            json!({"multi_match": {"query": "error", "fields": 1}}),
+            json!({"simple_query_string": {"query": "error", "fields": ["title^x"]}}),
+            json!({"simple_query_string": {"query": "error", "fields": ["title^inf"]}}),
+            json!({"match": {"title": {"query": "error", "operator": "xor"}}}),
+            json!({"match": {"title": {"query": "error", "operator": 1}}}),
+            json!({"simple_query_string": {"query": "error", "default_operator": "xor"}}),
+            json!({"match": {"title": {"query": "error", "lenient": "yes"}}}),
+            json!({"match": {"title": {"query": "error", "zero_terms_query": "some"}}}),
+            json!({"match": {"title": {"query": "error", "max_expansions": "10"}}}),
+            json!({"match": {"title": {"query": "error", "fuzzy_transpositions": "true"}}}),
+            json!({"match_phrase_prefix": {"title": {"query": "error", "max_expansions": "10"}}}),
+            json!({"multi_match": {"query": "error", "tie_breaker": "0.3"}}),
+            json!({"multi_match": {"query": "error", "auto_generate_synonyms_phrase_query": "true"}}),
+            json!({"match": {"title": {"operator": "and"}}}),
+            json!({"match_phrase": {"title": {"boost": 1}}}),
+            json!({"multi_match": {"fields": ["title"]}}),
+            json!({"simple_query_string": {"fields": ["title"]}}),
+            json!({"match": {"title": null}}),
+            json!({"match": {"title": ["error"]}}),
+            json!({"match": {"title": {"query": null}}}),
+            json!({"match_phrase": {"title": null}}),
+            json!({"match_phrase": {"title": {"query": null}}}),
+            json!({"multi_match": {"query": null}}),
+            json!({"simple_query_string": {"query": null}}),
+            json!({"simple_query_string": {"query": 1}}),
+            json!({"simple_query_string": 1}),
+        ] {
+            let (status, body) = render_refusal(unsupported_query.clone()).await;
+            assert_eq!(
+                (status, body["error"]["type"].clone()),
+                (StatusCode::BAD_REQUEST, json!("parsing_exception")),
+                "{unsupported_query}"
+            );
+        }
     }
 }
