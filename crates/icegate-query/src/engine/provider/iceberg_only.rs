@@ -11,12 +11,20 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 
 /// A table without a WAL topic, served by `inner` (the static Iceberg provider), whose scan is
-/// handed only filters on scalar values.
+/// handed only filters on scalar values, and none that casts to a floating type.
 ///
-/// A null check (`IS NULL`, `IS NOT NULL`) of a struct, list or MAP column is answered
-/// `Unsupported` and never reaches `inner`: DataFusion evaluates it above the scan. The
-/// regression test `exists_on_a_struct_column_is_a_null_check` (`query_dsl::lower`) fails when
-/// such a filter reaches the scan. Every other filter gets `inner`'s answer.
+/// Two kinds of filter are answered `Unsupported` and never reach `inner`; DataFusion evaluates
+/// them above the scan:
+///
+/// - a null check (`IS NULL`, `IS NOT NULL`) of a struct, list or MAP column. The regression test
+///   `exists_on_a_struct_column_is_a_null_check` (`query_dsl::lower`) fails when such a filter
+///   reaches the scan;
+/// - a filter holding a cast to a floating type (a decimal or 32-bit float column read as a
+///   double). Handed to the inner scan, it fails the query; the regression test
+///   `a_decimal_rate_column_compares_as_a_double` (`query_dsl::lower`) fails when such a filter
+///   reaches the scan.
+///
+/// Every other filter gets `inner`'s answer.
 #[derive(Debug)]
 pub(super) struct IcebergOnlyTableProvider {
     /// The provider reading the committed snapshot.
@@ -54,7 +62,7 @@ impl TableProvider for IcebergOnlyTableProvider {
         let schema = self.inner.schema();
         let is_held_back = filters
             .iter()
-            .map(|filter| has_nested_null_check(filter, &schema))
+            .map(|filter| Ok(has_nested_null_check(filter, &schema)? || has_floating_cast(filter)?))
             .collect::<DataFusionResult<Vec<bool>>>()?;
         let pushable_filters: Vec<&Expr> = filters
             .iter()
@@ -90,6 +98,11 @@ fn has_nested_null_check(filter: &Expr, schema: &Schema) -> DataFusionResult<boo
     })
 }
 
+/// Whether `filter` holds a cast to a floating-point type.
+fn has_floating_cast(filter: &Expr) -> DataFusionResult<bool> {
+    filter.exists(|node| Ok(matches!(node, Expr::Cast(cast) if cast.field.data_type().is_floating())))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -99,7 +112,7 @@ mod tests {
     use datafusion::catalog::{Session, TableProvider};
     use datafusion::datasource::MemTable;
     use datafusion::error::Result as DataFusionResult;
-    use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType, col, lit};
+    use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType, cast, col, lit};
     use datafusion::physical_plan::ExecutionPlan;
 
     use super::IcebergOnlyTableProvider;
@@ -190,6 +203,43 @@ mod tests {
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Inexact,
                 TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Inexact,
+            ]
+        );
+        assert_eq!(*inner.asked_filter_counts.lock().unwrap(), vec![2]);
+    }
+
+    /// A filter holding a cast to a floating type anywhere is answered `Unsupported` without
+    /// asking the inner provider; a cast to another type, and a filter without a cast, get the
+    /// inner provider's answer, in filter order.
+    #[test]
+    fn a_filter_with_a_cast_to_a_floating_type_is_kept_above_the_inner_scan() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("rate", DataType::Decimal128(38, 10), true),
+            Field::new("count", DataType::Int32, true),
+        ]));
+        let inner = Arc::new(InexactPushdownTable {
+            schema,
+            asked_filter_counts: Mutex::new(Vec::new()),
+        });
+        let provider = IcebergOnlyTableProvider::new(Arc::clone(&inner) as Arc<dyn TableProvider>);
+        let filters = [
+            cast(col("rate"), DataType::Float64).gt_eq(lit(0.5)),
+            col("count").eq(lit(1)),
+            cast(col("count"), DataType::Float32)
+                .lt(lit(1.5_f32))
+                .and(col("count").is_not_null()),
+            cast(col("count"), DataType::Int64).eq(lit(1_i64)),
+        ];
+
+        let answers = provider.supports_filters_pushdown(&filters.iter().collect::<Vec<_>>()).unwrap();
+
+        assert_eq!(
+            answers,
+            vec![
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Inexact,
                 TableProviderFilterPushDown::Unsupported,
                 TableProviderFilterPushDown::Inexact,
             ]

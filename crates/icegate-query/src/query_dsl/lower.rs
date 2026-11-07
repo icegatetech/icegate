@@ -11,7 +11,7 @@ use datafusion::functions::core::expr_fn::coalesce;
 use datafusion::functions::string::expr_fn::{lower, starts_with};
 use datafusion::functions_nested::expr_fn::cardinality;
 use datafusion::logical_expr::expr::Like;
-use datafusion::logical_expr::{Expr, in_list, lit, not, when};
+use datafusion::logical_expr::{Expr, cast, in_list, lit, not, when};
 use datafusion::scalar::ScalarValue;
 use serde_json::Value;
 
@@ -22,6 +22,10 @@ use crate::query_dsl::ast::{
     BoolQuery, ExistsQuery, PrefixQuery, Query, RangeBound, RangeQuery, TermQuery, TermsQuery, WildcardQuery,
 };
 use crate::query_dsl::date_math::{BoundSide, resolve_date_bound};
+use crate::query_dsl::literal::{
+    IntegerBound, LiteralError, NumericTerm, parse_boolean_literal, parse_java_double, parse_numeric_term,
+    resolve_date_term, resolve_integer_bound, step_exclusive_double,
+};
 
 /// What a query is lowered against: one index of one tenant-scoped session, at the request
 /// instant.
@@ -43,11 +47,12 @@ pub(crate) struct LoweringScope<'a> {
 /// # Errors
 ///
 /// Returns the 400 `search_phase_execution_exception` with a `query_shard_exception` root cause
-/// for a literal of the wrong form for its field (an invalid hex id) and for `prefix` or
-/// `wildcard` on an id, numeric, date or boolean field; `parsing_exception` for `nested` on a
-/// data index; `illegal_argument_exception` for the leaves the data path does not lower yet; `500`
-/// for a leaf on a column no `OpenSearch` type represents; and the error the index's table failed
-/// to open with.
+/// for a literal of the wrong form for its field (an invalid hex id; a malformed, non-finite or
+/// out-of-range number; a boolean other than `true` or `false`; text that is no date) and for
+/// `prefix` or `wildcard` on an id, numeric, date or boolean field; `parsing_exception` for
+/// `nested` on a data index; `illegal_argument_exception` for the leaves the data path does not
+/// lower yet; `500` for a leaf on a column no `OpenSearch` type represents; and the error the
+/// index's table failed to open with.
 pub(crate) fn lower_query(query: &Query, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
     match query {
         Query::MatchAll => Ok(lit(true)),
@@ -206,8 +211,8 @@ fn refuse_term_pattern(field: &ResolvedField, leaf: &str, scope: &LoweringScope<
     )
 }
 
-/// A `term`: an exact keyword or hex-id equality; a name the index lacks, or an `object`,
-/// matches nothing.
+/// A `term`: an exact keyword, hex-id, numeric or boolean equality, or the range a date term
+/// covers; a name the index lacks, or an `object`, matches nothing.
 fn lower_term(query: &TermQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
     let Some(field) = resolve_leaf_field(scope, &query.field)? else {
         return Ok(lit(false));
@@ -223,21 +228,24 @@ fn lower_term(query: &TermQuery, scope: &LoweringScope<'_>) -> Result<Expr, Open
         } else {
             read_expr.eq(lit(text))
         }),
+        (FieldType::Integer | FieldType::Long | FieldType::Double, _) => {
+            let (operand, literal_type) = build_numeric_operand(read_expr, &field, scope)?;
+            Ok(build_numeric_literal(&text, &literal_type, &field, scope)?
+                .map_or_else(|| lit(false), |literal| operand.eq(literal)))
+        }
+        (FieldType::Boolean, _) => Ok(read_expr.eq(lit(parse_boolean_value(&text, &field, scope)?))),
+        (FieldType::Date, _) => {
+            let data_type = read_typed_column_type(&field, scope)?;
+            lower_date_term(read_expr, &text, &data_type, &field, scope)
+        }
         (FieldType::Object, _) => Ok(lit(false)),
-        (
-            FieldType::Text
-            | FieldType::Date
-            | FieldType::Integer
-            | FieldType::Long
-            | FieldType::Double
-            | FieldType::Boolean,
-            _,
-        ) => Err(refuse_unsupported_leaf(&field, "term", scope)),
+        (FieldType::Text, _) => Err(refuse_unsupported_leaf(&field, "term", scope)),
     }
 }
 
-/// A `terms`: the value is one of the listed keywords or hex ids; an empty list matches
-/// nothing.
+/// A `terms`: the value is one of the listed values. Every listed value is read before the
+/// leaf answers, so a malformed one is the 400 wherever it stands; a list of no matchable value
+/// matches nothing.
 fn lower_terms(query: &TermsQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
     let Some(field) = resolve_leaf_field(scope, &query.field)? else {
         return Ok(lit(false));
@@ -262,16 +270,37 @@ fn lower_terms(query: &TermsQuery, scope: &LoweringScope<'_>) -> Result<Expr, Op
         (FieldType::Keyword, FieldValue::Column { .. } | FieldValue::MapKey { .. }) => {
             Ok(in_list(read_expr, texts.into_iter().map(lit).collect(), false))
         }
+        (FieldType::Integer | FieldType::Long | FieldType::Double, _) => {
+            let (operand, literal_type) = build_numeric_operand(read_expr, &field, scope)?;
+            let mut literals = Vec::with_capacity(texts.len());
+            for text in &texts {
+                if let Some(literal) = build_numeric_literal(text, &literal_type, &field, scope)? {
+                    literals.push(literal);
+                }
+            }
+            Ok(if literals.is_empty() {
+                lit(false)
+            } else {
+                in_list(operand, literals, false)
+            })
+        }
+        (FieldType::Boolean, _) => {
+            let literals = texts
+                .iter()
+                .map(|text| parse_boolean_value(text, &field, scope).map(lit))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(in_list(read_expr, literals, false))
+        }
+        (FieldType::Date, _) => {
+            let data_type = read_typed_column_type(&field, scope)?;
+            let covered_ranges = texts
+                .iter()
+                .map(|text| lower_date_term(read_expr.clone(), text, &data_type, &field, scope))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(covered_ranges.into_iter().reduce(Expr::or).unwrap_or_else(|| lit(false)))
+        }
         (FieldType::Object, _) => Ok(lit(false)),
-        (
-            FieldType::Text
-            | FieldType::Date
-            | FieldType::Integer
-            | FieldType::Long
-            | FieldType::Double
-            | FieldType::Boolean,
-            _,
-        ) => Err(refuse_unsupported_leaf(&field, "terms", scope)),
+        (FieldType::Text, _) => Err(refuse_unsupported_leaf(&field, "terms", scope)),
     }
 }
 
@@ -280,8 +309,8 @@ fn conjoin_bounds(read_expr: Expr, bounds: Vec<Expr>) -> Expr {
     bounds.into_iter().reduce(Expr::and).unwrap_or_else(|| read_expr.is_not_null())
 }
 
-/// A `range`: keyword bounds compare lexicographically, hex-id bounds byte-wise, and date
-/// bounds as typed timestamps of the column's unit.
+/// A `range`: keyword bounds compare lexicographically, hex-id bounds byte-wise, numeric and
+/// boolean bounds by their typed rules, and date bounds as typed timestamps of the column's unit.
 fn lower_range(query: &RangeQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
     let Some(field) = resolve_leaf_field(scope, &query.field)? else {
         return Ok(lit(false));
@@ -315,13 +344,237 @@ fn lower_range(query: &RangeQuery, scope: &LoweringScope<'_>) -> Result<Expr, Op
             }
             Ok(conjoin_bounds(read_expr, bounds))
         }
-        (FieldType::Date, FieldValue::Column { column } | FieldValue::HexId { column, .. }) => {
-            lower_date_range(query, read_expr, column, scope)
+        (FieldType::Date, FieldValue::Column { .. } | FieldValue::HexId { .. }) => {
+            lower_date_range(query, read_expr, &field, scope)
         }
+        (FieldType::Integer | FieldType::Long, _) => lower_integer_range(query, read_expr, &field, scope),
+        (FieldType::Double, _) => lower_double_range(query, read_expr, &field, scope),
+        (FieldType::Boolean, _) => lower_boolean_range(query, read_expr, &field, scope),
         (FieldType::Object | FieldType::Date, _) => Ok(lit(false)),
-        (FieldType::Text | FieldType::Integer | FieldType::Long | FieldType::Double | FieldType::Boolean, _) => {
-            Err(refuse_unsupported_leaf(&field, "range", scope))
-        }
+        (FieldType::Text, _) => Err(refuse_unsupported_leaf(&field, "range", scope)),
+    }
+}
+
+/// The side a range bound is on.
+const fn classify_bound_side(is_lower: bool, bound: &RangeBound) -> BoundSide {
+    match (is_lower, bound.is_inclusive) {
+        (true, true) => BoundSide::LowerInclusive,
+        (true, false) => BoundSide::LowerExclusive,
+        (false, true) => BoundSide::UpperInclusive,
+        (false, false) => BoundSide::UpperExclusive,
+    }
+}
+
+/// The present bounds of `query`, each with whether it is the lower one.
+fn list_present_bounds(query: &RangeQuery) -> impl Iterator<Item = (bool, &RangeBound)> {
+    [(true, query.lower.as_ref()), (false, query.upper.as_ref())]
+        .into_iter()
+        .filter_map(|(is_lower, bound)| bound.map(|present_bound| (is_lower, present_bound)))
+}
+
+/// The Arrow type of the column a typed (numeric, boolean or date) field reads.
+///
+/// # Errors
+///
+/// Returns `500` when the field is no column of the index's table, and the error the table
+/// failed to open with.
+fn read_typed_column_type(field: &ResolvedField, scope: &LoweringScope<'_>) -> Result<DataType, OpenSearchError> {
+    let (FieldValue::Column { column } | FieldValue::HexId { column, .. }) = &field.value else {
+        return Err(OpenSearchError::internal(format!(
+            "typed field [{}] is not a column",
+            field.name
+        )));
+    };
+    scope
+        .session
+        .column_data_type(scope.entry, column)?
+        .ok_or_else(|| OpenSearchError::internal(format!("column `{column}` vanished from its table")))
+}
+
+/// The query-shard 400 for `text`, which is no value of `field`.
+fn refuse_literal(
+    field: &ResolvedField,
+    text: &str,
+    error: LiteralError,
+    scope: &LoweringScope<'_>,
+) -> OpenSearchError {
+    OpenSearchError::query_shard(
+        scope.entry.name(),
+        &format!(
+            "failed to create query: [{text}] is not a [{}] value of field [{}]: {error}",
+            field.field_type.name(),
+            field.name
+        ),
+    )
+}
+
+/// The expression a numeric comparison reads, and the Arrow type of the literals it compares
+/// with.
+///
+/// An integer field reads its column as stored. A `double` field stored in another type (a
+/// decimal or a 32-bit float) reads its column cast to a 64-bit double: a double literal cast to
+/// the column's type would round, so a stepped exclusive bound or an inexact term could land
+/// back on a stored value it must exclude. A filter with that cast is evaluated above an
+/// Iceberg-only scan, which never receives it (`engine::provider::iceberg_only`).
+fn build_numeric_operand(
+    read_expr: Expr,
+    field: &ResolvedField,
+    scope: &LoweringScope<'_>,
+) -> Result<(Expr, DataType), OpenSearchError> {
+    let column_type = read_typed_column_type(field, scope)?;
+    if field.field_type == FieldType::Double && column_type != DataType::Float64 {
+        return Ok((cast(read_expr, DataType::Float64), DataType::Float64));
+    }
+    Ok((read_expr, column_type))
+}
+
+/// The literal of `literal_type` a numeric term compares with; `None` when the term matches no
+/// row (a fraction on an integer field).
+///
+/// # Errors
+///
+/// Returns the query-shard 400 for a malformed, non-finite or out-of-range term, and `500` when
+/// a range-checked value does not convert to `literal_type`.
+fn build_numeric_literal(
+    text: &str,
+    literal_type: &DataType,
+    field: &ResolvedField,
+    scope: &LoweringScope<'_>,
+) -> Result<Option<Expr>, OpenSearchError> {
+    let scalar =
+        match parse_numeric_term(text, field.field_type).map_err(|error| refuse_literal(field, text, error, scope))? {
+            NumericTerm::Integer(value) => ScalarValue::Int64(Some(value)),
+            NumericTerm::Double(value) => ScalarValue::Float64(Some(value)),
+            NumericTerm::NoMatch => return Ok(None),
+        };
+    // The term is range-checked for the field's type, which matches `literal_type`, so a failed
+    // conversion is a broken invariant, not a client error.
+    scalar
+        .cast_to(literal_type)
+        .map(|typed_scalar| Some(lit(typed_scalar)))
+        .map_err(|error| OpenSearchError::internal(format!("cannot type literal [{text}] as {literal_type}: {error}")))
+}
+
+/// `text` as a boolean value of `field`, or the query-shard 400 naming it.
+fn parse_boolean_value(text: &str, field: &ResolvedField, scope: &LoweringScope<'_>) -> Result<bool, OpenSearchError> {
+    parse_boolean_literal(text).ok_or_else(|| refuse_literal(field, text, LiteralError::Malformed, scope))
+}
+
+/// A date term: the rows inside the half-open range the term covers, compared as typed
+/// timestamps of `data_type`, the field's column type.
+fn lower_date_term(
+    read_expr: Expr,
+    text: &str,
+    data_type: &DataType,
+    field: &ResolvedField,
+    scope: &LoweringScope<'_>,
+) -> Result<Expr, OpenSearchError> {
+    let (start, end) =
+        resolve_date_term(text, None, scope.now).map_err(|error| refuse_literal(field, text, error, scope))?;
+    Ok(read_expr
+        .clone()
+        .gt_eq(build_date_literal(start, data_type)?)
+        .and(read_expr.lt(build_date_literal(end, data_type)?)))
+}
+
+/// An integer range: each side rounds toward the inside of the range and compares inclusively.
+/// Both sides are read before the range answers, so a malformed bound is the 400 even beside a
+/// side that admits no value.
+fn lower_integer_range(
+    query: &RangeQuery,
+    read_expr: Expr,
+    field: &ResolvedField,
+    scope: &LoweringScope<'_>,
+) -> Result<Expr, OpenSearchError> {
+    let data_type = read_typed_column_type(field, scope)?;
+    let mut resolved_bounds = Vec::with_capacity(2);
+    for (is_lower, bound) in list_present_bounds(query) {
+        let text = render_literal_text(&bound.value, &query.field)?;
+        let integer_bound = resolve_integer_bound(&text, field.field_type, classify_bound_side(is_lower, bound))
+            .map_err(|error| refuse_literal(field, &text, error, scope))?;
+        resolved_bounds.push((is_lower, integer_bound));
+    }
+    if resolved_bounds
+        .iter()
+        .any(|(_, integer_bound)| *integer_bound == IntegerBound::Empty)
+    {
+        return Ok(lit(false));
+    }
+    let mut bounds = Vec::with_capacity(resolved_bounds.len());
+    for (is_lower, integer_bound) in resolved_bounds {
+        let IntegerBound::Inclusive(value) = integer_bound else {
+            continue;
+        };
+        // Each bound is rounded into the field's range, the range of its column type, so a
+        // failed conversion is a broken invariant, not a client error.
+        let literal = lit(ScalarValue::Int64(Some(value)).cast_to(&data_type).map_err(|error| {
+            OpenSearchError::internal(format!("cannot type literal [{value}] as {data_type}: {error}"))
+        })?);
+        bounds.push(if is_lower {
+            read_expr.clone().gt_eq(literal)
+        } else {
+            read_expr.clone().lt_eq(literal)
+        });
+    }
+    Ok(conjoin_bounds(read_expr, bounds))
+}
+
+/// A double range: an exclusive bound steps to the adjacent double in IEEE totalOrder, so every
+/// comparison is inclusive and statistics that treat `-0.0` and `+0.0` alike cannot prune a
+/// matching file. Bounds are not finiteness-checked.
+fn lower_double_range(
+    query: &RangeQuery,
+    read_expr: Expr,
+    field: &ResolvedField,
+    scope: &LoweringScope<'_>,
+) -> Result<Expr, OpenSearchError> {
+    let (operand, _) = build_numeric_operand(read_expr, field, scope)?;
+    let mut bounds = Vec::with_capacity(2);
+    for (is_lower, bound) in list_present_bounds(query) {
+        let text = render_literal_text(&bound.value, &query.field)?;
+        let value =
+            parse_java_double(&text).ok_or_else(|| refuse_literal(field, &text, LiteralError::Malformed, scope))?;
+        let literal = lit(step_exclusive_double(value, classify_bound_side(is_lower, bound)));
+        bounds.push(if is_lower {
+            operand.clone().gt_eq(literal)
+        } else {
+            operand.clone().lt_eq(literal)
+        });
+    }
+    Ok(conjoin_bounds(operand, bounds))
+}
+
+/// A boolean range over `false < true`.
+fn lower_boolean_range(
+    query: &RangeQuery,
+    read_expr: Expr,
+    field: &ResolvedField,
+    scope: &LoweringScope<'_>,
+) -> Result<Expr, OpenSearchError> {
+    let mut is_false_admitted = true;
+    let mut is_true_admitted = true;
+    for (is_lower, bound) in list_present_bounds(query) {
+        let limit = parse_boolean_value(&render_literal_text(&bound.value, &query.field)?, field, scope)?;
+        let side = classify_bound_side(is_lower, bound);
+        is_false_admitted &= check_boolean_bound(false, limit, side);
+        is_true_admitted &= check_boolean_bound(true, limit, side);
+    }
+    Ok(match (is_false_admitted, is_true_admitted) {
+        (false, false) => lit(false),
+        (true, false) => read_expr.eq(lit(false)),
+        (false, true) => read_expr.eq(lit(true)),
+        (true, true) => read_expr.is_not_null(),
+    })
+}
+
+/// Whether `value` lies on the admitted `side` of the boolean bound `limit`, over `false < true`.
+fn check_boolean_bound(value: bool, limit: bool, side: BoundSide) -> bool {
+    let order = value.cmp(&limit);
+    match side {
+        BoundSide::LowerInclusive => order.is_ge(),
+        BoundSide::LowerExclusive => order.is_gt(),
+        BoundSide::UpperInclusive => order.is_le(),
+        BoundSide::UpperExclusive => order.is_lt(),
     }
 }
 
@@ -330,43 +583,25 @@ fn lower_range(query: &RangeQuery, scope: &LoweringScope<'_>) -> Result<Expr, Op
 fn lower_date_range(
     query: &RangeQuery,
     read_expr: Expr,
-    column: &str,
+    field: &ResolvedField,
     scope: &LoweringScope<'_>,
 ) -> Result<Expr, OpenSearchError> {
-    let data_type = scope
-        .session
-        .column_data_type(scope.entry, column)?
-        .ok_or_else(|| OpenSearchError::internal(format!("date column `{column}` vanished from its table")))?;
+    let data_type = read_typed_column_type(field, scope)?;
     let mut bounds = Vec::with_capacity(2);
-    if let Some(bound) = &query.lower {
-        let side = if bound.is_inclusive {
-            BoundSide::LowerInclusive
-        } else {
-            BoundSide::LowerExclusive
-        };
+    for (is_lower, bound) in list_present_bounds(query) {
         let micros = resolve_date_bound(
             &render_literal_text(&bound.value, &query.field)?,
             query.format,
             query.time_zone.as_ref(),
             scope.now,
-            side,
+            classify_bound_side(is_lower, bound),
         )?;
-        bounds.push(read_expr.clone().gt_eq(build_date_literal(micros, &data_type)?));
-    }
-    if let Some(bound) = &query.upper {
-        let side = if bound.is_inclusive {
-            BoundSide::UpperInclusive
+        let literal = build_date_literal(micros, &data_type)?;
+        bounds.push(if is_lower {
+            read_expr.clone().gt_eq(literal)
         } else {
-            BoundSide::UpperExclusive
-        };
-        let micros = resolve_date_bound(
-            &render_literal_text(&bound.value, &query.field)?,
-            query.format,
-            query.time_zone.as_ref(),
-            scope.now,
-            side,
-        )?;
-        bounds.push(read_expr.clone().lt(build_date_literal(micros, &data_type)?));
+            read_expr.clone().lt(literal)
+        });
     }
     Ok(conjoin_bounds(read_expr, bounds))
 }
@@ -539,15 +774,16 @@ mod tests {
     use iceberg::spec::{NestedField, PrimitiveType, StructType, Type};
     use iceberg::{NamespaceIdent, TableCreation};
     use icegate_common::schema::{
-        COL_BODY, COL_LOG_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP,
-        COL_TRACE_ID,
+        COL_BODY, COL_INPUT_USD_PER_1M, COL_LOG_ATTRIBUTES, COL_MODEL, COL_SERVICE_NAME, COL_SEVERITY_TEXT,
+        COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID,
     };
-    use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE, OPERATIONS_TABLE};
+    use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE, OPERATIONS_TABLE, PRICES_TABLE};
     use serde_json::{Value, json};
 
     use super::{LoweringScope, build_date_literal, lower_query, translate_wildcard_to_like};
     use crate::opensearch::error::{OpenSearchError, render_envelope};
     use crate::query_dsl::parse::parse_query;
+    use crate::test_rows::{OPERATION_NAME, STREAM, TEMPERATURE, TOP_K, build_operation_row};
     use crate::test_support::{FIXTURE_COMMITTED_WAL_OFFSET, SearchFixture, TestCell, TestRow, find_index_entry};
 
     const TENANT_A: &str = "tenant-a";
@@ -1734,5 +1970,387 @@ mod tests {
         let rows = session.collect(plan).await.expect("execute");
         let row_count: usize = rows.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(row_count, 2);
+    }
+
+    /// Lower `query` for tenant A on `index` and check it is the query-shard 400.
+    async fn assert_query_shard_400(fixture: &SearchFixture, index: &str, query: Value) {
+        let error = select_matching_values(fixture, TENANT_A, index, query.clone(), COL_TIMESTAMP)
+            .await
+            .expect_err("refused");
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status.as_u16(), 400, "{query}");
+        assert_eq!(body["error"]["type"], "search_phase_execution_exception", "{query}");
+        assert_eq!(
+            body["error"]["root_cause"][0]["type"], "query_shard_exception",
+            "{query}"
+        );
+    }
+
+    /// The `-0.0` and `+0.0` rows sit in both stores. Every double bound reaches the scans as an
+    /// inclusive comparison, so statistics that treat the two zeros alike prune no matching file.
+    #[tokio::test]
+    async fn double_comparisons_order_negative_zero_before_positive_zero_on_both_paths() {
+        let fixture = SearchFixture::new().await;
+        fixture
+            .commit_rows(
+                OPERATIONS_TABLE,
+                &[
+                    build_operation_row(
+                        TENANT_A,
+                        "neg-zero-iceberg",
+                        T0,
+                        vec![(TEMPERATURE, TestCell::Double(-0.0))],
+                    ),
+                    build_operation_row(
+                        TENANT_A,
+                        "pos-zero-iceberg",
+                        T0,
+                        vec![(TEMPERATURE, TestCell::Double(0.0))],
+                    ),
+                    build_operation_row(
+                        TENANT_A,
+                        "minus-one-iceberg",
+                        T0,
+                        vec![(TEMPERATURE, TestCell::Double(-1.0))],
+                    ),
+                    build_operation_row(TENANT_B, "b-pos-zero", T0, vec![(TEMPERATURE, TestCell::Double(0.0))]),
+                ],
+            )
+            .await;
+        fixture
+            .write_wal_segment(
+                OPERATIONS_TABLE,
+                FIXTURE_COMMITTED_WAL_OFFSET + 1,
+                &[
+                    build_operation_row(
+                        TENANT_A,
+                        "neg-zero-wal",
+                        T0,
+                        vec![(TEMPERATURE, TestCell::Double(-0.0))],
+                    ),
+                    build_operation_row(TENANT_A, "pos-zero-wal", T0, vec![(TEMPERATURE, TestCell::Double(0.0))]),
+                    build_operation_row(TENANT_A, "half-wal", T0, vec![(TEMPERATURE, TestCell::Double(0.5))]),
+                    build_operation_row(TENANT_A, "unset-wal", T0, vec![]),
+                    build_operation_row(TENANT_B, "b-neg-zero", T0, vec![(TEMPERATURE, TestCell::Double(-0.0))]),
+                ],
+            )
+            .await;
+
+        let cases = [
+            (
+                json!({"term": {"temperature": "-0.0"}}),
+                vec!["neg-zero-iceberg", "neg-zero-wal"],
+            ),
+            (
+                json!({"term": {"temperature": "0.0"}}),
+                vec!["pos-zero-iceberg", "pos-zero-wal"],
+            ),
+            (
+                json!({"terms": {"temperature": ["-0.0", "0.5"]}}),
+                vec!["neg-zero-iceberg", "neg-zero-wal", "half-wal"],
+            ),
+            (
+                json!({"range": {"temperature": {"gt": "-0.0"}}}),
+                vec!["pos-zero-iceberg", "pos-zero-wal", "half-wal"],
+            ),
+            (
+                json!({"range": {"temperature": {"gte": 0}}}),
+                vec!["pos-zero-iceberg", "pos-zero-wal", "half-wal"],
+            ),
+            (
+                json!({"range": {"temperature": {"lt": 0}}}),
+                vec!["neg-zero-iceberg", "neg-zero-wal", "minus-one-iceberg"],
+            ),
+            (
+                json!({"range": {"temperature": {"lte": "-0.0"}}}),
+                vec!["neg-zero-iceberg", "neg-zero-wal", "minus-one-iceberg"],
+            ),
+            (json!({"range": {"temperature": {"gt": 0}}}), vec!["half-wal"]),
+        ];
+        for (query, expected) in cases {
+            let matched_values =
+                select_matching_values(&fixture, TENANT_A, OPERATIONS_TABLE, query.clone(), OPERATION_NAME)
+                    .await
+                    .expect("search");
+            assert_eq!(matched_values, build_name_set(&expected), "{query}");
+        }
+    }
+
+    /// The range bounds are quoted booleans: a JSON boolean is no range bound.
+    #[tokio::test]
+    async fn a_boolean_range_orders_false_before_true_and_must_not_keeps_rows_without_the_field() {
+        let fixture = SearchFixture::new().await;
+        fixture
+            .commit_rows(
+                OPERATIONS_TABLE,
+                &[
+                    build_operation_row(TENANT_A, "streamed", T0, vec![(STREAM, TestCell::Bool(true))]),
+                    build_operation_row(TENANT_B, "b-not-streamed", T0, vec![(STREAM, TestCell::Bool(false))]),
+                ],
+            )
+            .await;
+        fixture
+            .write_wal_segment(
+                OPERATIONS_TABLE,
+                FIXTURE_COMMITTED_WAL_OFFSET + 1,
+                &[
+                    build_operation_row(TENANT_A, "not-streamed", T0, vec![(STREAM, TestCell::Bool(false))]),
+                    build_operation_row(TENANT_A, "unknown", T0, vec![]),
+                ],
+            )
+            .await;
+
+        let cases = [
+            (json!({"term": {"stream": true}}), vec!["streamed"]),
+            (json!({"term": {"stream": "false"}}), vec!["not-streamed"]),
+            (
+                json!({"terms": {"stream": [true, false]}}),
+                vec!["streamed", "not-streamed"],
+            ),
+            (json!({"range": {"stream": {"gt": "false"}}}), vec!["streamed"]),
+            (json!({"range": {"stream": {"lt": "true"}}}), vec!["not-streamed"]),
+            (
+                json!({"range": {"stream": {"gte": "false", "lte": "true"}}}),
+                vec!["streamed", "not-streamed"],
+            ),
+            (json!({"range": {"stream": {"gt": "true"}}}), vec![]),
+            (
+                json!({"bool": {"must_not": [{"term": {"stream": true}}]}}),
+                vec!["not-streamed", "unknown"],
+            ),
+        ];
+        for (query, expected) in cases {
+            let matched_values =
+                select_matching_values(&fixture, TENANT_A, OPERATIONS_TABLE, query.clone(), OPERATION_NAME)
+                    .await
+                    .expect("search");
+            assert_eq!(matched_values, build_name_set(&expected), "{query}");
+        }
+        for query in [
+            json!({"term": {"stream": "TRUE"}}),
+            json!({"range": {"stream": {"gte": "1"}}}),
+        ] {
+            assert_query_shard_400(&fixture, OPERATIONS_TABLE, query).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_finite_numeric_term_is_malformed_and_a_range_bound_is_not_checked() {
+        let fixture = SearchFixture::new().await;
+        fixture
+            .commit_rows(
+                OPERATIONS_TABLE,
+                &[
+                    build_operation_row(TENANT_A, "warm", T0, vec![(TEMPERATURE, TestCell::Double(0.7))]),
+                    build_operation_row(TENANT_A, "cold", T0, vec![(TEMPERATURE, TestCell::Double(-3.5))]),
+                    build_operation_row(TENANT_A, "unset", T0, vec![]),
+                    build_operation_row(TENANT_B, "b-warm", T0, vec![(TEMPERATURE, TestCell::Double(0.7))]),
+                ],
+            )
+            .await;
+
+        for query in [
+            json!({"term": {"temperature": "NaN"}}),
+            json!({"term": {"temperature": "Infinity"}}),
+            json!({"term": {"temperature": "warm"}}),
+            json!({"range": {"temperature": {"gt": "warm"}}}),
+        ] {
+            assert_query_shard_400(&fixture, OPERATIONS_TABLE, query).await;
+        }
+        let cases = [
+            (
+                json!({"range": {"temperature": {"gte": "-Infinity"}}}),
+                vec!["warm", "cold"],
+            ),
+            (
+                json!({"range": {"temperature": {"lte": "Infinity"}}}),
+                vec!["warm", "cold"],
+            ),
+            (
+                json!({"range": {"temperature": {"gt": "-Infinity", "lt": "0x1p0"}}}),
+                vec!["warm", "cold"],
+            ),
+            (json!({"range": {"temperature": {"gt": 0.7}}}), vec![]),
+            (json!({"term": {"temperature": "7e-1"}}), vec!["warm"]),
+        ];
+        for (query, expected) in cases {
+            let matched_values =
+                select_matching_values(&fixture, TENANT_A, OPERATIONS_TABLE, query.clone(), OPERATION_NAME)
+                    .await
+                    .expect("search");
+            assert_eq!(matched_values, build_name_set(&expected), "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_out_of_range_integer_term_is_a_400() {
+        let fixture = SearchFixture::new().await;
+        fixture
+            .commit_rows(
+                OPERATIONS_TABLE,
+                &[
+                    build_operation_row(TENANT_A, "ten", T0, vec![(TOP_K, TestCell::Long(10))]),
+                    build_operation_row(TENANT_A, "max", T0, vec![(TOP_K, TestCell::Long(i64::MAX))]),
+                    build_operation_row(TENANT_B, "b-ten", T0, vec![(TOP_K, TestCell::Long(10))]),
+                ],
+            )
+            .await;
+
+        for query in [
+            json!({"term": {"top_k": "9223372036854775808"}}),
+            json!({"term": {"top_k": "ten"}}),
+            json!({"terms": {"top_k": ["10", "1e20"]}}),
+        ] {
+            assert_query_shard_400(&fixture, OPERATIONS_TABLE, query).await;
+        }
+        let cases = [
+            (json!({"term": {"top_k": "1e1"}}), vec!["ten"]),
+            (json!({"term": {"top_k": 9_223_372_036_854_775_807_i64}}), vec!["max"]),
+            (json!({"term": {"top_k": "10.5"}}), vec![]),
+            (json!({"range": {"top_k": {"gt": 9.5, "lt": 10.5}}}), vec!["ten"]),
+            (json!({"range": {"top_k": {"gte": "1e19"}}}), vec![]),
+            (json!({"terms": {"top_k": ["10.5", "0.25"]}}), vec![]),
+            (json!({"terms": {"top_k": ["10", "1e1", "10.5"]}}), vec!["ten"]),
+        ];
+        for (query, expected) in cases {
+            let matched_values =
+                select_matching_values(&fixture, TENANT_A, OPERATIONS_TABLE, query.clone(), OPERATION_NAME)
+                    .await
+                    .expect("search");
+            assert_eq!(matched_values, build_name_set(&expected), "{query}");
+        }
+    }
+
+    /// `1e19` lies past every `long`, so on its own it empties the range; beside a malformed
+    /// bound the range is still the 400, whichever side the malformed bound is on.
+    #[tokio::test]
+    async fn a_malformed_integer_bound_is_a_400_beside_a_bound_that_empties_the_range() {
+        let fixture = SearchFixture::new().await;
+
+        for query in [
+            json!({"range": {"top_k": {"gte": "1e19", "lte": "abc"}}}),
+            json!({"range": {"top_k": {"gte": "abc", "lte": "1e19"}}}),
+        ] {
+            assert_query_shard_400(&fixture, OPERATIONS_TABLE, query).await;
+        }
+    }
+
+    /// The `prices` rate columns are decimals typed `double`: they compare as doubles, never as
+    /// a double rounded to the column's scale. `1.00000000004` and `1e-11` have no exact value at
+    /// scale 10, and the smallest positive double rounds to 0 there. `prices` is a global table,
+    /// read whole by every tenant, so it has no cross-tenant case.
+    #[tokio::test]
+    async fn a_decimal_rate_column_compares_as_a_double() {
+        let fixture = SearchFixture::new().await;
+        let build_price_row = |model: &'static str, unscaled_rate: i128| TestRow {
+            tenant: TENANT_A,
+            cells: vec![
+                (COL_MODEL, TestCell::Text(model)),
+                (COL_INPUT_USD_PER_1M, TestCell::Decimal(unscaled_rate)),
+            ],
+        };
+        fixture
+            .commit_rows(
+                PRICES_TABLE,
+                &[
+                    build_price_row("zero", 0),
+                    build_price_row("one", 10_000_000_000),
+                    build_price_row("one-and-a-bit", 10_000_000_001),
+                ],
+            )
+            .await;
+
+        let cases = [
+            (
+                json!({"range": {"input_usd_per_1m": {"gt": 0}}}),
+                vec!["one", "one-and-a-bit"],
+            ),
+            (
+                json!({"range": {"input_usd_per_1m": {"gte": "1.00000000004"}}}),
+                vec!["one-and-a-bit"],
+            ),
+            (json!({"term": {"input_usd_per_1m": "1e-11"}}), vec![]),
+            (json!({"term": {"input_usd_per_1m": "1"}}), vec!["one"]),
+            (
+                json!({"terms": {"input_usd_per_1m": ["0", "1.0000000001"]}}),
+                vec!["zero", "one-and-a-bit"],
+            ),
+        ];
+        for (query, expected) in cases {
+            let matched_values = select_matching_values(&fixture, TENANT_A, PRICES_TABLE, query.clone(), COL_MODEL)
+                .await
+                .expect("search");
+            assert_eq!(matched_values, build_name_set(&expected), "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_date_term_matches_the_rows_inside_the_range_it_covers() {
+        let fixture = SearchFixture::new().await;
+        seed_logs(
+            &fixture,
+            &[
+                build_log_row(
+                    TENANT_A,
+                    1_760_000_000_000_000,
+                    vec![(COL_BODY, TestCell::Text("a-same-day"))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    1_759_967_999_999_999,
+                    vec![(COL_BODY, TestCell::Text("a-day-before"))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    1_759_968_000_000_000,
+                    vec![(COL_BODY, TestCell::Text("a-first-microsecond"))],
+                ),
+            ],
+            &[
+                build_log_row(
+                    TENANT_A,
+                    1_760_054_399_999_999,
+                    vec![(COL_BODY, TestCell::Text("a-last-microsecond"))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    1_760_054_400_000_000,
+                    vec![(COL_BODY, TestCell::Text("a-next-day"))],
+                ),
+                build_log_row(
+                    TENANT_B,
+                    1_760_000_000_000_000,
+                    vec![(COL_BODY, TestCell::Text("b-same-day"))],
+                ),
+            ],
+        )
+        .await;
+
+        // 2025-10-09 covers [1759968000000000, 1760054400000000) µs.
+        let day_matches = select_matching_values(
+            &fixture,
+            TENANT_A,
+            LOGS_TABLE,
+            json!({"term": {"timestamp": "2025-10-09"}}),
+            COL_BODY,
+        )
+        .await
+        .expect("search");
+        assert_eq!(
+            day_matches,
+            build_name_set(&["a-same-day", "a-first-microsecond", "a-last-microsecond"])
+        );
+
+        let instant_matches = select_matching_values(
+            &fixture,
+            TENANT_A,
+            LOGS_TABLE,
+            json!({"terms": {"timestamp": ["1760000000000", "2025-10-09T23:59:59.999Z"]}}),
+            COL_BODY,
+        )
+        .await
+        .expect("search");
+        assert_eq!(instant_matches, build_name_set(&["a-same-day", "a-last-microsecond"]));
+        assert_query_shard_400(&fixture, LOGS_TABLE, json!({"term": {"timestamp": "yesterday"}})).await;
     }
 }

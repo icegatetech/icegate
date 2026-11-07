@@ -10,14 +10,16 @@ use icegate_common::schema::{
     COL_BODY, COL_INGESTED_TIMESTAMP, COL_LOG_ATTRIBUTES, COL_NAME, COL_OBSERVED_TIMESTAMP, COL_RESOURCE_ATTRIBUTES,
     COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID,
 };
-use icegate_common::{LOGS_TABLE, MemoryPressureConfig, MemoryPressureSampler, SPANS_TABLE, UsageReader};
+use icegate_common::{
+    LOGS_TABLE, MemoryPressureConfig, MemoryPressureSampler, OPERATIONS_TABLE, SPANS_TABLE, UsageReader,
+};
 use icegate_query::opensearch::{OpenSearchConfig, SearchLimitsConfig, SystemIndicesConfig};
 use reqwest::Method;
 use serde_json::{Value, json};
 
 use super::data::{Cell, Row, commit_rows, create_exact_name_table, required_string, write_wal_segment};
 use super::harness::{ServerOptions, TestServer};
-use super::test_rows::COMMITTED_WAL_OFFSET;
+use super::test_rows::{COMMITTED_WAL_OFFSET, OPERATION_NAME, STREAM, TEMPERATURE, TOP_K, build_operation_row};
 
 const TENANT_A: &str = "tenant-a";
 const TENANT_B: &str = "tenant-b";
@@ -729,6 +731,158 @@ async fn a_search_on_an_exact_name_table_with_a_timestamp_column_returns_its_row
     assert_eq!(
         answer["hits"]["hits"][0]["_source"],
         json!({COL_TIMESTAMP: "2025-10-09T08:53:20.000000Z", "scan_id": "scan-a"})
+    );
+    server.shutdown().await;
+}
+
+/// The exact-name table of the decimal case, its decimal column and its label column.
+const RATES_TABLE: &str = "rates";
+const RATE_COLUMN: &str = "rate";
+const RATE_LABEL_COLUMN: &str = "rate_label";
+
+/// A `rates` row of `tenant` labelled `label`, its rate given unscaled at scale 10.
+fn build_rate_row<'a>(tenant: &'a str, label: &'a str, unscaled_rate: i128) -> Row<'a> {
+    Row {
+        tenant,
+        cells: vec![
+            (COL_TIMESTAMP, Cell::Micros(T0)),
+            (RATE_COLUMN, Cell::Decimal(unscaled_rate)),
+            (RATE_LABEL_COLUMN, Cell::Text(label)),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn numeric_boolean_and_date_terms_filter_rows_over_http() {
+    let (server, catalog) = TestServer::start().await;
+    commit_rows(
+        &catalog,
+        OPERATIONS_TABLE,
+        &[
+            build_operation_row(
+                TENANT_A,
+                "a-warm",
+                T0,
+                vec![
+                    (TEMPERATURE, Cell::Double(0.7)),
+                    (STREAM, Cell::Bool(true)),
+                    (TOP_K, Cell::Long(40)),
+                ],
+            ),
+            build_operation_row(
+                TENANT_A,
+                "a-cold",
+                T0,
+                vec![(TEMPERATURE, Cell::Double(0.0)), (STREAM, Cell::Bool(false))],
+            ),
+            build_operation_row(TENANT_A, "a-unset", T0, vec![]),
+            build_operation_row(
+                TENANT_B,
+                "b-warm",
+                T0,
+                vec![
+                    (TEMPERATURE, Cell::Double(0.7)),
+                    (STREAM, Cell::Bool(true)),
+                    (TOP_K, Cell::Long(40)),
+                ],
+            ),
+        ],
+    )
+    .await
+    .expect("commit operations");
+    commit_rows(
+        &catalog,
+        LOGS_TABLE,
+        &[
+            build_log_row(TENANT_A, T0, "a-on-the-day", "INFO"),
+            build_log_row(TENANT_A, T0 + 86_400_000_000, "a-next-day", "INFO"),
+            build_log_row(TENANT_B, T0, "b-on-the-day", "INFO"),
+        ],
+    )
+    .await
+    .expect("commit logs");
+    create_exact_name_table(
+        &catalog,
+        RATES_TABLE,
+        vec![
+            required_string(1, COL_TENANT_ID),
+            NestedField::required(2, COL_TIMESTAMP, Type::Primitive(PrimitiveType::Timestamp)),
+            NestedField::optional(
+                3,
+                RATE_COLUMN,
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 38,
+                    scale: 10,
+                }),
+            ),
+            NestedField::optional(4, RATE_LABEL_COLUMN, Type::Primitive(PrimitiveType::String)),
+        ],
+    )
+    .await
+    .expect("create rates");
+    commit_rows(
+        &catalog,
+        RATES_TABLE,
+        &[
+            build_rate_row(TENANT_A, "a-zero", 0),
+            build_rate_row(TENANT_A, "a-one", 10_000_000_000),
+            build_rate_row(TENANT_B, "b-one", 10_000_000_000),
+        ],
+    )
+    .await
+    .expect("commit rates");
+
+    let operation_cases = [
+        (json!({"term": {"temperature": 0.7}}), vec!["a-warm"]),
+        (json!({"range": {"temperature": {"gt": 0}}}), vec!["a-warm"]),
+        (json!({"term": {"stream": true}}), vec!["a-warm"]),
+        (
+            json!({"bool": {"must_not": [{"term": {"stream": true}}]}}),
+            vec!["a-cold", "a-unset"],
+        ),
+        (json!({"term": {"top_k": "4e1"}}), vec!["a-warm"]),
+    ];
+    for (query, expected) in operation_cases {
+        let (status, answer) =
+            post_json(&server, Some(TENANT_A), "/operations/_search", &json!({"query": query})).await;
+        assert_eq!(status, 200, "{query}: {answer}");
+        assert_eq!(read_sorted_source_texts(&answer, OPERATION_NAME), expected, "{query}");
+    }
+
+    let (status, day) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({"query": {"term": {"timestamp": "2025-10-09"}}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{day}");
+    assert_eq!(read_sorted_source_texts(&day, COL_BODY), vec!["a-on-the-day"]);
+
+    // The smallest positive double rounds to 0 at the decimal's scale; compared as a double,
+    // `gt 0` still excludes the zero rate.
+    let (status, rates) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/rates/_search",
+        &json!({"query": {"range": {"rate": {"gt": 0}}}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{rates}");
+    assert_eq!(read_sorted_source_texts(&rates, RATE_LABEL_COLUMN), vec!["a-one"]);
+
+    let (status, refusal_answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/operations/_search",
+        &json!({"query": {"term": {"stream": "yes"}}}),
+    )
+    .await;
+    assert_eq!(status, 400, "{refusal_answer}");
+    assert_eq!(refusal_answer["error"]["type"], "search_phase_execution_exception");
+    assert_eq!(
+        refusal_answer["error"]["root_cause"][0]["type"],
+        "query_shard_exception"
     );
     server.shutdown().await;
 }

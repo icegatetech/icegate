@@ -205,6 +205,52 @@ pub(crate) fn parse_stored_date_millis(text: &str) -> Option<i64> {
     parse_date_text(text, None, &DEFAULT_ZONE, false).ok()
 }
 
+/// The half-open span `[start, end)` of instants a `strict_date_optional_time` date term
+/// covers, at millisecond precision; `None` when `text` is no such date, or an instant it spells
+/// lies outside the range `chrono` represents.
+///
+/// A date without a time (`yyyy`, `yyyy-MM`, `yyyy-MM-dd`) covers its one local day from
+/// midnight to the next midnight, so the day of a DST change covers its 23 or 25 hours. `THH`,
+/// `THH:mm` and `THH:mm:ss` cover one hour, minute or second from their instant. A fraction
+/// covers the millisecond it falls in; digits below the millisecond are dropped. A stated offset
+/// places the local time; otherwise `time_zone` does, UTC without one. A local time that a DST
+/// change skips moves forward by the gap, using the offset in force before it; an ambiguous one
+/// takes its earlier instant.
+pub(crate) fn resolve_date_text_span(
+    text: &str,
+    time_zone: Option<&TimeZoneSpec>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let parsed_date = parse_date_optional_time(text)?;
+    let zone = time_zone.unwrap_or(&DEFAULT_ZONE);
+    let to_instant = |local_time: NaiveDateTime| {
+        parsed_date
+            .offset
+            .map_or_else(
+                || zone.to_instant(local_time),
+                |offset| resolve_local_time(&offset, local_time),
+            )
+            .ok()
+    };
+    let start = to_instant(parsed_date.local_time)?;
+    let span_length = match parsed_date.precision {
+        Precision::Year | Precision::Month | Precision::Day => {
+            let next_day = advance_by_precision(parsed_date.local_time, Precision::Day)?;
+            return Some((start, to_instant(next_day)?));
+        }
+        Precision::Hour => TimeDelta::hours(1),
+        Precision::Minute => TimeDelta::minutes(1),
+        Precision::Second => TimeDelta::seconds(1),
+        Precision::Fraction => {
+            let millisecond_start = DateTime::from_timestamp_millis(start.timestamp_millis())?;
+            return Some((
+                millisecond_start,
+                millisecond_start.checked_add_signed(TimeDelta::milliseconds(1))?,
+            ));
+        }
+    };
+    Some((start, start.checked_add_signed(span_length)?))
+}
+
 /// The `illegal_argument_exception` naming a bound that does not resolve to an instant.
 fn refuse_date(text: &str) -> OpenSearchError {
     OpenSearchError::illegal_argument(format!("failed to parse date [{text}]"))

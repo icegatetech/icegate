@@ -15,8 +15,8 @@ use std::error::Error;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, ListArray, MapBuilder,
-    MapFieldNames, StringArray, StringBuilder, TimestampMicrosecondArray, new_empty_array, new_null_array,
+    ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, ListArray,
+    MapBuilder, MapFieldNames, StringArray, StringBuilder, TimestampMicrosecondArray, new_empty_array, new_null_array,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
@@ -32,7 +32,7 @@ use icegate_common::parquet_encoding::{
     SPANS_COLUMN_ENCODINGS,
 };
 use icegate_common::parquet_writer::ColumnEncoding;
-use icegate_common::schema::{self, COL_TENANT_ID};
+use icegate_common::schema::{self, COL_TENANT_ID, COL_TIMESTAMP};
 use icegate_common::{
     EVENTS_TABLE, ICEGATE_NAMESPACE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, PRICES_TABLE, SPANS_TABLE,
     WAL_OFFSET_PROPERTY, icegate_table_ident,
@@ -147,6 +147,15 @@ pub enum Cell<'a> {
     Bytes(&'a [u8]),
     /// The entries of a `MAP<string, string>` column, in stored order.
     Map(&'a [(&'a str, &'a str)]),
+    /// A 64-bit integer.
+    Long(i64),
+    /// A double.
+    Double(f64),
+    /// A boolean.
+    Bool(bool),
+    /// A decimal, as its unscaled value at the column's own scale (`1.5` at scale 10 is
+    /// `15_000_000_000`).
+    Decimal(i128),
 }
 
 /// One table row with explicit values: its tenant and the cells it sets. Every other column is
@@ -157,6 +166,30 @@ pub struct Row<'a> {
     pub tenant: &'a str,
     /// The cells, by column name.
     pub cells: Vec<(&'a str, Cell<'a>)>,
+}
+
+/// The `operations` label column, which has no `COL_*` constant. [`build_rows_batch`] panics on
+/// a cell naming a column the table lacks, so a renamed column fails the test that names it; the
+/// same holds for the three columns below.
+pub const OPERATION_NAME: &str = "operation_name";
+/// The `operations` double column `temperature`, which has no `COL_*` constant.
+pub const TEMPERATURE: &str = "temperature";
+/// The `operations` boolean column `stream`, which has no `COL_*` constant.
+pub const STREAM: &str = "stream";
+/// The `operations` long column `top_k`, which has no `COL_*` constant.
+pub const TOP_K: &str = "top_k";
+
+/// An `operations` row of `tenant` at `micros`, labelled `label` in [`OPERATION_NAME`], with
+/// `cells`.
+pub fn build_operation_row<'a>(
+    tenant: &'a str,
+    label: &'a str,
+    micros: i64,
+    mut cells: Vec<(&'a str, Cell<'a>)>,
+) -> Row<'a> {
+    cells.push((COL_TIMESTAMP, Cell::Micros(micros)));
+    cells.push((OPERATION_NAME, Cell::Text(label)));
+    Row { tenant, cells }
 }
 
 /// Build one batch of `rows` over `schema`. Panics when a cell names a column `schema` lacks or
@@ -218,20 +251,35 @@ fn build_rows_column(field: &Field, rows: &[Row<'_>]) -> Result<ArrayRef, RowWri
             assert_no_cells(rows, name);
             Arc::new(Int32Array::from_iter(rows.iter().map(|_| is_required.then_some(0))))
         }
-        DataType::Int64 => {
-            assert_no_cells(rows, name);
-            Arc::new(Int64Array::from_iter(rows.iter().map(|_| is_required.then_some(0))))
-        }
-        DataType::Float64 => {
-            assert_no_cells(rows, name);
-            Arc::new(Float64Array::from_iter(rows.iter().map(|_| is_required.then_some(0.0))))
-        }
-        DataType::Boolean => {
-            assert_no_cells(rows, name);
-            Arc::new(BooleanArray::from_iter(
-                rows.iter().map(|_| is_required.then_some(false)),
-            ))
-        }
+        DataType::Int64 => Arc::new(Int64Array::from_iter(rows.iter().map(|row| {
+            match find_row_cell(row, name) {
+                Some(Cell::Long(value)) => Some(*value),
+                None => is_required.then_some(0),
+                Some(_) => panic!("`{name}` takes Long"),
+            }
+        }))),
+        DataType::Float64 => Arc::new(Float64Array::from_iter(rows.iter().map(|row| {
+            match find_row_cell(row, name) {
+                Some(Cell::Double(value)) => Some(*value),
+                None => is_required.then_some(0.0),
+                Some(_) => panic!("`{name}` takes Double"),
+            }
+        }))),
+        DataType::Boolean => Arc::new(BooleanArray::from_iter(rows.iter().map(|row| {
+            match find_row_cell(row, name) {
+                Some(Cell::Bool(value)) => Some(*value),
+                None => is_required.then_some(false),
+                Some(_) => panic!("`{name}` takes Bool"),
+            }
+        }))),
+        DataType::Decimal128(precision, scale) => Arc::new(
+            Decimal128Array::from_iter(rows.iter().map(|row| match find_row_cell(row, name) {
+                Some(Cell::Decimal(value)) => Some(*value),
+                None => is_required.then_some(0),
+                Some(_) => panic!("`{name}` takes Decimal"),
+            }))
+            .with_precision_and_scale(*precision, *scale)?,
+        ),
         DataType::Timestamp(TimeUnit::Microsecond, timezone) => Arc::new(
             TimestampMicrosecondArray::from_iter(rows.iter().map(|row| match find_row_cell(row, name) {
                 Some(Cell::Micros(value)) => Some(*value),
