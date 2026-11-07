@@ -320,6 +320,22 @@ services:
         condition: service_started
     logging: *fluentd-logging
 
+  # OpenSearch Dashboards over the query service's OpenSearch listener. The image's minor stays
+  # at or below the minor the query service reports (config/docker/query.yaml, or the code
+  # default), pinned by crates/icegate-query/tests/config_file.rs.
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:3.9.0
+    ports:
+      - "5601:5601"
+    volumes:
+      - ./opensearch-dashboards/opensearch_dashboards.yml:/usr/share/opensearch-dashboards/config/opensearch_dashboards.yml:ro
+    environment:
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    depends_on:
+      query:
+        condition: service_started
+    logging: *fluentd-logging
+
   otelgen:
     image: ghcr.io/krzko/otelgen:v0.5.2
     command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "logs", "multi", "--workers", "10", "--duration", "0"]

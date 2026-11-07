@@ -3,11 +3,14 @@
 //!
 //! - `cat`: `_cat/indices` and `_cat/plugins`
 //! - `cluster`: the cluster-level endpoints
+//! - `dashboards_migration`: Dashboards-style saved-object call sequences (first boot, no-op and
+//!   reindexing upgrades, export and import) and the snapshot bound during a migration
 //! - `data`: table rows with explicit values, written through the production writer
 //! - `fields`: `_field_caps`, `_mapping` and `_mapping/field`
 //! - `harness`: the listener over a temporary warehouse, and a reqwest client
 //! - `indices`: `_resolve/index` and `<index>/_settings`
 //! - `listener`: the listener's start-up
+//! - `requests`: JSON and NDJSON request helpers shared by the system-index modules
 //! - `rustfs_conditional`: the object-store guarantees the system-index store builds on
 //! - `saved_objects`: system-index document endpoints
 //! - `system_indices`: index-level system-index endpoints and their tenant boundary

@@ -1,5 +1,8 @@
 //! `QueryConfig::from_file` over whole configuration documents: the stand's own,
-//! and one written before the tenant policy existed.
+//! and one written before the tenant policy existed. It also reads the stand's
+//! Compose document and its `opensearch_dashboards.yml`, to pin the Dashboards
+//! image against the version the query document resolves and the tenant header
+//! the stand's Dashboards sends.
 //!
 //! Nothing else loads `config/docker/query.yaml` in CI, and its `tenant` block
 //! decides whether the stand's readers are served at all: without it the policy
@@ -8,12 +11,14 @@
 #![allow(clippy::expect_used)]
 
 use std::{
+    collections::BTreeMap,
+    error::Error,
     io::Write as _,
     path::{Path, PathBuf},
 };
 
 use icegate_common::{
-    LOGS_TABLE, SPANS_TABLE, TenantPolicy, TlsConfig, load_config_file,
+    LOGS_TABLE, SPANS_TABLE, TENANT_ID_HEADER, TenantPolicy, TlsConfig, load_config_file,
     schema::{COL_BODY, COL_SEVERITY_TEXT, COL_TIMESTAMP},
 };
 use icegate_query::QueryConfig;
@@ -285,4 +290,121 @@ fn the_stand_query_document_resolves_the_system_location_to_the_warehouse_bucket
     let system_object_store = build_system_object_store(&config).expect("the stand's client builds");
 
     assert_eq!(system_object_store.location(), "s3://warehouse/opensearch-system");
+}
+
+/// The stand's Compose document.
+const STAND_COMPOSE_DOCUMENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/docker/docker-compose.yml");
+
+/// The configuration the stand's `OpenSearch` Dashboards runs with.
+const STAND_DASHBOARDS_DOCUMENT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../config/docker/opensearch-dashboards/opensearch_dashboards.yml"
+);
+
+/// The Compose service of the stand's `OpenSearch` Dashboards.
+const DASHBOARDS_SERVICE: &str = "opensearch-dashboards";
+
+/// The services of the stand's Compose document, each read as untyped YAML.
+#[derive(Deserialize)]
+struct ComposeDocument {
+    services: BTreeMap<String, serde_json::Value>,
+}
+
+/// The settings of the stand's `opensearch_dashboards.yml` this file pins.
+#[derive(Deserialize)]
+struct DashboardsDocument {
+    #[serde(rename = "opensearch.hosts")]
+    hosts: Vec<String>,
+    #[serde(rename = "opensearch.customHeaders")]
+    custom_headers: BTreeMap<String, String>,
+    #[serde(rename = "opensearch.requestHeadersWhitelist")]
+    forwarded_headers: Vec<String>,
+}
+
+/// `MAJOR.MINOR.PATCH` → `MINOR`, read independently of IceGate's version parser; `None` when
+/// `version` is not three dot-separated parts or its minor is not a number.
+fn read_minor(version: &str) -> Option<u32> {
+    let mut parts = version.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(_), Some(minor), Some(_), None) => minor.parse().ok(),
+        _ => None,
+    }
+}
+
+/// The stand's `OpenSearch` Dashboards service, as its Compose document declares it.
+///
+/// # Errors
+///
+/// Fails when the Compose document does not load or declares no Dashboards service.
+fn read_stand_dashboards_service() -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut compose: ComposeDocument = load_config_file(Path::new(STAND_COMPOSE_DOCUMENT))?;
+    compose
+        .services
+        .remove(DASHBOARDS_SERVICE)
+        .ok_or_else(|| format!("the stand Compose document declares no {DASHBOARDS_SERVICE} service").into())
+}
+
+/// The stand pairs one Dashboards image with one IceGate version. IceGate reports the version its
+/// configuration resolves (the code default when `config/docker/query.yaml` sets none), and the
+/// pairing the stand supports is a Dashboards whose minor is at most that minor.
+#[test]
+fn the_stand_dashboards_image_minor_is_at_most_the_minor_icegate_reports() {
+    let config = QueryConfig::from_file(STAND_QUERY_DOCUMENT).expect("the stand query document must load and validate");
+    let service = read_stand_dashboards_service().expect("the stand runs OpenSearch Dashboards");
+    let image = service["image"].as_str().expect("the Dashboards service names an image");
+    let (repository, tag) = image.rsplit_once(':').expect("the Dashboards image is pinned by tag");
+    let dashboards_minor = read_minor(tag).expect("the Dashboards tag is MAJOR.MINOR.PATCH with a numeric minor");
+    let icegate_minor =
+        read_minor(&config.opensearch.version).expect("IceGate's version is MAJOR.MINOR.PATCH with a numeric minor");
+
+    assert_eq!(repository, "opensearchproject/opensearch-dashboards");
+    assert!(
+        dashboards_minor <= icegate_minor,
+        "Dashboards {tag} pairs with IceGate {}",
+        config.opensearch.version
+    );
+}
+
+/// IceGate trusts the tenant header, so on the stand the Dashboards configuration is the one place that
+/// chooses the tenant: it sets the stand's tenant as a custom header, and the header is not in
+/// `opensearch.requestHeadersWhitelist`.
+#[test]
+fn the_stand_dashboards_document_sets_the_tenant_custom_header_and_leaves_it_out_of_the_request_header_whitelist() {
+    let config = QueryConfig::from_file(STAND_QUERY_DOCUMENT).expect("the stand query document must load and validate");
+    let dashboards_document: DashboardsDocument =
+        load_config_file(Path::new(STAND_DASHBOARDS_DOCUMENT)).expect("the stand Dashboards document must load");
+    let service = read_stand_dashboards_service().expect("the stand runs OpenSearch Dashboards");
+
+    assert_eq!(
+        dashboards_document.hosts,
+        [format!("http://query:{}", config.opensearch.port)]
+    );
+    let tenant_headers: Vec<(&String, &String)> = dashboards_document
+        .custom_headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(TENANT_ID_HEADER))
+        .collect();
+    assert_eq!(tenant_headers.len(), 1, "{:?}", dashboards_document.custom_headers);
+    assert_eq!(tenant_headers[0].1, "demo");
+    assert!(
+        !dashboards_document
+            .forwarded_headers
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(TENANT_ID_HEADER)),
+        "{:?}",
+        dashboards_document.forwarded_headers
+    );
+    assert_eq!(service["environment"]["DISABLE_SECURITY_DASHBOARDS_PLUGIN"], "true");
+    let volumes: Vec<&str> = service["volumes"]
+        .as_array()
+        .expect("the Dashboards service mounts its configuration")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        volumes.contains(
+            &"./opensearch-dashboards/opensearch_dashboards.yml:/usr/share/opensearch-dashboards/config/opensearch_dashboards.yml:ro"
+        ),
+        "{volumes:?}"
+    );
 }
