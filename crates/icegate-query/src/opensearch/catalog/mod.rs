@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use datafusion::arrow::datatypes::{DataType, Schema};
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::TableReference;
@@ -319,9 +319,18 @@ impl TenantSession {
         entry: &IndexEntry,
         column: &str,
     ) -> Result<Option<DataType>, OpenSearchError> {
-        let provider = self.open_table(entry)?;
-        let schema = provider.schema();
+        let schema = self.table_schema(entry)?;
         Ok(schema.field_with_name(column).ok().map(|field| field.data_type().clone()))
+    }
+
+    /// The tenant-scoped schema of `entry`'s table (no `tenant_id`), in column order: the
+    /// columns every scan of the index yields.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error the table failed to open with.
+    pub(crate) fn table_schema(&self, entry: &IndexEntry) -> Result<SchemaRef, OpenSearchError> {
+        Ok(self.open_table(entry)?.schema())
     }
 
     /// A scan of `entry`'s table through the tenant scope.

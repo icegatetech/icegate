@@ -4,6 +4,7 @@
 //! none included, through [`execute::search_data_indices`], one plan per index. Either answer is
 //! serialized on the blocking pool within `max_answer_bytes`.
 
+pub(crate) mod doc_id;
 mod execute;
 mod hits;
 pub(crate) mod request;

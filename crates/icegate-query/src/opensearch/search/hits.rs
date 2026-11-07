@@ -9,9 +9,10 @@ use datafusion::arrow::datatypes::{
     TimeUnit, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
     UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
+use datafusion::scalar::ScalarValue;
 use serde_json::{Map, Number, Value, json};
 
-use super::request::SearchRequest;
+use super::request::{SearchRequest, SortClause};
 use crate::opensearch::error::OpenSearchError;
 
 /// One hit of a response page: a row of one index's batch.
@@ -22,13 +23,18 @@ pub(crate) struct SearchHit<'a> {
     pub(crate) batch: &'a RecordBatch,
     /// The row within `batch`.
     pub(crate) row: usize,
+    /// The hit's `_id`.
+    pub(crate) document_id: &'a str,
+    /// The hit's `sort` values; `None` when the request does not sort.
+    pub(crate) sort_values: Option<Vec<Value>>,
 }
 
 /// The `_search` response, with its keys in this fixed order: `took`, `timed_out`, `_shards`,
 /// `hits`.
 ///
 /// `hits.total` is the exact `total` (an integer with `rest_total_hits_as_int`). Every hit
-/// scores `1.0`; `max_score` is `1.0` when a hit is returned and `null` otherwise.
+/// scores `1.0` and `max_score` is `1.0` when the request sorts on `_score` alone or not at all;
+/// with any other sort clause both are `null`. `max_score` is `null` when no hit is returned.
 ///
 /// # Errors
 ///
@@ -39,12 +45,10 @@ pub(crate) fn render_search_response(
     hits: &[SearchHit<'_>],
     request: &SearchRequest,
 ) -> Result<Value, OpenSearchError> {
-    let rendered_hits = hits.iter().map(render_hit).collect::<Result<Vec<_>, _>>()?;
-    let max_score = if rendered_hits.is_empty() {
-        Value::Null
-    } else {
-        json!(1.0)
-    };
+    let is_scored = request.sort.iter().all(|clause| matches!(clause, SortClause::Score { .. }));
+    let score = if is_scored { json!(1.0) } else { Value::Null };
+    let rendered_hits = hits.iter().map(|hit| render_hit(hit, &score)).collect::<Result<Vec<_>, _>>()?;
+    let max_score = if rendered_hits.is_empty() { Value::Null } else { score };
     let total = if request.rest_total_hits_as_int {
         json!(total)
     } else {
@@ -58,16 +62,42 @@ pub(crate) fn render_search_response(
     }))
 }
 
-/// One hit object: `_index`, `_score` and the row's `_source`.
-fn render_hit(hit: &SearchHit<'_>) -> Result<Value, OpenSearchError> {
+/// One hit object: `_index`, `_id`, `_score` (`score`), the row's `_source`, and `sort` when
+/// the request sorts.
+fn render_hit(hit: &SearchHit<'_>, score: &Value) -> Result<Value, OpenSearchError> {
     let mut object = Map::new();
     object.insert("_index".to_string(), json!(hit.index));
-    object.insert("_score".to_string(), json!(1.0));
+    object.insert("_id".to_string(), json!(hit.document_id));
+    object.insert("_score".to_string(), score.clone());
     object.insert(
         "_source".to_string(),
         Value::Object(render_row_source(hit.batch, hit.row)?),
     );
+    if let Some(sort_values) = &hit.sort_values {
+        object.insert("sort".to_string(), Value::Array(sort_values.clone()));
+    }
     Ok(Value::Object(object))
+}
+
+/// A field sort value: an integer or a double as a number, a string as is, a binary id as
+/// lowercase hex, a missing value as `null`.
+///
+/// # Errors
+///
+/// Returns `500` for a present value of any other type, which no sort key produces, rather than
+/// rendering it as a missing value.
+pub(crate) fn render_sort_scalar(value: &ScalarValue) -> Result<Value, OpenSearchError> {
+    match value {
+        ScalarValue::Int64(Some(number)) => Ok(json!(number)),
+        ScalarValue::Float64(Some(number)) => Ok(render_double(*number)),
+        ScalarValue::Utf8(Some(text)) => Ok(json!(text)),
+        ScalarValue::FixedSizeBinary(_, Some(bytes)) => Ok(json!(hex::encode(bytes))),
+        missing_value if missing_value.is_null() => Ok(Value::Null),
+        unexpected_value => Err(OpenSearchError::internal(format!(
+            "a sort value of the type {} has no rendering",
+            unexpected_value.data_type()
+        ))),
+    }
 }
 
 /// The `_source` of `row`: every non-null column, in schema order.
@@ -399,6 +429,32 @@ mod tests {
         ];
         for (name, array, expected) in cases {
             assert_eq!(render_array_value(array.as_ref(), 0), Ok(expected), "{name}");
+        }
+    }
+
+    /// Every sort key's value type renders by its own rule and a missing value as `null`; a
+    /// present value of a type no sort key produces is a 500 rather than a `null`.
+    #[tokio::test]
+    async fn sort_values_render_by_their_type_and_an_unexpected_type_is_a_500() {
+        let cases = [
+            (ScalarValue::Int64(Some(-5)), json!(-5)),
+            (ScalarValue::Float64(Some(2.5)), json!(2.5)),
+            (ScalarValue::Float64(Some(f64::NAN)), json!("NaN")),
+            (ScalarValue::Utf8(Some("a".to_string())), json!("a")),
+            (ScalarValue::FixedSizeBinary(2, Some(vec![0xab, 0x01])), json!("ab01")),
+            (ScalarValue::Int64(None), Value::Null),
+            (ScalarValue::Utf8(None), Value::Null),
+            (ScalarValue::FixedSizeBinary(2, None), Value::Null),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(render_sort_scalar(&value), Ok(expected), "{value:?}");
+        }
+        for value in [ScalarValue::Int32(Some(1)), ScalarValue::Boolean(Some(true))] {
+            let error = render_sort_scalar(&value).expect_err("no sort key produces this type");
+
+            let (status, body) = render_envelope(error).await;
+            assert_eq!(status.as_u16(), 500, "{value:?}");
+            assert_eq!(body["error"]["type"], "exception", "{value:?}");
         }
     }
 

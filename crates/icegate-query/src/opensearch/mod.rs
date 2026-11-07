@@ -21,7 +21,7 @@ mod glob;
 mod node;
 mod routes;
 mod script;
-mod search;
+pub(crate) mod search;
 mod server;
 mod state;
 pub(crate) mod system_index;

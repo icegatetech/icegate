@@ -1,8 +1,8 @@
 //! The search request model every `_search` evaluator shares: the body keys and query-string
 //! parameters a search accepts, parsed once into [`SearchRequest`].
 //!
-//! A key IceGate does not apply is refused rather than ignored: an ignored `search_after` or
-//! `highlight` would hand the client an answer to a different request.
+//! A key IceGate does not apply is refused rather than ignored: an ignored `highlight` would hand
+//! the client an answer to a different request.
 
 use std::borrow::Cow;
 use std::iter;
@@ -27,6 +27,9 @@ pub(crate) const DEFAULT_TOTAL_HITS_THRESHOLD: u64 = 10_000;
 /// a small request would multiply what a search holds in memory.
 const MAX_SORT_CLAUSES: usize = 64;
 
+/// The `numeric_type` values a field sort accepts.
+const NUMERIC_TYPES: [&str; 4] = ["long", "double", "date", "date_nanos"];
+
 /// A parsed search request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SearchRequest {
@@ -50,6 +53,8 @@ pub(crate) struct SearchRequest {
     pub(crate) version: bool,
     /// The `aggs` / `aggregations` body, unparsed: the evaluator that supports them parses it.
     pub(crate) aggregations: Option<Value>,
+    /// The sort values a page continues after; `None` when the body has no `search_after`.
+    pub(crate) search_after: Option<Vec<Value>>,
 }
 
 /// One sort clause.
@@ -63,6 +68,9 @@ pub(crate) enum SortClause {
         order: SortOrder,
         /// The type assumed where the mapping lacks the field.
         unmapped_type: Option<String>,
+        /// The numeric type the sort values are read as; validated, never applied (dates render
+        /// as epoch milliseconds).
+        numeric_type: Option<String>,
     },
     /// Sort on the score.
     Score {
@@ -225,6 +233,7 @@ fn parse_search_entries<'a, K: AsRef<str>>(
         seq_no_primary_term: false,
         version: false,
         aggregations: None,
+        search_after: None,
     };
     let mut body_track_total_hits = None;
     for (key, value) in entries {
@@ -239,6 +248,12 @@ fn parse_search_entries<'a, K: AsRef<str>>(
             "seq_no_primary_term" => request.seq_no_primary_term = read_flag(&value, key)?,
             "version" => request.version = read_flag(&value, key)?,
             "aggs" | "aggregations" => request.aggregations = Some(value.into_owned()),
+            "search_after" => {
+                let Value::Array(values) = value.into_owned() else {
+                    return Err(OpenSearchError::parsing("[search_after] must be an array"));
+                };
+                request.search_after = Some(values);
+            }
             unknown_key => {
                 return Err(OpenSearchError::parsing(format!(
                     "request does not support [{unknown_key}]"
@@ -403,26 +418,37 @@ fn parse_sort(value: &Value) -> Result<Vec<SortClause>, OpenSearchError> {
     }
 }
 
-/// One sort clause: `"field"`, `{"field": "asc"}` or `{"field": {"order", "unmapped_type"}}`.
+/// One sort clause: `"field"`, `{"field": "asc"}` or `{"field": {"order", "unmapped_type",
+/// "numeric_type"}}`. On `_doc` and `_score` the object form takes `order`, and accepts and
+/// ignores `unmapped_type`, since a document key has no mapping.
+///
+/// # Errors
+///
+/// `parsing_exception` for a malformed clause or an unknown option, and
+/// `illegal_argument_exception` for a `numeric_type` outside [`NUMERIC_TYPES`], so no evaluator
+/// receives one.
 fn parse_sort_clause(value: &Value) -> Result<SortClause, OpenSearchError> {
     match value {
-        Value::String(field) => Ok(build_sort_clause(field, None, None)),
+        Value::String(field) => Ok(build_sort_clause(field, None, None, None)),
         Value::Object(object) => {
             let mut entries = object.iter();
             let (Some((field, options)), None) = (entries.next(), entries.next()) else {
                 return Err(OpenSearchError::parsing("a sort clause names exactly one field"));
             };
             match options {
-                Value::String(order) => Ok(build_sort_clause(field, Some(SortOrder::parse(order)?), None)),
+                Value::String(order) => Ok(build_sort_clause(field, Some(SortOrder::parse(order)?), None, None)),
                 Value::Object(options) => {
                     let is_metadata_sort = field == "_score" || field == "_doc";
                     let mut order = None;
                     let mut unmapped_type = None;
+                    let mut numeric_type = None;
                     for (key, option) in options {
                         match (key.as_str(), option) {
                             ("order", Value::String(text)) => order = Some(SortOrder::parse(text)?),
-                            ("unmapped_type", Value::String(type_name)) if !is_metadata_sort => {
-                                unmapped_type = Some(type_name.clone());
+                            ("unmapped_type", Value::String(_)) if is_metadata_sort => {}
+                            ("unmapped_type", Value::String(type_name)) => unmapped_type = Some(type_name.clone()),
+                            ("numeric_type", Value::String(type_name)) if !is_metadata_sort => {
+                                numeric_type = Some(parse_numeric_type(type_name)?);
                             }
                             (unknown_option, _) => {
                                 return Err(OpenSearchError::parsing(format!(
@@ -431,7 +457,7 @@ fn parse_sort_clause(value: &Value) -> Result<SortClause, OpenSearchError> {
                             }
                         }
                     }
-                    Ok(build_sort_clause(field, order, unmapped_type))
+                    Ok(build_sort_clause(field, order, unmapped_type, numeric_type))
                 }
                 Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => {
                     Err(OpenSearchError::parsing(format!("malformed sort clause for [{field}]")))
@@ -444,8 +470,29 @@ fn parse_sort_clause(value: &Value) -> Result<SortClause, OpenSearchError> {
     }
 }
 
-/// The clause on `field`: `_score` defaults to `desc`, `_doc` and every field to `asc`.
-fn build_sort_clause(field: &str, order: Option<SortOrder>, unmapped_type: Option<String>) -> SortClause {
+/// A field sort's `numeric_type`, one of [`NUMERIC_TYPES`].
+///
+/// # Errors
+///
+/// Returns `illegal_argument_exception` naming any other value.
+fn parse_numeric_type(type_name: &str) -> Result<String, OpenSearchError> {
+    if NUMERIC_TYPES.contains(&type_name) {
+        return Ok(type_name.to_string());
+    }
+    Err(OpenSearchError::illegal_argument(format!(
+        "[numeric_type] must be one of [{}], got [{type_name}]",
+        NUMERIC_TYPES.join(", ")
+    )))
+}
+
+/// The clause on `field`: `_score` defaults to `desc`, `_doc` and every field to `asc`; a field
+/// clause carries its `unmapped_type` and `numeric_type`.
+fn build_sort_clause(
+    field: &str,
+    order: Option<SortOrder>,
+    unmapped_type: Option<String>,
+    numeric_type: Option<String>,
+) -> SortClause {
     match field {
         "_score" => SortClause::Score {
             order: order.unwrap_or(SortOrder::Desc),
@@ -457,6 +504,7 @@ fn build_sort_clause(field: &str, order: Option<SortOrder>, unmapped_type: Optio
             field: field.to_string(),
             order: order.unwrap_or(SortOrder::Asc),
             unmapped_type,
+            numeric_type,
         },
     }
 }
@@ -491,7 +539,6 @@ mod tests {
         for body in [
             json!({"query": {"match_all": {}}, "highlight": {"fields": {"*": {}}}}),
             json!({"script_fields": {"x": {"script": "1"}}}),
-            json!({"search_after": [1]}),
         ] {
             assert_refused(&body, "", "parsing_exception").await;
         }
@@ -623,6 +670,9 @@ mod tests {
                 {"dashboard.title.keyword": {"order": "asc", "unmapped_type": "keyword"}},
                 "_score",
                 {"_doc": {"order": "desc"}},
+                {"timestamp": {"order": "desc", "unmapped_type": "boolean", "numeric_type": "date_nanos"}},
+                {"_doc": {"order": "desc", "unmapped_type": "boolean"}},
+                {"_score": {"unmapped_type": "long"}},
                 "_doc",
                 {"_score": "asc"}
             ]}),
@@ -637,20 +687,31 @@ mod tests {
                 SortClause::Field {
                     field: "updated_at".to_string(),
                     order: SortOrder::Asc,
-                    unmapped_type: None
+                    unmapped_type: None,
+                    numeric_type: None,
                 },
                 SortClause::Field {
                     field: "type".to_string(),
                     order: SortOrder::Desc,
-                    unmapped_type: None
+                    unmapped_type: None,
+                    numeric_type: None,
                 },
                 SortClause::Field {
                     field: "dashboard.title.keyword".to_string(),
                     order: SortOrder::Asc,
                     unmapped_type: Some("keyword".to_string()),
+                    numeric_type: None,
                 },
                 SortClause::Score { order: SortOrder::Desc },
                 SortClause::Doc { order: SortOrder::Desc },
+                SortClause::Field {
+                    field: "timestamp".to_string(),
+                    order: SortOrder::Desc,
+                    unmapped_type: Some("boolean".to_string()),
+                    numeric_type: Some("date_nanos".to_string()),
+                },
+                SortClause::Doc { order: SortOrder::Desc },
+                SortClause::Score { order: SortOrder::Desc },
                 SortClause::Doc { order: SortOrder::Asc },
                 SortClause::Score { order: SortOrder::Asc },
             ]
@@ -660,23 +721,78 @@ mod tests {
             vec![SortClause::Field {
                 field: "_id".to_string(),
                 order: SortOrder::Desc,
-                unmapped_type: None
+                unmapped_type: None,
+                numeric_type: None,
             }]
         );
     }
 
+    /// An unknown option is refused rather than ignored, `numeric_type` included on `_doc` and
+    /// `_score`, and so is every malformed clause.
     #[tokio::test]
-    async fn malformed_sort_clauses_are_refused() {
+    async fn sort_clauses_with_unknown_options_are_refused() {
         for body in [
             json!({"sort": [{"updated_at": {"order": "up"}}]}),
             json!({"sort": [{"updated_at": {"order": 1}}]}),
             json!({"sort": [{"updated_at": "up"}]}),
             json!({"sort": [{"updated_at": 1}]}),
             json!({"sort": [{"updated_at": {"missing": "_first"}}]}),
-            json!({"sort": [{"_score": {"unmapped_type": "long"}}]}),
+            json!({"sort": [{"updated_at": {"numeric_type": 5}}]}),
+            json!({"sort": [{"_doc": {"missing": "_last"}}]}),
+            json!({"sort": [{"_score": {"numeric_type": "long"}}]}),
             json!({"sort": [{"a": "asc", "b": "desc"}]}),
             json!({"sort": [{}]}),
             json!({"sort": [1]}),
+        ] {
+            assert_refused(&body, "", "parsing_exception").await;
+        }
+    }
+
+    /// `numeric_type` is checked where every search request is parsed, so system and data indices
+    /// refuse the same values.
+    #[tokio::test]
+    async fn a_numeric_type_outside_the_accepted_set_is_an_illegal_argument() {
+        for numeric_type in ["long", "double", "date", "date_nanos"] {
+            let request =
+                parse_request(&json!({"sort": [{"timestamp": {"numeric_type": numeric_type}}]}), "").expect("parses");
+
+            assert_eq!(
+                request.sort,
+                vec![SortClause::Field {
+                    field: "timestamp".to_string(),
+                    order: SortOrder::Asc,
+                    unmapped_type: None,
+                    numeric_type: Some(numeric_type.to_string()),
+                }]
+            );
+        }
+        for numeric_type in ["fortnight", "integer", "Long", ""] {
+            let body = json!({"sort": [{"timestamp": {"numeric_type": numeric_type}}]});
+
+            assert_refused(&body, "", "illegal_argument_exception").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn search_after_parses_an_array_and_refuses_anything_else() {
+        let request = parse_request(&json!({"search_after": [1_760_000_000_000_i64, "x", null]}), "").expect("parses");
+        let parameters = parse_search_parameters("");
+        let borrowed_body = json!({"search_after": ["y"]});
+
+        assert_eq!(
+            request.search_after,
+            Some(vec![json!(1_760_000_000_000_i64), json!("x"), Value::Null])
+        );
+        assert_eq!(parse_request(&json!({}), "").expect("parses").search_after, None);
+        assert_eq!(
+            parse_search_value(&borrowed_body, &parameters).expect("parses").search_after,
+            Some(vec![json!("y")])
+        );
+        for body in [
+            json!({"search_after": 5}),
+            json!({"search_after": "x"}),
+            json!({"search_after": null}),
+            json!({"search_after": {"a": 1}}),
         ] {
             assert_refused(&body, "", "parsing_exception").await;
         }

@@ -239,7 +239,7 @@ enum SortKey<'s> {
 ///
 /// # Errors
 ///
-/// - `illegal_argument_exception` for aggregations, a mapping type or an `unmapped_type` the
+/// - `illegal_argument_exception` for aggregations, `search_after`, a mapping type or an `unmapped_type` the
 ///   evaluator does not support, a sort field of different kinds across `indices`, two sort clauses
 ///   reading one source of an index, naming the first such index of `indices`, or a stored value
 ///   that does not read as its sort field's kind;
@@ -256,6 +256,9 @@ pub(crate) fn search_system_indices(
         return Err(OpenSearchError::illegal_argument(
             "aggregations are not supported on system indices",
         ));
+    }
+    if request.search_after.is_some() {
+        return Err(OpenSearchError::unsupported_on_system_indices("search_after"));
     }
     let concrete_indices = find_system_indices(snapshot, indices)?;
     let sort_plans = concrete_indices
@@ -366,6 +369,7 @@ fn plan_sort<'r>(
                 field,
                 order,
                 unmapped_type,
+                ..
             } => plan_field_sort(mappings, index_name, field, *order, unmapped_type.as_deref()),
         })
         .collect::<Result<Vec<SortPlan<'r>>, OpenSearchError>>()?;
@@ -1635,5 +1639,22 @@ mod tests {
             json!({"total": 1, "successful": 1, "skipped": 0, "failed": 0})
         );
         assert!(plain_answer["took"].is_u64(), "{plain_answer}");
+    }
+
+    #[tokio::test]
+    async fn search_after_on_a_system_index_is_a_400_naming_it() {
+        let snapshot = build_snapshot(&[("a", json!({"type": "dashboard"}))]);
+
+        let error = search_kibana_index(
+            &snapshot,
+            &json!({"sort": [{"type": "asc"}], "search_after": ["dashboard"]}),
+            "",
+        )
+        .expect_err("search_after is refused");
+
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        assert_eq!(body["error"]["key"], "search_after");
     }
 }

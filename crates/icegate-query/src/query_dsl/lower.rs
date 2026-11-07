@@ -12,14 +12,19 @@ use datafusion::functions::string::expr_fn::{lower, starts_with};
 use datafusion::functions_nested::expr_fn::cardinality;
 use datafusion::logical_expr::expr::Like;
 use datafusion::logical_expr::{Expr, cast, in_list, lit, not, when};
+use datafusion::prelude::ident;
 use datafusion::scalar::ScalarValue;
+use icegate_common::schema::{COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID};
 use serde_json::Value;
 
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::opensearch::catalog::{FieldType, FieldValue, IndexEntry, ResolvedField, TenantSession, native_column_type};
 use crate::opensearch::error::OpenSearchError;
+use crate::opensearch::search::doc_id::{
+    DocumentIdPredicate, decode_document_id, document_row_hash_udf, is_instant_type,
+};
 use crate::query_dsl::ast::{
-    BoolQuery, ExistsQuery, PrefixQuery, Query, RangeBound, RangeQuery, TermQuery, TermsQuery, WildcardQuery,
+    BoolQuery, ExistsQuery, IdsQuery, PrefixQuery, Query, RangeBound, RangeQuery, TermQuery, TermsQuery, WildcardQuery,
 };
 use crate::query_dsl::date_math::{BoundSide, resolve_date_bound};
 use crate::query_dsl::literal::{
@@ -51,8 +56,9 @@ pub(crate) struct LoweringScope<'a> {
 /// out-of-range number; a boolean other than `true` or `false`; text that is no date) and for
 /// `prefix` or `wildcard` on an id, numeric, date or boolean field; `parsing_exception` for
 /// `nested` on a data index; `illegal_argument_exception` for the leaves the data path does not
-/// lower yet; `500` for a leaf on a column no `OpenSearch` type represents; and the error the
-/// index's table failed to open with.
+/// lower yet; `500` for a leaf on a column no `OpenSearch` type represents or for an `ids` value
+/// of an index with hashed ids and no timestamp column; and the error the index's table failed
+/// to open with.
 pub(crate) fn lower_query(query: &Query, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
     match query {
         Query::MatchAll => Ok(lit(true)),
@@ -65,10 +71,7 @@ pub(crate) fn lower_query(query: &Query, scope: &LoweringScope<'_>) -> Result<Ex
         Query::Exists(exists) => lower_exists(exists, scope),
         Query::Prefix(prefix) => lower_prefix(prefix, scope),
         Query::Wildcard(wildcard) => lower_wildcard(wildcard, scope),
-        Query::Ids(_) => Err(OpenSearchError::illegal_argument(format!(
-            "[ids] queries on data index [{}] are not supported yet",
-            scope.entry.name()
-        ))),
+        Query::Ids(ids) => lower_ids(ids, scope),
         Query::Nested(_) => Err(OpenSearchError::parsing(
             "[nested] queries are supported on system indices only",
         )),
@@ -644,6 +647,107 @@ pub(crate) fn build_date_literal(micros: i64, data_type: &DataType) -> Result<Ex
         }
     };
     Ok(lit(scalar))
+}
+
+/// What every hashed id of one index lowers with, read once per `ids` query.
+struct HashedIdColumns {
+    /// The type of the index's timestamp column, the unit its microsecond range is written in.
+    timestamp_type: DataType,
+    /// Whether the timestamp column may be NULL; such a row's `_id` carries microsecond `0`.
+    is_timestamp_nullable: bool,
+    /// The canonical row hash over every column of the index, in schema order.
+    row_hash: Expr,
+}
+
+impl HashedIdColumns {
+    /// Read the timestamp column and the columns of `scope`'s index.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error the index's table failed to open with, and `500` when the index has no
+    /// timestamp column.
+    fn from_scope(scope: &LoweringScope<'_>) -> Result<Self, OpenSearchError> {
+        let schema = scope.session.table_schema(scope.entry)?;
+        let timestamp_field = schema
+            .field_with_name(COL_TIMESTAMP)
+            .map_err(|_| OpenSearchError::internal("a hashed-id index has no timestamp column"))?;
+        let column_names: Vec<String> = schema.fields().iter().map(|field| field.name().clone()).collect();
+        let columns = column_names.iter().map(ident).collect();
+        Ok(Self {
+            timestamp_type: timestamp_field.data_type().clone(),
+            is_timestamp_nullable: timestamp_field.is_nullable(),
+            row_hash: document_row_hash_udf(column_names).call(columns),
+        })
+    }
+
+    /// The rows whose `_id` carries `timestamp_micros` and whose canonical hash is `row_hash`:
+    /// every row whose own `_id` this is, whatever the type of its timestamp column.
+    ///
+    /// # Errors
+    ///
+    /// Returns `500` when a boundary has no literal in the timestamp column's type.
+    fn build_predicate(&self, timestamp_micros: i64, row_hash: u64) -> Result<Expr, OpenSearchError> {
+        let row_hash_match = self.row_hash.clone().eq(lit(ScalarValue::UInt64(Some(row_hash))));
+        if !is_instant_type(&self.timestamp_type) {
+            // Such a column gives every row's `_id` microsecond 0, so no other id is of this
+            // index's form.
+            return Ok(if timestamp_micros == 0 {
+                row_hash_match
+            } else {
+                lit(false)
+            });
+        }
+        // The microsecond is the half-open range `[µs, µs + 1)` in the column's own unit, which
+        // rounds both ends up, so it holds the value a row's `_id` microsecond was floored from,
+        // whatever the unit, and both scans prune with it.
+        let mut instant = ident(COL_TIMESTAMP)
+            .gt_eq(build_date_literal(timestamp_micros, &self.timestamp_type)?)
+            .and(ident(COL_TIMESTAMP).lt(build_date_literal(
+                timestamp_micros.saturating_add(1),
+                &self.timestamp_type,
+            )?));
+        if timestamp_micros == 0 && self.is_timestamp_nullable {
+            // A row without a timestamp carries microsecond 0 in its `_id`.
+            instant = instant.or(ident(COL_TIMESTAMP).is_null());
+        }
+        Ok(instant.and(row_hash_match))
+    }
+}
+
+/// `ids`: each id decoded against this index. A spans-keyed id is a natural-key equality; a
+/// hashed id is its timestamp microsecond (prunable; at microsecond 0 also a NULL timestamp) and
+/// the canonical row hash, so an `_id` a search returned finds its own row. A malformed id, or
+/// one of another index's form, matches nothing.
+///
+/// # Errors
+///
+/// Returns the error the index's table failed to open with, and `500` when an index with hashed
+/// ids has no timestamp column.
+fn lower_ids(query: &IdsQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
+    let mut disjuncts = Vec::with_capacity(query.values.len());
+    // Read on the first hashed id: a query of span ids or of malformed ids never opens the schema.
+    let mut hashed_id_columns: Option<HashedIdColumns> = None;
+    for id in &query.values {
+        match decode_document_id(id, scope.entry) {
+            Some(DocumentIdPredicate::Span { trace_id, span_id }) => disjuncts.push(
+                ident(COL_TRACE_ID)
+                    .eq(lit(ScalarValue::FixedSizeBinary(16, Some(trace_id.to_vec()))))
+                    .and(ident(COL_SPAN_ID).eq(lit(ScalarValue::FixedSizeBinary(8, Some(span_id.to_vec()))))),
+            ),
+            Some(DocumentIdPredicate::Timestamped {
+                timestamp_micros,
+                row_hash,
+            }) => {
+                let columns = match hashed_id_columns {
+                    Some(ref columns) => columns,
+                    None => hashed_id_columns.insert(HashedIdColumns::from_scope(scope)?),
+                };
+                disjuncts.push(columns.build_predicate(timestamp_micros, row_hash)?);
+            }
+            None => {}
+        }
+    }
+    Ok(disjuncts.into_iter().reduce(Expr::or).unwrap_or_else(|| lit(false)))
 }
 
 /// An `exists`: a scalar or a struct is non-null; a MAP or a list holds at least one entry.

@@ -216,7 +216,7 @@ impl OpenSearchError {
         .with_metadata("index", index)
     }
 
-    /// The sort field `field` reads as different kinds in `first_index` and `other_index` (`400`),
+    /// The sort field `field` has different sort types in `first_index` and `other_index` (`400`),
     /// which `field` and `indices` carry for a client.
     pub(crate) fn sort_field_conflict(field: &str, first_index: &str, other_index: &str) -> Self {
         Self::illegal_argument(format!(
@@ -224,6 +224,13 @@ impl OpenSearchError {
         ))
         .with_metadata("field", field)
         .with_metadata("indices", json!([first_index, other_index]))
+    }
+
+    /// The request key `key` names a feature the system indices do not serve (`400`), which `key`
+    /// carries for a client. It is refused rather than ignored, because ignoring it would answer a
+    /// different request.
+    pub(crate) fn unsupported_on_system_indices(key: &str) -> Self {
+        Self::illegal_argument(format!("[{key}] is not supported on system indices")).with_metadata("key", key)
     }
 
     /// The document `id` of `index` holds a value of the sort field `field` that does not read as
