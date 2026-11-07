@@ -43,6 +43,13 @@ pub(crate) enum Query {
     MultiMatch(MultiMatchQuery),
     /// `simple_query_string`.
     SimpleQueryString(SimpleQueryStringQuery),
+    /// Internal: a predicate over every value of a MAP column. Built by the
+    /// full-text resolver for a field selection that covers all of a MAP
+    /// column's keys; never parsed from a request.
+    MapValues(MapValuesQuery),
+    /// Internal: consecutive tokens of one text field. Built by the full-text
+    /// resolver for a phrase of two or more tokens; never parsed from a request.
+    TokenPhrase(TokenPhraseQuery),
 }
 
 /// `bool`: every `must` and `filter` clause matches, no `must_not` clause matches, and at least
@@ -235,4 +242,83 @@ pub(crate) struct SimpleQueryStringQuery {
     pub(crate) default_operator: Operator,
     /// `None` defaults to `true` for the fields `*` and to `false` otherwise.
     pub(crate) lenient: Option<bool>,
+}
+
+/// What one value of a MAP column must satisfy. The values are keywords, so
+/// every comparison is exact and case-sensitive.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum MapValuePredicate {
+    /// The whole value equals the text.
+    Equals(String),
+    /// The value starts with the text.
+    StartsWith(String),
+}
+
+impl MapValuePredicate {
+    /// Whether one stored value satisfies the predicate.
+    pub(crate) fn matches(&self, value: &str) -> bool {
+        match self {
+            Self::Equals(expected) => value == expected,
+            Self::StartsWith(prefix) => value.starts_with(prefix.as_str()),
+        }
+    }
+}
+
+/// A predicate over the values of one MAP column: true when any entry's value
+/// satisfies it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MapValuesQuery {
+    /// The MAP column.
+    pub(crate) column: String,
+    /// What one value must satisfy.
+    pub(crate) predicate: MapValuePredicate,
+}
+
+/// Consecutive tokens of one text field, in order; with `is_last_token_prefix`
+/// the last token only has to start with the last listed one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TokenPhraseQuery {
+    /// The text field.
+    pub(crate) field: String,
+    /// The analyzed tokens, at least two.
+    pub(crate) tokens: Vec<String>,
+    /// Whether the last token is matched as a prefix.
+    pub(crate) is_last_token_prefix: bool,
+}
+
+/// A range over keyword-like values in UTF-8 byte order; an absent bound is open.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct KeywordRange {
+    /// The lower bound.
+    pub(crate) lower: Option<KeywordBound>,
+    /// The upper bound.
+    pub(crate) upper: Option<KeywordBound>,
+}
+
+impl KeywordRange {
+    /// Whether `value` lies inside the range.
+    pub(crate) fn contains(&self, value: &str) -> bool {
+        self.lower.as_ref().is_none_or(|bound| {
+            if bound.is_inclusive {
+                value >= bound.value.as_str()
+            } else {
+                value > bound.value.as_str()
+            }
+        }) && self.upper.as_ref().is_none_or(|bound| {
+            if bound.is_inclusive {
+                value <= bound.value.as_str()
+            } else {
+                value < bound.value.as_str()
+            }
+        })
+    }
+}
+
+/// One bound of a keyword range.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct KeywordBound {
+    /// The bound value.
+    pub(crate) value: String,
+    /// Whether the bound value itself is inside the range.
+    pub(crate) is_inclusive: bool,
 }

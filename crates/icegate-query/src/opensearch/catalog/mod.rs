@@ -36,7 +36,7 @@ use tokio::sync::OnceCell;
 
 use self::expression::ExpressionPart;
 pub(crate) use self::expression::IndexExpression;
-pub(crate) use self::field::{FieldType, FieldValue, IndexField, ResolvedField};
+pub(crate) use self::field::{FieldType, FieldValue, IndexField, ResolvedField, SelectedField};
 use self::map_key_cache::{MapKeyCache, MapKeys, MapKeysVersion};
 pub(crate) use self::native::native_column_type;
 use self::native::{list_native_fields, resolve_native_field};
@@ -662,7 +662,10 @@ mod tests {
     use crate::infra::metrics::test_support::{build_meter_provider, find_counter_total};
     use crate::opensearch::error::render_envelope;
     use crate::opensearch::extract::ExpandWildcards;
-    use crate::test_support::{LogAttributesRow, build_logs_warehouse, build_tenant, commit_log_attributes_rows};
+    use crate::test_support::{
+        LogAttributesRow, SearchFixture, build_logs_warehouse, build_tenant, commit_log_attributes_rows,
+        find_index_entry,
+    };
 
     const TENANT_A: &str = "tenant-a";
     const TENANT_B: &str = "tenant-b";
@@ -1086,5 +1089,131 @@ mod tests {
 
             assert_eq!(merged_names, expected_names, "{left_names:?} and {right_names:?}");
         }
+    }
+
+    /// A selection read back as comparable values: each field's resolution, or the MAP column a
+    /// whole-map selection names.
+    fn read_selected_fields(selected_fields: Vec<SelectedField>) -> Vec<(Option<ResolvedField>, Option<String>)> {
+        selected_fields
+            .into_iter()
+            .map(|selected_field| match selected_field {
+                SelectedField::Field(field) => (Some(field), None),
+                SelectedField::AllMapValues { column } => (None, Some(column)),
+            })
+            .collect()
+    }
+
+    /// List and struct columns hold no value a full-text term compares with, so a pattern skips
+    /// them; a MAP column it covers whole is one selection; and a pattern over the resource
+    /// attributes reaches the column ingest moved `service.name` into.
+    #[tokio::test]
+    async fn a_field_pattern_skips_list_columns_and_reaches_promoted_resource_keys() {
+        let fixture = SearchFixture::new().await;
+        let session = fixture.open_session(TENANT_A).await;
+        let spans = find_index_entry(&session, SPANS_TABLE);
+        let logs = find_index_entry(&session, LOGS_TABLE);
+
+        for list_pattern in ["event*", "link*"] {
+            assert_eq!(
+                read_selected_fields(session.expand_field_pattern(spans, list_pattern).expect("a selection")),
+                Vec::new(),
+                "[{list_pattern}] names only a list column"
+            );
+        }
+        let every_span_field =
+            read_selected_fields(session.expand_field_pattern(spans, "*").expect("a selection of every field"));
+        for list_column in [schema::COL_EVENTS, schema::COL_LINKS] {
+            assert!(
+                every_span_field
+                    .iter()
+                    .all(|(field, _)| field.as_ref().is_none_or(|field| field.name != list_column)),
+                "[*] skips [{list_column}]"
+            );
+        }
+        assert!(every_span_field.contains(&(None, Some(COL_SPAN_ATTRIBUTES.to_string()))));
+        assert!(every_span_field.contains(&(
+            Some(ResolvedField {
+                name: schema::COL_NAME.to_string(),
+                field_type: FieldType::Keyword,
+                value: FieldValue::Column {
+                    column: schema::COL_NAME.to_string(),
+                },
+            }),
+            None
+        )));
+
+        assert_eq!(
+            read_selected_fields(
+                session
+                    .expand_field_pattern(logs, "resource_attributes.*")
+                    .expect("a selection of every resource attribute")
+            ),
+            vec![
+                (None, Some(COL_RESOURCE_ATTRIBUTES.to_string())),
+                (
+                    Some(ResolvedField {
+                        name: schema::COL_SERVICE_NAME.to_string(),
+                        field_type: FieldType::Keyword,
+                        value: FieldValue::Column {
+                            column: schema::COL_SERVICE_NAME.to_string(),
+                        },
+                    }),
+                    None
+                ),
+            ]
+        );
+    }
+
+    /// A name without `*` or `?` is not a glob: it resolves exactly like a field name, so a
+    /// single MAP key is one keyword field rather than a partial selection of the map (which
+    /// a glob refuses), and an unmapped name selects nothing.
+    #[tokio::test]
+    async fn a_field_pattern_without_glob_characters_resolves_like_a_field_name() {
+        let fixture = SearchFixture::new().await;
+        let session = fixture.open_session(TENANT_A).await;
+        let logs = find_index_entry(&session, LOGS_TABLE);
+
+        assert_eq!(
+            read_selected_fields(
+                session
+                    .expand_field_pattern(logs, schema::COL_SERVICE_NAME)
+                    .expect("a selection of one column")
+            ),
+            vec![(
+                Some(ResolvedField {
+                    name: String::from("service_name"),
+                    field_type: FieldType::Keyword,
+                    value: FieldValue::Column {
+                        column: schema::COL_SERVICE_NAME.to_string(),
+                    },
+                }),
+                None
+            )]
+        );
+        assert_eq!(
+            read_selected_fields(
+                session
+                    .expand_field_pattern(logs, "log_attributes.http.method")
+                    .expect("a selection of one key")
+            ),
+            vec![(
+                Some(ResolvedField {
+                    name: String::from("log_attributes.http.method"),
+                    field_type: FieldType::Keyword,
+                    value: FieldValue::MapKey {
+                        column: COL_LOG_ATTRIBUTES.to_string(),
+                        key: String::from("http.method"),
+                    },
+                }),
+                None
+            )]
+        );
+        assert!(
+            session
+                .expand_field_pattern(logs, "no_such_field")
+                .expect("an empty selection")
+                .is_empty(),
+            "an unmapped name selects nothing"
+        );
     }
 }

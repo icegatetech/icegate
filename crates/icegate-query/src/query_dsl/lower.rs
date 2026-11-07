@@ -18,18 +18,31 @@ use icegate_common::schema::{COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID};
 use serde_json::Value;
 
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
-use crate::opensearch::catalog::{FieldType, FieldValue, IndexEntry, ResolvedField, TenantSession, native_column_type};
+use crate::opensearch::catalog::{
+    FieldType, FieldValue, IndexEntry, ResolvedField, SelectedField, TenantSession, native_column_type,
+};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::{
     DocumentIdPredicate, decode_document_id, document_row_hash_udf, is_instant_type,
 };
+use crate::query_dsl::analyzer::normalize_standard;
 use crate::query_dsl::ast::{
-    BoolQuery, ExistsQuery, IdsQuery, PrefixQuery, Query, RangeBound, RangeQuery, TermQuery, TermsQuery, WildcardQuery,
+    BoolQuery, ExistsQuery, IdsQuery, MapValuesQuery, MatchPhrasePrefixQuery, MatchPhraseQuery, MatchQuery,
+    MultiMatchQuery, MultiMatchType, Operator, PrefixQuery, Query, RangeBound, RangeQuery, SimpleQueryStringQuery,
+    TermQuery, TermsQuery, TokenPhraseQuery, WildcardQuery, ZeroTermsQuery,
 };
 use crate::query_dsl::date_math::{BoundSide, resolve_date_bound};
+use crate::query_dsl::full_text::{
+    FieldSelector, FullTextFields, FullTextLeaf, FullTextQuery, FullTextTerm, LeafSettings, SearchField, SearchKind,
+    build_field_selectors, build_simple_query_tree, resolve_full_text, selects_all_fields,
+};
 use crate::query_dsl::literal::{
     IntegerBound, LiteralError, NumericTerm, parse_boolean_literal, parse_java_double, parse_numeric_term,
     resolve_date_term, resolve_integer_bound, step_exclusive_double,
+};
+use crate::query_dsl::udf::{
+    build_map_value_match_udf, build_text_phrase_match_udf, build_text_prefix_match_udf, build_text_range_match_udf,
+    build_text_regex_match_udf, build_text_term_match_udf, escape_wildcard, translate_wildcard,
 };
 
 /// What a query is lowered against: one index of one tenant-scoped session, at the request
@@ -54,9 +67,11 @@ pub(crate) struct LoweringScope<'a> {
 /// Returns the 400 `search_phase_execution_exception` with a `query_shard_exception` root cause
 /// for a literal of the wrong form for its field (an invalid hex id; a malformed, non-finite or
 /// out-of-range number; a boolean other than `true` or `false`; text that is no date) and for
-/// `prefix` or `wildcard` on an id, numeric, date or boolean field; `parsing_exception` for
-/// `nested` on a data index; `illegal_argument_exception` for the leaves the data path does not
-/// lower yet; `500` for a leaf on a column no `OpenSearch` type represents or for an `ids` value
+/// `prefix` or `wildcard` on an id, numeric, date or boolean field, for a strict full-text leaf
+/// whose text does not parse for a typed field, and for a phrase prefix on a field that is not
+/// text; `parsing_exception` for `nested` on a data index; `illegal_argument_exception` for a
+/// field pattern that selects only some keys of a MAP column and for a pattern that does not
+/// compile; `500` for a leaf on a column no `OpenSearch` type represents or for an `ids` value
 /// of an index with hashed ids and no timestamp column; and the error the index's table failed
 /// to open with.
 pub(crate) fn lower_query(query: &Query, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
@@ -75,14 +90,252 @@ pub(crate) fn lower_query(query: &Query, scope: &LoweringScope<'_>) -> Result<Ex
         Query::Nested(_) => Err(OpenSearchError::parsing(
             "[nested] queries are supported on system indices only",
         )),
-        Query::Match(_)
-        | Query::MatchPhrase(_)
-        | Query::MatchPhrasePrefix(_)
-        | Query::MultiMatch(_)
-        | Query::SimpleQueryString(_) => Err(OpenSearchError::illegal_argument(format!(
-            "full-text queries on data index [{}] are not supported yet",
-            scope.entry.name()
+        Query::Match(query) => lower_match(query, scope),
+        Query::MatchPhrase(query) => lower_match_phrase(query, scope),
+        Query::MatchPhrasePrefix(query) => lower_match_phrase_prefix(query, scope),
+        Query::MultiMatch(query) => lower_multi_match(query, scope),
+        Query::SimpleQueryString(query) => lower_simple_query_string(query, scope),
+        Query::MapValues(query) => Ok(lower_map_values(query)),
+        Query::TokenPhrase(query) => lower_token_phrase(query, scope),
+    }
+}
+
+/// The searchable fields of the index a lowering scope reads, for the full-text resolver.
+struct IndexSearchFields<'a> {
+    scope: &'a LoweringScope<'a>,
+}
+
+impl FullTextFields for IndexSearchFields<'_> {
+    fn index_name(&self) -> &str {
+        self.scope.entry.name()
+    }
+
+    fn expand_selector(&self, selector: &FieldSelector) -> Result<Vec<SearchField>, OpenSearchError> {
+        let selected_fields = match selector {
+            FieldSelector::Name(name) => self.scope.session.select_named_field(self.scope.entry, name),
+            FieldSelector::Pattern(pattern) => self.scope.session.expand_field_pattern(self.scope.entry, pattern)?,
+        };
+        Ok(selected_fields.into_iter().filter_map(build_search_field).collect())
+    }
+}
+
+/// The searchable field one selected field stands for; `None` for an object field.
+fn build_search_field(selected_field: SelectedField) -> Option<SearchField> {
+    match selected_field {
+        SelectedField::Field(field) => {
+            read_search_kind(&field).map(|kind| SearchField::Typed { name: field.name, kind })
+        }
+        SelectedField::AllMapValues { column } => Some(SearchField::MapValues { column }),
+    }
+}
+
+/// How a resolved field matches full-text input; an object field (a MAP column
+/// named whole) matches nothing.
+const fn read_search_kind(field: &ResolvedField) -> Option<SearchKind> {
+    if let FieldValue::HexId { width, .. } = &field.value {
+        return Some(SearchKind::HexId { width: *width });
+    }
+    match field.field_type {
+        FieldType::Text => Some(SearchKind::Text),
+        FieldType::Keyword => Some(SearchKind::Keyword),
+        FieldType::Date => Some(SearchKind::Date),
+        FieldType::Integer => Some(SearchKind::Integer),
+        FieldType::Long => Some(SearchKind::Long),
+        FieldType::Double => Some(SearchKind::Double),
+        FieldType::Boolean => Some(SearchKind::Boolean),
+        FieldType::Object => None,
+    }
+}
+
+/// Resolves a full-text tree for this index and lowers what survives;
+/// `when_dropped` is what a tree whose every clause analyzed to no token matches.
+fn lower_full_text(
+    query: &FullTextQuery,
+    scope: &LoweringScope<'_>,
+    when_dropped: Expr,
+) -> Result<Expr, OpenSearchError> {
+    resolve_full_text(query, &IndexSearchFields { scope }, scope.now)?.map_or_else(
+        || Ok(when_dropped),
+        |resolved_query| lower_query(&resolved_query, scope),
+    )
+}
+
+/// `match` on one field; a text with no token matches what `zero_terms_query` says.
+fn lower_match(query: &MatchQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
+    let settings = LeafSettings {
+        operator: query.operator,
+        is_lenient: query.lenient.unwrap_or(false),
+    };
+    let leaf = settings.build_leaf(
+        vec![FieldSelector::Name(query.field.clone())],
+        FullTextTerm::Text(render_literal_text(&query.query, &query.field)?),
+    );
+    let when_dropped = match query.zero_terms_query {
+        ZeroTermsQuery::All => lit(true),
+        ZeroTermsQuery::None => lit(false),
+    };
+    lower_full_text(&FullTextQuery::Leaf(leaf), scope, when_dropped)
+}
+
+/// `match_phrase` on one field, strict; a phrase with no token matches nothing.
+fn lower_match_phrase(query: &MatchPhraseQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
+    let leaf = build_strict_field_leaf(&query.field, FullTextTerm::Phrase(query.query.clone()));
+    lower_full_text(&FullTextQuery::Leaf(leaf), scope, lit(false))
+}
+
+/// `match_phrase_prefix` on one field, strict: every token sharing the last token's prefix
+/// counts, with no expansion limit.
+fn lower_match_phrase_prefix(
+    query: &MatchPhrasePrefixQuery,
+    scope: &LoweringScope<'_>,
+) -> Result<Expr, OpenSearchError> {
+    let leaf = build_strict_field_leaf(&query.field, FullTextTerm::PhrasePrefix(query.query.clone()));
+    lower_full_text(&FullTextQuery::Leaf(leaf), scope, lit(false))
+}
+
+/// A leaf over the one field a phrase query names: strict, and the operator is
+/// irrelevant because a phrase is never split into alternative terms.
+fn build_strict_field_leaf(field: &str, term: FullTextTerm) -> FullTextLeaf {
+    let settings = LeafSettings {
+        operator: Operator::Or,
+        is_lenient: false,
+    };
+    settings.build_leaf(vec![FieldSelector::Name(field.to_owned())], term)
+}
+
+/// `multi_match`: one field of the list matching is enough; lenient by default under the
+/// all-fields selection.
+fn lower_multi_match(query: &MultiMatchQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
+    let settings = LeafSettings {
+        operator: query.operator,
+        is_lenient: query.lenient.unwrap_or_else(|| selects_all_fields(&query.fields)),
+    };
+    let term = match query.match_type {
+        MultiMatchType::BestFields => FullTextTerm::Text(query.query.clone()),
+        MultiMatchType::Phrase => FullTextTerm::Phrase(query.query.clone()),
+    };
+    let leaf = settings.build_leaf(build_field_selectors(&query.fields), term);
+    lower_full_text(&FullTextQuery::Leaf(leaf), scope, lit(false))
+}
+
+/// `simple_query_string`: the DSL parser has already parsed the query string, so the
+/// tree is built from that parse.
+fn lower_simple_query_string(
+    query: &SimpleQueryStringQuery,
+    scope: &LoweringScope<'_>,
+) -> Result<Expr, OpenSearchError> {
+    let settings = LeafSettings {
+        operator: query.default_operator,
+        is_lenient: query.lenient.unwrap_or_else(|| selects_all_fields(&query.fields)),
+    };
+    let tree = build_simple_query_tree(&query.query, &build_field_selectors(&query.fields), &settings);
+    lower_full_text(&tree, scope, lit(false))
+}
+
+/// Any value of the MAP column satisfies the predicate.
+fn lower_map_values(query: &MapValuesQuery) -> Expr {
+    build_map_value_match_udf(query.predicate.clone()).call(vec![ident(&query.column)])
+}
+
+/// Consecutive tokens of a text column; a field the index lacks matches nothing.
+///
+/// # Errors
+///
+/// `500` when the field is not a text column: the resolver builds a token phrase only for one.
+fn lower_token_phrase(query: &TokenPhraseQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
+    let Some(field) = scope.session.resolve_field(scope.entry, &query.field) else {
+        return Ok(lit(false));
+    };
+    let Some(column) = find_text_column(&field) else {
+        return Err(OpenSearchError::internal(format!(
+            "a token phrase reached [{}], which is not a text column",
+            query.field
+        )));
+    };
+    let tokens: Vec<ScalarValue> = query
+        .tokens
+        .iter()
+        .map(|token| ScalarValue::Utf8(Some(token.clone())))
+        .collect();
+    Ok(build_text_phrase_match_udf().call(vec![
+        ident(column),
+        lit(ScalarValue::List(ScalarValue::new_list_nullable(
+            &tokens,
+            &DataType::Utf8,
         ))),
+        lit(query.is_last_token_prefix),
+    ]))
+}
+
+/// The column of a resolved text field; `None` for every other field.
+fn find_text_column(field: &ResolvedField) -> Option<&str> {
+    match (&field.value, field.field_type) {
+        (FieldValue::Column { column }, FieldType::Text) => Some(column),
+        _ => None,
+    }
+}
+
+/// One token of a text column equals `term`. The term is never analyzed, so
+/// `term: {body: "Error"}` matches no token (tokens are lower case); with
+/// `is_case_insensitive` ASCII letters match in either case.
+fn match_text_token(text: Expr, term: &str, is_case_insensitive: bool) -> Result<Expr, OpenSearchError> {
+    if is_case_insensitive {
+        return Ok(build_text_regex_match_udf(translate_wildcard(&escape_wildcard(term), true)?).call(vec![text]));
+    }
+    Ok(build_text_term_match_udf().call(vec![text, lit(term.to_owned())]))
+}
+
+/// `terms` on a text column: one token equals one of the terms.
+fn lower_text_terms(text: Expr, terms: &[String]) -> Result<Expr, OpenSearchError> {
+    let Some((last_term, leading_terms)) = terms.split_last() else {
+        return Ok(lit(false));
+    };
+    let mut disjuncts = Vec::with_capacity(terms.len());
+    for term in leading_terms {
+        disjuncts.push(match_text_token(text.clone(), term, false)?);
+    }
+    disjuncts.push(match_text_token(text, last_term, false)?);
+    Ok(disjuncts.into_iter().reduce(Expr::or).unwrap_or_else(|| lit(false)))
+}
+
+/// `prefix` on a text column: one token starts with the value lowercased the way the
+/// analyzer lowercases (`normalize_standard`); the value is never split.
+fn lower_text_prefix(text: Expr, query: &PrefixQuery) -> Result<Expr, OpenSearchError> {
+    let prefix = normalize_standard(&query.value);
+    if query.case_insensitive {
+        let pattern = translate_wildcard(&format!("{}*", escape_wildcard(&prefix)), true)?;
+        return Ok(build_text_regex_match_udf(pattern).call(vec![text]));
+    }
+    Ok(build_text_prefix_match_udf().call(vec![text, lit(prefix)]))
+}
+
+/// `wildcard` on a text column: one token matches the pattern lowercased the way the
+/// analyzer lowercases (`normalize_standard`); the pattern is never split.
+fn lower_text_wildcard(text: Expr, query: &WildcardQuery) -> Result<Expr, OpenSearchError> {
+    let pattern = translate_wildcard(&normalize_standard(&query.pattern), query.case_insensitive)?;
+    Ok(build_text_regex_match_udf(pattern).call(vec![text]))
+}
+
+/// `range` on a text column: one token lies in the range, in UTF-8 byte order. A range
+/// with no bound matches every row holding at least one token, as on system indices: a text
+/// that analyzes to no token holds no value to compare.
+fn lower_text_range(text: Expr, query: &RangeQuery) -> Result<Expr, OpenSearchError> {
+    let (lower, is_lower_inclusive) = build_text_range_bound(query.lower.as_ref(), &query.field)?;
+    let (upper, is_upper_inclusive) = build_text_range_bound(query.upper.as_ref(), &query.field)?;
+    Ok(build_text_range_match_udf().call(vec![
+        text,
+        lower,
+        lit(is_lower_inclusive),
+        upper,
+        lit(is_upper_inclusive),
+    ]))
+}
+
+/// A range bound as the two arguments of `text_range_match`; an absent bound is open (NULL).
+fn build_text_range_bound(bound: Option<&RangeBound>, field: &str) -> Result<(Expr, bool), OpenSearchError> {
+    match bound {
+        Some(bound) => Ok((lit(render_literal_text(&bound.value, field)?), bound.is_inclusive)),
+        None => Ok((lit(ScalarValue::Utf8(None)), false)),
     }
 }
 
@@ -188,16 +441,6 @@ fn decode_hex_literal(
         })
 }
 
-/// The 400 for a leaf this field type does not lower yet.
-fn refuse_unsupported_leaf(field: &ResolvedField, leaf: &str, scope: &LoweringScope<'_>) -> OpenSearchError {
-    OpenSearchError::illegal_argument(format!(
-        "[{leaf}] on field [{}] of type [{}] in data index [{}] is not supported yet",
-        field.name,
-        field.field_type.name(),
-        scope.entry.name()
-    ))
-}
-
 /// The final query-shard 400 for a term pattern (`prefix`, `wildcard`) on a field that only
 /// matches whole parsed values.
 fn refuse_term_pattern(field: &ResolvedField, leaf: &str, scope: &LoweringScope<'_>) -> OpenSearchError {
@@ -214,8 +457,9 @@ fn refuse_term_pattern(field: &ResolvedField, leaf: &str, scope: &LoweringScope<
     )
 }
 
-/// A `term`: an exact keyword, hex-id, numeric or boolean equality, or the range a date term
-/// covers; a name the index lacks, or an `object`, matches nothing.
+/// A `term`: an exact keyword, hex-id, numeric or boolean equality, the range a date term
+/// covers, or one token of a text field equal to the unanalyzed term; a name the index lacks,
+/// or an `object`, matches nothing.
 fn lower_term(query: &TermQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
     let Some(field) = resolve_leaf_field(scope, &query.field)? else {
         return Ok(lit(false));
@@ -242,7 +486,7 @@ fn lower_term(query: &TermQuery, scope: &LoweringScope<'_>) -> Result<Expr, Open
             lower_date_term(read_expr, &text, &data_type, &field, scope)
         }
         (FieldType::Object, _) => Ok(lit(false)),
-        (FieldType::Text, _) => Err(refuse_unsupported_leaf(&field, "term", scope)),
+        (FieldType::Text, _) => match_text_token(read_expr, &text, query.case_insensitive),
     }
 }
 
@@ -303,7 +547,7 @@ fn lower_terms(query: &TermsQuery, scope: &LoweringScope<'_>) -> Result<Expr, Op
             Ok(covered_ranges.into_iter().reduce(Expr::or).unwrap_or_else(|| lit(false)))
         }
         (FieldType::Object, _) => Ok(lit(false)),
-        (FieldType::Text, _) => Err(refuse_unsupported_leaf(&field, "terms", scope)),
+        (FieldType::Text, _) => lower_text_terms(read_expr, &texts),
     }
 }
 
@@ -313,7 +557,8 @@ fn conjoin_bounds(read_expr: Expr, bounds: Vec<Expr>) -> Expr {
 }
 
 /// A `range`: keyword bounds compare lexicographically, hex-id bounds byte-wise, numeric and
-/// boolean bounds by their typed rules, and date bounds as typed timestamps of the column's unit.
+/// boolean bounds by their typed rules, date bounds as typed timestamps of the column's unit, and
+/// text bounds with each token of the field.
 fn lower_range(query: &RangeQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
     let Some(field) = resolve_leaf_field(scope, &query.field)? else {
         return Ok(lit(false));
@@ -354,7 +599,7 @@ fn lower_range(query: &RangeQuery, scope: &LoweringScope<'_>) -> Result<Expr, Op
         (FieldType::Double, _) => lower_double_range(query, read_expr, &field, scope),
         (FieldType::Boolean, _) => lower_boolean_range(query, read_expr, &field, scope),
         (FieldType::Object | FieldType::Date, _) => Ok(lit(false)),
-        (FieldType::Text, _) => Err(refuse_unsupported_leaf(&field, "range", scope)),
+        (FieldType::Text, _) => lower_text_range(read_expr, query),
     }
 }
 
@@ -785,8 +1030,8 @@ fn lower_exists(query: &ExistsQuery, scope: &LoweringScope<'_>) -> Result<Expr, 
     })
 }
 
-/// A `prefix` on a keyword value; the final query-shard 400 on an id, numeric, date or boolean
-/// field.
+/// A `prefix` on a keyword value or on one token of a text field; the final query-shard 400 on
+/// an id, numeric, date or boolean field.
 fn lower_prefix(query: &PrefixQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
     let Some(field) = resolve_leaf_field(scope, &query.field)? else {
         return Ok(lit(false));
@@ -801,7 +1046,7 @@ fn lower_prefix(query: &PrefixQuery, scope: &LoweringScope<'_>) -> Result<Expr, 
             })
         }
         (FieldType::Object, _) => Ok(lit(false)),
-        (FieldType::Text, _) => Err(refuse_unsupported_leaf(&field, "prefix", scope)),
+        (FieldType::Text, _) => lower_text_prefix(field.value.build_read_expr(), query),
         (FieldType::Keyword, FieldValue::HexId { .. })
         | (FieldType::Date | FieldType::Integer | FieldType::Long | FieldType::Double | FieldType::Boolean, _) => {
             Err(refuse_term_pattern(&field, "prefix", scope))
@@ -809,8 +1054,8 @@ fn lower_prefix(query: &PrefixQuery, scope: &LoweringScope<'_>) -> Result<Expr, 
     }
 }
 
-/// A `wildcard` over a whole keyword value; the final query-shard 400 on an id, numeric, date
-/// or boolean field.
+/// A `wildcard` over a whole keyword value or one token of a text field; the final query-shard
+/// 400 on an id, numeric, date or boolean field.
 fn lower_wildcard(query: &WildcardQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
     let Some(field) = resolve_leaf_field(scope, &query.field)? else {
         return Ok(lit(false));
@@ -824,7 +1069,7 @@ fn lower_wildcard(query: &WildcardQuery, scope: &LoweringScope<'_>) -> Result<Ex
             query.case_insensitive,
         ))),
         (FieldType::Object, _) => Ok(lit(false)),
-        (FieldType::Text, _) => Err(refuse_unsupported_leaf(&field, "wildcard", scope)),
+        (FieldType::Text, _) => lower_text_wildcard(field.value.build_read_expr(), query),
         (FieldType::Keyword, FieldValue::HexId { .. })
         | (FieldType::Date | FieldType::Integer | FieldType::Long | FieldType::Double | FieldType::Boolean, _) => {
             Err(refuse_term_pattern(&field, "wildcard", scope))

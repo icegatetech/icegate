@@ -55,12 +55,13 @@ use serde_json::Value;
 
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::glob::matches_glob;
-use crate::query_dsl::analyzer::{Token, normalize_standard, tokenize_standard};
+use crate::query_dsl::analyzer::{Token, contains_token_phrase, normalize_standard, tokenize_standard};
 use crate::query_dsl::ast::{
-    ALL_FIELDS, BoolQuery, MatchQuery, MultiMatchQuery, MultiMatchType, NestedQuery, Operator, Query, RangeBound,
-    RangeQuery, SimpleQueryStringQuery, ZeroTermsQuery,
+    BoolQuery, MatchQuery, MultiMatchQuery, MultiMatchType, NestedQuery, Operator, Query, RangeBound, RangeQuery,
+    SimpleQueryStringQuery, ZeroTermsQuery,
 };
 use crate::query_dsl::date_math::{BoundSide, parse_stored_date_millis, resolve_date_bound};
+use crate::query_dsl::full_text::selects_all_fields;
 use crate::query_dsl::simple_query::SimpleQuery;
 
 /// The metadata field naming a document's id.
@@ -344,6 +345,9 @@ impl<'a> DocumentView<'a> {
             }
             Query::MultiMatch(query) => self.matches_multi_match(query),
             Query::SimpleQueryString(query) => self.matches_simple_query_string(query),
+            Query::MapValues(_) | Query::TokenPhrase(_) => Err(OpenSearchError::internal(
+                "a leaf the full-text resolver builds for data indices reached the system-index evaluator",
+            )),
         }
     }
 
@@ -673,7 +677,7 @@ impl<'a> DocumentView<'a> {
             MultiMatchType::BestFields => FullTextForm::Tokens(query.operator),
             MultiMatchType::Phrase => FullTextForm::Phrase,
         };
-        let is_lenient = query.lenient.unwrap_or_else(|| is_all_fields(&query.fields));
+        let is_lenient = query.lenient.unwrap_or_else(|| selects_all_fields(&query.fields));
         let fields = self.resolve_searched_fields(&query.fields)?;
         let match_result = self.match_any_field(&fields, &QueryText::new(&query.query, form), is_lenient)?;
         Ok(match_result.unwrap_or(false))
@@ -681,7 +685,7 @@ impl<'a> DocumentView<'a> {
 
     /// Whether this document satisfies a `simple_query_string`.
     fn matches_simple_query_string(&self, query: &SimpleQueryStringQuery) -> Result<bool, OpenSearchError> {
-        let is_lenient = query.lenient.unwrap_or_else(|| is_all_fields(&query.fields));
+        let is_lenient = query.lenient.unwrap_or_else(|| selects_all_fields(&query.fields));
         let fields = self.resolve_searched_fields(&query.fields)?;
         let match_result = self.evaluate_simple_query(&query.query, &fields, query.default_operator, is_lenient)?;
         Ok(match_result.unwrap_or(false))
@@ -1180,11 +1184,6 @@ impl<'t> QueryText<'t> {
     }
 }
 
-/// Whether `patterns` hold the all-fields pattern, under which `lenient` defaults to true.
-fn is_all_fields(patterns: &[String]) -> bool {
-    patterns.iter().any(|pattern| pattern == ALL_FIELDS)
-}
-
 /// Full-text matching on the values of a `text` field, each analyzed on its own (through
 /// `analyzed_values`, so once per document and query); `None` when the query text yields no token.
 fn match_analyzed_values(
@@ -1215,41 +1214,10 @@ fn match_analyzed_values(
         FullTextForm::Tokens(Operator::And) => {
             query_tokens.iter().all(|query_token| contains_token(&tokens, query_token))
         }
-        FullTextForm::Phrase => contains_phrase(&tokens, query_tokens, false),
+        FullTextForm::Phrase => contains_token_phrase(&tokens, query_tokens, false),
         // A `Prefix` text has no tokens and returned above; it is listed because the match is exhaustive.
-        FullTextForm::PhrasePrefix | FullTextForm::Prefix => contains_phrase(&tokens, query_tokens, true),
+        FullTextForm::PhrasePrefix | FullTextForm::Prefix => contains_token_phrase(&tokens, query_tokens, true),
     }))
-}
-
-/// Whether `phrase` occurs in `tokens` at consecutive positions; with `is_prefix`, its last token
-/// need only prefix the token at its position.
-fn contains_phrase(tokens: &[Token], phrase: &[Token], is_prefix: bool) -> bool {
-    let Some((last_token, leading_tokens)) = phrase.split_last() else {
-        return false;
-    };
-    tokens.windows(phrase.len()).any(|window| {
-        // `Token::position` is what a phrase is defined over. The standard analyzer numbers tokens
-        // one by one, so neighbours in the slice hold it today; the check is what keeps a phrase
-        // from spanning a gap if a token stream ever leaves one.
-        let is_consecutive = || {
-            window
-                .iter()
-                .zip(0_u32..)
-                .all(|(token, offset)| window[0].position.checked_add(offset) == Some(token.position))
-        };
-        window
-            .iter()
-            .zip(leading_tokens)
-            .all(|(token, query_token)| token.text == query_token.text)
-            && window.last().is_some_and(|token| {
-                if is_prefix {
-                    token.text.starts_with(&last_token.text)
-                } else {
-                    token.text == last_token.text
-                }
-            })
-            && is_consecutive()
-    })
 }
 
 /// The node `mapping_node` declares through `properties` for one path `segment`; `None` for a

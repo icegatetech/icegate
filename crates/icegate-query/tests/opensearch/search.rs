@@ -2,6 +2,7 @@
 //! explicit values, and every expected result is stated here.
 #![allow(clippy::expect_used)]
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -2811,5 +2812,352 @@ async fn terminate_after_reports_not_terminated_early_and_source_false_omits_sou
         plain.get("terminated_early").is_none(),
         "only terminate_after adds the key: {plain}"
     );
+    server.shutdown().await;
+}
+
+/// 2026-10-08T12:00:00Z in microseconds: the base timestamp of the full-text rows.
+const FULL_TEXT_BASE_MICROS: i64 = 1_791_460_800_000_000;
+
+/// A log row of the full-text tests. Each row stores its id as the `row` log
+/// attribute, so a hit names the row it came from; a `None` body stays NULL.
+fn build_full_text_log_row<'a>(
+    tenant: &'a str,
+    offset_micros: i64,
+    body: Option<&'a str>,
+    severity_text: &'a str,
+    log_attributes: &'a [(&'a str, &'a str)],
+) -> Row<'a> {
+    let micros = FULL_TEXT_BASE_MICROS + offset_micros;
+    let mut cells = vec![
+        (COL_TIMESTAMP, Cell::Micros(micros)),
+        (COL_OBSERVED_TIMESTAMP, Cell::Micros(micros)),
+        (COL_INGESTED_TIMESTAMP, Cell::Micros(micros)),
+        (COL_SEVERITY_TEXT, Cell::Text(severity_text)),
+        (COL_LOG_ATTRIBUTES, Cell::Map(log_attributes)),
+    ];
+    if let Some(body) = body {
+        cells.push((COL_BODY, Cell::Text(body)));
+    }
+    Row { tenant, cells }
+}
+
+/// Five rows of tenant A and two of tenant B sharing their values: rows 1, 2 and b1
+/// in one Iceberg commit, rows 3, 4, 5 and b2 in the WAL segment after it.
+async fn seed_full_text_rows(server: &TestServer, catalog: &Arc<dyn iceberg::Catalog>) -> Result<(), RowWriteError> {
+    let iceberg_rows = [
+        build_full_text_log_row(
+            TENANT_A,
+            1,
+            Some("Connection refused by upstream"),
+            "ERROR",
+            &[("http.method", "GET"), ("row", "1"), ("user.email", "ann@example.com")],
+        ),
+        build_full_text_log_row(
+            TENANT_A,
+            2,
+            Some("Retrying connection in 5s"),
+            "WARN",
+            &[("http.method", "POST"), ("row", "2")],
+        ),
+        build_full_text_log_row(
+            TENANT_B,
+            1,
+            Some("Connection refused by upstream"),
+            "ERROR",
+            &[("http.method", "GET"), ("row", "b1")],
+        ),
+    ];
+    let wal_rows = [
+        build_full_text_log_row(TENANT_A, 3, Some("user@example.com logged in"), "INFO", &[("row", "3")]),
+        build_full_text_log_row(TENANT_A, 4, None, "ERROR", &[("region", "eu-west-1"), ("row", "4")]),
+        build_full_text_log_row(TENANT_A, 5, Some("!!!"), "DEBUG", &[("row", "5")]),
+        build_full_text_log_row(
+            TENANT_B,
+            4,
+            Some("Retrying connection in 5s"),
+            "ERROR",
+            &[("region", "eu-west-1"), ("row", "b2")],
+        ),
+    ];
+    commit_rows(catalog, LOGS_TABLE, &iceberg_rows).await?;
+    write_wal_segment(
+        &server.wal_store,
+        catalog,
+        LOGS_TABLE,
+        COMMITTED_WAL_OFFSET + 1,
+        &wal_rows,
+    )
+    .await
+}
+
+/// The `row` log attribute of each hit: the ids of the rows a search returned.
+fn read_full_text_hit_rows(answer: &Value) -> BTreeSet<String> {
+    answer["hits"]["hits"]
+        .as_array()
+        .expect("a hits array")
+        .iter()
+        .map(|hit| {
+            hit["_source"]["log_attributes"]["row"]
+                .as_str()
+                .expect("each hit names its row")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn build_row_ids(ids: &[&str]) -> BTreeSet<String> {
+    ids.iter().map(|id| (*id).to_owned()).collect()
+}
+
+#[tokio::test]
+async fn the_full_text_semantics_table_matches_the_stated_rows() {
+    let (server, catalog) = TestServer::start().await;
+    seed_full_text_rows(&server, &catalog).await.expect("the full-text rows");
+    // Tokens of the bodies: row 1 [connection, refused, by, upstream], row 2 [retrying,
+    // connection, in, 5s], row 3 [user, example.com, logged, in], row 4 NULL, row 5 none.
+    let table: Vec<(Value, &[&str])> = vec![
+        (json!({"match": {"body": "connection"}}), &["1", "2"]),
+        (
+            json!({"match": {"body": {"query": "connection upstream", "operator": "and"}}}),
+            &["1"],
+        ),
+        (json!({"match": {"body": "user@example.com"}}), &["3"]),
+        (json!({"match": {"severity_text": "ERROR"}}), &["1", "4"]),
+        (
+            json!({"match": {"body": {"query": "!!!", "zero_terms_query": "all"}}}),
+            &["1", "2", "3", "4", "5"],
+        ),
+        (json!({"match_phrase": {"body": "refused by"}}), &["1"]),
+        (json!({"match_phrase": {"body": "by refused"}}), &[]),
+        (json!({"term": {"body": "connection"}}), &["1", "2"]),
+        (json!({"term": {"body": "Connection"}}), &[]),
+        (
+            json!({"term": {"body": {"value": "CONNECTION", "case_insensitive": true}}}),
+            &["1", "2"],
+        ),
+        (json!({"term": {"severity_text": "error"}}), &[]),
+        // `terms` compares each value with the tokens unanalyzed: `Error` matches no token.
+        (json!({"terms": {"body": ["upstream", "Error", "logged"]}}), &["1", "3"]),
+        (json!({"terms": {"body": ["Error"]}}), &[]),
+        (json!({"prefix": {"body": "conn"}}), &["1", "2"]),
+        // A prefix or wildcard on a text field is lowercased like the tokens.
+        (json!({"prefix": {"body": "Conn"}}), &["1", "2"]),
+        (
+            json!({"prefix": {"body": {"value": "RETR", "case_insensitive": true}}}),
+            &["2"],
+        ),
+        (json!({"wildcard": {"body": "c*n"}}), &["1", "2"]),
+        (json!({"wildcard": {"body": "C*N"}}), &["1", "2"]),
+        (json!({"range": {"body": {"gte": "upstream"}}}), &["1", "3"]),
+        // Exclusive at the bound: row 1's `upstream` itself is out, row 3's `user` sorts after it.
+        (json!({"range": {"body": {"gt": "upstream"}}}), &["3"]),
+        // No bound: every row holding at least one token; row 5's `!!!` holds none.
+        (json!({"range": {"body": {}}}), &["1", "2", "3"]),
+        (json!({"exists": {"field": "body"}}), &["1", "2", "3", "5"]),
+        (
+            json!({"multi_match": {"query": "GET", "fields": ["log_attributes.http.method", "body"]}}),
+            &["1"],
+        ),
+        (
+            json!({"simple_query_string": {"query": "refused | retrying", "fields": ["body"]}}),
+            &["1", "2"],
+        ),
+        (
+            json!({"multi_match": {"query": "refused by", "type": "phrase", "fields": ["body"]}}),
+            &["1"],
+        ),
+        (
+            json!({"simple_query_string": {"query": "\"refused by\" | retr*", "fields": ["body"]}}),
+            &["1", "2"],
+        ),
+        // A negated text with no token drops its group: it neither excludes nor selects.
+        (
+            json!({"simple_query_string": {"query": "-!!!", "fields": ["body"]}}),
+            &[],
+        ),
+        (
+            json!({"bool": {"must_not": [{"match": {"body": "connection"}}]}}),
+            &["3", "4", "5"],
+        ),
+    ];
+    for (query, expected) in table {
+        let (status, answer) = post_json(
+            &server,
+            Some(TENANT_A),
+            "/logs/_search",
+            &json!({"query": query.clone(), "size": 100}),
+        )
+        .await;
+        assert_eq!(status, 200, "{query}: {answer}");
+        assert_eq!(read_full_text_hit_rows(&answer), build_row_ids(expected), "{query}");
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_star_default_matches_any_value_of_a_map_column_including_a_key_only_in_the_wal() {
+    let (server, catalog) = TestServer::start().await;
+    seed_full_text_rows(&server, &catalog).await.expect("the full-text rows");
+    // `region` exists only in the WAL segment, on row 4 and on tenant B's row b2.
+    let (status, answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({"query": {"multi_match": {"query": "eu-west-1", "fields": ["*"]}}, "size": 100}),
+    )
+    .await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(read_full_text_hit_rows(&answer), build_row_ids(&["4"]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn match_phrase_prefix_matches_every_value_sharing_the_prefix_on_the_data_path() {
+    let (server, catalog) = TestServer::start().await;
+    let bodies: Vec<String> = (0..80).map(|index| format!("deploy step-{index:02}")).collect();
+    let ids: Vec<String> = (0..80).map(|index| format!("p{index:02}")).collect();
+    let attributes: Vec<[(&str, &str); 1]> = ids.iter().map(|id| [("row", id.as_str())]).collect();
+    let rows: Vec<Row<'_>> = bodies
+        .iter()
+        .zip(&attributes)
+        .enumerate()
+        .map(|(index, (body, attributes))| {
+            let offset = i64::try_from(index).expect("eighty rows");
+            build_full_text_log_row(TENANT_A, offset, Some(body.as_str()), "INFO", attributes)
+        })
+        .collect();
+    let other_rows = [
+        build_full_text_log_row(TENANT_A, 100, Some("deploy ok"), "INFO", &[("row", "x")]),
+        build_full_text_log_row(TENANT_B, 100, Some("deploy step-00"), "INFO", &[("row", "b")]),
+    ];
+    commit_rows(&catalog, LOGS_TABLE, &rows[..40])
+        .await
+        .expect("the Iceberg rows commit");
+    // Two hot segments after the commit.
+    write_wal_segment(
+        &server.wal_store,
+        &catalog,
+        LOGS_TABLE,
+        COMMITTED_WAL_OFFSET + 1,
+        &rows[40..],
+    )
+    .await
+    .expect("the first WAL segment is written");
+    write_wal_segment(
+        &server.wal_store,
+        &catalog,
+        LOGS_TABLE,
+        COMMITTED_WAL_OFFSET + 2,
+        &other_rows,
+    )
+    .await
+    .expect("the second WAL segment is written");
+    let (status, answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({"query": {"match_phrase_prefix": {"body": "deploy st"}}, "size": 100}),
+    )
+    .await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["hits"]["total"], json!({"value": 80, "relation": "eq"}));
+    let expected_ids: BTreeSet<String> = ids.iter().cloned().collect();
+    assert_eq!(read_full_text_hit_rows(&answer), expected_ids);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_zero_token_match_matches_nothing() {
+    let (server, catalog) = TestServer::start().await;
+    seed_full_text_rows(&server, &catalog).await.expect("the full-text rows");
+    for query in [
+        json!({"match": {"body": "!!!"}}),
+        json!({"match_phrase": {"body": "..."}}),
+    ] {
+        let (status, answer) = post_json(
+            &server,
+            Some(TENANT_A),
+            "/logs/_search",
+            &json!({"query": query.clone(), "size": 100}),
+        )
+        .await;
+        assert_eq!(status, 200, "{query}: {answer}");
+        assert_eq!(answer["hits"]["total"]["value"], json!(0), "{query}");
+        assert_eq!(read_full_text_hit_rows(&answer), BTreeSet::new(), "{query}");
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unqualified_term_is_lenient_per_field() {
+    let (server, catalog) = TestServer::start().await;
+    seed_full_text_rows(&server, &catalog).await.expect("the full-text rows");
+    // Under the all-fields default, `ERROR` is not a date or a hex id: those fields add
+    // nothing, and the keyword `severity_text` matches rows 1 and 4.
+    let (status, answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({"query": {"simple_query_string": {"query": "ERROR"}}, "size": 100}),
+    )
+    .await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(read_full_text_hit_rows(&answer), build_row_ids(&["1", "4"]));
+    // Named fields make the leaf strict: `ERROR` on the hex id `trace_id` is a 400.
+    let (status, answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({"query": {"multi_match": {"query": "ERROR", "fields": ["trace_id", "severity_text"]}}}),
+    )
+    .await;
+    assert_eq!(status, 400, "{answer}");
+    assert_eq!(answer["error"]["type"], "search_phase_execution_exception");
+    assert_eq!(answer["error"]["root_cause"][0]["type"], "query_shard_exception");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pattern_selecting_some_keys_of_a_map_column_is_a_400() {
+    let (server, catalog) = TestServer::start().await;
+    seed_full_text_rows(&server, &catalog).await.expect("the full-text rows");
+    let (status, answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({"query": {"multi_match": {"query": "GET", "fields": ["log_attributes.http*"]}}}),
+    )
+    .await;
+    assert_eq!(status, 400, "{answer}");
+    assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    server.shutdown().await;
+}
+
+/// Ingest moves `service.name` out of the resource attributes into `service_name`, so a
+/// pattern over every resource attribute reaches that column too.
+#[tokio::test]
+async fn a_resource_attributes_pattern_reaches_the_promoted_service_name_column() {
+    let (server, catalog) = TestServer::start().await;
+    let mut rows = [
+        build_full_text_log_row(TENANT_A, 1, Some("charged"), "INFO", &[("row", "1")]),
+        build_full_text_log_row(TENANT_A, 2, Some("charged"), "INFO", &[("row", "2")]),
+        build_full_text_log_row(TENANT_B, 1, Some("charged"), "INFO", &[("row", "b1")]),
+    ];
+    for (row, service_name) in rows.iter_mut().zip(["checkout", "billing", "checkout"]) {
+        row.cells.push((COL_SERVICE_NAME, Cell::Text(service_name)));
+    }
+    commit_rows(&catalog, LOGS_TABLE, &rows).await.expect("the Iceberg rows commit");
+    let (status, answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({
+            "query": {"multi_match": {"query": "checkout", "fields": ["resource_attributes.*"]}},
+            "size": 100
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(read_full_text_hit_rows(&answer), build_row_ids(&["1"]));
     server.shutdown().await;
 }

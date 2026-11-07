@@ -1,9 +1,15 @@
 //! The fields an index exposes, as `_field_caps` and `_mapping` report them, and a field name
 //! resolved against one index.
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::functions::core::expr_fn::get_field;
 use datafusion::logical_expr::Expr;
 use datafusion::prelude::ident;
+use icegate_common::schema::{COL_RESOURCE_ATTRIBUTES, promoted_resource_keys};
+
+use super::{IndexEntry, TenantSession};
+use crate::opensearch::error::OpenSearchError;
+use crate::opensearch::glob::matches_glob;
 
 /// An `OpenSearch` field type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +138,138 @@ impl FieldValue {
     }
 }
 
+/// What a field name or pattern of a full-text query selects in one index.
+#[derive(Debug, Clone)]
+pub(crate) enum SelectedField {
+    /// One field, resolved like any field name.
+    Field(ResolvedField),
+    /// Every value of a MAP column: the pattern covers all of its key paths, so
+    /// the column is matched as a whole, without enumerating keys, and a key that
+    /// is only in the WAL is covered too.
+    AllMapValues {
+        /// The MAP column.
+        column: String,
+    },
+}
+
+impl TenantSession {
+    /// The field `name` selects in `entry`, read literally (`*` and `?` are plain
+    /// characters): the field [`TenantSession::resolve_field`] resolves, or nothing
+    /// when unmapped.
+    pub(crate) fn select_named_field(&self, entry: &IndexEntry, name: &str) -> Vec<SelectedField> {
+        self.resolve_field(entry, name).map(SelectedField::Field).into_iter().collect()
+    }
+
+    /// The searchable fields `pattern` selects in `entry`.
+    ///
+    /// A name without `*` or `?` selects like [`TenantSession::select_named_field`].
+    /// A pattern selects, by glob: every column except the tenant column and list
+    /// or struct columns; one [`SelectedField::AllMapValues`] per MAP column whose
+    /// every key path it covers (`*`, `log_attributes.*`, `log_*`); and the column
+    /// of each promoted resource key whose attribute path it matches, so
+    /// `resource_attributes.*` reaches `service_name` where ingest moved that key
+    /// out of the map.
+    ///
+    /// # Errors
+    ///
+    /// `illegal_argument` (400) when the pattern matches some but not every key
+    /// path of a MAP column: which keys exist is not known without enumerating
+    /// them, and a silently partial selection would return wrong rows. Any error of
+    /// [`TenantSession::scan_index`].
+    pub(crate) fn expand_field_pattern(
+        &self,
+        entry: &IndexEntry,
+        pattern: &str,
+    ) -> Result<Vec<SelectedField>, OpenSearchError> {
+        if !pattern.contains(['*', '?']) {
+            return Ok(self.select_named_field(entry, pattern));
+        }
+        let scan = self.scan_index(entry)?;
+        let mut selected_fields = Vec::new();
+        for field in scan.schema().fields() {
+            let column = field.name();
+            match field.data_type() {
+                DataType::Map(..) => {
+                    if covers_every_key(pattern, column) {
+                        selected_fields.push(SelectedField::AllMapValues { column: column.clone() });
+                    } else if glob_matches_some_extension(pattern, &format!("{column}.")) {
+                        return Err(OpenSearchError::illegal_argument(format!(
+                            "field pattern [{pattern}] selects some keys of [{column}]: name one key, or select \
+                             every key with [{column}.*]"
+                        )));
+                    }
+                }
+                DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..) | DataType::Struct(_) => {}
+                _ => {
+                    if matches_glob(pattern, column)
+                        && let Some(resolved_field) = self.resolve_field(entry, column)
+                    {
+                        selected_fields.push(SelectedField::Field(resolved_field));
+                    }
+                }
+            }
+        }
+        for promoted_key in promoted_resource_keys(entry.table()) {
+            let is_selected = selected_fields
+                .iter()
+                .any(|candidate| matches!(candidate, SelectedField::Field(field) if field.name == promoted_key.column));
+            if !is_selected
+                && matches_glob(
+                    pattern,
+                    &format!("{COL_RESOURCE_ATTRIBUTES}.{}", promoted_key.attribute_key),
+                )
+                && let Some(resolved_field) = self.resolve_field(entry, promoted_key.column)
+            {
+                selected_fields.push(SelectedField::Field(resolved_field));
+            }
+        }
+        Ok(selected_fields)
+    }
+}
+
+/// Whether `pattern` matches every key path `<column>.<key>`: it ends with `*`
+/// and matches `<column>.` itself, so its final `*` absorbs any key.
+fn covers_every_key(pattern: &str, column: &str) -> bool {
+    pattern.ends_with('*') && matches_glob(pattern, &format!("{column}."))
+}
+
+/// Whether some text starting with `prefix` matches the glob `pattern` (`*` any
+/// run, `?` one character). After `prefix` is consumed the pattern can still
+/// match exactly when some pattern position is reachable, because any remaining
+/// glob suffix matches some text.
+fn glob_matches_some_extension(pattern: &str, prefix: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let mut reachable_positions = vec![false; pattern.len() + 1];
+    reachable_positions[0] = true;
+    skip_stars(&pattern, &mut reachable_positions);
+    for character in prefix.chars() {
+        let mut next_positions = vec![false; pattern.len() + 1];
+        for (position, glob_character) in pattern.iter().enumerate() {
+            if !reachable_positions[position] {
+                continue;
+            }
+            match glob_character {
+                '*' => next_positions[position] = true,
+                '?' => next_positions[position + 1] = true,
+                literal if *literal == character => next_positions[position + 1] = true,
+                _ => {}
+            }
+        }
+        skip_stars(&pattern, &mut next_positions);
+        reachable_positions = next_positions;
+    }
+    reachable_positions.contains(&true)
+}
+
+/// A `*` may match nothing: every position reaching a `*` also reaches the one after it.
+fn skip_stars(pattern: &[char], reachable_positions: &mut [bool]) {
+    for position in 0..pattern.len() {
+        if reachable_positions[position] && pattern[position] == '*' {
+            reachable_positions[position + 1] = true;
+        }
+    }
+}
+
 #[cfg(test)]
 mod resolution_tests {
     use datafusion::arrow::datatypes::Schema;
@@ -140,8 +278,10 @@ mod resolution_tests {
         logs_schema, metrics_schema, spans_schema,
     };
     use icegate_common::{LOGS_TABLE, METRICS_TABLE, SPANS_TABLE};
+    use rand::rngs::StdRng;
+    use rand::{Rng as _, SeedableRng as _};
 
-    use super::{FieldType, FieldValue, ResolvedField};
+    use super::{FieldType, FieldValue, ResolvedField, covers_every_key, glob_matches_some_extension};
     use crate::opensearch::catalog::native::resolve_native_field;
 
     fn convert_arrow_schema(iceberg_schema: icegate_common::Result<iceberg::spec::Schema>) -> Schema {
@@ -258,6 +398,113 @@ mod resolution_tests {
                     width: 16,
                 },
             })
+        );
+    }
+
+    #[test]
+    fn a_pattern_covering_every_key_of_a_map_is_told_apart_from_one_covering_some() {
+        for pattern in ["*", "log_*", "log_attributes.*", "*.*", "l?g_attributes.*"] {
+            assert!(
+                covers_every_key(pattern, "log_attributes"),
+                "[{pattern}] covers every key"
+            );
+        }
+        // A leading `*` absorbs any prefix, so `*_attributes` matches the key path
+        // `log_attributes.x_attributes`: some keys, not all.
+        for pattern in [
+            "log_attributes.http*",
+            "*method",
+            "log_attributes.?",
+            "*_name",
+            "*_attributes",
+        ] {
+            assert!(
+                !covers_every_key(pattern, "log_attributes"),
+                "[{pattern}] does not cover every key"
+            );
+            assert!(
+                glob_matches_some_extension(pattern, "log_attributes."),
+                "[{pattern}] covers some key"
+            );
+        }
+        for pattern in ["service_*", "scope_attributes.*", "log_attributes", "resource_*"] {
+            assert!(
+                !glob_matches_some_extension(pattern, "log_attributes."),
+                "[{pattern}] covers no key"
+            );
+        }
+    }
+
+    /// The characters patterns and texts are drawn from: two letters, the separator `.`, and
+    /// the glob metacharacters, which only patterns hold.
+    const EXTENSION_ALPHABET: [char; 3] = ['a', 'b', '.'];
+    const GLOB_ALPHABET: [char; 5] = ['a', 'b', '.', '*', '?'];
+    const EXTENSION_CASE_COUNT: usize = 2_000;
+
+    /// The glob rule stated directly: `*` tries every split, `?` takes one character, any other
+    /// character matches itself.
+    fn matches_glob_naively(pattern: &[char], text: &[char]) -> bool {
+        match pattern.split_first() {
+            None => text.is_empty(),
+            Some(('*', pattern_rest)) => {
+                (0..=text.len()).any(|skipped_count| matches_glob_naively(pattern_rest, &text[skipped_count..]))
+            }
+            Some((glob_character, pattern_rest)) => text.split_first().is_some_and(|(character, text_rest)| {
+                (*glob_character == '?' || glob_character == character) && matches_glob_naively(pattern_rest, text_rest)
+            }),
+        }
+    }
+
+    /// Whether some extension of `prefix` of at most `max_length` characters over
+    /// [`EXTENSION_ALPHABET`] matches `pattern`. A pattern consumes at most one text character
+    /// per non-`*` character, so when any extension matches, one of at most the pattern's length
+    /// over the pattern's own literals does: with the pattern drawn from that alphabet, this
+    /// enumeration decides the question exactly.
+    fn enumerate_matching_extension(pattern: &[char], prefix: &mut Vec<char>, max_length: usize) -> bool {
+        if matches_glob_naively(pattern, prefix) {
+            return true;
+        }
+        if max_length == 0 {
+            return false;
+        }
+        EXTENSION_ALPHABET.iter().any(|character| {
+            prefix.push(*character);
+            let is_found = enumerate_matching_extension(pattern, prefix, max_length - 1);
+            prefix.pop();
+            is_found
+        })
+    }
+
+    #[test]
+    fn some_extension_agrees_with_enumerating_extensions_on_seeded_patterns() {
+        let mut generator = StdRng::seed_from_u64(0x00E5_7E0D);
+        let mut found_count = 0;
+        for _ in 0..EXTENSION_CASE_COUNT {
+            let pattern: Vec<char> = (0..generator.random_range(0..=5))
+                .map(|_| GLOB_ALPHABET[generator.random_range(0..GLOB_ALPHABET.len())])
+                .collect();
+            let prefix: Vec<char> = (0..generator.random_range(0..=4))
+                .map(|_| EXTENSION_ALPHABET[generator.random_range(0..EXTENSION_ALPHABET.len())])
+                .collect();
+            let pattern_text: String = pattern.iter().collect();
+            let prefix_text: String = prefix.iter().collect();
+            let is_expected = enumerate_matching_extension(&pattern, &mut prefix.clone(), pattern.len());
+
+            assert_eq!(
+                glob_matches_some_extension(&pattern_text, &prefix_text),
+                is_expected,
+                "{pattern_text:?} after {prefix_text:?}"
+            );
+            found_count += usize::from(is_expected);
+        }
+        // Both answers occur often enough for the agreement to mean something.
+        assert!(
+            found_count >= EXTENSION_CASE_COUNT / 4,
+            "{found_count} extensible cases"
+        );
+        assert!(
+            EXTENSION_CASE_COUNT - found_count >= EXTENSION_CASE_COUNT / 4,
+            "{found_count} extensible cases"
         );
     }
 }

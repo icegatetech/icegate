@@ -55,6 +55,13 @@ pub(crate) struct Token {
     pub(crate) position: u32,
 }
 
+impl AsRef<str> for Token {
+    /// The lowercased token text, which is what matching compares.
+    fn as_ref(&self) -> &str {
+        &self.text
+    }
+}
+
 /// Tokenizes `text` like the standard analyzer: standard tokenizer, then lowercasing.
 ///
 /// Never fails: a code point that starts no token is skipped, and a run longer than
@@ -78,6 +85,40 @@ pub(crate) fn tokenize_standard(text: &str) -> Vec<Token> {
 /// This is the normalization `prefix` and `wildcard` patterns on `text` fields receive.
 pub(crate) fn normalize_standard(text: &str) -> String {
     text.chars().map(lowercase_character).collect()
+}
+
+/// Whether `phrase` occurs in `tokens` at consecutive positions; with `is_last_token_prefix`, its
+/// last element need only prefix the token at its position. An empty phrase occurs nowhere.
+///
+/// Every phrase matcher (the system-index evaluator and the data-path phrase function) calls this
+/// one, so the two paths agree on what a phrase matches.
+pub(crate) fn contains_token_phrase<T: AsRef<str>>(tokens: &[Token], phrase: &[T], is_last_token_prefix: bool) -> bool {
+    let Some((last_element, leading_elements)) = phrase.split_last() else {
+        return false;
+    };
+    tokens.windows(phrase.len()).any(|window| {
+        // `Token::position` is what a phrase is defined over. The standard analyzer numbers tokens
+        // one by one, so neighbours in the slice hold it today; the check is what keeps a phrase
+        // from spanning a gap if a token stream ever leaves one.
+        let is_consecutive = || {
+            window
+                .iter()
+                .zip(0_u32..)
+                .all(|(token, offset)| window[0].position.checked_add(offset) == Some(token.position))
+        };
+        window
+            .iter()
+            .zip(leading_elements)
+            .all(|(token, element)| token.text == element.as_ref())
+            && window.last().is_some_and(|token| {
+                if is_last_token_prefix {
+                    token.text.starts_with(last_element.as_ref())
+                } else {
+                    token.text == last_element.as_ref()
+                }
+            })
+            && is_consecutive()
+    })
 }
 
 /// The simple lowercase of `character` at Unicode 16.0; itself when it has none.
