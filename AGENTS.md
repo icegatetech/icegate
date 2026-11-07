@@ -71,8 +71,8 @@ goes in `icegate-common`, never copied into a component.
 - `icegate-common` is the foundation and depends on no other workspace crate;
 - Components depend on `common` plus the library crates they need (`queue`, `catalog-s3`).
 - `catalog-s3`'s production library pulls no other workspace crate (dev-only dependency on `common`).
-- `icegate-query-grammar` depends on no workspace crate; visitors and AST builders stay in
-  `icegate-query`.
+- `icegate-query-grammar` depends on no workspace crate; `icegate-query` depends on it, and visitors
+  and AST builders stay in `icegate-query`.
 - The job/task framework is **not** a workspace crate: it lives in
   [icegatetech/jobmanager](https://github.com/icegatetech/jobmanager) and enters the build as an
   external dependency, git-pinned once in `[workspace.dependencies]` as `jobmanager`.

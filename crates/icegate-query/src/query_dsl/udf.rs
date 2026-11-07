@@ -33,6 +33,13 @@ use crate::opensearch::error::OpenSearchError;
 #[derive(Debug, Clone)]
 pub(crate) struct MatchRegex(Regex);
 
+impl MatchRegex {
+    /// Whether the whole of `text` matches the anchored pattern.
+    pub(crate) fn matches(&self, text: &str) -> bool {
+        self.0.is_match(text)
+    }
+}
+
 impl PartialEq for MatchRegex {
     fn eq(&self, other: &Self) -> bool {
         self.0.as_str() == other.0.as_str()
@@ -249,7 +256,7 @@ impl ScalarUDFImpl for TextMatch {
                 })?
             }
             TextMatchKind::Regex(pattern) => match_each_text(&texts, name, |text| {
-                tokenize_standard(text).iter().any(|token| pattern.0.is_match(&token.text))
+                tokenize_standard(text).iter().any(|token| pattern.matches(&token.text))
             })?,
         };
         Ok(ColumnarValue::Array(Arc::new(match_flags)))

@@ -22,7 +22,7 @@ use icegate_common::{
 };
 use icegate_query::opensearch::{OpenSearchConfig, SearchLimitsConfig, SystemIndicesConfig};
 use reqwest::Method;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::data::{Cell, Row, RowWriteError, commit_rows, create_exact_name_table, required_string, write_wal_segment};
 use super::harness::{ServerOptions, TestServer};
@@ -3159,5 +3159,363 @@ async fn a_resource_attributes_pattern_reaches_the_promoted_service_name_column(
     .await;
     assert_eq!(status, 200, "{answer}");
     assert_eq!(read_full_text_hit_rows(&answer), build_row_ids(&["1"]));
+    server.shutdown().await;
+}
+
+/// A log row of the full-text tests carrying a trace id and a span id.
+fn build_traced_log_row<'a>(
+    tenant: &'a str,
+    offset_micros: i64,
+    trace_id: &'a [u8; 16],
+    span_id: &'a [u8; 8],
+    log_attributes: &'a [(&'a str, &'a str)],
+) -> Row<'a> {
+    let mut row = build_full_text_log_row(tenant, offset_micros, Some("request handled"), "INFO", log_attributes);
+    row.cells.push((COL_TRACE_ID, Cell::Bytes(trace_id)));
+    row.cells.push((COL_SPAN_ID, Cell::Bytes(span_id)));
+    row
+}
+
+/// Searches tenant A's `logs` with a `query_string` holding `text`, and any further leaf keys.
+async fn search_query_string(server: &TestServer, text: &str, options: &Map<String, Value>) -> (u16, Value) {
+    let mut leaf = options.clone();
+    leaf.insert(String::from("query"), Value::String(text.to_owned()));
+    post_json(
+        server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({"query": {"query_string": leaf}, "size": 100}),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_query_string_syntax_error_is_a_search_phase_exception_with_a_query_shard_root_cause() {
+    let (server, catalog) = TestServer::start().await;
+    seed_full_text_rows(&server, &catalog).await.expect("the full-text rows");
+    let (status, body) = search_query_string(&server, "a/b", &Map::new()).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["status"], json!(400));
+    assert_eq!(body["error"]["type"], "search_phase_execution_exception");
+    assert_eq!(body["error"]["phase"], "query");
+    assert_eq!(body["error"]["grouped"], json!(true));
+    assert_eq!(body["error"]["root_cause"][0]["type"], "query_shard_exception");
+    assert_eq!(body["error"]["root_cause"][0]["index"], "logs");
+    // Fuzzy syntax is refused while the request is parsed, before any index is read.
+    let (status, body) = search_query_string(&server, "roam~", &Map::new()).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["type"], "parsing_exception");
+    assert_eq!(body["error"]["construct"], "fuzzy");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_trace_to_logs_style_unqualified_span_and_trace_pair_matches_the_log_carrying_both() {
+    let (server, catalog) = TestServer::start().await;
+    let trace = [0x11_u8; 16];
+    let other_trace = [0x44_u8; 16];
+    let span = [0x22_u8; 8];
+    let other_span = [0x33_u8; 8];
+    let iceberg_rows = [
+        build_traced_log_row(TENANT_A, 1, &trace, &span, &[("row", "both")]),
+        build_traced_log_row(TENANT_A, 2, &trace, &other_span, &[("row", "trace-only")]),
+        build_traced_log_row(TENANT_B, 1, &trace, &span, &[("row", "other-tenant")]),
+    ];
+    let wal_rows = [
+        build_traced_log_row(TENANT_A, 3, &other_trace, &span, &[("row", "span-only")]),
+        build_traced_log_row(TENANT_B, 4, &trace, &span, &[("row", "other-tenant-wal")]),
+    ];
+    commit_rows(&catalog, LOGS_TABLE, &iceberg_rows)
+        .await
+        .expect("the Iceberg rows commit");
+    write_wal_segment(
+        &server.wal_store,
+        &catalog,
+        LOGS_TABLE,
+        COMMITTED_WAL_OFFSET + 1,
+        &wal_rows,
+    )
+    .await
+    .expect("the WAL segment is written");
+    // Unqualified quoted ids under the all-fields default: each one matches the id field of its
+    // width and nothing else.
+    let query = format!("\"{}\" AND \"{}\"", "22".repeat(8), "11".repeat(16));
+    let (status, body) = search_query_string(&server, &query, &Map::new()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(read_full_text_hit_rows(&body), build_row_ids(&["both"]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_lucene_filter_on_a_dotted_map_key_matches_its_stored_key() {
+    let (server, catalog) = TestServer::start().await;
+    let iceberg_rows = [
+        build_full_text_log_row(
+            TENANT_A,
+            1,
+            Some("GET handled"),
+            "INFO",
+            &[("http", "x"), ("http.method", "GET"), ("row", "d1")],
+        ),
+        build_full_text_log_row(
+            TENANT_A,
+            2,
+            Some("POST handled"),
+            "INFO",
+            &[("http.method", "POST"), ("row", "d2")],
+        ),
+        build_full_text_log_row(
+            TENANT_B,
+            1,
+            Some("GET handled"),
+            "INFO",
+            &[("http", "x"), ("http.method", "GET"), ("row", "b1")],
+        ),
+    ];
+    let wal_rows = [
+        build_full_text_log_row(
+            TENANT_A,
+            3,
+            Some("GET handled"),
+            "INFO",
+            &[("http", "y"), ("http.method", "GET"), ("row", "d3")],
+        ),
+        build_full_text_log_row(
+            TENANT_B,
+            2,
+            Some("GET handled"),
+            "INFO",
+            &[("http.method", "GET"), ("row", "b2")],
+        ),
+    ];
+    commit_rows(&catalog, LOGS_TABLE, &iceberg_rows)
+        .await
+        .expect("the Iceberg rows commit");
+    write_wal_segment(
+        &server.wal_store,
+        &catalog,
+        LOGS_TABLE,
+        COMMITTED_WAL_OFFSET + 1,
+        &wal_rows,
+    )
+    .await
+    .expect("the WAL segment is written");
+    let rows: [(String, &[&str]); 2] = [
+        (format!("{COL_LOG_ATTRIBUTES}.http.method:GET"), &["d1", "d3"]),
+        (format!("{COL_LOG_ATTRIBUTES}.http:x"), &["d1"]),
+    ];
+    for (query, expected) in rows {
+        let (status, body) = search_query_string(&server, &query, &Map::new()).await;
+        assert_eq!(status, 200, "{query}: {body}");
+        assert_eq!(read_full_text_hit_rows(&body), build_row_ids(expected), "{query}");
+    }
+    server.shutdown().await;
+}
+
+/// Zero-token clauses are dropped before the occurrence rules apply: a query left with no clause
+/// matches nothing, and a dropped clause does not change what its neighbour matches.
+#[tokio::test]
+async fn query_string_zero_token_clauses_match_the_stated_rows() {
+    let (server, catalog) = TestServer::start().await;
+    seed_full_text_rows(&server, &catalog).await.expect("the full-text rows");
+    // An empty `severity_text` in each tenant, in one batch, with no body.
+    let empty_severity_rows = [
+        build_full_text_log_row(TENANT_A, 6, None, "", &[("row", "e1")]),
+        build_full_text_log_row(TENANT_B, 6, None, "", &[("row", "be1")]),
+    ];
+    commit_rows(&catalog, LOGS_TABLE, &empty_severity_rows)
+        .await
+        .expect("the empty-severity rows commit");
+    // `connection` is a token of rows 1 and 2 (and of tenant B's rows); `!!!` yields no token.
+    let rows: [(String, &[&str]); 5] = [
+        (format!("{COL_BODY}:\"!!!\""), &[]),
+        (format!("-{COL_BODY}:\"!!!\""), &[]),
+        (format!("connection AND {COL_BODY}:\"!!!\""), &["1", "2"]),
+        (format!("connection AND ({COL_BODY}:\"!!!\")"), &["1", "2"]),
+        // An empty whole value on the keyword-like fields: only row e1's `severity_text` is one.
+        (String::from("\"\""), &["e1"]),
+    ];
+    for (query, expected) in rows {
+        let (status, body) = search_query_string(&server, &query, &Map::new()).await;
+        assert_eq!(status, 200, "{query}: {body}");
+        assert_eq!(read_full_text_hit_rows(&body), build_row_ids(expected), "{query}");
+    }
+    server.shutdown().await;
+}
+
+/// How deeply `query_string` groups may nest: the limit the query process accepts.
+const QUERY_STRING_DEPTH_LIMIT: usize = 128;
+
+/// Groups nested to the limit go through the whole data path (translation, resolution, lowering
+/// and planning) and answer their rows; one level more is refused before anything is read.
+#[tokio::test]
+async fn query_string_groups_nested_to_the_limit_answer_the_stated_rows_and_one_more_level_is_a_400() {
+    let (server, catalog) = TestServer::start().await;
+    seed_full_text_rows(&server, &catalog).await.expect("the full-text rows");
+    let nest_groups = |depth: usize| format!("{}{COL_BODY}:connection{}", "(".repeat(depth), ")".repeat(depth));
+    // A left-deep chain `((connection OR logged) AND NOT refused) ...`: each level wraps the
+    // previous one with one more clause, cycling through four steps. Over the body tokens of
+    // tenant A (connection: 1, 2; logged: 3; refused: 1; upstream: 1; in: 2, 3) the first cycle
+    // goes {1, 2} -> {1, 2, 3} -> {2, 3} -> {1, 2, 3} -> {2, 3}, and every later cycle returns
+    // to {2, 3}, so the 128 levels (32 whole cycles) end at {2, 3}.
+    let chain_steps = [
+        format!("OR {COL_BODY}:logged"),
+        format!("AND NOT {COL_BODY}:refused"),
+        format!("OR {COL_BODY}:upstream"),
+        format!("AND {COL_BODY}:in"),
+    ];
+    let left_deep_chain = chain_steps
+        .iter()
+        .cycle()
+        .take(QUERY_STRING_DEPTH_LIMIT)
+        .fold(format!("{COL_BODY}:connection"), |chain, step| {
+            format!("({chain} {step})")
+        });
+    let rows: [(String, &[&str]); 2] = [
+        (nest_groups(QUERY_STRING_DEPTH_LIMIT), &["1", "2"]),
+        (left_deep_chain, &["2", "3"]),
+    ];
+    for (query, expected) in rows {
+        let (status, body) = search_query_string(&server, &query, &Map::new()).await;
+        assert_eq!(status, 200, "{query}: {body}");
+        assert_eq!(read_full_text_hit_rows(&body), build_row_ids(expected), "{query}");
+    }
+    let (status, body) = search_query_string(&server, &nest_groups(QUERY_STRING_DEPTH_LIMIT + 1), &Map::new()).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["type"], "parsing_exception");
+    assert_eq!(body["error"]["limit"], json!(QUERY_STRING_DEPTH_LIMIT));
+    server.shutdown().await;
+}
+
+/// `time_zone` reads an unquoted date term and a range bound on a named date field in the zone,
+/// and a quoted term in UTC. The rows sit on both sides of the Asia/Dubai (UTC+4) day 2026-10-08,
+/// which runs from 2026-10-07T20:00:00Z to 2026-10-08T20:00:00Z.
+#[tokio::test]
+async fn query_string_time_zone_reads_date_terms_and_ranges_as_stated() {
+    const HOUR_MICROS: i64 = 3_600_000_000;
+    const MILLI_MICROS: i64 = 1_000;
+    let (server, catalog) = TestServer::start().await;
+    // Offsets from 2026-10-08T12:00:00Z.
+    let before_dubai_day = -16 * HOUR_MICROS - MILLI_MICROS;
+    let dubai_day_start = -16 * HOUR_MICROS;
+    let dubai_day_end = 8 * HOUR_MICROS - MILLI_MICROS;
+    let after_dubai_day = 8 * HOUR_MICROS;
+    let after_utc_day = 12 * HOUR_MICROS;
+    let iceberg_rows = [
+        build_full_text_log_row(TENANT_A, before_dubai_day, Some("tick"), "INFO", &[("row", "t1")]),
+        build_full_text_log_row(TENANT_A, dubai_day_start, Some("tick"), "INFO", &[("row", "t2")]),
+        build_full_text_log_row(TENANT_A, dubai_day_end, Some("tick"), "INFO", &[("row", "t3")]),
+        build_full_text_log_row(TENANT_B, dubai_day_start, Some("tick"), "INFO", &[("row", "b2")]),
+    ];
+    let wal_rows = [
+        build_full_text_log_row(TENANT_A, after_dubai_day, Some("tick"), "INFO", &[("row", "t4")]),
+        build_full_text_log_row(TENANT_A, after_utc_day, Some("tick"), "INFO", &[("row", "t5")]),
+        build_full_text_log_row(TENANT_B, dubai_day_end, Some("tick"), "INFO", &[("row", "b3")]),
+    ];
+    commit_rows(&catalog, LOGS_TABLE, &iceberg_rows)
+        .await
+        .expect("the Iceberg rows commit");
+    write_wal_segment(
+        &server.wal_store,
+        &catalog,
+        LOGS_TABLE,
+        COMMITTED_WAL_OFFSET + 1,
+        &wal_rows,
+    )
+    .await
+    .expect("the WAL segment is written");
+    let mut in_dubai = Map::new();
+    in_dubai.insert(String::from("time_zone"), json!("Asia/Dubai"));
+    let rows: [(String, &[&str]); 3] = [
+        // The Dubai day.
+        (format!("{COL_TIMESTAMP}:2026-10-08"), &["t2", "t3"]),
+        // Quoted: the UTC day, 2026-10-08T00:00:00Z to 2026-10-09T00:00:00Z.
+        (format!("{COL_TIMESTAMP}:\"2026-10-08\""), &["t3", "t4"]),
+        // From the start of the Dubai day on.
+        (format!("{COL_TIMESTAMP}:[2026-10-08 TO *]"), &["t2", "t3", "t4", "t5"]),
+    ];
+    for (query, expected) in rows {
+        let (status, body) = search_query_string(&server, &query, &in_dubai).await;
+        assert_eq!(status, 200, "{query}: {body}");
+        assert_eq!(read_full_text_hit_rows(&body), build_row_ids(expected), "{query}");
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn query_string_on_a_system_index_matches_the_stated_documents() {
+    let (server, _catalog) = TestServer::start().await;
+    let mappings = json!({
+        "properties": {"type": {"type": "keyword"}, "index-pattern": {"properties": {"title": {"type": "text"}}}}
+    });
+    for tenant in [TENANT_A, TENANT_B] {
+        let response = server
+            .request(Method::PUT, Some(tenant), "/.kibana_7")
+            .json(&json!({"mappings": mappings.clone(), "settings": {"number_of_shards": 1}}))
+            .send()
+            .await
+            .expect("the index creation answers");
+        assert_eq!(response.status().as_u16(), 200, "{tenant}");
+    }
+    let documents = [
+        (
+            TENANT_A,
+            "index-pattern%3Alogs",
+            json!({"type": "index-pattern", "index-pattern": {"title": "logs-*"}}),
+        ),
+        (
+            TENANT_A,
+            "index-pattern%3Aotel",
+            json!({"type": "index-pattern", "index-pattern": {"title": "logs-otel"}}),
+        ),
+        (
+            TENANT_A,
+            "index-pattern%3Ametrics",
+            json!({"type": "index-pattern", "index-pattern": {"title": "metrics-*"}}),
+        ),
+        (TENANT_A, "config%3A3.9.0", json!({"type": "config"})),
+        (
+            TENANT_B,
+            "index-pattern%3Alogs-b",
+            json!({"type": "index-pattern", "index-pattern": {"title": "logs-b"}}),
+        ),
+    ];
+    for (tenant, id, source) in documents {
+        let response = server
+            .request(Method::PUT, Some(tenant), &format!("/.kibana_7/_doc/{id}"))
+            .json(&source)
+            .send()
+            .await
+            .expect("the document write answers");
+        assert_eq!(response.status().as_u16(), 201, "{id}");
+    }
+    let rows: [(&str, &[&str]); 3] = [
+        (
+            "index-pattern.title:logs*",
+            &["index-pattern:logs", "index-pattern:otel"],
+        ),
+        (
+            "type:index-pattern AND NOT index-pattern.title:metrics",
+            &["index-pattern:logs", "index-pattern:otel"],
+        ),
+        ("type:config", &["config:3.9.0"]),
+    ];
+    for (query, expected) in rows {
+        let (status, body) = post_json(
+            &server,
+            Some(TENANT_A),
+            "/.kibana_7/_search",
+            &json!({"query": {"query_string": {"query": query}}, "size": 100}),
+        )
+        .await;
+        assert_eq!(status, 200, "{query}: {body}");
+        let ids: BTreeSet<String> = body["hits"]["hits"]
+            .as_array()
+            .expect("a hits array")
+            .iter()
+            .map(|hit| hit["_id"].as_str().expect("an id").to_owned())
+            .collect();
+        assert_eq!(ids, build_row_ids(expected), "{query}");
+    }
     server.shutdown().await;
 }

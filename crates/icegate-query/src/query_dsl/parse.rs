@@ -5,11 +5,12 @@
 //! data. Every leaf accepts a numeric `boost` and ignores it: IceGate does not score.
 //!
 //! Full-text leaves (`match`, `match_phrase`, `match_phrase_prefix`, `multi_match`,
-//! `simple_query_string`) refuse a non-zero `fuzziness` or `slop`, and a fuzzy term or sloppy
-//! phrase inside a `simple_query_string`: IceGate matches exactly. `max_expansions`,
-//! `prefix_length`, `fuzzy_transpositions`, `auto_generate_synonyms_phrase_query` and `tie_breaker`
-//! are accepted when they carry their type, and not applied. A field pattern may carry `^boost`,
-//! which is dropped; `fields` absent or empty is every field.
+//! `simple_query_string`, `query_string`) refuse a non-zero `fuzziness`, `slop` or
+//! `phrase_slop`, and a fuzzy term or sloppy phrase inside a `simple_query_string` or a
+//! `query_string`: IceGate matches exactly. `max_expansions`, `prefix_length`,
+//! `fuzzy_transpositions`, `auto_generate_synonyms_phrase_query` and `tie_breaker` are accepted
+//! when they carry their type, and not applied. A field pattern may carry `^boost`, which is
+//! dropped; `fields` absent or empty is every field.
 
 use serde_json::{Map, Value};
 
@@ -27,10 +28,10 @@ use crate::opensearch::error::OpenSearchError;
 const NESTED_SCORE_MODES: [&str; 5] = ["avg", "sum", "min", "max", "none"];
 
 /// Why a `fuzziness` above zero is refused.
-const FUZZINESS_REFUSAL: &str = "fuzzy matching is not evaluated";
+pub(super) const FUZZINESS_REFUSAL: &str = "fuzzy matching is not evaluated";
 
 /// Why a `slop` above zero is refused.
-const SLOP_REFUSAL: &str = "sloppy phrases are not evaluated";
+pub(super) const SLOP_REFUSAL: &str = "sloppy phrases are not evaluated";
 
 /// Parse one query object.
 ///
@@ -39,7 +40,11 @@ const SLOP_REFUSAL: &str = "sloppy phrases are not evaluated";
 /// `parsing_exception` naming the offending leaf or key: a value that is not an object with
 /// exactly one leaf, an unknown leaf, an unknown key in a known leaf (`_name` included), a value
 /// of the wrong JSON type, a `wildcard` that states its value under both of its keys, a non-zero
-/// `fuzziness` or `slop`, or a `simple_query_string` that [`parse_simple_query_string`] refuses.
+/// `fuzziness`, `slop` or `phrase_slop`, a `simple_query_string` that
+/// [`parse_simple_query_string`] refuses, or a `query_string` that
+/// [`parse_query_string`](super::lucene::parse_query_string) refuses (fuzzy, proximity or
+/// regular expression syntax, both `fields` and `default_field`, groups nested past its limit).
+/// A `query_string` syntax error is not refused here: each searched index answers it.
 pub(crate) fn parse_query(value: &Value) -> Result<Query, OpenSearchError> {
     let (leaf, body) = read_single_entry(value, "query")?;
     match leaf {
@@ -92,6 +97,7 @@ pub(crate) fn parse_query(value: &Value) -> Result<Query, OpenSearchError> {
         }
         "multi_match" => parse_multi_match(body).map(Query::MultiMatch),
         "simple_query_string" => parse_simple_query_string_leaf(body).map(Query::SimpleQueryString),
+        "query_string" => super::lucene::parse_query_string(body),
         other => Err(OpenSearchError::parsing(format!("unknown query [{other}]"))),
     }
 }
@@ -126,7 +132,7 @@ fn require_numeric_boost(boost: &Value, leaf: &str) -> Result<(), OpenSearchErro
 }
 
 /// `body` as the options object of `leaf`, holding only `allowed` keys and a numeric `boost`.
-fn read_leaf_object<'a>(
+pub(super) fn read_leaf_object<'a>(
     body: &'a Value,
     leaf: &str,
     allowed: &[&str],
@@ -157,12 +163,16 @@ fn read_scalar(value: &Value, leaf: &str) -> Result<Value, OpenSearchError> {
 }
 
 /// The boolean option `key`, `false` when it is absent.
-fn read_flag(options: &Map<String, Value>, key: &str, leaf: &str) -> Result<bool, OpenSearchError> {
+pub(super) fn read_flag(options: &Map<String, Value>, key: &str, leaf: &str) -> Result<bool, OpenSearchError> {
     Ok(read_optional_flag(options, key, leaf)?.unwrap_or(false))
 }
 
 /// The required string option `key`.
-fn read_text<'a>(options: &'a Map<String, Value>, key: &str, leaf: &str) -> Result<&'a str, OpenSearchError> {
+pub(super) fn read_text<'a>(
+    options: &'a Map<String, Value>,
+    key: &str,
+    leaf: &str,
+) -> Result<&'a str, OpenSearchError> {
     options
         .get(key)
         .and_then(Value::as_str)
@@ -578,7 +588,7 @@ fn read_query_text(value: &Value, leaf: &str) -> Result<String, OpenSearchError>
 }
 
 /// `fields`: field patterns without their `^boost`; absent or empty is every field.
-fn read_field_patterns(options: &Map<String, Value>, leaf: &str) -> Result<Vec<String>, OpenSearchError> {
+pub(super) fn read_field_patterns(options: &Map<String, Value>, leaf: &str) -> Result<Vec<String>, OpenSearchError> {
     let patterns: Vec<&str> = match options.get("fields") {
         None => Vec::new(),
         Some(Value::String(pattern)) => vec![pattern.as_str()],
@@ -614,7 +624,7 @@ fn strip_field_boost(pattern: &str, leaf: &str) -> Result<String, OpenSearchErro
 }
 
 /// `or` (the default) or `and`, in any case.
-fn read_operator(options: &Map<String, Value>, key: &str, leaf: &str) -> Result<Operator, OpenSearchError> {
+pub(super) fn read_operator(options: &Map<String, Value>, key: &str, leaf: &str) -> Result<Operator, OpenSearchError> {
     match options.get(key) {
         None => Ok(Operator::Or),
         Some(Value::String(name)) if name.eq_ignore_ascii_case("or") => Ok(Operator::Or),
@@ -626,7 +636,11 @@ fn read_operator(options: &Map<String, Value>, key: &str, leaf: &str) -> Result<
 }
 
 /// The boolean option `key`, `None` when it is absent.
-fn read_optional_flag(options: &Map<String, Value>, key: &str, leaf: &str) -> Result<Option<bool>, OpenSearchError> {
+pub(super) fn read_optional_flag(
+    options: &Map<String, Value>,
+    key: &str,
+    leaf: &str,
+) -> Result<Option<bool>, OpenSearchError> {
     options.get(key).map_or(Ok(None), |value| {
         value
             .as_bool()
@@ -654,7 +668,7 @@ fn is_zero(value: &Value) -> bool {
 
 /// Refuses the option `key` unless it is absent or zero, which is all IceGate accepts of an option
 /// asking for inexact matching: `reason` says what it does not evaluate.
-fn refuse_nonzero_option(
+pub(super) fn refuse_nonzero_option(
     options: &Map<String, Value>,
     key: &str,
     reason: &str,

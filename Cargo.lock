@@ -5365,6 +5365,7 @@ dependencies = [
  "iceberg",
  "iceberg-datafusion",
  "icegate-common",
+ "icegate-query-grammar",
  "icegate-queue",
  "itoa",
  "lru",

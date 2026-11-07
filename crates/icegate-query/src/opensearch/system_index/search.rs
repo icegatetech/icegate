@@ -29,7 +29,7 @@ use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::extract::{EndpointParameters, Parameters, PathParameters, RequestBody, deserialize_flag};
 use crate::opensearch::search::request::{SearchRequest, SortClause, SortOrder, SourceFilter, TrackTotalHits};
 use crate::opensearch::state::OpenSearchState;
-use crate::query_dsl::ast::Query;
+use crate::query_dsl::ast::{Query, QueryStringClauses};
 use crate::query_dsl::parse::parse_query;
 
 /// Parameters of `_count`.
@@ -148,19 +148,61 @@ pub(crate) fn find_system_indices<'a>(
         .collect()
 }
 
+/// The failure of the first `query_string` in `query` whose translation failed (a syntax error
+/// or a refused leading wildcard); `None` when every one translated. A searched index answers it
+/// before reading any document, so whether a request fails does not depend on what the index
+/// holds or on which clause a document matched first.
+fn find_query_string_error(query: &Query) -> Option<&str> {
+    match query {
+        Query::LuceneQueryString(QueryStringClauses::Invalid { reason }) => Some(reason),
+        Query::Bool(bool_query) => bool_query
+            .must
+            .iter()
+            .chain(&bool_query.filter)
+            .chain(&bool_query.should)
+            .chain(&bool_query.must_not)
+            .find_map(find_query_string_error),
+        Query::ConstantScore(inner) => find_query_string_error(inner),
+        Query::Nested(nested) => find_query_string_error(&nested.query),
+        Query::LuceneQueryString(QueryStringClauses::Translated(_))
+        | Query::MatchAll
+        | Query::MatchNone
+        | Query::Term(_)
+        | Query::Terms(_)
+        | Query::Ids(_)
+        | Query::Range(_)
+        | Query::Exists(_)
+        | Query::Prefix(_)
+        | Query::Wildcard(_)
+        | Query::Match(_)
+        | Query::MatchPhrase(_)
+        | Query::MatchPhrasePrefix(_)
+        | Query::MultiMatch(_)
+        | Query::SimpleQueryString(_)
+        | Query::MapValues(_)
+        | Query::TokenPhrase(_) => None,
+    }
+}
+
 /// How many documents of `indices` match `query` at `now`.
 ///
 /// # Errors
 ///
-/// The errors of [`find_system_indices`] and of [`matches_document`].
+/// The query-shard failure of the first index for a `query_string` whose translation failed (a
+/// syntax error or a refused leading wildcard), whatever the index holds, and the errors of
+/// [`find_system_indices`] and of [`matches_document`].
 pub(crate) fn count_system_documents(
     snapshot: &SystemSnapshot,
     indices: &[String],
     query: &Query,
     now: DateTime<Utc>,
 ) -> Result<u64, OpenSearchError> {
+    let query_string_error = find_query_string_error(query);
     let mut count = 0_u64;
     for (index_name, index) in find_system_indices(snapshot, indices)? {
+        if let Some(reason) = query_string_error {
+            return Err(OpenSearchError::query_shard(index_name, reason));
+        }
         for (id, document) in index.documents() {
             if matches_document(query, index_name, id, &document.source, &index.mappings, now)? {
                 count += 1;
@@ -245,7 +287,8 @@ enum SortKey<'s> {
 ///   reading one source of an index, naming the first such index of `indices`, or a stored value
 ///   that does not read as its sort field's kind;
 /// - `query_shard` for a sort on a field the mapping lacks without `unmapped_type`, or on a text,
-///   object or nested field;
+///   object or nested field, and, on the first index, for a `query_string` whose translation
+///   failed (a syntax error or a refused leading wildcard), whatever the index holds;
 /// - the errors of [`find_system_indices`] and [`matches_document`].
 pub(crate) fn search_system_indices(
     snapshot: &SystemSnapshot,
@@ -275,8 +318,12 @@ pub(crate) fn search_system_indices(
         .map(|&(index_name, index)| plan_sort(&index.mappings, index_name, &request.sort))
         .collect::<Result<Vec<Vec<SortPlan<'_>>>, OpenSearchError>>()?;
     verify_sort_field_kinds(&concrete_indices, &sort_plans, &request.sort)?;
+    let query_string_error = find_query_string_error(&request.query);
     let mut keyed_hits = Vec::new();
     for (&(index_name, index), clause_plans) in concrete_indices.iter().zip(&sort_plans) {
+        if let Some(reason) = query_string_error {
+            return Err(OpenSearchError::query_shard(index_name, reason));
+        }
         for (id, document) in index.documents() {
             if matches_document(
                 &request.query,
@@ -1689,5 +1736,35 @@ mod tests {
             empty_lists_answer["hits"]["total"],
             json!({"value": 1, "relation": "eq"})
         );
+    }
+
+    /// A `query_string` syntax error is answered by the searched index before any document is
+    /// read: on an index with no document, and when a document would match an earlier clause.
+    #[tokio::test]
+    async fn a_query_string_syntax_error_is_the_query_shard_400_of_the_index_whatever_it_holds() {
+        let invalid_clause = json!({"query_string": {"query": "a/b"}});
+        let bool_query = json!({"bool": {
+            "should": [{"term": {"type": "dashboard"}}, invalid_clause.clone()],
+            "minimum_should_match": 1
+        }});
+        let empty_snapshot = build_snapshot(&[]);
+        let filled_snapshot = build_snapshot(&[("dashboard:1", json!({"type": "dashboard"}))]);
+        let names = [String::from(".kibana_1")];
+        let now = build_context().now;
+        for (snapshot, query) in [(&empty_snapshot, &invalid_clause), (&filled_snapshot, &bool_query)] {
+            let searched = search_kibana_index(snapshot, &json!({"query": query}), "").expect_err("refused");
+            let parsed_query = parse_query(query).expect("the query parses");
+            let counted = count_system_documents(snapshot, &names, &parsed_query, now).expect_err("refused");
+            for error in [searched, counted] {
+                let (status, body) = render_envelope(error).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+                assert_eq!(body["error"]["type"], "search_phase_execution_exception", "{query}");
+                assert_eq!(
+                    body["error"]["root_cause"][0]["type"], "query_shard_exception",
+                    "{query}"
+                );
+                assert_eq!(body["error"]["root_cause"][0]["index"], ".kibana_1", "{query}");
+            }
+        }
     }
 }

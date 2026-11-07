@@ -1,34 +1,43 @@
 //! The full-text query tree and its resolution against one index's fields.
 //!
-//! `match`, `match_phrase`, `match_phrase_prefix`, `multi_match` and
-//! `simple_query_string` describe text to look for in a set of fields. The tree
-//! here keeps that description free of field types, and [`resolve_full_text`]
-//! turns it, per searched index, into plain DSL leaves on concrete fields, which
-//! the data-path lowering matches. The per-field decisions are made here, once:
+//! `match`, `match_phrase`, `match_phrase_prefix`, `multi_match`,
+//! `simple_query_string` and `query_string` describe text to look for in a set of
+//! fields. The tree here keeps that description free of field types, and
+//! [`resolve_full_text`] turns it, per searched index, into plain DSL leaves on
+//! concrete fields, which the data-path lowering and the system-index evaluator
+//! match. The per-field decisions are made here, once:
 //!
 //! - a text field is analyzed with the standard analyzer; text yielding no token
 //!   there contributes nothing, and a leaf whose every field contributes nothing
 //!   is dropped (`Ok(None)`), so the caller decides what a dropped query matches;
 //! - every other field compares the whole text as one value of its type; a value
-//!   that does not parse matches nothing when the leaf is lenient and is a
-//!   query-shard 400 otherwise;
+//!   that does not parse, and a wildcard, prefix or range a field type does not
+//!   support, match nothing when the leaf is lenient and are a query-shard 400
+//!   otherwise;
 //! - a selection that names no field matches nothing (an unmapped field is not
 //!   an error);
-//! - the per-field queries of a leaf are alternatives: one matching field is enough.
+//! - the per-field queries of a leaf are alternatives: one matching field is enough;
+//! - a classic clause list (`query_string`) takes each clause's occurrence from
+//!   its conjunction and modifier, applied over the clauses that survive analysis
+//!   (see [`ClassicQuery`]);
+//! - a `query_string` time zone reads an unquoted term on one explicitly named
+//!   field and every unquoted range bound; a quoted value is never read in it, and
+//!   an epoch-millisecond value read in it is that zone's wall-clock time.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Offset, TimeZone, Utc};
 use datafusion::arrow::datatypes::DataType;
 use serde_json::{Number, Value};
 
 use super::{
     analyzer::{normalize_standard, tokenize_standard},
     ast::{
-        ALL_FIELDS, BoolQuery, MapValuePredicate, MapValuesQuery, Operator, PrefixQuery, Query, RangeBound, RangeQuery,
-        TermQuery, TokenPhraseQuery,
+        ALL_FIELDS, BoolQuery, ExistsQuery, KeywordBound, KeywordRange, MapValuePredicate, MapValuesQuery, Operator,
+        PrefixQuery, Query, RangeBound, RangeQuery, TermQuery, TokenPhraseQuery, WildcardQuery,
     },
-    date_math::DateFormat,
-    literal::{NumericTerm, parse_boolean_literal, parse_numeric_term, resolve_date_term},
+    date_math::{BoundSide, DateFormat, TimeZoneSpec, resolve_date_bound},
+    literal::{NumericTerm, parse_boolean_literal, parse_java_double, parse_numeric_term, resolve_date_term},
     simple_query::SimpleQuery,
+    udf::translate_wildcard,
 };
 use crate::{
     engine::fixed_binary::decode_fixed_binary_literal,
@@ -88,16 +97,19 @@ pub(crate) struct LeafSettings {
     pub(crate) operator: Operator,
     /// Whether a malformed or wrong-typed value matches nothing instead of failing.
     pub(crate) is_lenient: bool,
+    /// The zone of `query_string` date values; `None` for the other leaves.
+    pub(crate) time_zone: Option<TimeZoneSpec>,
 }
 
 impl LeafSettings {
     /// A leaf over `fields` with these settings.
-    pub(crate) const fn build_leaf(&self, fields: Vec<FieldSelector>, term: FullTextTerm) -> FullTextLeaf {
+    pub(crate) fn build_leaf(&self, fields: Vec<FieldSelector>, term: FullTextTerm) -> FullTextLeaf {
         FullTextLeaf {
             fields,
             term,
             operator: self.operator,
             is_lenient: self.is_lenient,
+            time_zone: self.time_zone.clone(),
         }
     }
 }
@@ -113,6 +125,9 @@ pub(crate) struct FullTextLeaf {
     pub(crate) operator: Operator,
     /// Whether a malformed or wrong-typed value matches nothing instead of failing.
     pub(crate) is_lenient: bool,
+    /// The zone of date values without an offset: applied to an unquoted term on
+    /// one explicitly named field and to every unquoted range bound.
+    pub(crate) time_zone: Option<TimeZoneSpec>,
 }
 
 /// What a leaf looks for.
@@ -125,9 +140,38 @@ pub(crate) enum FullTextTerm {
     Phrase(String),
     /// Consecutive tokens whose last one is a prefix; text fields only.
     PhrasePrefix(String),
-    /// A prefix: of one normalized token on a text field, of the whole value on a
+    /// A prefix: of one normalized token on a text field (with `is_analyzed`, the
+    /// analyzed tokens whose last one is the prefix), of the whole value on a
     /// keyword; refused on the other field types.
-    Prefix(String),
+    Prefix {
+        /// The prefix, escapes removed.
+        prefix: String,
+        /// Whether the prefix is analyzed on a text field (`analyze_wildcard`).
+        is_analyzed: bool,
+    },
+    /// A wildcard pattern (`*`, `?`, `\` escapes kept): per normalized token on a
+    /// text field, the whole value on a keyword; refused on the other field types.
+    Wildcard(String),
+    /// A range; an absent bound is open, and with both absent the field exists.
+    Range {
+        /// The lower bound.
+        lower: Option<FullTextBound>,
+        /// The upper bound.
+        upper: Option<FullTextBound>,
+    },
+    /// The field has a value.
+    Exists,
+}
+
+/// One bound of a full-text range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FullTextBound {
+    /// The bound as written, escapes removed.
+    pub(crate) text: String,
+    /// Whether the bound value itself is inside the range.
+    pub(crate) is_inclusive: bool,
+    /// Whether it was quoted, which keeps a time zone from applying to it.
+    pub(crate) is_quoted: bool,
 }
 
 /// A full-text query before field types are known.
@@ -141,6 +185,10 @@ pub(crate) enum FullTextQuery {
     /// left empty, or holding only the optional match-all a negation adds, is
     /// itself dropped.
     Bool(Vec<FullTextClause>),
+    /// A classic clause list (`query_string`): occurrences come from each clause's
+    /// conjunction and modifier over the clauses that survive analysis; a list left
+    /// empty is itself dropped.
+    Classic(ClassicQuery),
 }
 
 /// One clause of a [`FullTextQuery::Bool`].
@@ -160,6 +208,66 @@ impl FullTextClause {
     }
 }
 
+/// A clause list of the classic query syntax, before analysis.
+///
+/// The occurrence of each clause is decided per searched index, over the clauses
+/// that survive analysis there, so a clause dropped for want of a token neither
+/// matches nor changes a neighbour. Under the `OR` default a clause is required
+/// when it carries `+` or follows `AND`, prohibited when it carries `-`, `NOT` or
+/// `!`, optional otherwise; an `AND` also makes the previous surviving clause
+/// required. Under the `AND` default a clause is required unless it is prohibited
+/// or follows `OR`, and an `OR` makes the previous surviving clause optional. A
+/// prohibited clause never changes. A multi-term entry occurs as the default
+/// operator says (optional under `OR`, required under `AND`) and changes no
+/// neighbour. A list whose surviving clauses are all prohibited matches every row
+/// minus them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClassicQuery {
+    /// The default operator, which the occurrence rules read.
+    pub(crate) operator: Operator,
+    /// The clauses in order.
+    pub(crate) entries: Vec<ClassicEntry>,
+}
+
+/// One entry of a classic clause list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClassicEntry {
+    /// A clause with the conjunction before it and its modifier, as written.
+    Clause {
+        /// `AND`, `OR` or nothing before the clause.
+        conjunction: Conjunction,
+        /// `+`, `-` / `NOT` / `!` or nothing on the clause.
+        modifier: Modifier,
+        /// The clause.
+        query: FullTextQuery,
+    },
+    /// Adjacent bare terms analyzed together; occurs as the default operator says
+    /// and changes no neighbour's occurrence.
+    MultiTerm(FullTextLeaf),
+}
+
+/// The conjunction written before a classic clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Conjunction {
+    /// None written.
+    Implicit,
+    /// `AND` or `&&`.
+    And,
+    /// `OR` or `||`.
+    Or,
+}
+
+/// The modifier written on a classic clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Modifier {
+    /// None written.
+    Absent,
+    /// `+`.
+    Required,
+    /// `-`, `NOT` or `!`.
+    Prohibited,
+}
+
 /// The tree of a parsed `simple_query_string` over `fields`. A query with no term
 /// ([`SimpleQuery::MatchNone`], only ever the whole query) is an empty clause list,
 /// which is dropped and so matches nothing.
@@ -171,7 +279,10 @@ pub(crate) fn build_simple_query_tree(
     let build_leaf_query = |term| FullTextQuery::Leaf(settings.build_leaf(fields.to_vec(), term));
     match query {
         SimpleQuery::Term { text, is_prefix: false } => build_leaf_query(FullTextTerm::Text(text.clone())),
-        SimpleQuery::Term { text, is_prefix: true } => build_leaf_query(FullTextTerm::Prefix(text.clone())),
+        SimpleQuery::Term { text, is_prefix: true } => build_leaf_query(FullTextTerm::Prefix {
+            prefix: text.clone(),
+            is_analyzed: false,
+        }),
         SimpleQuery::Phrase { text } => build_leaf_query(FullTextTerm::Phrase(text.clone())),
         SimpleQuery::MatchAll => FullTextQuery::MatchAll,
         SimpleQuery::MatchNone => FullTextQuery::Bool(Vec::new()),
@@ -254,7 +365,8 @@ pub(crate) enum SearchField {
 /// # Errors
 ///
 /// A query-shard 400 for a malformed or wrong-typed value in a strict leaf, and
-/// for a phrase prefix on a field that is not text; any error of
+/// for a phrase prefix on a field that is not text; `illegal_argument` for a
+/// wildcard on MAP values that does not compile; any error of
 /// [`FullTextFields::expand_selector`].
 pub(crate) fn resolve_full_text(
     query: &FullTextQuery,
@@ -279,6 +391,72 @@ pub(crate) fn resolve_full_text(
                 None
             })
         }
+        FullTextQuery::Classic(classic) => resolve_classic_clauses(classic, fields, now),
+    }
+}
+
+/// A classic clause list: each surviving clause with the occurrence [`ClassicQuery`] states.
+fn resolve_classic_clauses(
+    classic: &ClassicQuery,
+    fields: &dyn FullTextFields,
+    now: DateTime<Utc>,
+) -> Result<Option<Query>, OpenSearchError> {
+    let mut resolved_clauses = Vec::with_capacity(classic.entries.len());
+    for entry in &classic.entries {
+        match entry {
+            ClassicEntry::MultiTerm(leaf) => {
+                if let Some(query) = resolve_leaf(leaf, fields, now)? {
+                    resolved_clauses.push((choose_multi_term_occur(classic.operator), query));
+                }
+            }
+            ClassicEntry::Clause {
+                conjunction,
+                modifier,
+                query,
+            } => {
+                // The conjunction marks the previous surviving clause before this one is
+                // known to survive: a dropped clause still joins its neighbours.
+                mark_previous_clause(&mut resolved_clauses, classic.operator, *conjunction);
+                if let Some(query) = resolve_full_text(query, fields, now)? {
+                    resolved_clauses.push((choose_clause_occur(classic.operator, *conjunction, *modifier), query));
+                }
+            }
+        }
+    }
+    Ok(combine_clauses(resolved_clauses))
+}
+
+/// The occurrence of a multi-term entry: the default operator's.
+const fn choose_multi_term_occur(operator: Operator) -> Occur {
+    match operator {
+        Operator::Or => Occur::Should,
+        Operator::And => Occur::Must,
+    }
+}
+
+/// What a conjunction does to the previous surviving clause: `AND` makes it
+/// required, `OR` under the `AND` default optional; a prohibited clause stays.
+fn mark_previous_clause(clauses: &mut [(Occur, Query)], operator: Operator, conjunction: Conjunction) {
+    let Some((occur, _)) = clauses.last_mut() else {
+        return;
+    };
+    if *occur == Occur::MustNot {
+        return;
+    }
+    match (conjunction, operator) {
+        (Conjunction::And, _) => *occur = Occur::Must,
+        (Conjunction::Or, Operator::And) => *occur = Occur::Should,
+        (Conjunction::Or, Operator::Or) | (Conjunction::Implicit, _) => {}
+    }
+}
+
+/// The occurrence of a classic clause from its conjunction and modifier.
+const fn choose_clause_occur(operator: Operator, conjunction: Conjunction, modifier: Modifier) -> Occur {
+    match (modifier, operator, conjunction) {
+        (Modifier::Prohibited, _, _) => Occur::MustNot,
+        (Modifier::Required | Modifier::Absent, Operator::And, Conjunction::Or)
+        | (Modifier::Absent, Operator::Or, Conjunction::Implicit | Conjunction::Or) => Occur::Should,
+        (Modifier::Required | Modifier::Absent, _, _) => Occur::Must,
     }
 }
 
@@ -381,22 +559,39 @@ impl LeafContext<'_> {
     /// The leaf on one typed field; `None` when its text yields no token there.
     fn resolve_typed_field(&self, name: &str, kind: SearchKind) -> Result<Option<Query>, OpenSearchError> {
         match (&self.leaf.term, kind) {
+            (FullTextTerm::Text(text), _) => self.build_exact_value_query(name, kind, text, self.read_term_time_zone()),
             (FullTextTerm::Phrase(text), SearchKind::Text) => Ok(build_phrase_query(name, text, false)),
-            (FullTextTerm::Text(text) | FullTextTerm::Phrase(text), _) => {
-                self.build_exact_value_query(name, kind, text)
-            }
+            (FullTextTerm::Phrase(text), _) => self.build_exact_value_query(name, kind, text, None),
             (FullTextTerm::PhrasePrefix(text), SearchKind::Text) => Ok(build_phrase_query(name, text, true)),
             (FullTextTerm::PhrasePrefix(_), _) => Err(OpenSearchError::query_shard(
                 self.fields.index_name(),
                 &format!("a phrase prefix needs a text field, and [{name}] is not one"),
             )),
-            (FullTextTerm::Prefix(prefix), SearchKind::Text) => {
-                Ok(Some(build_prefix_query(name, normalize_standard(prefix))))
+            (FullTextTerm::Prefix { prefix, is_analyzed }, SearchKind::Text) => {
+                Ok(self.build_text_prefix_query(name, prefix, *is_analyzed))
             }
-            (FullTextTerm::Prefix(prefix), SearchKind::Keyword) => Ok(Some(build_prefix_query(name, prefix.clone()))),
-            (FullTextTerm::Prefix(_), _) => self.refuse_malformed_value(&format!(
+            (FullTextTerm::Prefix { prefix, .. }, SearchKind::Keyword) => {
+                Ok(Some(build_prefix_query(name, prefix.clone())))
+            }
+            (FullTextTerm::Prefix { .. }, _) => self.refuse_malformed_value(&format!(
                 "prefix queries need a keyword or text field, and [{name}] is not one"
             )),
+            // The pattern stays as written: the wildcard leaf lowercases it for a text
+            // field and reads it verbatim on a keyword, on both evaluation paths.
+            (FullTextTerm::Wildcard(pattern), SearchKind::Text | SearchKind::Keyword) => {
+                Ok(Some(Query::Wildcard(WildcardQuery {
+                    field: name.to_owned(),
+                    pattern: pattern.clone(),
+                    case_insensitive: false,
+                })))
+            }
+            (FullTextTerm::Wildcard(_), _) => self.refuse_malformed_value(&format!(
+                "wildcard queries need a keyword or text field, and [{name}] is not one"
+            )),
+            (FullTextTerm::Range { lower, upper }, _) => {
+                self.build_value_range_query(name, kind, lower.as_ref(), upper.as_ref())
+            }
+            (FullTextTerm::Exists, _) => Ok(Some(build_exists_query(name))),
         }
     }
 
@@ -404,7 +599,13 @@ impl LeafContext<'_> {
     fn resolve_map_values(&self, column: &str) -> Result<Query, OpenSearchError> {
         let predicate = match &self.leaf.term {
             FullTextTerm::Text(text) | FullTextTerm::Phrase(text) => MapValuePredicate::Equals(text.clone()),
-            FullTextTerm::Prefix(prefix) => MapValuePredicate::StartsWith(prefix.clone()),
+            FullTextTerm::Prefix { prefix, .. } => MapValuePredicate::StartsWith(prefix.clone()),
+            FullTextTerm::Wildcard(pattern) => MapValuePredicate::Matches(translate_wildcard(pattern, false)?),
+            FullTextTerm::Range { lower, upper } => MapValuePredicate::InRange(KeywordRange {
+                lower: lower.as_ref().map(build_keyword_bound),
+                upper: upper.as_ref().map(build_keyword_bound),
+            }),
+            FullTextTerm::Exists => MapValuePredicate::AnyValue,
             FullTextTerm::PhrasePrefix(_) => {
                 return Err(OpenSearchError::query_shard(
                     self.fields.index_name(),
@@ -418,13 +619,23 @@ impl LeafContext<'_> {
         }))
     }
 
+    /// The zone of an unquoted term: only on one explicitly named field.
+    const fn read_term_time_zone(&self) -> Option<&TimeZoneSpec> {
+        match self.leaf.fields.as_slice() {
+            [FieldSelector::Name(_)] => self.leaf.time_zone.as_ref(),
+            _ => None,
+        }
+    }
+
     /// The whole text as one value of the field: analyzed into terms on a text
-    /// field, exact on a keyword, parsed on the typed fields.
+    /// field, exact on a keyword, parsed on the typed fields; a date without an
+    /// offset is read in `time_zone`.
     fn build_exact_value_query(
         &self,
         name: &str,
         kind: SearchKind,
         text: &str,
+        time_zone: Option<&TimeZoneSpec>,
     ) -> Result<Option<Query>, OpenSearchError> {
         match kind {
             SearchKind::Text => Ok(join_terms(
@@ -446,7 +657,7 @@ impl LeafContext<'_> {
             SearchKind::Integer => self.build_numeric_term_query(name, text, FieldType::Integer),
             SearchKind::Long => self.build_numeric_term_query(name, text, FieldType::Long),
             SearchKind::Double => self.build_numeric_term_query(name, text, FieldType::Double),
-            SearchKind::Date => self.build_date_term_query(name, text),
+            SearchKind::Date => self.build_date_term_query(name, text, time_zone),
             SearchKind::Boolean => parse_boolean_literal(text).map_or_else(
                 || self.refuse_malformed_value(&format!("[{text}] is not a boolean for [{name}]")),
                 |value| Ok(Some(build_term_query(name, Value::Bool(value)))),
@@ -480,12 +691,163 @@ impl LeafContext<'_> {
 
     /// A date term: the half-open microsecond range it covers, written as the
     /// inclusive millisecond range whose epoch-millisecond bounds lower back to it
-    /// (`gte X` is `>= X·1000 µs`, `lte Y` is `< (Y+1)·1000 µs`).
-    fn build_date_term_query(&self, name: &str, text: &str) -> Result<Option<Query>, OpenSearchError> {
-        resolve_date_term(text, None, self.now).map_or_else(
-            |error| self.refuse_malformed_value(&format!("[{text}] is not a date for [{name}]: {error}")),
+    /// (`gte X` is `>= X·1000 µs`, `lte Y` is `< (Y+1)·1000 µs`). An
+    /// epoch-millisecond term read in a zone is first shifted to that wall-clock time.
+    fn build_date_term_query(
+        &self,
+        name: &str,
+        text: &str,
+        time_zone: Option<&TimeZoneSpec>,
+    ) -> Result<Option<Query>, OpenSearchError> {
+        let covered_range = match time_zone {
+            Some(zone) if is_epoch_millis_text(text) => shift_epoch_millis(text, zone)
+                .ok_or_else(|| format!("[{text}] is not a date for [{name}] in the time zone"))
+                .and_then(|shifted| {
+                    resolve_date_term(&shifted, None, self.now)
+                        .map_err(|error| format!("[{text}] is not a date for [{name}]: {error}"))
+                }),
+            _ => resolve_date_term(text, time_zone, self.now)
+                .map_err(|error| format!("[{text}] is not a date for [{name}]: {error}")),
+        };
+        covered_range.map_or_else(
+            |reason| self.refuse_malformed_value(&reason),
             |(start_micros, end_micros)| Ok(Some(build_millisecond_range(name, start_micros, end_micros))),
         )
+    }
+
+    /// A prefix on a text field: the normalized prefix of one token, or, with
+    /// `is_analyzed`, the analyzed tokens joined by the operator, the last one a prefix.
+    fn build_text_prefix_query(&self, name: &str, prefix: &str, is_analyzed: bool) -> Option<Query> {
+        if !is_analyzed {
+            return Some(build_prefix_query(name, normalize_standard(prefix)));
+        }
+        let mut tokens = tokenize_standard(prefix);
+        let last_token = tokens.pop()?;
+        let mut queries: Vec<Query> = tokens
+            .into_iter()
+            .map(|token| build_term_query(name, Value::String(token.text)))
+            .collect();
+        queries.push(build_prefix_query(name, last_token.text));
+        join_terms(self.leaf.operator, queries)
+    }
+
+    /// A range on one field: normalized bounds per token on a text field,
+    /// byte-order bounds on a keyword, parsed bounds on the typed fields.
+    fn build_value_range_query(
+        &self,
+        name: &str,
+        kind: SearchKind,
+        lower: Option<&FullTextBound>,
+        upper: Option<&FullTextBound>,
+    ) -> Result<Option<Query>, OpenSearchError> {
+        if lower.is_none() && upper.is_none() {
+            return Ok(Some(build_exists_query(name)));
+        }
+        if kind == SearchKind::Date {
+            return self.build_date_range_query(name, lower, upper);
+        }
+        let mut range_bounds = [None, None];
+        for (slot, bound) in range_bounds.iter_mut().zip([lower, upper]) {
+            let Some(bound) = bound else { continue };
+            let value = match kind {
+                SearchKind::Text => Some(Value::String(normalize_standard(&bound.text))),
+                SearchKind::Keyword => Some(Value::String(bound.text.clone())),
+                SearchKind::HexId { width } => {
+                    decode_fixed_binary_literal(&bound.text, &DataType::FixedSizeBinary(width))
+                        .ok()
+                        .map(|_| Value::String(bound.text.clone()))
+                }
+                // The range leaf parses numeric bounds itself; this check only chooses
+                // that leaf or a refusal.
+                SearchKind::Integer | SearchKind::Long | SearchKind::Double => {
+                    parse_java_double(&bound.text).map(|_| Value::String(bound.text.clone()))
+                }
+                SearchKind::Boolean => parse_boolean_literal(&bound.text).map(Value::Bool),
+                SearchKind::Date => None,
+            };
+            let Some(value) = value else {
+                return self
+                    .refuse_malformed_value(&format!("[{}] is not a value of the type of [{name}]", bound.text));
+            };
+            *slot = Some(RangeBound {
+                value,
+                is_inclusive: bound.is_inclusive,
+            });
+        }
+        let [lower, upper] = range_bounds;
+        Ok(Some(build_range_query(name, lower, upper, None, None)))
+    }
+
+    /// A date range: each unquoted bound read in the leaf's zone, an
+    /// epoch-millisecond bound shifted by that zone's offset first.
+    fn build_date_range_query(
+        &self,
+        name: &str,
+        lower: Option<&FullTextBound>,
+        upper: Option<&FullTextBound>,
+    ) -> Result<Option<Query>, OpenSearchError> {
+        let sides = [
+            lower.map(|bound| {
+                let side = if bound.is_inclusive {
+                    BoundSide::LowerInclusive
+                } else {
+                    BoundSide::LowerExclusive
+                };
+                (bound, side)
+            }),
+            upper.map(|bound| {
+                let side = if bound.is_inclusive {
+                    BoundSide::UpperInclusive
+                } else {
+                    BoundSide::UpperExclusive
+                };
+                (bound, side)
+            }),
+        ];
+        let mut readings = [None, None];
+        for (slot, side) in readings.iter_mut().zip(sides) {
+            let Some((bound, side)) = side else { continue };
+            match self.read_date_bound(name, bound, side) {
+                Ok(reading) => *slot = Some(reading),
+                Err(reason) => return self.refuse_malformed_value(&reason),
+            }
+        }
+        Ok(Some(combine_date_bounds(name, readings)))
+    }
+
+    /// One date bound of `name` as the range leaf will read it; `Err` holds why that leaf
+    /// could not read it, the parse cause included, so the refusal is made here, under the
+    /// leaf's leniency.
+    fn read_date_bound(&self, name: &str, bound: &FullTextBound, side: BoundSide) -> Result<DateBoundReading, String> {
+        let zone = if bound.is_quoted {
+            None
+        } else {
+            self.leaf.time_zone.as_ref()
+        };
+        let (text, format, time_zone) = match zone {
+            Some(zone) if is_epoch_millis_text(&bound.text) => (
+                shift_epoch_millis(&bound.text, zone)
+                    .ok_or_else(|| format!("[{}] is not a date for [{name}] in the time zone", bound.text))?,
+                Some(DateFormat::EpochMillis),
+                None,
+            ),
+            _ => (bound.text.clone(), choose_date_format(&bound.text), zone.cloned()),
+        };
+        if let Err(error) = resolve_date_bound(&text, format, time_zone.as_ref(), self.now, side) {
+            return Err(format!(
+                "[{}] is not a date for [{name}]: {}",
+                bound.text,
+                error.reason()
+            ));
+        }
+        Ok(DateBoundReading {
+            bound: RangeBound {
+                value: Value::String(text),
+                is_inclusive: bound.is_inclusive,
+            },
+            format,
+            time_zone,
+        })
     }
 
     /// A malformed or wrong-typed value: nothing under leniency, a 400 otherwise.
@@ -498,22 +860,115 @@ impl LeafContext<'_> {
     }
 }
 
+/// One date bound as the range leaf reads it.
+struct DateBoundReading {
+    bound: RangeBound,
+    format: Option<DateFormat>,
+    time_zone: Option<TimeZoneSpec>,
+}
+
+/// One range when both bounds are read alike, otherwise two one-sided ranges that
+/// must both hold.
+fn combine_date_bounds(name: &str, readings: [Option<DateBoundReading>; 2]) -> Query {
+    match readings {
+        [Some(lower), Some(upper)] if lower.format == upper.format && lower.time_zone == upper.time_zone => {
+            build_range_query(
+                name,
+                Some(lower.bound),
+                Some(upper.bound),
+                lower.format,
+                lower.time_zone,
+            )
+        }
+        [Some(lower), Some(upper)] => build_bool_query(
+            vec![
+                build_range_query(name, Some(lower.bound), None, lower.format, lower.time_zone),
+                build_range_query(name, None, Some(upper.bound), upper.format, upper.time_zone),
+            ],
+            Vec::new(),
+            Vec::new(),
+        ),
+        [Some(lower), None] => build_range_query(name, Some(lower.bound), None, lower.format, lower.time_zone),
+        [None, Some(upper)] => build_range_query(name, None, Some(upper.bound), upper.format, upper.time_zone),
+        [None, None] => build_exists_query(name),
+    }
+}
+
+fn build_range_query(
+    name: &str,
+    lower: Option<RangeBound>,
+    upper: Option<RangeBound>,
+    format: Option<DateFormat>,
+    time_zone: Option<TimeZoneSpec>,
+) -> Query {
+    Query::Range(RangeQuery {
+        field: name.to_owned(),
+        lower,
+        upper,
+        format,
+        time_zone,
+    })
+}
+
 /// The inclusive epoch-millisecond range covering the half-open microsecond range
 /// `[start_micros, end_micros)`.
 fn build_millisecond_range(name: &str, start_micros: i64, end_micros: i64) -> Query {
-    Query::Range(RangeQuery {
-        field: name.to_owned(),
-        lower: Some(RangeBound {
+    build_range_query(
+        name,
+        Some(RangeBound {
             value: Value::from(start_micros.div_euclid(1000)),
             is_inclusive: true,
         }),
-        upper: Some(RangeBound {
+        Some(RangeBound {
             value: Value::from(end_micros.div_euclid(1000) - 1),
             is_inclusive: true,
         }),
-        format: Some(DateFormat::EpochMillis),
-        time_zone: None,
-    })
+        Some(DateFormat::EpochMillis),
+        None,
+    )
+}
+
+/// The format a date range bound is read with: epoch milliseconds for digits (with an
+/// optional sign and fraction) that are not a four-digit year, the strict date
+/// format for a four-digit year, the default date parsing otherwise.
+fn choose_date_format(text: &str) -> Option<DateFormat> {
+    if is_epoch_millis_text(text) {
+        Some(DateFormat::EpochMillis)
+    } else if text.len() == 4 && text.bytes().all(|byte| byte.is_ascii_digit()) {
+        Some(DateFormat::StrictDateOptionalTime)
+    } else {
+        None
+    }
+}
+
+/// Whether `text` is epoch milliseconds (`-?digits[.digits]`) and not an unsigned
+/// four-digit year, which reads as a date.
+fn is_epoch_millis_text(text: &str) -> bool {
+    let unsigned_text = text.strip_prefix('-').unwrap_or(text);
+    let (integer_text, fraction_text) = unsigned_text.split_once('.').unwrap_or((unsigned_text, ""));
+    let is_digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let is_year = integer_text.len() == 4 && fraction_text.is_empty() && unsigned_text.len() == text.len();
+    is_digits(integer_text) && (fraction_text.is_empty() || is_digits(fraction_text)) && !is_year
+}
+
+/// Epoch milliseconds read as wall-clock time in `zone`: the value minus the
+/// zone's offset at that local time, sub-millisecond digits truncated. `None` for
+/// a local time the zone skips or a value out of range.
+fn shift_epoch_millis(text: &str, zone: &TimeZoneSpec) -> Option<String> {
+    let integer_text = text.split_once('.').map_or(text, |(integer_text, _)| integer_text);
+    let millis: i64 = integer_text.parse().ok()?;
+    let local_time = DateTime::from_timestamp_millis(millis)?.naive_utc();
+    let offset_seconds = match zone {
+        TimeZoneSpec::Fixed(offset) => offset.local_minus_utc(),
+        TimeZoneSpec::Named(named) => named
+            .offset_from_local_datetime(&local_time)
+            .earliest()?
+            .fix()
+            .local_minus_utc(),
+    };
+    millis
+        .checked_sub(i64::from(offset_seconds) * 1000)
+        .map(|shifted| shifted.to_string())
 }
 
 /// A phrase on a text field: none for no token, a term or a prefix for one, a
@@ -529,6 +984,13 @@ fn build_phrase_query(name: &str, text: &str, is_last_token_prefix: bool) -> Opt
             tokens,
             is_last_token_prefix,
         })),
+    }
+}
+
+fn build_keyword_bound(bound: &FullTextBound) -> KeywordBound {
+    KeywordBound {
+        value: bound.text.clone(),
+        is_inclusive: bound.is_inclusive,
     }
 }
 
@@ -548,10 +1010,16 @@ fn build_prefix_query(name: &str, value: String) -> Query {
     })
 }
 
+fn build_exists_query(name: &str) -> Query {
+    Query::Exists(ExistsQuery { field: name.to_owned() })
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
     use chrono::{DateTime, Utc};
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
     use serde_json::{Value, json};
 
     use super::{
@@ -562,10 +1030,11 @@ mod tests {
         opensearch::error::{OpenSearchError, render_envelope},
         query_dsl::{
             ast::{
-                BoolQuery, MapValuePredicate, MapValuesQuery, Operator, PrefixQuery, Query, RangeBound, RangeQuery,
-                TermQuery, TokenPhraseQuery,
+                BoolQuery, ExistsQuery, KeywordBound, KeywordRange, MapValuePredicate, MapValuesQuery, Operator,
+                PrefixQuery, Query, QueryStringQuery, RangeBound, RangeQuery, TermQuery, TokenPhraseQuery,
             },
-            date_math::DateFormat,
+            date_math::{DateFormat, TimeZoneSpec},
+            lucene::{QueryStringError, translate_query_string},
             simple_query::{SimpleQuery, SimpleQueryFlags, parse_simple_query_string},
         },
     };
@@ -651,6 +1120,7 @@ mod tests {
             term,
             operator,
             is_lenient,
+            time_zone: None,
         })
     }
 
@@ -865,6 +1335,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_malformed_date_range_bound_matches_nothing_under_leniency_and_its_400_states_the_cause() {
+        let mut query = build_query_string_options("timestamp:[not-a-date TO *]", None, Operator::Or);
+        query.lenient = Some(true);
+        assert_eq!(
+            try_resolve_query_string(&query).expect("a lenient bound resolves"),
+            Some(Query::MatchNone)
+        );
+        query.lenient = Some(false);
+        let refusal_reason = assert_query_shard_400(try_resolve_query_string(&query)).await;
+        assert_eq!(
+            refusal_reason,
+            "[not-a-date] is not a date for [timestamp]: failed to parse date [not-a-date]"
+        );
+    }
+
+    #[tokio::test]
     async fn phrases_of_several_tokens_become_token_phrases_and_one_token_a_term() {
         assert_eq!(
             resolve_query(&build_leaf_query(
@@ -976,7 +1462,10 @@ mod tests {
         assert_eq!(
             resolve_query(&build_leaf_query(
                 build_all_fields_selectors(),
-                FullTextTerm::Prefix(String::from("Err")),
+                FullTextTerm::Prefix {
+                    prefix: String::from("Err"),
+                    is_analyzed: false,
+                },
                 Operator::Or,
                 true
             )),
@@ -988,7 +1477,10 @@ mod tests {
         );
         assert_query_shard_400(try_resolve_query(&build_leaf_query(
             build_named_selectors("count"),
-            FullTextTerm::Prefix(String::from("1")),
+            FullTextTerm::Prefix {
+                prefix: String::from("1"),
+                is_analyzed: false,
+            },
             Operator::Or,
             false,
         )))
@@ -1016,6 +1508,7 @@ mod tests {
         let settings = LeafSettings {
             operator: Operator::Or,
             is_lenient: true,
+            time_zone: None,
         };
         let build_clause = |occur, term| FullTextClause {
             occur,
@@ -1026,7 +1519,13 @@ mod tests {
             FullTextQuery::Bool(vec![
                 build_clause(Occur::Must, build_text_term("a")),
                 build_clause(Occur::Should, FullTextTerm::Phrase(String::from("b c"))),
-                build_clause(Occur::MustNot, FullTextTerm::Prefix(String::from("d"))),
+                build_clause(
+                    Occur::MustNot,
+                    FullTextTerm::Prefix {
+                        prefix: String::from("d"),
+                        is_analyzed: false,
+                    }
+                ),
                 FullTextClause {
                     occur: Occur::MustNot,
                     query: FullTextQuery::MatchAll
@@ -1117,6 +1616,7 @@ mod tests {
         let settings = LeafSettings {
             operator: Operator::Or,
             is_lenient: false,
+            time_zone: None,
         };
         let build_body_tree = |text: &str| {
             let parsed =
@@ -1162,5 +1662,655 @@ mod tests {
                 minimum_should_match: None,
             }))
         );
+    }
+
+    fn build_query_string_options(text: &str, default_field: Option<&str>, operator: Operator) -> QueryStringQuery {
+        QueryStringQuery {
+            query: text.to_owned(),
+            default_field: default_field.map(str::to_owned),
+            fields: Vec::new(),
+            default_operator: operator,
+            analyze_wildcard: false,
+            allow_leading_wildcard: true,
+            lenient: None,
+            time_zone: None,
+        }
+    }
+
+    fn try_resolve_query_string(query: &QueryStringQuery) -> Result<Option<Query>, OpenSearchError> {
+        try_resolve_query(&translate_query_string(query).expect("the query string translates"))
+    }
+
+    fn resolve_query_string(text: &str, default_field: Option<&str>, operator: Operator) -> Option<Query> {
+        try_resolve_query_string(&build_query_string_options(text, default_field, operator))
+            .expect("the query string resolves")
+    }
+
+    const fn build_bool(must: Vec<Query>, should: Vec<Query>, must_not: Vec<Query>) -> Query {
+        Query::Bool(BoolQuery {
+            must,
+            filter: vec![],
+            should,
+            must_not,
+            minimum_should_match: None,
+        })
+    }
+
+    const fn build_range(
+        field: String,
+        lower: Option<RangeBound>,
+        upper: Option<RangeBound>,
+        format: Option<DateFormat>,
+        time_zone: Option<TimeZoneSpec>,
+    ) -> Query {
+        Query::Range(RangeQuery {
+            field,
+            lower,
+            upper,
+            format,
+            time_zone,
+        })
+    }
+
+    const fn build_range_bound(value: Value, is_inclusive: bool) -> RangeBound {
+        RangeBound { value, is_inclusive }
+    }
+
+    fn build_millisecond_range_query(field: &str, first_millis: i64, last_millis: i64) -> Query {
+        build_range(
+            field.to_owned(),
+            Some(build_range_bound(json!(first_millis), true)),
+            Some(build_range_bound(json!(last_millis), true)),
+            Some(DateFormat::EpochMillis),
+            None,
+        )
+    }
+
+    #[test]
+    fn classic_clauses_take_the_stated_occurrences() {
+        let build_level_term = |value: &str| build_term("severity_text", json!(value));
+        let rows = [
+            (
+                "a OR b AND c",
+                Operator::Or,
+                build_bool(
+                    vec![build_level_term("b"), build_level_term("c")],
+                    vec![build_level_term("a")],
+                    vec![],
+                ),
+            ),
+            (
+                "a AND b OR c",
+                Operator::Or,
+                build_bool(
+                    vec![build_level_term("a"), build_level_term("b")],
+                    vec![build_level_term("c")],
+                    vec![],
+                ),
+            ),
+            (
+                "a b OR c",
+                Operator::Or,
+                build_bool(
+                    vec![],
+                    vec![build_level_term("a"), build_level_term("b"), build_level_term("c")],
+                    vec![],
+                ),
+            ),
+            (
+                "+a OR b",
+                Operator::Or,
+                build_bool(vec![build_level_term("a")], vec![build_level_term("b")], vec![]),
+            ),
+            (
+                "-a OR b",
+                Operator::Or,
+                build_bool(vec![], vec![build_level_term("b")], vec![build_level_term("a")]),
+            ),
+            (
+                "a OR b AND c",
+                Operator::And,
+                build_bool(
+                    vec![build_level_term("b"), build_level_term("c")],
+                    vec![build_level_term("a")],
+                    vec![],
+                ),
+            ),
+            (
+                "a AND b OR c",
+                Operator::And,
+                build_bool(
+                    vec![build_level_term("a")],
+                    vec![build_level_term("b"), build_level_term("c")],
+                    vec![],
+                ),
+            ),
+            (
+                "a b OR c",
+                Operator::And,
+                build_bool(
+                    vec![build_level_term("a")],
+                    vec![build_level_term("b"), build_level_term("c")],
+                    vec![],
+                ),
+            ),
+            (
+                "+a OR b",
+                Operator::And,
+                build_bool(vec![], vec![build_level_term("a"), build_level_term("b")], vec![]),
+            ),
+            (
+                "-a OR b",
+                Operator::And,
+                build_bool(vec![], vec![build_level_term("b")], vec![build_level_term("a")]),
+            ),
+            // A keyword compares the multi-term group's whole text.
+            ("foo bar", Operator::Or, build_level_term("foo bar")),
+        ];
+        for (text, operator, expected) in rows {
+            assert_eq!(
+                resolve_query_string(text, Some("severity_text"), operator),
+                Some(expected),
+                "[{text}] under {operator:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_token_clauses_are_dropped_and_emptied_groups_removed() {
+        // Under `*`: `a` is a token of `body`, a whole value of `severity_text` and of every
+        // MAP value; the typed fields cannot parse it and add nothing.
+        let build_star_a = || {
+            build_bool(
+                vec![],
+                vec![
+                    build_term("body", json!("a")),
+                    build_term("severity_text", json!("a")),
+                    build_map_values_query(MapValuePredicate::Equals(String::from("a"))),
+                ],
+                vec![],
+            )
+        };
+        let rows = [
+            ("body:\"!!!\"", None),
+            ("-body:\"!!!\"", None),
+            ("a AND body:\"!!!\"", Some(build_star_a())),
+            ("a AND (body:\"!!!\")", Some(build_star_a())),
+            // The dropped clause takes no part in the occurrence rules: `AND` makes `a` required.
+            (
+                "a OR body:\"!!!\" AND severity_text:c",
+                Some(build_bool(
+                    vec![build_star_a(), build_term("severity_text", json!("c"))],
+                    vec![],
+                    vec![],
+                )),
+            ),
+            // An unqualified empty phrase is an empty whole value on the keyword-like fields.
+            (
+                "\"\"",
+                Some(build_bool(
+                    vec![],
+                    vec![
+                        build_term("severity_text", json!("")),
+                        build_map_values_query(MapValuePredicate::Equals(String::new())),
+                    ],
+                    vec![],
+                )),
+            ),
+        ];
+        for (text, expected) in rows {
+            assert_eq!(resolve_query_string(text, None, Operator::Or), expected, "[{text}]");
+        }
+    }
+
+    #[test]
+    fn boolean_literals_under_the_star_default_match_as_stated() {
+        let build_equals = |value: &str| build_map_values_query(MapValuePredicate::Equals(value.to_owned()));
+        let rows = [
+            (
+                "true",
+                build_bool(
+                    vec![],
+                    vec![
+                        build_term("body", json!("true")),
+                        build_term("flag", json!(true)),
+                        build_term("severity_text", json!("true")),
+                        build_equals("true"),
+                    ],
+                    vec![],
+                ),
+            ),
+            // `TRUE` is no boolean literal: it matches the text and keyword fields only.
+            (
+                "TRUE",
+                build_bool(
+                    vec![],
+                    vec![
+                        build_term("body", json!("true")),
+                        build_term("severity_text", json!("TRUE")),
+                        build_equals("TRUE"),
+                    ],
+                    vec![],
+                ),
+            ),
+            // One malformed value under leniency.
+            ("flag:(true false)", Query::MatchNone),
+            (
+                "flag:(true OR false)",
+                build_bool(
+                    vec![],
+                    vec![build_term("flag", json!(true)), build_term("flag", json!(false))],
+                    vec![],
+                ),
+            ),
+            // `must_not` keeps the rows without `flag` (lowered as NOT coalesce(p, false)).
+            (
+                "-flag:true",
+                build_bool(vec![], vec![], vec![build_term("flag", json!(true))]),
+            ),
+            (
+                "flag:[false TO true}",
+                build_range(
+                    String::from("flag"),
+                    Some(build_range_bound(json!(false), true)),
+                    Some(build_range_bound(json!(true), false)),
+                    None,
+                    None,
+                ),
+            ),
+            // Prefix on a boolean is wrong-typed: nothing under leniency.
+            ("flag:t*", Query::MatchNone),
+        ];
+        for (text, expected) in rows {
+            assert_eq!(
+                resolve_query_string(text, None, Operator::Or),
+                Some(expected),
+                "[{text}]"
+            );
+        }
+    }
+
+    /// Field-qualified date terms and ranges in `dubai` (UTC+4) and what each resolves to.
+    fn list_named_date_rows(dubai: &TimeZoneSpec) -> Vec<(&'static str, Query)> {
+        let timestamp = || String::from("timestamp");
+        let build_text_bound = |value: &str, is_inclusive| Some(build_range_bound(json!(value), is_inclusive));
+        vec![
+            // The local day 2026-10-08 in UTC+4: 2026-10-07T20:00:00Z (1791403200000 ms)
+            // up to 2026-10-08T20:00:00Z (1791489600000 ms).
+            (
+                "timestamp:2026-10-08",
+                build_millisecond_range_query("timestamp", 1_791_403_200_000, 1_791_489_599_999),
+            ),
+            // Quoted: never shifted, the UTC day.
+            (
+                "timestamp:\"2026-10-08\"",
+                build_millisecond_range_query("timestamp", 1_791_417_600_000, 1_791_503_999_999),
+            ),
+            // An explicit `Z` is not shifted: one second from 2026-10-08T12:00:00Z.
+            (
+                "timestamp:2026-10-08T12\\:00\\:00Z",
+                build_millisecond_range_query("timestamp", 1_791_460_800_000, 1_791_460_800_999),
+            ),
+            // An epoch-millisecond term is read as Dubai wall-clock time: 1791460800000 - 14400000.
+            (
+                "timestamp:1791460800000",
+                build_millisecond_range_query("timestamp", 1_791_446_400_000, 1_791_446_400_000),
+            ),
+            (
+                "timestamp:[2026-10-08 TO 2026-10-09]",
+                build_range(
+                    timestamp(),
+                    build_text_bound("2026-10-08", true),
+                    build_text_bound("2026-10-09", true),
+                    None,
+                    Some(dubai.clone()),
+                ),
+            ),
+            (
+                "timestamp:[1791460800000 TO *]",
+                build_range(
+                    timestamp(),
+                    build_text_bound("1791446400000", true),
+                    None,
+                    Some(DateFormat::EpochMillis),
+                    None,
+                ),
+            ),
+            (
+                "timestamp:[\"2026-10-08\" TO *]",
+                build_range(timestamp(), build_text_bound("2026-10-08", true), None, None, None),
+            ),
+            (
+                "timestamp:[2026 TO *]",
+                build_range(
+                    timestamp(),
+                    build_text_bound("2026", true),
+                    None,
+                    Some(DateFormat::StrictDateOptionalTime),
+                    Some(dubai.clone()),
+                ),
+            ),
+            (
+                "timestamp:[1791460800000 TO 2026-10-09]",
+                build_bool(
+                    vec![
+                        build_range(
+                            timestamp(),
+                            build_text_bound("1791446400000", true),
+                            None,
+                            Some(DateFormat::EpochMillis),
+                            None,
+                        ),
+                        build_range(
+                            timestamp(),
+                            None,
+                            build_text_bound("2026-10-09", true),
+                            None,
+                            Some(dubai.clone()),
+                        ),
+                    ],
+                    vec![],
+                    vec![],
+                ),
+            ),
+        ]
+    }
+
+    #[test]
+    fn time_zone_shifts_unquoted_date_terms_and_ranges_as_stated() {
+        let dubai = TimeZoneSpec::Named(chrono_tz::Asia::Dubai);
+        let resolve_in_dubai = |text: &str| {
+            let mut query = build_query_string_options(text, None, Operator::Or);
+            query.time_zone = Some(dubai.clone());
+            try_resolve_query_string(&query).expect("resolves")
+        };
+        let build_text_bound = |value: &str, is_inclusive| Some(build_range_bound(json!(value), is_inclusive));
+        for (text, expected) in list_named_date_rows(&dubai) {
+            assert_eq!(resolve_in_dubai(text), Some(expected), "[{text}]");
+        }
+        // Under `*` an unquoted term is not read in the zone (the UTC day), a range bound is.
+        assert_eq!(
+            resolve_in_dubai("2026-10-08"),
+            Some(build_bool(
+                vec![],
+                vec![
+                    build_bool(
+                        vec![],
+                        vec![
+                            build_term("body", json!("2026")),
+                            build_term("body", json!("10")),
+                            build_term("body", json!("08")),
+                        ],
+                        vec![],
+                    ),
+                    build_term("severity_text", json!("2026-10-08")),
+                    build_millisecond_range_query("timestamp", 1_791_417_600_000, 1_791_503_999_999),
+                    build_map_values_query(MapValuePredicate::Equals(String::from("2026-10-08"))),
+                ],
+                vec![],
+            ))
+        );
+        assert_eq!(
+            resolve_in_dubai("[2026-10-08 TO *]"),
+            Some(build_bool(
+                vec![],
+                vec![
+                    build_range(
+                        String::from("body"),
+                        build_text_bound("2026-10-08", true),
+                        None,
+                        None,
+                        None
+                    ),
+                    build_range(
+                        String::from("severity_text"),
+                        build_text_bound("2026-10-08", true),
+                        None,
+                        None,
+                        None
+                    ),
+                    build_range(
+                        String::from("timestamp"),
+                        build_text_bound("2026-10-08", true),
+                        None,
+                        None,
+                        Some(dubai.clone())
+                    ),
+                    build_map_values_query(MapValuePredicate::InRange(KeywordRange {
+                        lower: Some(KeywordBound {
+                            value: String::from("2026-10-08"),
+                            is_inclusive: true,
+                        }),
+                        upper: None,
+                    })),
+                ],
+                vec![],
+            ))
+        );
+    }
+
+    #[test]
+    fn an_unqualified_range_is_an_or_of_per_field_ranges_in_each_fields_order() {
+        let build_ten_range = |field: &str| {
+            build_range(
+                field.to_owned(),
+                Some(build_range_bound(json!("10"), false)),
+                None,
+                None,
+                None,
+            )
+        };
+        assert_eq!(
+            resolve_query_string(">10", None, Operator::Or),
+            Some(build_bool(
+                vec![],
+                vec![
+                    build_ten_range("body"),
+                    build_ten_range("count"),
+                    build_ten_range("ratio"),
+                    build_ten_range("severity_text"),
+                    build_ten_range("status"),
+                    build_range(
+                        String::from("timestamp"),
+                        Some(build_range_bound(json!("10"), false)),
+                        None,
+                        Some(DateFormat::EpochMillis),
+                        None
+                    ),
+                    build_map_values_query(MapValuePredicate::InRange(KeywordRange {
+                        lower: Some(KeywordBound {
+                            value: String::from("10"),
+                            is_inclusive: false,
+                        }),
+                        upper: None,
+                    })),
+                ],
+                vec![],
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn wildcard_and_prefix_terms_on_an_id_field_are_a_400_and_match_nothing_under_lenient() {
+        for text in ["trace_id:ab*", "trace_id:a?c"] {
+            assert_eq!(
+                resolve_query_string(text, None, Operator::Or),
+                Some(Query::MatchNone),
+                "[{text}] under leniency"
+            );
+            assert_query_shard_400(try_resolve_query_string(&build_query_string_options(
+                text,
+                Some("body"),
+                Operator::Or,
+            )))
+            .await;
+        }
+    }
+
+    #[test]
+    fn star_and_exists_resolve_as_stated() {
+        assert_eq!(resolve_query_string("*", None, Operator::Or), Some(Query::MatchAll));
+        assert_eq!(
+            resolve_query_string("_exists_:*", None, Operator::Or),
+            Some(Query::MatchNone)
+        );
+        assert_eq!(
+            resolve_query_string("_exists_:body", None, Operator::Or),
+            Some(Query::Exists(ExistsQuery {
+                field: String::from("body")
+            }))
+        );
+        assert_eq!(
+            resolve_query_string("_exists_:log_attributes.\\*", None, Operator::Or),
+            Some(build_map_values_query(MapValuePredicate::AnyValue))
+        );
+        // Unescaped, the trailing `*` is part of a literal name: the MAP key named `*`.
+        assert_eq!(
+            resolve_query_string("_exists_:log_attributes.*", None, Operator::Or),
+            Some(Query::Exists(ExistsQuery {
+                field: String::from("log_attributes.*")
+            }))
+        );
+        assert_eq!(
+            resolve_query_string("body:Err*", None, Operator::Or),
+            Some(build_prefix("body", "err"))
+        );
+    }
+
+    /// Fragments the query-string generator joins: terms (ASCII, non-ASCII, numbers, a date, an
+    /// address, a boolean, hex), field prefixes (typed, a MAP key, unmapped, two patterns,
+    /// `_exists_`), operators, quotes, brackets, escapes (a truncated `\u` among them), `~`, `^`,
+    /// wildcards, a regular expression and whitespace.
+    const QUERY_STRING_FRAGMENTS: &[&str] = &[
+        "a",
+        "Err",
+        "café",
+        "10",
+        "-3.5",
+        "2026-10-08",
+        "user@example.com",
+        "true",
+        "ab12",
+        "body:",
+        "count:",
+        "flag:",
+        "severity_text:",
+        "timestamp:",
+        "trace_id:",
+        "log_attributes.http.method:",
+        "missing:",
+        "*:",
+        "log_attributes.\\*:",
+        "_exists_:",
+        " AND ",
+        " OR ",
+        " NOT ",
+        " && ",
+        " || ",
+        "!",
+        "+",
+        "-",
+        "\"",
+        "\"a b\"",
+        "(",
+        ")",
+        "[",
+        "]",
+        "{",
+        "}",
+        " TO ",
+        "\\",
+        "\\:",
+        "\\*",
+        "\\u00e9",
+        "\\u12",
+        "~",
+        "~2",
+        "^",
+        "^2",
+        "*",
+        "?",
+        "/",
+        "/ERR.*/",
+        ":",
+        ">",
+        ">=",
+        "<",
+        "<=",
+        " ",
+        "\t",
+    ];
+
+    /// The fields of [`StatedFields`], with every pattern selecting all of them: a generated
+    /// query string writes patterns no index states, and only the absence of a panic and of a
+    /// 500 is checked over it.
+    struct GeneratedFields {
+        stated_fields: StatedFields,
+    }
+
+    impl FullTextFields for GeneratedFields {
+        fn index_name(&self) -> &str {
+            self.stated_fields.index_name()
+        }
+
+        fn expand_selector(&self, selector: &FieldSelector) -> Result<Vec<SearchField>, OpenSearchError> {
+            match selector {
+                FieldSelector::Name(_) => self.stated_fields.expand_selector(selector),
+                FieldSelector::Pattern(_) => {
+                    self.stated_fields.expand_selector(&FieldSelector::Pattern(String::from("*")))
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generated_query_strings_translate_or_fail_as_a_400_and_never_panic() {
+        // A failing input is kept as a literal row of the visitor or resolver tests above, and
+        // the visitor or the resolver is fixed; the generator stays as it is.
+        let generated_fields = GeneratedFields {
+            stated_fields: StatedFields { index: "logs" },
+        };
+        let mut generator = StdRng::seed_from_u64(0x5EED_0C1A_551C);
+        for _ in 0..5_000 {
+            let text: String = (0..generator.random_range(1..=12))
+                .map(|_| QUERY_STRING_FRAGMENTS[generator.random_range(0..QUERY_STRING_FRAGMENTS.len())])
+                .collect();
+            let mut query = build_query_string_options(&text, None, Operator::Or);
+            if generator.random_bool(0.5) {
+                query.default_operator = Operator::And;
+            }
+            if generator.random_bool(0.3) {
+                query.default_field = Some(String::from("body"));
+            }
+            query.analyze_wildcard = generator.random_bool(0.5);
+            query.allow_leading_wildcard = generator.random_bool(0.7);
+            if generator.random_bool(0.2) {
+                query.lenient = Some(false);
+            }
+            if generator.random_bool(0.3) {
+                query.time_zone = Some(TimeZoneSpec::Named(chrono_tz::America::New_York));
+            }
+            match translate_query_string(&query) {
+                Ok(tree) => {
+                    if let Err(error) = resolve_full_text(&tree, &generated_fields, parse_request_instant()) {
+                        assert_eq!(
+                            error.status(),
+                            StatusCode::BAD_REQUEST,
+                            "[{text}] resolves to {error:?}"
+                        );
+                    }
+                }
+                Err(QueryStringError::Invalid(reason)) => {
+                    assert!(!reason.is_empty(), "[{text}] fails without a reason");
+                }
+                Err(QueryStringError::Refused(error)) => {
+                    assert_eq!(
+                        error.status(),
+                        StatusCode::BAD_REQUEST,
+                        "[{text}] is refused as {error:?}"
+                    );
+                }
+            }
+        }
     }
 }

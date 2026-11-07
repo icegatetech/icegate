@@ -2,7 +2,8 @@
 
 Generated ANTLR parsers of IceGate's query languages, and the entry points that run them.
 This crate holds no query semantics: turning a parse tree into a query is left to the
-caller that walks it.
+caller that walks it. `icegate-query` depends on it: the visitor in its
+`query_dsl/lucene/visitor.rs` walks the Lucene tree into the query of a `query_string` leaf.
 
 | Module | Start rule | Entry point |
 |---|---|---|
@@ -11,6 +12,10 @@ caller that walks it.
 Each entry point stops at the first syntax error and returns it as `SyntaxError`; the doc
 comments of the entry point and of `SyntaxError` state where the error is reported and what
 it carries.
+
+`lucene` also exposes `measure_group_depth`, which runs only the lexer and answers how many
+group levels the parser would recurse through, so a caller can refuse a deeply nested string
+before parsing it. Its doc comment states what it counts.
 
 ## The Lucene query-string grammar
 

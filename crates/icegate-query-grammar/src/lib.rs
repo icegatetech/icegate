@@ -2,9 +2,11 @@
 //!
 //! Each language module exposes one entry point per start rule: it takes the
 //! query text, runs the generated lexer and parser, and stops at the first
-//! syntax error. Turning a parse tree into a query is the caller's job; this
-//! crate holds no query semantics. The grammars, their origins and the
-//! regeneration recipe are described in the crate README.
+//! syntax error. A module may also expose lexer-only measures of the text, such
+//! as the group depth its parser recurses through. Turning a parse tree into a
+//! query is the caller's job; this crate holds no query semantics. The
+//! grammars, their origins and the regeneration recipe are described in the
+//! crate README.
 
 pub mod lucene;
 

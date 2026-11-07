@@ -28,8 +28,8 @@ use crate::opensearch::search::doc_id::{
 use crate::query_dsl::analyzer::normalize_standard;
 use crate::query_dsl::ast::{
     BoolQuery, ExistsQuery, IdsQuery, MapValuesQuery, MatchPhrasePrefixQuery, MatchPhraseQuery, MatchQuery,
-    MultiMatchQuery, MultiMatchType, Operator, PrefixQuery, Query, RangeBound, RangeQuery, SimpleQueryStringQuery,
-    TermQuery, TermsQuery, TokenPhraseQuery, WildcardQuery, ZeroTermsQuery,
+    MultiMatchQuery, MultiMatchType, Operator, PrefixQuery, Query, QueryStringClauses, RangeBound, RangeQuery,
+    SimpleQueryStringQuery, TermQuery, TermsQuery, TokenPhraseQuery, WildcardQuery, ZeroTermsQuery,
 };
 use crate::query_dsl::date_math::{BoundSide, resolve_date_bound};
 use crate::query_dsl::full_text::{
@@ -68,9 +68,10 @@ pub(crate) struct LoweringScope<'a> {
 /// for a literal of the wrong form for its field (an invalid hex id; a malformed, non-finite or
 /// out-of-range number; a boolean other than `true` or `false`; text that is no date) and for
 /// `prefix` or `wildcard` on an id, numeric, date or boolean field, for a strict full-text leaf
-/// whose text does not parse for a typed field, and for a phrase prefix on a field that is not
-/// text; `parsing_exception` for `nested` on a data index; `illegal_argument_exception` for a
-/// field pattern that selects only some keys of a MAP column and for a pattern that does not
+/// whose text does not parse for a typed field, for a phrase prefix on a field that is not
+/// text, and for a `query_string` whose translation failed (a syntax error or a refused leading
+/// wildcard); `parsing_exception` for `nested` on a data index; `illegal_argument_exception` for
+/// a field pattern that selects only some keys of a MAP column and for a pattern that does not
 /// compile; `500` for a leaf on a column no `OpenSearch` type represents or for an `ids` value
 /// of an index with hashed ids and no timestamp column; and the error the index's table failed
 /// to open with.
@@ -95,6 +96,10 @@ pub(crate) fn lower_query(query: &Query, scope: &LoweringScope<'_>) -> Result<Ex
         Query::MatchPhrasePrefix(query) => lower_match_phrase_prefix(query, scope),
         Query::MultiMatch(query) => lower_multi_match(query, scope),
         Query::SimpleQueryString(query) => lower_simple_query_string(query, scope),
+        Query::LuceneQueryString(QueryStringClauses::Translated(tree)) => lower_full_text(tree, scope, lit(false)),
+        Query::LuceneQueryString(QueryStringClauses::Invalid { reason }) => {
+            Err(OpenSearchError::query_shard(scope.entry.name(), reason))
+        }
         Query::MapValues(query) => Ok(lower_map_values(query)),
         Query::TokenPhrase(query) => lower_token_phrase(query, scope),
     }
@@ -165,6 +170,7 @@ fn lower_match(query: &MatchQuery, scope: &LoweringScope<'_>) -> Result<Expr, Op
     let settings = LeafSettings {
         operator: query.operator,
         is_lenient: query.lenient.unwrap_or(false),
+        time_zone: None,
     };
     let leaf = settings.build_leaf(
         vec![FieldSelector::Name(query.field.clone())],
@@ -199,6 +205,7 @@ fn build_strict_field_leaf(field: &str, term: FullTextTerm) -> FullTextLeaf {
     let settings = LeafSettings {
         operator: Operator::Or,
         is_lenient: false,
+        time_zone: None,
     };
     settings.build_leaf(vec![FieldSelector::Name(field.to_owned())], term)
 }
@@ -209,6 +216,7 @@ fn lower_multi_match(query: &MultiMatchQuery, scope: &LoweringScope<'_>) -> Resu
     let settings = LeafSettings {
         operator: query.operator,
         is_lenient: query.lenient.unwrap_or_else(|| selects_all_fields(&query.fields)),
+        time_zone: None,
     };
     let term = match query.match_type {
         MultiMatchType::BestFields => FullTextTerm::Text(query.query.clone()),
@@ -227,6 +235,7 @@ fn lower_simple_query_string(
     let settings = LeafSettings {
         operator: query.default_operator,
         is_lenient: query.lenient.unwrap_or_else(|| selects_all_fields(&query.fields)),
+        time_zone: None,
     };
     let tree = build_simple_query_tree(&query.query, &build_field_selectors(&query.fields), &settings);
     lower_full_text(&tree, scope, lit(false))

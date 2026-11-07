@@ -57,11 +57,13 @@ use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::glob::matches_glob;
 use crate::query_dsl::analyzer::{Token, contains_token_phrase, normalize_standard, tokenize_standard};
 use crate::query_dsl::ast::{
-    BoolQuery, MatchQuery, MultiMatchQuery, MultiMatchType, NestedQuery, Operator, Query, RangeBound, RangeQuery,
-    SimpleQueryStringQuery, ZeroTermsQuery,
+    BoolQuery, MatchQuery, MultiMatchQuery, MultiMatchType, NestedQuery, Operator, Query, QueryStringClauses,
+    RangeBound, RangeQuery, SimpleQueryStringQuery, TokenPhraseQuery, ZeroTermsQuery,
 };
 use crate::query_dsl::date_math::{BoundSide, parse_stored_date_millis, resolve_date_bound};
-use crate::query_dsl::full_text::selects_all_fields;
+use crate::query_dsl::full_text::{
+    FieldSelector, FullTextFields, FullTextQuery, SearchField, SearchKind, resolve_full_text, selects_all_fields,
+};
 use crate::query_dsl::simple_query::SimpleQuery;
 
 /// The metadata field naming a document's id.
@@ -345,10 +347,42 @@ impl<'a> DocumentView<'a> {
             }
             Query::MultiMatch(query) => self.matches_multi_match(query),
             Query::SimpleQueryString(query) => self.matches_simple_query_string(query),
-            Query::MapValues(_) | Query::TokenPhrase(_) => Err(OpenSearchError::internal(
-                "a leaf the full-text resolver builds for data indices reached the system-index evaluator",
+            Query::LuceneQueryString(QueryStringClauses::Invalid { reason }) => {
+                Err(OpenSearchError::query_shard(self.index, reason))
+            }
+            Query::LuceneQueryString(QueryStringClauses::Translated(tree)) => self.matches_query_string(tree),
+            Query::TokenPhrase(phrase) => self.matches_token_phrase(phrase),
+            Query::MapValues(_) => Err(OpenSearchError::internal(
+                "a MAP-value leaf built for data indices reached the system-index evaluator",
             )),
         }
+    }
+
+    /// A translated `query_string`: resolved against this document's fields, then evaluated
+    /// like any other query; a tree whose every clause analyzed to no token matches nothing.
+    fn matches_query_string(&self, tree: &FullTextQuery) -> Result<bool, OpenSearchError> {
+        let Some(resolved_query) = resolve_full_text(tree, self, self.now)? else {
+            return Ok(false);
+        };
+        // `matches_query` borrows its query for the view's lifetime. The view only holds shared
+        // references, so a copy of it at the shorter lifetime of `resolved_query` evaluates the
+        // resolved query, keeping the `nested` scope and the analyzed values of this evaluation.
+        let view: DocumentView<'_> = *self;
+        view.matches_query(&resolved_query)
+    }
+
+    /// Consecutive tokens of one text field, matched as `match_phrase` matches them; a field of
+    /// another kind holds no tokens and does not match.
+    fn matches_token_phrase(&self, phrase: &TokenPhraseQuery) -> Result<bool, OpenSearchError> {
+        let field_values = self.resolve_field(&phrase.field)?;
+        if field_values.kind != Some(FieldKind::Text) {
+            return Ok(false);
+        }
+        Ok(field_values.values.iter().any(|stored_value| {
+            self.analyzed_values
+                .tokenize_value(stored_value)
+                .is_some_and(|tokens| contains_token_phrase(&tokens, &phrase.tokens, phrase.is_last_token_prefix))
+        }))
     }
 
     /// Whether this document satisfies the clauses of `query`, as [`BoolQuery`] states them.
@@ -886,6 +920,58 @@ impl<'a> DocumentView<'a> {
             collect_leaf_fields(scope.element, mapping_node, scope.path, &mut fields);
         }
         fields
+    }
+}
+
+/// The searchable fields of one system-index document, for the full-text resolver. A field is
+/// typed by [`DocumentView::resolve_field`], the resolution every other leaf on this document
+/// uses, so a `query_string` and a `match` type a field alike: the stored mapping first
+/// (multi-fields such as `title.keyword` included), then the document's own value.
+impl FullTextFields for DocumentView<'_> {
+    fn index_name(&self) -> &str {
+        self.index
+    }
+
+    /// A name selects itself; a pattern selects the document's leaf fields it matches
+    /// ([`DocumentView::expand_field_patterns`]). A field with no type here (unmapped and
+    /// absent) or an object-like type is not selected.
+    fn expand_selector(&self, selector: &FieldSelector) -> Result<Vec<SearchField>, OpenSearchError> {
+        match selector {
+            FieldSelector::Name(name) => {
+                let kind = self.resolve_field(name)?.kind.and_then(choose_search_kind);
+                Ok(kind.map_or_else(Vec::new, |kind| {
+                    vec![SearchField::Typed {
+                        name: name.clone(),
+                        kind,
+                    }]
+                }))
+            }
+            FieldSelector::Pattern(pattern) => {
+                let names = self.expand_field_patterns(std::slice::from_ref(pattern));
+                let mut fields = Vec::with_capacity(names.len());
+                for name in names {
+                    if let Some(kind) = self.resolve_field(&name)?.kind.and_then(choose_search_kind) {
+                        fields.push(SearchField::Typed { name, kind });
+                    }
+                }
+                Ok(fields)
+            }
+        }
+    }
+}
+
+/// How a field the evaluator typed as `kind` meets full-text input. The id matches as a
+/// keyword; `integer` and `long` both search as a 64-bit integer; an object or a `nested` field
+/// takes no full-text clause.
+const fn choose_search_kind(kind: FieldKind) -> Option<SearchKind> {
+    match kind {
+        FieldKind::Identifier | FieldKind::Keyword => Some(SearchKind::Keyword),
+        FieldKind::Text => Some(SearchKind::Text),
+        FieldKind::Date => Some(SearchKind::Date),
+        FieldKind::Integer => Some(SearchKind::Long),
+        FieldKind::Float => Some(SearchKind::Double),
+        FieldKind::Boolean => Some(SearchKind::Boolean),
+        FieldKind::Object | FieldKind::Nested => None,
     }
 }
 
@@ -3254,5 +3340,78 @@ mod tests {
         let deepest_query = build_query(build_text(128));
         assert_matches(&[(deepest_query.clone(), true)], &json!({"title": "error"}), &mappings);
         assert_matches(&[(deepest_query, false)], &json!({"title": "rate"}), &mappings);
+    }
+
+    #[test]
+    fn a_query_string_on_a_system_document_resolves_against_its_mapping_and_its_own_leaves() {
+        let mappings = json!({
+            "properties": {
+                "type": {"type": "keyword"},
+                "index-pattern": {"properties": {"title": {"type": "text", "fields": {"keyword": {"type": "keyword"}}}}}
+            }
+        });
+        let logs = json!({"type": "index-pattern", "index-pattern": {"title": "Logs-*"}, "note": "first pattern"});
+        let metrics = json!({"type": "index-pattern", "index-pattern": {"title": "metrics-*"}});
+        let rows = [
+            ("index-pattern.title:logs*", true, false),
+            // A keyword prefix over the whole value, not normalized; the multi-field reads the
+            // values of its parent path.
+            ("index-pattern.title.keyword:Logs-*", true, false),
+            ("type:index-pattern AND NOT index-pattern.title:metrics", true, false),
+            // `note` is not mapped: typed `text` from the document's own value.
+            ("note:\"first pattern\"", true, false),
+            ("note:pattern", true, false),
+            ("note:\"pattern first\"", false, false),
+        ];
+        for (text, matches_logs, matches_metrics) in rows {
+            let query = parse_query(&json!({"query_string": {"query": text}})).expect("the query parses");
+            assert_eq!(
+                matches_document(
+                    &query,
+                    ".kibana_1",
+                    "index-pattern:logs",
+                    &logs,
+                    &mappings,
+                    parse_request_instant()
+                )
+                .expect("evaluates"),
+                matches_logs,
+                "[{text}] on logs"
+            );
+            assert_eq!(
+                matches_document(
+                    &query,
+                    ".kibana_1",
+                    "index-pattern:metrics",
+                    &metrics,
+                    &mappings,
+                    parse_request_instant()
+                )
+                .expect("evaluates"),
+                matches_metrics,
+                "[{text}] on metrics"
+            );
+        }
+    }
+
+    /// A syntax error is carried by the parsed query and answered by the evaluated index as its
+    /// query-shard failure.
+    #[tokio::test]
+    async fn a_query_string_syntax_error_is_the_query_shard_failure_of_the_evaluated_index() {
+        let query = parse_query(&json!({"query_string": {"query": "a/b"}})).expect("the query parses");
+        let error = matches_document(
+            &query,
+            ".kibana_7",
+            "1",
+            &json!({}),
+            &json!({}),
+            parse_request_instant(),
+        )
+        .expect_err("refused");
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "search_phase_execution_exception");
+        assert_eq!(body["error"]["root_cause"][0]["type"], "query_shard_exception");
+        assert_eq!(body["error"]["root_cause"][0]["index"], ".kibana_7");
     }
 }

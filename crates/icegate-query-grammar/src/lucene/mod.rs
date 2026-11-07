@@ -15,7 +15,7 @@ mod luceneparservisitor;
 use std::{cell::Cell, rc::Rc};
 
 use antlr4rust::{
-    Parser as _,
+    Parser as _, TokenSource as _,
     common_token_stream::CommonTokenStream,
     error_listener::ErrorListener,
     error_strategy::BailErrorStrategy,
@@ -131,6 +131,36 @@ pub fn parse_lucene_query(text: &str) -> Result<Rc<TopLevelQueryContextAll<'_>>,
             offending_text: Some(offending_text),
         }
     })
+}
+
+/// The deepest group nesting of a Lucene classic query string: the most group levels
+/// [`parse_lucene_query`] recurses through when it parses `text`.
+///
+/// Only the lexer runs, in one pass and without recursion, so a caller can bound the
+/// parser's recursion before parsing. The count is taken from the same tokens the parser
+/// reads: each `(` token opens a level and each `)` token closes one, a `)` with no level
+/// open closes none, and a parenthesis inside another token (escaped, quoted, in a range
+/// bound or in a regular expression term) opens or closes nothing. Text the lexer cannot
+/// match yields no tokens and so no levels; its error is reported by
+/// [`parse_lucene_query`], not here.
+#[must_use]
+pub fn measure_group_depth(text: &str) -> usize {
+    let mut lexer = LuceneLexer::new(InputStream::new(text));
+    // Lexer errors are reported by the parse; without a listener none is printed.
+    lexer.remove_error_listeners();
+    let mut depth = 0_usize;
+    let mut deepest = 0_usize;
+    loop {
+        match lexer.next_token().get_token_type() {
+            TOKEN_EOF => return deepest,
+            lucenelexer::LPAREN => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            lucenelexer::RPAREN => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
 }
 
 /// The character at a 1-based line and a 0-based column counted in characters.

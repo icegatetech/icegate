@@ -26,6 +26,8 @@ bytes = { workspace = true }
 
 # ANTLR parser
 antlr4rust = { workspace = true }
+# The generated Lucene query-string parser that `query_dsl::lucene` walks.
+icegate-query-grammar = { workspace = true }
 
 # Iceberg
 iceberg = { workspace = true }

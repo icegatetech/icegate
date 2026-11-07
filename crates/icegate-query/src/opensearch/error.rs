@@ -139,6 +139,11 @@ impl OpenSearchError {
         self.status
     }
 
+    /// The envelope's `reason`, which a refusal that wraps this error quotes as its cause.
+    pub(crate) fn reason(&self) -> &str {
+        &self.reason
+    }
+
     /// `index` does not exist (`404`). `index` is the concrete name that is missing, or the whole
     /// expression when it matched nothing and the endpoint disallows an empty match.
     pub(crate) fn index_not_found(index: &str) -> Self {

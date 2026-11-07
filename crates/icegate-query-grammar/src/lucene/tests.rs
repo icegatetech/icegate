@@ -1,4 +1,5 @@
-//! The accept/reject table and the lexer modes of the adjusted Lucene grammar.
+//! The accept/reject table, the lexer modes and the group depth of the adjusted Lucene
+//! grammar.
 //!
 //! Every row is derived by hand from the classic query parser's rules and the
 //! adjustments listed in the crate README.
@@ -11,7 +12,7 @@ use super::{
     BareOperatorTermContextAttrs, BoostContextAttrs, ClauseContextAttrs, ConjoinedClauseContextAttrs,
     ConjunctionContextAttrs, FieldNameContextAttrs, GroupContextAttrs, ModClauseContextAll, ModClauseContextAttrs,
     ModifierContextAttrs, PlainTermContextAttrs, QueryContextAll, QueryContextAttrs, TermContextAll,
-    TermModifiersContextAttrs, TopLevelQueryContextAttrs, parse_lucene_query,
+    TermModifiersContextAttrs, TopLevelQueryContextAttrs, measure_group_depth, parse_lucene_query,
 };
 use crate::SyntaxError;
 
@@ -328,4 +329,31 @@ fn a_bare_operator_followed_by_whitespace_parses_as_a_term() {
     let required_clauses = collect_clauses("+a");
     assert_eq!(required_clauses.len(), 1);
     assert!(required_clauses[0].modifier().expect("a modifier").PLUS().is_some());
+}
+
+#[test]
+fn group_depth_counts_only_the_parenthesis_tokens_the_parser_reads() {
+    let rows = [
+        ("", 0),
+        ("((a) (b (c)))", 3),
+        // An escaped parenthesis is a term character.
+        ("\\(\\( (a)", 1),
+        // A quoted phrase is one token.
+        ("\"((\" (a)", 1),
+        // In the range mode a parenthesis is part of a bound.
+        ("[( TO )] (a)", 1),
+        ("/a(b/ (c)", 1),
+        // A quote with no closing quote matches no rule, so the lexer error takes the rest
+        // of the text and the groups after it are no tokens.
+        ("(a) \"b ((c))", 1),
+        // A quote inside a range bound or a regular expression term opens no phrase.
+        ("[a\"b TO c] ((d))", 2),
+        ("[\"a TO b] ((c))", 2),
+        ("/a\"b/ ((c))", 2),
+        // A `)` with no group open closes nothing.
+        (")) ((a))", 2),
+    ];
+    for (text, depth) in rows {
+        assert_eq!(measure_group_depth(text), depth, "[{text}]");
+    }
 }

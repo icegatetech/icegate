@@ -4,7 +4,9 @@
 use serde_json::Value;
 
 use super::date_math::{DateFormat, TimeZoneSpec};
+use super::full_text::FullTextQuery;
 use super::simple_query::SimpleQuery;
+use super::udf::MatchRegex;
 
 /// One query node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +45,8 @@ pub(crate) enum Query {
     MultiMatch(MultiMatchQuery),
     /// `simple_query_string`.
     SimpleQueryString(SimpleQueryStringQuery),
+    /// `query_string`: a Lucene classic query string, translated when the request is parsed.
+    LuceneQueryString(QueryStringClauses),
     /// Internal: a predicate over every value of a MAP column. Built by the
     /// full-text resolver for a field selection that covers all of a MAP
     /// column's keys; never parsed from a request.
@@ -248,18 +252,27 @@ pub(crate) struct SimpleQueryStringQuery {
 /// every comparison is exact and case-sensitive.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum MapValuePredicate {
+    /// Any value: the map has at least one entry with a value.
+    AnyValue,
     /// The whole value equals the text.
     Equals(String),
     /// The value starts with the text.
     StartsWith(String),
+    /// The whole value matches an anchored pattern.
+    Matches(MatchRegex),
+    /// The value lies in a range, in UTF-8 byte order.
+    InRange(KeywordRange),
 }
 
 impl MapValuePredicate {
     /// Whether one stored value satisfies the predicate.
     pub(crate) fn matches(&self, value: &str) -> bool {
         match self {
+            Self::AnyValue => true,
             Self::Equals(expected) => value == expected,
             Self::StartsWith(prefix) => value.starts_with(prefix.as_str()),
+            Self::Matches(pattern) => pattern.matches(value),
+            Self::InRange(range) => range.contains(value),
         }
     }
 }
@@ -321,4 +334,40 @@ pub(crate) struct KeywordBound {
     pub(crate) value: String,
     /// Whether the bound value itself is inside the range.
     pub(crate) is_inclusive: bool,
+}
+
+/// The options of a `query_string` leaf as the DSL parser reads them. The translation reads
+/// every field once, when the request is parsed; the parsed query keeps only the translation
+/// ([`QueryStringClauses`]).
+#[derive(Debug, Clone)]
+pub(crate) struct QueryStringQuery {
+    /// The query string.
+    pub(crate) query: String,
+    /// The single default field, when set.
+    pub(crate) default_field: Option<String>,
+    /// The default fields (names or patterns), already stripped of `^boost`.
+    pub(crate) fields: Vec<String>,
+    /// The operator between clauses without one, and between the tokens of one text.
+    pub(crate) default_operator: Operator,
+    /// Whether a prefix term on a text field is analyzed (earlier tokens become terms).
+    pub(crate) analyze_wildcard: bool,
+    /// Whether a term may start with `*` or `?`.
+    pub(crate) allow_leading_wildcard: bool,
+    /// Whether malformed or wrong-typed values match nothing; unset means "only under `*`".
+    pub(crate) lenient: Option<bool>,
+    /// The zone in which date terms and range bounds without an offset are read.
+    pub(crate) time_zone: Option<TimeZoneSpec>,
+}
+
+/// A `query_string` after translation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum QueryStringClauses {
+    /// The type-free clause tree, resolved per searched index.
+    Translated(FullTextQuery),
+    /// A syntax error or a refused leading wildcard: each searched index answers it as its
+    /// query-shard failure.
+    Invalid {
+        /// The failure, in IceGate's wording.
+        reason: String,
+    },
 }

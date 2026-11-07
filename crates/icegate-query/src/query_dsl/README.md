@@ -17,12 +17,29 @@ on the stored key it names. The predicate reads only the columns of the tenant-s
 cannot widen the tenant scope. What each leaf lowers to, and what it refuses, is documented on
 `lower_query` and the function lowering that leaf.
 
+## Full-text leaves and Lucene query strings (`full_text.rs`, `lucene/`)
+
+`match`, `match_phrase`, `match_phrase_prefix`, `multi_match`, `simple_query_string` and
+`query_string` describe text to look for in a set of fields. `full_text.rs` keeps that
+description free of field types and resolves it per searched index into term-level leaves, so
+the data path (`lower.rs`) and the system-index evaluator agree on what a query matches. The
+per-field rules (analysis, leniency, MAP values, unmapped fields, the `query_string` time zone)
+are stated once, in the module documentation of `full_text.rs`; the occurrence rules of a
+`query_string` clause list are on `ClassicQuery`.
+
+`query_string` is parsed by the Lucene grammar of `icegate-query-grammar` (its origin and its
+differences from the upstream grammars are in that crate's
+[README](../../../icegate-query-grammar/README.md)). `lucene/visitor.rs` turns the parse tree into
+clause lists once per request, and the resolver applies the occurrence rules per index over the
+clauses that survive analysis. What the leaf accepts and refuses, and the nesting limit, are
+documented on `lucene::parse_query_string` and `lucene::translate_query_string`.
+
 ## The standard analyzer (`analyzer/`)
 
 The analyzer splits text into tokens and lowercases them; no stop words are removed.
 `tokenize_standard` is used wherever a leaf is compared with the tokens of a `text` field, and
-`normalize_standard` (lowercasing without splitting) wherever a `prefix` or `wildcard` pattern
-meets a `text` field.
+`normalize_standard` (lowercasing without splitting) wherever a `prefix` or `wildcard` pattern,
+or a `query_string` range bound, meets a `text` field.
 
 ### Parity target
 
