@@ -14,19 +14,24 @@
 //! millisecond precision, the precision IceGate gives `date` values; `case_insensitive` folds
 //! ASCII letters only. `ids` and `_id` match the document id.
 //!
-//! `text` fields are matched without tokenizing: `exists` is answered, and a `term` is answered
-//! when the stored value consists only of ASCII digit groups joined by single dots (a version
-//! such as `7.10.0`) and is no longer than `MAX_TOKEN_LENGTH`, because IceGate treats such a value
-//! as one token equal to it. Every other leaf on a `text` field is a 400 rather than an answer
-//! under a rule other than token matching.
+//! `text` fields are matched through the standard analyzer, token by token, and each array
+//! element is analyzed on its own: a `term` or `terms` value is not analyzed and matches when it
+//! equals one token of a stored value (`Logs` never matches the token `logs`); a `prefix` or
+//! `wildcard` pattern is lowercased the way the analyzer lowercases, without splitting, and
+//! matches when one token matches it; a `range` matches when one token lies within it, compared
+//! as strings; `exists` holds for any present value, the empty string included.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::opensearch::error::OpenSearchError;
+use crate::query_dsl::analyzer::{Token, normalize_standard, tokenize_standard};
 use crate::query_dsl::ast::{BoolQuery, NestedQuery, Query, RangeBound, RangeQuery};
 use crate::query_dsl::date_math::{BoundSide, parse_stored_date_millis, resolve_date_bound};
 
@@ -35,10 +40,6 @@ pub(crate) const ID_FIELD: &str = "_id";
 
 /// The subfield an inferred `text` value carries for exact matching.
 const KEYWORD_SUBFIELD_SUFFIX: &str = ".keyword";
-
-/// The longest value IceGate treats as one token, in UTF-16 units (digit groups are ASCII, so
-/// bytes count the same).
-const MAX_TOKEN_LENGTH: usize = 255;
 
 /// How the evaluator compares a field's values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,9 +113,8 @@ impl DeclaredFieldType {
 ///
 /// # Errors
 ///
-/// `illegal_argument_exception` for a value that does not parse for its field's type, a leaf
-/// on a `text` field outside the forms the module documentation lists, a string leaf on a
-/// non-string field, or a mapping type the evaluator does not support.
+/// `illegal_argument_exception` for a value that does not parse for its field's type, a string
+/// leaf on a non-string field, or a mapping type the evaluator does not support.
 pub(crate) fn matches_document(
     query: &Query,
     id: &str,
@@ -122,12 +122,14 @@ pub(crate) fn matches_document(
     mappings: &Value,
     now: DateTime<Utc>,
 ) -> Result<bool, OpenSearchError> {
+    let analyzed_values = AnalyzedValues::default();
     DocumentView {
         id,
         source,
         mappings,
         now,
         nested: None,
+        analyzed_values: &analyzed_values,
     }
     .matches_query(query)
 }
@@ -196,6 +198,44 @@ struct NestedScope<'a> {
     element: &'a Value,
 }
 
+/// The tokens of each stored value one evaluation has analyzed, keyed by the value's address in
+/// the document. Every value a field resolves to is borrowed from the document, which outlives
+/// the evaluation, so an address names one value for the whole evaluation; a value is therefore
+/// tokenized once per document and query however many leaves, terms or fields read it.
+#[derive(Default)]
+struct AnalyzedValues {
+    /// The tokens by the value's address. The address is only compared, never read through.
+    tokens: RefCell<HashMap<*const Value, Rc<[Token]>>>,
+}
+
+impl AnalyzedValues {
+    /// The standard analyzer's tokens of `value`'s text; `None` for a value without a text form.
+    fn tokenize_value(&self, value: &Value) -> Option<Rc<[Token]>> {
+        let address = std::ptr::from_ref(value);
+        // Bound to a local so the shared borrow ends before the insert below borrows mutably.
+        let cached_tokens = self.tokens.borrow().get(&address).cloned();
+        if cached_tokens.is_some() {
+            return cached_tokens;
+        }
+        let tokens: Rc<[Token]> = tokenize_standard(&render_text(value)?).into();
+        self.tokens.borrow_mut().insert(address, Rc::clone(&tokens));
+        Some(tokens)
+    }
+
+    /// Whether `predicate` holds for one token of `stored_values`; a value without a text form
+    /// has no token. The first error ends the search.
+    fn matches_any_token(
+        &self,
+        stored_values: &[&Value],
+        predicate: impl Fn(&Token) -> Result<bool, OpenSearchError>,
+    ) -> Result<bool, OpenSearchError> {
+        matches_any_item(stored_values, |stored_value| {
+            self.tokenize_value(stored_value)
+                .map_or(Ok(false), |tokens| matches_any_item(&tokens[..], &predicate))
+        })
+    }
+}
+
 /// The values one document holds at a field path, and how to compare them.
 struct DocumentFieldValues<'a> {
     /// `None` for a path with neither a mapping nor a value.
@@ -217,6 +257,8 @@ struct DocumentView<'a> {
     now: DateTime<Utc>,
     /// The array element a `nested` query evaluates within.
     nested: Option<NestedScope<'a>>,
+    /// The tokens of the stored values this evaluation has analyzed.
+    analyzed_values: &'a AnalyzedValues,
 }
 
 impl<'a> DocumentView<'a> {
@@ -236,12 +278,14 @@ impl<'a> DocumentView<'a> {
             Query::Ids(ids) => Ok(ids.values.iter().any(|value| value == self.id)),
             Query::Range(range) => self.matches_range(range),
             Query::Exists(exists) => self.has_field(&exists.field),
-            Query::Prefix(prefix) => self.matches_pattern(&prefix.field, "prefix", |text| {
-                starts_with_folded(text, &prefix.value, prefix.case_insensitive)
+            Query::Prefix(prefix) => self.matches_pattern(&prefix.field, "prefix", &prefix.value, |text, value| {
+                starts_with_folded(text, value, prefix.case_insensitive)
             }),
-            Query::Wildcard(wildcard) => self.matches_pattern(&wildcard.field, "wildcard", |text| {
-                matches_wildcard(&wildcard.pattern, text, wildcard.case_insensitive)
-            }),
+            Query::Wildcard(wildcard) => {
+                self.matches_pattern(&wildcard.field, "wildcard", &wildcard.pattern, |text, pattern| {
+                    matches_wildcard(pattern, text, wildcard.case_insensitive)
+                })
+            }
             Query::ConstantScore(inner) => self.matches_query(inner),
             Query::Nested(nested) => self.matches_nested(nested),
         }
@@ -372,7 +416,13 @@ impl<'a> DocumentView<'a> {
                         .is_some_and(|text| equals_text(&text, &expected_text, is_case_insensitive))
                 }))
             }
-            FieldKind::Text => matches_text_term(field, value, &field_values.values),
+            FieldKind::Text => matches_text_term(
+                field,
+                value,
+                &field_values.values,
+                self.analyzed_values,
+                is_case_insensitive,
+            ),
             FieldKind::Integer | FieldKind::Float => {
                 let expected_number = parse_numeric(value, field)?;
                 Ok(field_values
@@ -406,7 +456,9 @@ impl<'a> DocumentView<'a> {
         };
         match kind {
             FieldKind::Object | FieldKind::Nested => Ok(false),
-            FieldKind::Text => Err(refuse_text_leaf("range", &range.field)),
+            FieldKind::Text => self
+                .analyzed_values
+                .matches_any_token(&field_values.values, |token| is_within_text_range(&token.text, range)),
             FieldKind::Identifier => is_within_text_range(self.id, range),
             FieldKind::Keyword => matches_any_item(&field_values.values, |stored_value| {
                 render_text(stored_value).map_or(Ok(false), |text| is_within_text_range(&text, range))
@@ -483,12 +535,15 @@ impl<'a> DocumentView<'a> {
         })
     }
 
-    /// Whether `matcher` accepts the text of a value of the string field `field`.
+    /// Whether `matcher(text, pattern)` holds for one of the field's values: the id or a keyword
+    /// value whole, against `pattern` as given; a token of a `text` value, against `pattern`
+    /// lowercased the way the analyzer lowercases.
     fn matches_pattern(
         &self,
         field: &str,
         leaf: &str,
-        matcher: impl Fn(&str) -> bool,
+        pattern: &str,
+        matcher: impl Fn(&str, &str) -> bool,
     ) -> Result<bool, OpenSearchError> {
         let field_values = self.resolve_field(field)?;
         let Some(kind) = field_values.kind else {
@@ -496,12 +551,17 @@ impl<'a> DocumentView<'a> {
         };
         match kind {
             FieldKind::Object | FieldKind::Nested => Ok(false),
-            FieldKind::Identifier => Ok(matcher(self.id)),
+            FieldKind::Identifier => Ok(matcher(self.id, pattern)),
             FieldKind::Keyword => Ok(field_values
                 .values
                 .iter()
-                .any(|stored_value| render_text(stored_value).is_some_and(|text| matcher(&text)))),
-            FieldKind::Text => Err(refuse_text_leaf(leaf, field)),
+                .any(|stored_value| render_text(stored_value).is_some_and(|text| matcher(&text, pattern)))),
+            FieldKind::Text => {
+                let normalized_pattern = normalize_standard(pattern);
+                self.analyzed_values.matches_any_token(&field_values.values, |token| {
+                    Ok(matcher(&token.text, &normalized_pattern))
+                })
+            }
             FieldKind::Date | FieldKind::Integer | FieldKind::Float | FieldKind::Boolean => {
                 Err(OpenSearchError::illegal_argument(format!(
                     "[{leaf}] applies to string fields and [{field}] is not one"
@@ -629,38 +689,18 @@ fn has_leaf(value: &Value) -> bool {
     }
 }
 
-/// A `term` on a `text` field, answered only for stored values that are a single digit-group
-/// token (see the module documentation).
-fn matches_text_term(field: &str, value: &Value, stored_values: &[&Value]) -> Result<bool, OpenSearchError> {
+/// A `term` on a `text` field: the unanalyzed value equals one token of a stored value.
+fn matches_text_term(
+    field: &str,
+    value: &Value,
+    stored_values: &[&Value],
+    analyzed_values: &AnalyzedValues,
+    is_case_insensitive: bool,
+) -> Result<bool, OpenSearchError> {
     let expected_text = render_text(value).ok_or_else(|| refuse_value(field, value))?;
-    // The loop never stops at a match: a later value that is no token still refuses the leaf, so
-    // the answer does not depend on the order of a stored array.
-    let mut has_expected_token = false;
-    for stored_value in stored_values {
-        let Some(text) = render_text(stored_value) else {
-            continue;
-        };
-        if !is_single_digit_group_token(&text) {
-            return Err(refuse_text_leaf("term", field));
-        }
-        has_expected_token |= text == expected_text;
-    }
-    Ok(has_expected_token)
-}
-
-/// ASCII digit groups joined by single dots, at most [`MAX_TOKEN_LENGTH`] characters.
-fn is_single_digit_group_token(text: &str) -> bool {
-    text.len() <= MAX_TOKEN_LENGTH
-        && text
-            .split('.')
-            .all(|group| !group.is_empty() && group.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
-/// The `illegal_argument_exception` for `leaf` on the `text` field `field`.
-fn refuse_text_leaf(leaf: &str, field: &str) -> OpenSearchError {
-    OpenSearchError::illegal_argument(format!(
-        "[{leaf}] on the text field [{field}] is not supported on system indices"
-    ))
+    analyzed_values.matches_any_token(stored_values, |token| {
+        Ok(equals_text(&token.text, &expected_text, is_case_insensitive))
+    })
 }
 
 /// The `illegal_argument_exception` for `value`, which does not fit the type of `field`.
@@ -861,9 +901,9 @@ mod tests {
     }
 
     fn assert_matches(cases: &[(Value, bool)], source: &Value, mappings: &Value) {
-        for (query, expected) in cases {
+        for (query, should_match) in cases {
             let is_match = evaluate(query, source, mappings).expect("the query evaluates");
-            assert_eq!(is_match, *expected, "{query} on {source}");
+            assert_eq!(is_match, *should_match, "{query} on {source}");
         }
     }
 
@@ -1160,10 +1200,10 @@ mod tests {
             ("title.keyword.raw", None),
             ("absent", None),
         ];
-        for (path, expected) in cases {
+        for (path, expected_type) in cases {
             assert_eq!(
                 find_mapped_field(&mappings, path).expect("the path resolves"),
-                expected,
+                expected_type,
                 "{path}"
             );
         }
@@ -1183,10 +1223,10 @@ mod tests {
             ("object", FieldKind::Object),
             ("nested", FieldKind::Nested),
         ];
-        for (type_name, expected) in cases {
+        for (type_name, expected_kind) in cases {
             assert_eq!(
                 FieldKind::from_mapping_type(type_name, "a").expect("a known type"),
-                expected,
+                expected_kind,
                 "{type_name}"
             );
         }
@@ -1216,11 +1256,11 @@ mod tests {
             ("j", vec![json!(5), json!(6)]),
             ("absent", vec![]),
         ];
-        for (path, expected) in cases {
+        for (path, expected_values) in cases {
             let mut values = Vec::new();
             collect_source_values(&source, path, &mut values);
-            let collected: Vec<Value> = values.into_iter().cloned().collect();
-            assert_eq!(collected, expected, "{path}");
+            let collected_values: Vec<Value> = values.into_iter().cloned().collect();
+            assert_eq!(collected_values, expected_values, "{path}");
         }
     }
 
@@ -1237,10 +1277,10 @@ mod tests {
             (json!({"dashboard": {"panels": []}}), false),
             (json!({"type": "dashboard"}), false),
         ];
-        for (source, expected) in cases {
+        for (source, should_match) in cases {
             assert_eq!(
                 evaluate(&query, &source, &mappings).expect("evaluates"),
-                expected,
+                should_match,
                 "{source}"
             );
         }
@@ -1301,10 +1341,10 @@ mod tests {
             (json!({"updated_at": 1.5}), false),
             (json!({"updated_at": 9_223_372_036_854_775_807_i64}), false),
         ];
-        for (source, expected) in cases {
+        for (source, should_match) in cases {
             assert_eq!(
                 evaluate(&query, &source, &mappings).expect("evaluates"),
-                expected,
+                should_match,
                 "{source}"
             );
         }
@@ -1362,78 +1402,197 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_text_leaf_is_refused_unless_the_value_is_one_digit_group_token() {
-        let mappings = json!({"properties": {"title": {"type": "text"}}});
-        let words = json!({"title": "Logs overview"});
-        let version = json!({"title": "7.9.3"});
+    #[test]
+    fn a_term_on_a_text_field_matches_only_a_lowercased_token() {
+        let mappings = json!({"properties": {"title": {"type": "text"}, "tags": {"type": "text"}}});
+        // Tokens: "logs", "overview", "error", "rates"; tags: "alpha", "beta" and "gamma".
+        let source = json!({"title": "Logs Overview: ERROR-rates", "tags": ["Alpha beta", "Gamma"]});
 
-        for refused_query in [
-            json!({"term": {"title": "logs"}}),
-            json!({"prefix": {"title": "lo"}}),
-            json!({"wildcard": {"title": "lo*"}}),
-            json!({"range": {"title": {"gte": "a"}}}),
-        ] {
-            assert_refused(&refused_query, &words, &mappings).await;
-        }
         assert_matches(
             &[
-                (json!({"term": {"title": "7.9.3"}}), true),
-                (json!({"term": {"title": "7.9.0"}}), false),
+                (json!({"term": {"title": "logs"}}), true),
+                (json!({"term": {"title": "error"}}), true),
+                (json!({"term": {"title": "Logs"}}), false),
+                (json!({"term": {"title": "ERROR"}}), false),
+                (
+                    json!({"term": {"title": {"value": "ERROR", "case_insensitive": true}}}),
+                    true,
+                ),
+                (json!({"term": {"title": "logs overview"}}), false),
+                (json!({"term": {"title": "error-rates"}}), false),
+                (json!({"terms": {"title": ["missing", "rates"]}}), true),
+                (json!({"term": {"tags": "gamma"}}), true),
+                (json!({"term": {"tags": "alpha beta"}}), false),
+                (json!({"term": {"title": ""}}), false),
             ],
-            &version,
+            &source,
             &mappings,
         );
-        assert_matches(&[(json!({"exists": {"field": "title"}}), true)], &words, &mappings);
+        // A string under a dynamic object is `text` too: the version is one number token.
         assert_matches(
-            &[(json!({"exists": {"field": "title"}}), true)],
-            &json!({"title": ""}),
-            &mappings,
+            &[(json!({"term": {"migrationVersion.dashboard": "7.9.3"}}), true)],
+            &json!({"migrationVersion": {"dashboard": "7.9.3"}}),
+            &json!({"properties": {"migrationVersion": {"dynamic": "true", "type": "object"}}}),
         );
-        // A stored object has no text to compare; a term reads past it to the next value.
+    }
+
+    #[test]
+    fn prefix_and_wildcard_on_a_text_field_match_a_normalized_token() {
+        let mappings = json!({"properties": {"title": {"type": "text"}}});
+        // Tokens: "visualization", "of", "ünicode", "errors".
+        let source = json!({"title": "Visualization of Ünicode Errors"});
+
         assert_matches(
-            &[(json!({"term": {"title": "1"}}), true)],
-            &json!({"title": [{"nested": true}, "1"]}),
+            &[
+                (json!({"prefix": {"title": "Visual"}}), true),
+                (json!({"prefix": {"title": "ÜNI"}}), true),
+                (json!({"prefix": {"title": "rrors"}}), false),
+                (json!({"prefix": {"title": "of ünicode"}}), false),
+                (json!({"wildcard": {"title": "E*S"}}), true),
+                (json!({"wildcard": {"title": "visuali?ation"}}), true),
+                (json!({"wildcard": {"title": "*code err*"}}), false),
+                (json!({"wildcard": {"title": "visualization"}}), true),
+            ],
+            &source,
             &mappings,
         );
-        // A value that is no token refuses the leaf from either side of a matching one.
-        for stored_values in [json!(["7.9.3", "abc"]), json!(["abc", "7.9.3"])] {
-            assert_refused(
-                &json!({"term": {"title": "7.9.3"}}),
+    }
+
+    #[test]
+    fn a_range_on_a_text_field_matches_when_one_token_is_within_it() {
+        let mappings = json!({"properties": {"title": {"type": "text"}}});
+        // Tokens: "beta", "zeta"; compared as strings, in byte order.
+        let source = json!({"title": "Beta ZETA"});
+
+        assert_matches(
+            &[
+                (json!({"range": {"title": {"gte": "b", "lt": "c"}}}), true),
+                (json!({"range": {"title": {"gte": "c", "lte": "d"}}}), false),
+                (json!({"range": {"title": {"gte": "zeta"}}}), true),
+                (json!({"range": {"title": {"gt": "zeta"}}}), false),
+                (json!({"range": {"title": {"lt": "Z"}}}), false),
+            ],
+            &source,
+            &mappings,
+        );
+    }
+
+    #[test]
+    fn exists_on_a_text_field_is_true_for_an_empty_string() {
+        let mappings = json!({"properties": {"title": {"type": "text"}}});
+        let exists_query = json!({"exists": {"field": "title"}});
+
+        // `""` and `!!!` yield no token but are present values.
+        assert_matches(&[(exists_query.clone(), true)], &json!({"title": ""}), &mappings);
+        assert_matches(&[(exists_query.clone(), true)], &json!({"title": "!!!"}), &mappings);
+        assert_matches(&[(exists_query.clone(), false)], &json!({"title": null}), &mappings);
+        assert_matches(&[(exists_query, false)], &json!({}), &mappings);
+    }
+
+    #[test]
+    fn a_text_field_value_without_text_has_no_token_and_the_next_value_still_matches() {
+        let mappings = json!({"properties": {"title": {"type": "text"}}});
+
+        // A stored object has no text to compare: its key is no token, and every leaf reads past
+        // it, whichever side of the other value it is on.
+        for stored_values in [json!([{"nested": true}, "Logs 1"]), json!(["Logs 1", {"nested": true}])] {
+            assert_matches(
+                &[
+                    (json!({"term": {"title": "1"}}), true),
+                    (json!({"term": {"title": "nested"}}), false),
+                    (json!({"prefix": {"title": "LO"}}), true),
+                    (json!({"prefix": {"title": "ne"}}), false),
+                    (json!({"wildcard": {"title": "l*s"}}), true),
+                    (json!({"wildcard": {"title": "n*d"}}), false),
+                    (json!({"range": {"title": {"gte": "l", "lt": "m"}}}), true),
+                    (json!({"range": {"title": {"gte": "n"}}}), false),
+                ],
                 &json!({"title": stored_values}),
                 &mappings,
-            )
-            .await;
+            );
         }
     }
 
-    #[tokio::test]
-    async fn a_token_longer_than_the_limit_is_refused_and_one_at_the_limit_is_answered() {
+    #[test]
+    fn a_text_field_tokenizes_the_json_spelling_of_a_stored_number_or_boolean() {
+        let mappings = json!({"properties": {"title": {"type": "text"}}});
+
+        assert_matches(
+            &[
+                (json!({"term": {"title": "7"}}), true),
+                (json!({"term": {"title": 7}}), true),
+                (json!({"term": {"title": "true"}}), true),
+                (json!({"term": {"title": true}}), true),
+                (json!({"term": {"title": "8"}}), false),
+            ],
+            &json!({"title": [7, true]}),
+            &mappings,
+        );
+    }
+
+    #[test]
+    fn a_stored_value_is_tokenized_once_per_evaluation() {
+        let analyzed_values = AnalyzedValues::default();
+        let stored_value = json!("Logs overview");
+        let equal_stored_value = json!("Logs overview");
+
+        let first_tokens = analyzed_values.tokenize_value(&stored_value).expect("a string has text");
+        let repeated_tokens = analyzed_values.tokenize_value(&stored_value).expect("a string has text");
+        let equal_value_tokens = analyzed_values.tokenize_value(&equal_stored_value).expect("a string has text");
+
+        assert!(
+            Rc::ptr_eq(&first_tokens, &repeated_tokens),
+            "the second read is served by the memo"
+        );
+        assert!(
+            !Rc::ptr_eq(&first_tokens, &equal_value_tokens),
+            "the memo is keyed by the value's address, not by its text"
+        );
+        assert_eq!(first_tokens, equal_value_tokens);
+        assert_eq!(analyzed_values.tokenize_value(&json!({"no": "text"})), None);
+    }
+
+    #[test]
+    fn a_text_value_past_the_token_limit_is_cut_and_one_at_the_limit_stays_one_token() {
         let mappings = json!({"properties": {"title": {"type": "text"}}});
         let token_below_limit = "7".repeat(254);
         let token_at_limit = "7".repeat(255);
         let token_above_limit = "7".repeat(256);
 
-        for answered_token in [token_below_limit, token_at_limit] {
+        for whole_token in [&token_below_limit, &token_at_limit] {
             assert_matches(
-                &[(json!({"term": {"title": answered_token}}), true)],
-                &json!({"title": answered_token}),
+                &[(json!({"term": {"title": whole_token}}), true)],
+                &json!({"title": whole_token}),
                 &mappings,
             );
         }
-        assert_refused(
-            &json!({"term": {"title": token_above_limit}}),
+        // 256 digits are a token of 255 digits and a token of one digit, so the whole value is no
+        // token.
+        assert_matches(
+            &[
+                (json!({"term": {"title": token_above_limit}}), false),
+                (json!({"term": {"title": token_at_limit}}), true),
+                (json!({"term": {"title": "7"}}), true),
+            ],
             &json!({"title": token_above_limit}),
             &mappings,
-        )
-        .await;
-        for malformed_group in ["7..3", ".7", "7.", ""] {
-            assert_refused(
-                &json!({"term": {"title": "7"}}),
-                &json!({"title": malformed_group}),
+        );
+    }
+
+    #[test]
+    fn a_dot_joins_digits_in_a_text_value_only_between_two_digits() {
+        let mappings = json!({"properties": {"title": {"type": "text"}}});
+        let term_query = json!({"term": {"title": "7"}});
+
+        // `7.3` is one number token, so `7` is not among its tokens; a dot with a digit on one side
+        // only is dropped and leaves the token `7`; `""` holds no token.
+        let cases = [("7.3", false), ("7..3", true), (".7", true), ("7.", true), ("", false)];
+        for (stored_text, should_match) in cases {
+            assert_matches(
+                &[(term_query.clone(), should_match)],
+                &json!({"title": stored_text}),
                 &mappings,
-            )
-            .await;
+            );
         }
     }
 
@@ -1569,10 +1728,10 @@ mod tests {
             ("a\\*", "a", false),
             ("a*\\*", "ab*", true),
         ];
-        for (pattern, text, expected_match) in cases {
+        for (pattern, text, should_match) in cases {
             assert_eq!(
                 matches_wildcard(pattern, text, false),
-                expected_match,
+                should_match,
                 "{pattern:?} against {text:?}"
             );
         }
@@ -1583,10 +1742,10 @@ mod tests {
             // Folding covers ASCII letters only.
             ("Ö", "ö", false),
         ];
-        for (pattern, text, expected_match) in folded_cases {
+        for (pattern, text, should_match) in folded_cases {
             assert_eq!(
                 matches_wildcard(pattern, text, true),
-                expected_match,
+                should_match,
                 "{pattern:?} against {text:?}"
             );
         }
@@ -1675,14 +1834,14 @@ mod tests {
                 (0..text_length).map(|_| draw_wildcard_character(&mut generator)).collect()
             };
             let text: String = text_characters.iter().collect();
-            let expected_match = matches_elements_naively(&elements, &text_characters);
+            let should_match = matches_elements_naively(&elements, &text_characters);
 
             assert_eq!(
                 matches_wildcard(&pattern, &text, false),
-                expected_match,
+                should_match,
                 "{pattern:?} against {text:?}"
             );
-            matched_count += usize::from(expected_match);
+            matched_count += usize::from(should_match);
         }
         assert!(matched_count >= WILDCARD_CASE_COUNT / 4, "{matched_count} matches");
         assert!(
