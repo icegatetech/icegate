@@ -6,6 +6,7 @@ mod date_histogram;
 mod parse;
 mod plan;
 mod render;
+mod terms;
 
 pub(crate) use parse::parse_aggregations;
 pub(crate) use plan::{AggregationScope, execute_aggregations, plan_aggregation_rows};

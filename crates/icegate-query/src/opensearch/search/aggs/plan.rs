@@ -9,13 +9,20 @@
 //!    and the second plan reads them from memory at every level, so the matching rows are
 //!    scanned and grouped a single time however many levels the chain has.
 //! 2. Over the collected groups: per level, the buckets whose own key is not NULL (a row without
-//!    the key counts in its parent and emits no bucket) and that hold at least `min_doc_count`
-//!    rows, semi-joined top-down to the surviving buckets of the level above. The levels are
-//!    concatenated and capped at one row more than the bucket budget, so a search over the limit
-//!    is refused without collecting every bucket.
+//!    the key counts in its parent and emits no bucket), that hold at least `min_doc_count` rows
+//!    and, for a `terms` level, whose key `include` admits and `exclude` does not, semi-joined
+//!    top-down to the surviving buckets of the level above. A `terms` level then ranks its
+//!    buckets with `row_number()` over the partition of their parent keys, in the requested order
+//!    with the key ascending last, keeps the first `size`, and carries the partition's document
+//!    total, from which assembly counts the documents of the buckets the ranking cut. Filtering
+//!    before ranking keeps a dropped key from taking a ranked slot. The levels are concatenated
+//!    and capped at one row more than the bucket budget, so a search over the limit is refused
+//!    without collecting every bucket.
 //!
 //! Assembly into the response tree, gap filling and ordering happen in Rust (`assemble`).
 
+use std::collections::BTreeMap;
+use std::fmt::Display;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -26,15 +33,19 @@ use datafusion::datasource::{MemTable, provider_as_source};
 use datafusion::functions::expr_fn::coalesce;
 use datafusion::functions_aggregate::expr_fn::count;
 use datafusion::functions_aggregate::grouping::grouping_udaf;
+use datafusion::functions_aggregate::sum::sum_udaf;
+use datafusion::functions_window::expr_fn::row_number;
+use datafusion::logical_expr::expr::WindowFunction;
 use datafusion::logical_expr::{
-    Expr, JoinType, LogicalPlan, LogicalPlanBuilder, TableSource, cast, col, grouping_set, lit,
+    Expr, ExprFunctionExt, JoinType, LogicalPlan, LogicalPlanBuilder, TableSource, cast, col, grouping_set, lit,
 };
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::assemble::{BucketBudget, assemble_buckets};
 use super::date_histogram::BucketRounding;
 use super::parse::{AggregationKind, AggregationTree, DateHistogramSpec, NamedAggregation, read_epoch_millis};
 use super::render::render_bucket_list;
+use super::terms::{TermsSpec, build_filter_predicate, build_key_literal, build_rank_order};
 use crate::opensearch::catalog::{FieldType, FieldValue, IndexEntry, ResolvedField, TenantSession};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::MICROS_PER_MILLISECOND;
@@ -49,6 +60,11 @@ pub(super) const DOC_COUNT_COLUMN: &str = "__doc_count";
 /// Column of the `grouping()` bitmask: a set bit marks a key the row's grouping set omits, as
 /// `grouping_marks_the_keys_a_level_omits_with_the_last_key_as_the_low_bit` pins.
 const LEVEL_MASK_COLUMN: &str = "__level_mask";
+/// Column of the document count of a ranked bucket's whole partition, before ranking cut it;
+/// NULL for a level that is not ranked.
+pub(super) const PARTITION_TOTAL_COLUMN: &str = "__partition_total";
+/// Column of a bucket's rank within its partition.
+const RANK_COLUMN: &str = "__rank";
 /// The in-memory table holding the collected groups.
 const GROUPS_TABLE: &str = "bucket_groups";
 /// Most bucket levels one chain may nest; the level mask is an `i32`.
@@ -84,10 +100,18 @@ pub(super) enum LevelKind<'a> {
         /// Its rounding.
         rounding: BucketRounding,
     },
+    /// `terms` buckets.
+    Terms {
+        /// The request.
+        spec: &'a TermsSpec,
+        /// The type of the key column, read from the matching rows.
+        key_type: DataType,
+    },
 }
 
 impl BucketLevel<'_> {
-    /// The key of this level for each matching row, as SQL over `rows`.
+    /// The key of this level for each matching row, as SQL over `rows`, the rows `plan_levels`
+    /// planned the level from.
     fn key_expression(&self, rows: &LogicalPlan) -> Result<Expr, OpenSearchError> {
         match &self.kind {
             LevelKind::DateHistogram { spec, rounding } => {
@@ -111,6 +135,17 @@ impl BucketLevel<'_> {
                 };
                 rounding.key_expression(value)
             }
+            LevelKind::Terms { spec, key_type } => {
+                // `plan_levels` read `key_type` from this column, which proved it exists.
+                let field = Expr::Column(Column::from_name(spec.field.as_str()));
+                match &spec.missing {
+                    Some(missing) => Ok(coalesce(vec![
+                        field,
+                        build_key_literal(self.name, "missing", missing, key_type)?,
+                    ])),
+                    None => Ok(field),
+                }
+            }
         }
     }
 
@@ -119,6 +154,7 @@ impl BucketLevel<'_> {
     fn read_minimum_doc_count(&self) -> Option<i64> {
         let minimum = match &self.kind {
             LevelKind::DateHistogram { spec, .. } => spec.min_doc_count,
+            LevelKind::Terms { spec, .. } => spec.min_doc_count,
         };
         (minimum > 1).then(|| i64::try_from(minimum).unwrap_or(i64::MAX))
     }
@@ -134,7 +170,9 @@ impl BucketLevel<'_> {
 /// # Errors
 ///
 /// `400 too_many_buckets_exception` past `scope.max_buckets`; `400 illegal_argument_exception`
-/// for a nesting not planned yet; `500` when planning or execution fails.
+/// for a nesting not planned yet, a `terms` pattern on a key that is not a string keyword, and a
+/// `missing` or listed `include` / `exclude` value that does not fit the key type; `500` when
+/// planning or execution fails.
 pub(crate) async fn execute_aggregations(
     rows: LogicalPlan,
     tree: &AggregationTree,
@@ -144,7 +182,7 @@ pub(crate) async fn execute_aggregations(
     let mut rendered = Map::new();
     for aggregation in &tree.aggregations {
         let chain = collect_chain(aggregation)?;
-        let levels = plan_levels(&chain)?;
+        let levels = plan_levels(&chain, &rows)?;
         let group_plan = plan_bucket_groups(rows.clone(), &levels)?;
         let groups = scope.session.collect(group_plan.clone()).await?;
         let survivor_plan = plan_surviving_buckets(&group_plan, groups, &levels, budget.remaining())?;
@@ -187,20 +225,33 @@ fn find_single_child(aggregation: &NamedAggregation) -> Result<Option<&NamedAggr
     }
 }
 
-/// The nestings answered today: one `date_histogram` without sub-aggregations. Any other nesting
-/// is refused rather than answered in part.
+/// The nestings answered today: one `date_histogram` or one `terms`, alone, or a `terms` holding
+/// one `date_histogram`. Any other nesting is refused rather than answered in part.
 fn check_supported_chain(chain: &[&NamedAggregation]) -> Result<(), OpenSearchError> {
     match chain {
         [_] => Ok(()),
+        [parent, child]
+            if matches!(parent.kind, AggregationKind::Terms(_))
+                && matches!(child.kind, AggregationKind::DateHistogram(_)) =>
+        {
+            Ok(())
+        }
         [parent, ..] => Err(OpenSearchError::unsupported_aggregation(
             &parent.name,
-            format!("the sub-aggregations of [{}] are not supported yet", parent.name),
+            format!(
+                "the sub-aggregations of [{}] are not supported yet; a [terms] may hold one [date_histogram]",
+                parent.name
+            ),
         )),
         [] => Err(OpenSearchError::internal("an empty aggregation chain")),
     }
 }
 
-fn plan_levels<'a>(chain: &[&'a NamedAggregation]) -> Result<Vec<BucketLevel<'a>>, OpenSearchError> {
+/// The levels of `chain`, a `terms` key typed as its column of `rows`.
+fn plan_levels<'a>(
+    chain: &[&'a NamedAggregation],
+    rows: &LogicalPlan,
+) -> Result<Vec<BucketLevel<'a>>, OpenSearchError> {
     chain
         .iter()
         .map(|aggregation| {
@@ -208,6 +259,10 @@ fn plan_levels<'a>(chain: &[&'a NamedAggregation]) -> Result<Vec<BucketLevel<'a>
                 AggregationKind::DateHistogram(spec) => LevelKind::DateHistogram {
                     spec,
                     rounding: BucketRounding::from_spec(spec)?,
+                },
+                AggregationKind::Terms(spec) => LevelKind::Terms {
+                    spec,
+                    key_type: find_row_column_type(rows, &spec.field, &aggregation.name)?,
                 },
             };
             Ok(BucketLevel {
@@ -220,12 +275,23 @@ fn plan_levels<'a>(chain: &[&'a NamedAggregation]) -> Result<Vec<BucketLevel<'a>
 
 /// The column of `rows` holding `field`, which planning names after the field.
 fn find_row_column(rows: &LogicalPlan, field: &str, aggregation: &str) -> Result<Expr, OpenSearchError> {
-    if rows.schema().field_with_unqualified_name(field).is_err() {
-        return Err(OpenSearchError::internal(format!(
-            "the rows of [{aggregation}] lack the field [{field}]"
-        )));
-    }
+    find_row_column_type(rows, field, aggregation)?;
     Ok(Expr::Column(Column::from_name(field)))
+}
+
+/// The type of the column of `rows` holding `field`.
+///
+/// # Errors
+///
+/// Returns an internal error when `rows` lack the column: planning names a column after every
+/// field it resolved.
+fn find_row_column_type(rows: &LogicalPlan, field: &str, aggregation: &str) -> Result<DataType, OpenSearchError> {
+    rows.schema()
+        .field_with_unqualified_name(field)
+        .map(|column| column.data_type().clone())
+        .map_err(|error| {
+            OpenSearchError::internal(format!("the rows of [{aggregation}] lack the field [{field}]: {error}"))
+        })
 }
 
 /// The `grouping()` mask of the rows of level `depth` among `level_count` levels: the bits of the
@@ -297,7 +363,8 @@ fn plan_surviving_buckets(
         .map_err(convert_plan_error)
 }
 
-/// The surviving buckets of level `depth`: `LEVEL_COLUMN`, every key column, `DOC_COUNT_COLUMN`.
+/// The surviving buckets of level `depth`: `LEVEL_COLUMN`, every key column, `DOC_COUNT_COLUMN`
+/// and `PARTITION_TOTAL_COLUMN`.
 fn plan_level_survivors(
     source: &Arc<dyn TableSource>,
     level_count: usize,
@@ -305,11 +372,17 @@ fn plan_level_survivors(
     level: &BucketLevel<'_>,
     parent: Option<&LogicalPlan>,
 ) -> Result<LogicalPlan, OpenSearchError> {
+    let key = col(name_key_column(depth));
     let mut predicate = col(LEVEL_MASK_COLUMN)
         .eq(lit(compute_level_mask(level_count, depth)?))
-        .and(col(name_key_column(depth)).is_not_null());
+        .and(key.clone().is_not_null());
     if let Some(minimum) = level.read_minimum_doc_count() {
         predicate = predicate.and(col(DOC_COUNT_COLUMN).gt_eq(lit(minimum)));
+    }
+    if let LevelKind::Terms { spec, key_type } = &level.kind
+        && let Some(filter) = build_filter_predicate(level.name, spec, &key, key_type)?
+    {
+        predicate = predicate.and(filter);
     }
     let mut builder = LogicalPlanBuilder::scan(GROUPS_TABLE, Arc::clone(source), None)
         .and_then(|builder| builder.filter(predicate))
@@ -317,10 +390,36 @@ fn plan_level_survivors(
     if let Some(parent) = parent {
         builder = semi_join_parent(builder, parent.clone(), depth)?;
     }
+    let partition_total = match &level.kind {
+        LevelKind::Terms { spec, .. } => {
+            let parent_keys: Vec<Expr> = (0..depth).map(|position| col(name_key_column(position))).collect();
+            let rank = row_number()
+                .partition_by(parent_keys.clone())
+                .order_by(build_rank_order(spec, &key, &col(DOC_COUNT_COLUMN)))
+                .build()
+                .map_err(convert_plan_error)?
+                .alias(RANK_COLUMN);
+            let total = Expr::from(WindowFunction::new(sum_udaf(), vec![col(DOC_COUNT_COLUMN)]))
+                .partition_by(parent_keys)
+                .build()
+                .map_err(convert_plan_error)?
+                .alias(PARTITION_TOTAL_COLUMN);
+            let size = u64::try_from(spec.size).unwrap_or(u64::MAX);
+            // The total is unordered and the rank is ordered, so each gets its own `Window` node.
+            builder = builder
+                .window(vec![total])
+                .and_then(|builder| builder.window(vec![rank]))
+                .and_then(|builder| builder.filter(col(RANK_COLUMN).lt_eq(lit(size))))
+                .map_err(convert_plan_error)?;
+            col(PARTITION_TOTAL_COLUMN)
+        }
+        LevelKind::DateHistogram { .. } => lit(ScalarValue::Int64(None)).alias(PARTITION_TOTAL_COLUMN),
+    };
     let depth_literal = i32::try_from(depth).map_err(|_| OpenSearchError::internal("too many bucket levels"))?;
     let mut output = vec![lit(depth_literal).alias(LEVEL_COLUMN)];
     output.extend((0..level_count).map(|position| col(name_key_column(position))));
     output.push(col(DOC_COUNT_COLUMN));
+    output.push(partition_total);
     builder
         .project(output)
         .and_then(LogicalPlanBuilder::build)
@@ -371,8 +470,11 @@ struct AggregationField {
 ///
 /// # Errors
 ///
-/// `400 illegal_argument_exception` for a field an aggregation cannot read (a `date_histogram`
-/// over a field that is not a date); the lowering's errors; `500` when planning fails.
+/// `400 aggregation_execution_exception` for a field an aggregation reads that the searched
+/// indices map to different types, or store as different Arrow types, with `field` and
+/// `indices_by_type` naming the indices of each type; `400 illegal_argument_exception` for a
+/// field an aggregation cannot read (a `date_histogram` over a field that is not a date, a
+/// `terms` over a text or an object field); the lowering's errors; `500` when planning fails.
 pub(crate) fn plan_aggregation_rows(
     session: &TenantSession,
     entries: &[&IndexEntry],
@@ -449,32 +551,79 @@ fn list_aggregations(tree: &AggregationTree) -> Vec<&NamedAggregation> {
     listed
 }
 
-/// Refuse a field `aggregation` cannot read in one of the indices that map it.
+/// Refuse a field mapped to different types, or stored as different Arrow types, across the
+/// searched indices, and a field `aggregation` cannot read.
 fn check_field_for_aggregation(
     aggregation: &NamedAggregation,
     entries: &[&IndexEntry],
     resolved: &[Option<ResolvedField>],
 ) -> Result<(), OpenSearchError> {
-    let mapped_field_types = entries
+    let field_name = aggregation.kind.field();
+    let mapped_fields: Vec<(&str, &ResolvedField)> = entries
         .iter()
         .zip(resolved)
-        .filter_map(|(entry, field)| field.as_ref().map(|field| (entry.name(), field.field_type)));
-    match &aggregation.kind {
-        AggregationKind::DateHistogram(spec) => {
-            for (index, field_type) in mapped_field_types {
-                if !matches!(field_type, FieldType::Date) {
-                    return Err(OpenSearchError::unsupported_aggregation_field(
-                        &spec.field,
-                        field_type.name(),
-                        index,
-                        &aggregation.name,
-                        "date_histogram",
-                    ));
-                }
-            }
-            Ok(())
-        }
+        .filter_map(|(entry, field)| field.as_ref().map(|field| (entry.name(), field)))
+        .collect();
+    let type_names: Vec<(&str, &str)> = mapped_fields
+        .iter()
+        .map(|(index, field)| (*index, field.field_type.name()))
+        .collect();
+    check_single_kind(field_name, "it is", &type_names)?;
+    // One mapped type can still be stored two ways (an encoded id in one index, a string in
+    // another): the rows plan casts every branch to one Arrow type, and that cast would fail
+    // during execution.
+    let stored_types: Vec<(&str, DataType)> = mapped_fields
+        .iter()
+        .filter_map(|(index, field)| map_field_data_type(field).map(|data_type| (*index, data_type)))
+        .collect();
+    check_single_kind(field_name, "its values are stored as", &stored_types)?;
+    let Some(&(index, field)) = mapped_fields.first() else {
+        return Ok(());
+    };
+    let aggregation_type = match (&aggregation.kind, field.field_type) {
+        (AggregationKind::DateHistogram(_), FieldType::Date) => return Ok(()),
+        (AggregationKind::DateHistogram(_), _) => "date_histogram",
+        (AggregationKind::Terms(_), FieldType::Text | FieldType::Object) => "terms",
+        (AggregationKind::Terms(_), _) => return Ok(()),
+    };
+    Err(OpenSearchError::unsupported_aggregation_field(
+        field_name,
+        field.field_type.name(),
+        index,
+        &aggregation.name,
+        aggregation_type,
+    ))
+}
+
+/// `400 aggregation_execution_exception` when the indices of `kinds` give the field more than one
+/// kind (a mapped type, or a stored Arrow type), naming the indices of each in the reason, which
+/// `subject` introduces, and under `indices_by_type`.
+fn check_single_kind<K: Ord + Display>(
+    field_name: &str,
+    subject: &str,
+    kinds: &[(&str, K)],
+) -> Result<(), OpenSearchError> {
+    let mut indices_by_kind: BTreeMap<&K, Vec<&str>> = BTreeMap::new();
+    for (index, kind) in kinds {
+        indices_by_kind.entry(kind).or_default().push(*index);
     }
+    if indices_by_kind.len() < 2 {
+        return Ok(());
+    }
+    let listing = indices_by_kind
+        .iter()
+        .map(|(kind, indices)| format!("[{kind}] in [{}]", indices.join(", ")))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let indices_by_type: Map<String, Value> = indices_by_kind
+        .iter()
+        .map(|(kind, indices)| (kind.to_string(), json!(indices)))
+        .collect();
+    Err(OpenSearchError::aggregation_field_conflict(
+        field_name,
+        &format!("[{field_name}] cannot be aggregated: {subject} {listing}"),
+        indices_by_type,
+    ))
 }
 
 /// The type a field holds in the rows plan: the type of its first mapping, or the kind's own
@@ -486,6 +635,7 @@ fn choose_row_data_type(aggregation: &NamedAggregation, resolved: &[Option<Resol
         .find_map(map_field_data_type)
         .unwrap_or(match &aggregation.kind {
             AggregationKind::DateHistogram(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
+            AggregationKind::Terms(_) => DataType::Utf8,
         })
 }
 
@@ -524,13 +674,19 @@ mod tests {
 
     use axum::http::StatusCode;
     use chrono::{DateTime, Utc};
-    use datafusion::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, TimestampMicrosecondArray};
+    use datafusion::arrow::array::{
+        Array, ArrayRef, AsArray, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array,
+        RecordBatch, StringArray, TimestampMicrosecondArray,
+    };
     use datafusion::arrow::datatypes::{Int32Type, Int64Type};
+    use datafusion::common::ScalarValue;
     use datafusion::datasource::{MemTable, provider_as_source};
-    use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
+    use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, col, lit};
     use datafusion::prelude::SessionContext;
     use icegate_common::LOGS_TABLE;
-    use icegate_common::schema::COL_TIMESTAMP;
+    use icegate_common::schema::{COL_BODY, COL_RESOURCE_ATTRIBUTES, COL_TIMESTAMP};
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
     use serde_json::{Value, json};
 
     use super::{
@@ -540,8 +696,10 @@ mod tests {
     };
     use crate::opensearch::SearchLimitsConfig;
     use crate::opensearch::error::{OpenSearchError, render_envelope};
+    use crate::opensearch::extract::parse_parameters;
     use crate::opensearch::search::aggs::parse::{AggregationTree, NamedAggregation, parse_aggregations};
     use crate::opensearch::search::aggs::test_support::parse_instant_micros;
+    use crate::opensearch::search::request::{SearchParameters, parse_search_request};
     use crate::query_dsl::parse::parse_query;
     use crate::test_support::{FIXTURE_COMMITTED_WAL_OFFSET, SearchFixture, TestCell, TestRow, find_index_entry};
 
@@ -1022,6 +1180,672 @@ mod tests {
         assert_unsupported_aggregation(error, "outer").await;
     }
 
+    /// A log-shaped row: severity, service, timestamp, and a second, nullable date.
+    struct LiteralRow<'a> {
+        severity_text: Option<&'a str>,
+        service_name: Option<&'a str>,
+        timestamp: &'a str,
+        observed: Option<&'a str>,
+    }
+
+    /// The batch of `rows`, one column per field of [`LiteralRow`].
+    fn build_literal_rows(rows: &[LiteralRow<'_>]) -> RecordBatch {
+        let severity: StringArray = rows.iter().map(|row| row.severity_text).collect();
+        let service: StringArray = rows.iter().map(|row| row.service_name).collect();
+        let timestamp: TimestampMicrosecondArray =
+            rows.iter().map(|row| Some(parse_instant_micros(row.timestamp))).collect();
+        let observed: TimestampMicrosecondArray =
+            rows.iter().map(|row| row.observed.map(parse_instant_micros)).collect();
+        RecordBatch::try_from_iter(vec![
+            ("severity_text", Arc::new(severity) as ArrayRef),
+            ("service_name", Arc::new(service) as ArrayRef),
+            ("timestamp", Arc::new(timestamp) as ArrayRef),
+            ("observed", Arc::new(observed) as ArrayRef),
+        ])
+        .expect("rows batch")
+    }
+
+    /// A `checkout` row of `severity_text` at `timestamp`, without an observed date.
+    const fn build_severity_row<'a>(severity_text: Option<&'a str>, timestamp: &'a str) -> LiteralRow<'a> {
+        LiteralRow {
+            severity_text,
+            service_name: Some("checkout"),
+            timestamp,
+            observed: None,
+        }
+    }
+
+    /// The answer of a `terms` level: `other_doc_count` documents outside `buckets`.
+    fn build_terms_list(other_doc_count: u64, buckets: &Value) -> Value {
+        json!({"doc_count_error_upper_bound": 0, "sum_other_doc_count": other_doc_count, "buckets": buckets})
+    }
+
+    #[tokio::test]
+    async fn a_logs_volume_style_terms_over_a_date_histogram_answers_the_stated_buckets() {
+        let rows = build_literal_rows(&[
+            build_severity_row(Some("ERROR"), "2026-10-08T10:05:00Z"),
+            build_severity_row(Some("INFO"), "2026-10-08T10:10:00Z"),
+            build_severity_row(Some("INFO"), "2026-10-08T10:20:00Z"),
+            build_severity_row(Some("ERROR"), "2026-10-08T10:40:00Z"),
+            build_severity_row(None, "2026-10-08T10:50:00Z"),
+            build_severity_row(Some("INFO"), "2026-10-08T11:15:00Z"),
+            build_severity_row(Some("WARN"), "2026-10-08T11:45:00Z"),
+        ]);
+
+        let answer = aggregate_rows(
+            rows,
+            json!({"2": {
+                "terms": {"field": "severity_text", "size": 500, "order": {"_count": "desc"}, "min_doc_count": 0, "missing": "unknown"},
+                "aggs": {"3": {"date_histogram": {
+                    "field": "timestamp", "interval": "1h", "min_doc_count": 0,
+                    "extended_bounds": {"min": 1_791_453_600_000_i64, "max": 1_791_457_200_000_i64},
+                    "format": "epoch_millis"
+                }}}
+            }}),
+        )
+        .await;
+
+        let build_hour_buckets = |ten: u64, eleven: u64| {
+            json!({"buckets": [
+                {"key_as_string": "1791453600000", "key": 1_791_453_600_000_i64, "doc_count": ten},
+                {"key_as_string": "1791457200000", "key": 1_791_457_200_000_i64, "doc_count": eleven}
+            ]})
+        };
+        // INFO (3) and ERROR (2) lead by count; WARN and unknown tie at 1 and follow by key in
+        // byte order, `W` (0x57) before `u` (0x75).
+        assert_eq!(
+            answer,
+            json!({"2": build_terms_list(0, &json!([
+                {"key": "INFO", "doc_count": 3, "3": build_hour_buckets(2, 1)},
+                {"key": "ERROR", "doc_count": 2, "3": build_hour_buckets(2, 0)},
+                {"key": "WARN", "doc_count": 1, "3": build_hour_buckets(0, 1)},
+                {"key": "unknown", "doc_count": 1, "3": build_hour_buckets(1, 0)}
+            ]))})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_suggestion_style_terms_with_include_and_terminate_after_answers_the_stated_keys() {
+        let rows = build_literal_rows(&[
+            LiteralRow {
+                severity_text: Some("INFO"),
+                service_name: Some("checkout"),
+                timestamp: "2026-10-08T10:00:00Z",
+                observed: None,
+            },
+            LiteralRow {
+                severity_text: Some("INFO"),
+                service_name: Some("cart"),
+                timestamp: "2026-10-08T10:01:00Z",
+                observed: None,
+            },
+            LiteralRow {
+                severity_text: Some("INFO"),
+                service_name: Some("checkout"),
+                timestamp: "2026-10-08T10:02:00Z",
+                observed: None,
+            },
+            LiteralRow {
+                severity_text: Some("INFO"),
+                service_name: None,
+                timestamp: "2026-10-08T10:03:00Z",
+                observed: None,
+            },
+            LiteralRow {
+                severity_text: Some("INFO"),
+                service_name: Some("cart"),
+                timestamp: "2026-10-08T10:04:00Z",
+                observed: None,
+            },
+            LiteralRow {
+                severity_text: Some("INFO"),
+                service_name: Some("checkout"),
+                timestamp: "2026-10-08T10:05:00Z",
+                observed: None,
+            },
+        ]);
+        let parameters: SearchParameters = parse_parameters(None).expect("no parameters");
+        let request = parse_search_request(
+            br#"{"size":0,"terminate_after":100000,"timeout":"1000ms","query":{"match_all":{}},"aggs":{"suggestions":{"terms":{"field":"service_name","include":".*","execution_hint":"map","shard_size":10}}}}"#,
+            &parameters,
+        )
+        .expect("a value-suggestion-style request parses");
+        let aggregations = request.aggregations.expect("the request carries aggregations");
+
+        let answer = aggregate_plan(scan_rows(rows), &aggregations, read_default_max_buckets())
+            .await
+            .expect("the aggregations answer");
+
+        assert_eq!(request.size, 0);
+        assert_eq!(
+            answer,
+            json!({"suggestions": build_terms_list(0, &json!([
+                {"key": "checkout", "doc_count": 3},
+                {"key": "cart", "doc_count": 2}
+            ]))})
+        );
+    }
+
+    #[tokio::test]
+    async fn min_doc_count_zero_emits_only_keys_present_in_the_matching_rows() {
+        let rows = build_literal_rows(&[
+            build_severity_row(Some("WARN"), "2026-10-08T09:30:00Z"),
+            build_severity_row(Some("ERROR"), "2026-10-08T10:05:00Z"),
+            build_severity_row(Some("INFO"), "2026-10-08T10:20:00Z"),
+        ]);
+        // The filter stands for the request's time range: the WARN row lies outside it.
+        let ten_o_clock = lit(ScalarValue::TimestampMicrosecond(
+            Some(parse_instant_micros("2026-10-08T10:00:00Z")),
+            None,
+        ));
+        let rows_in_time_range = LogicalPlanBuilder::from(scan_rows(rows))
+            .filter(col("timestamp").gt_eq(ten_o_clock))
+            .and_then(LogicalPlanBuilder::build)
+            .expect("the rows in the time range");
+
+        let answer = aggregate_plan(
+            rows_in_time_range,
+            &json!({"levels": {"terms": {"field": "severity_text", "min_doc_count": 0}}}),
+            read_default_max_buckets(),
+        )
+        .await
+        .expect("the aggregations answer");
+
+        assert_eq!(
+            answer,
+            json!({"levels": build_terms_list(0, &json!([
+                {"key": "ERROR", "doc_count": 1},
+                {"key": "INFO", "doc_count": 1}
+            ]))})
+        );
+    }
+
+    #[tokio::test]
+    async fn the_missing_bucket_appears_only_when_a_matching_row_lacks_the_field() {
+        let request = json!({"levels": {"terms": {"field": "severity_text", "missing": "unknown"}}});
+        let answer_without_gap = aggregate_rows(
+            build_literal_rows(&[
+                build_severity_row(Some("ERROR"), "2026-10-08T10:05:00Z"),
+                build_severity_row(Some("INFO"), "2026-10-08T10:20:00Z"),
+            ]),
+            request.clone(),
+        )
+        .await;
+        let answer_with_gap = aggregate_rows(
+            build_literal_rows(&[
+                build_severity_row(Some("ERROR"), "2026-10-08T10:05:00Z"),
+                build_severity_row(Some("INFO"), "2026-10-08T10:20:00Z"),
+                build_severity_row(None, "2026-10-08T10:30:00Z"),
+            ]),
+            request,
+        )
+        .await;
+
+        assert_eq!(
+            answer_without_gap,
+            json!({"levels": build_terms_list(0, &json!([
+                {"key": "ERROR", "doc_count": 1},
+                {"key": "INFO", "doc_count": 1}
+            ]))})
+        );
+        assert_eq!(
+            answer_with_gap,
+            json!({"levels": build_terms_list(0, &json!([
+                {"key": "ERROR", "doc_count": 1},
+                {"key": "INFO", "doc_count": 1},
+                {"key": "unknown", "doc_count": 1}
+            ]))})
+        );
+    }
+
+    #[tokio::test]
+    async fn count_ties_break_by_key_ascending() {
+        let rows = build_literal_rows(&[
+            build_severity_row(Some("b"), "2026-10-08T10:00:00Z"),
+            build_severity_row(Some("b"), "2026-10-08T10:01:00Z"),
+            build_severity_row(Some("a"), "2026-10-08T10:02:00Z"),
+            build_severity_row(Some("a"), "2026-10-08T10:03:00Z"),
+            build_severity_row(Some("c"), "2026-10-08T10:04:00Z"),
+            build_severity_row(Some("c"), "2026-10-08T10:05:00Z"),
+            build_severity_row(Some("d"), "2026-10-08T10:06:00Z"),
+        ]);
+
+        let answer = aggregate_rows(
+            rows,
+            json!({"levels": {"terms": {"field": "severity_text", "size": 3}}}),
+        )
+        .await;
+
+        assert_eq!(
+            answer,
+            json!({"levels": build_terms_list(1, &json!([
+                {"key": "a", "doc_count": 2},
+                {"key": "b", "doc_count": 2},
+                {"key": "c", "doc_count": 2}
+            ]))})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_null_child_key_counts_in_the_parent_but_emits_no_child_bucket() {
+        let rows = build_literal_rows(&[
+            LiteralRow {
+                severity_text: Some("ERROR"),
+                service_name: None,
+                timestamp: "2026-10-08T10:05:00Z",
+                observed: Some("2026-10-08T10:05:00Z"),
+            },
+            LiteralRow {
+                severity_text: Some("ERROR"),
+                service_name: None,
+                timestamp: "2026-10-08T10:06:00Z",
+                observed: None,
+            },
+            LiteralRow {
+                severity_text: Some("INFO"),
+                service_name: None,
+                timestamp: "2026-10-08T10:20:00Z",
+                observed: Some("2026-10-08T10:20:00Z"),
+            },
+        ]);
+
+        let answer = aggregate_rows(
+            rows,
+            json!({"levels": {
+                "terms": {"field": "severity_text"},
+                "aggs": {"seen": {"date_histogram": {"field": "observed", "fixed_interval": "1h", "min_doc_count": 1}}}
+            }}),
+        )
+        .await;
+
+        let ten_o_clock = json!({"buckets": [
+            {"key_as_string": "2026-10-08T10:00:00.000Z", "key": 1_791_453_600_000_i64, "doc_count": 1}
+        ]});
+        assert_eq!(
+            answer,
+            json!({"levels": build_terms_list(0, &json!([
+                {"key": "ERROR", "doc_count": 2, "seen": ten_o_clock},
+                {"key": "INFO", "doc_count": 1, "seen": ten_o_clock}
+            ]))})
+        );
+    }
+
+    #[tokio::test]
+    async fn exclude_drops_matching_keys_before_ranking() {
+        let mut rows = Vec::new();
+        for (key, count) in [("a", 5), ("b", 4), ("c", 3)] {
+            for _ in 0..count {
+                rows.push(build_severity_row(Some(key), "2026-10-08T10:00:00Z"));
+            }
+        }
+
+        let answer = aggregate_rows(
+            build_literal_rows(&rows),
+            json!({
+                "by_pattern": {"terms": {"field": "severity_text", "size": 2, "exclude": "a"}},
+                "by_values": {"terms": {"field": "severity_text", "size": 1, "exclude": ["b"]}}
+            }),
+        )
+        .await;
+
+        // Excluding `a` before ranking leaves room for `c`; `by_values` keeps `a` and counts `c`
+        // (3 rows) as other.
+        assert_eq!(
+            answer,
+            json!({
+                "by_pattern": build_terms_list(0, &json!([
+                    {"key": "b", "doc_count": 4},
+                    {"key": "c", "doc_count": 3}
+                ])),
+                "by_values": build_terms_list(3, &json!([
+                    {"key": "a", "doc_count": 5}
+                ]))
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn min_doc_count_above_one_drops_smaller_buckets() {
+        let mut rows = Vec::new();
+        for (key, count) in [("a", 1), ("b", 2), ("c", 3)] {
+            for _ in 0..count {
+                rows.push(build_severity_row(Some(key), "2026-10-08T10:00:00Z"));
+            }
+        }
+
+        let answer = aggregate_rows(
+            build_literal_rows(&rows),
+            json!({"levels": {"terms": {"field": "severity_text", "min_doc_count": 2}}}),
+        )
+        .await;
+
+        // `a` holds one document, below the minimum: it is dropped before ranking, so it is not
+        // counted as other either.
+        assert_eq!(
+            answer,
+            json!({"levels": build_terms_list(0, &json!([
+                {"key": "c", "doc_count": 3},
+                {"key": "b", "doc_count": 2}
+            ]))})
+        );
+    }
+
+    #[tokio::test]
+    async fn terms_buckets_up_to_max_buckets_are_answered_and_one_more_is_a_400() {
+        // Three distinct keys, `size` well above every limit tried.
+        let build_rows = || {
+            build_literal_rows(&[
+                build_severity_row(Some("a"), "2026-10-08T10:00:00Z"),
+                build_severity_row(Some("b"), "2026-10-08T10:01:00Z"),
+                build_severity_row(Some("c"), "2026-10-08T10:02:00Z"),
+            ])
+        };
+        let request = json!({"levels": {"terms": {"field": "severity_text", "size": 100}}});
+
+        let below_limit = aggregate_plan(scan_rows(build_rows()), &request, 4)
+            .await
+            .expect("three buckets fit four");
+        let at_limit = aggregate_plan(scan_rows(build_rows()), &request, 3)
+            .await
+            .expect("three buckets fit three");
+        let past_limit = aggregate_plan(scan_rows(build_rows()), &request, 2)
+            .await
+            .expect_err("three buckets exceed two");
+
+        let expected = json!({"levels": build_terms_list(0, &json!([
+            {"key": "a", "doc_count": 1},
+            {"key": "b", "doc_count": 1},
+            {"key": "c", "doc_count": 1}
+        ]))});
+        assert_eq!(below_limit, expected);
+        assert_eq!(at_limit, expected);
+        assert_too_many_buckets(past_limit, 2).await;
+    }
+
+    #[tokio::test]
+    async fn a_terms_inside_a_terms_is_refused_until_it_is_planned() {
+        let error = aggregate_plan(
+            scan_rows(build_literal_rows(&[build_severity_row(Some("INFO"), "2026-10-08T10:00:00Z")])),
+            &json!({"outer": {"terms": {"field": "severity_text"}, "aggs": {"inner": {"terms": {"field": "service_name"}}}}}),
+            read_default_max_buckets(),
+        )
+        .await
+        .expect_err("refused");
+
+        assert_unsupported_aggregation(error, "outer").await;
+    }
+
+    /// Rows of one column of every type a `terms` key is stored as, three rows each.
+    fn build_typed_rows() -> RecordBatch {
+        let low_id = [0x01_u8; 16];
+        let high_id = [0xfe_u8; 16];
+        let small_values = Int32Array::from(vec![5, -2, 5]);
+        let count = Int64Array::from(vec![3, -7, 3]);
+        let ratio = Float64Array::from(vec![-1.5, 2.25, 2.25]);
+        let flag = BooleanArray::from(vec![true, false, true]);
+        let trace_id = FixedSizeBinaryArray::try_from_iter([high_id, low_id, high_id].into_iter()).expect("the ids");
+        let seen_instants: TimestampMicrosecondArray = [
+            "2026-10-08T10:05:00Z",
+            "2026-10-08T10:05:00Z",
+            "2026-10-08T11:30:00.250Z",
+        ]
+        .into_iter()
+        .map(|text| Some(parse_instant_micros(text)))
+        .collect();
+        RecordBatch::try_from_iter(vec![
+            ("small", Arc::new(small_values) as ArrayRef),
+            ("count", Arc::new(count) as ArrayRef),
+            ("ratio", Arc::new(ratio) as ArrayRef),
+            ("flag", Arc::new(flag) as ArrayRef),
+            ("trace_id", Arc::new(trace_id) as ArrayRef),
+            ("seen", Arc::new(seen_instants) as ArrayRef),
+        ])
+        .expect("rows batch")
+    }
+
+    #[tokio::test]
+    async fn terms_keys_of_every_stored_type_render_their_stated_key_and_key_as_string() {
+        let build_key_ordered_terms = |field: &str| json!({"terms": {"field": field, "order": {"_key": "asc"}}});
+
+        let answer = aggregate_rows(
+            build_typed_rows(),
+            json!({
+                "small": build_key_ordered_terms("small"),
+                "count": build_key_ordered_terms("count"),
+                "ratio": build_key_ordered_terms("ratio"),
+                "flag": build_key_ordered_terms("flag"),
+                "trace_id": build_key_ordered_terms("trace_id"),
+                "seen": build_key_ordered_terms("seen")
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            answer,
+            json!({
+                "small": build_terms_list(0, &json!([
+                    {"key": -2, "doc_count": 1},
+                    {"key": 5, "doc_count": 2}
+                ])),
+                "count": build_terms_list(0, &json!([
+                    {"key": -7, "doc_count": 1},
+                    {"key": 3, "doc_count": 2}
+                ])),
+                "ratio": build_terms_list(0, &json!([
+                    {"key": -1.5, "doc_count": 1},
+                    {"key": 2.25, "doc_count": 2}
+                ])),
+                "flag": build_terms_list(0, &json!([
+                    {"key": 0, "key_as_string": "false", "doc_count": 1},
+                    {"key": 1, "key_as_string": "true", "doc_count": 2}
+                ])),
+                "trace_id": build_terms_list(0, &json!([
+                    {"key": "01010101010101010101010101010101", "doc_count": 1},
+                    {"key": "fefefefefefefefefefefefefefefefe", "doc_count": 2}
+                ])),
+                "seen": build_terms_list(0, &json!([
+                    {"key": 1_791_453_900_000_i64, "key_as_string": "2026-10-08T10:05:00.000Z", "doc_count": 2},
+                    {"key": 1_791_459_000_250_i64, "key_as_string": "2026-10-08T11:30:00.250Z", "doc_count": 1}
+                ]))
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn terms_refuses_a_pattern_on_a_non_keyword_key_and_a_text_or_object_field() {
+        for field in ["count", "small", "ratio", "flag", "seen", "trace_id"] {
+            let error = aggregate_plan(
+                scan_rows(build_typed_rows()),
+                &json!({"levels": {"terms": {"field": field, "include": ".*"}}}),
+                read_default_max_buckets(),
+            )
+            .await
+            .expect_err("a pattern applies to string keywords only");
+
+            let (status, envelope) = render_envelope(error).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}");
+            assert_eq!(envelope["error"]["type"], "illegal_argument_exception", "{field}");
+            // Only the encoded id is told apart: it takes a list of hex ids instead.
+            assert_eq!(
+                envelope["error"]["field_storage"] == "encoded_id",
+                field == "trace_id",
+                "{field}"
+            );
+        }
+
+        let fixture = SearchFixture::new().await;
+        let session = fixture.open_session("tenant-a").await;
+        let entry = find_index_entry(&session, LOGS_TABLE);
+        let query = parse_query(&json!({"match_all": {}})).expect("match_all");
+        let now = DateTime::parse_from_rfc3339("2026-10-08T12:00:00Z")
+            .expect("now")
+            .with_timezone(&Utc);
+        for (field, field_type) in [(COL_BODY, "text"), (COL_RESOURCE_ATTRIBUTES, "object")] {
+            let tree = parse_aggregations(&json!({"levels": {"terms": {"field": field}}})).expect("a terms");
+
+            let error = plan_aggregation_rows(&session, &[entry], &query, now, &tree)
+                .expect_err("a text or an object field is not aggregated");
+
+            let (status, envelope) = render_envelope(error).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}");
+            assert_eq!(envelope["error"]["type"], "illegal_argument_exception", "{field}");
+            assert_eq!(envelope["error"]["field"], field);
+            assert_eq!(envelope["error"]["field_type"], field_type);
+            assert_eq!(envelope["error"]["index"], LOGS_TABLE);
+            assert_eq!(envelope["error"]["aggregation"], "levels");
+            assert_eq!(envelope["error"]["aggregation_type"], "terms");
+        }
+    }
+
+    /// The keys one round of the ranking property draws from, each listed in ascending key
+    /// order, so the position of a key is its rank in the stated order.
+    enum KeyDomain {
+        /// Keywords, in byte order.
+        Keyword(&'static [&'static str]),
+        /// Integers.
+        Long(&'static [i64]),
+        /// Doubles, a negative one among them.
+        Double(&'static [f64]),
+        /// `false` before `true`.
+        Boolean,
+    }
+
+    impl KeyDomain {
+        fn count_keys(&self) -> usize {
+            match self {
+                Self::Keyword(keys) => keys.len(),
+                Self::Long(keys) => keys.len(),
+                Self::Double(keys) => keys.len(),
+                Self::Boolean => 2,
+            }
+        }
+
+        /// The column of the keys at `positions`.
+        fn build_column(&self, positions: &[usize]) -> ArrayRef {
+            match self {
+                Self::Keyword(keys) => Arc::new(StringArray::from_iter_values(positions.iter().map(|&at| keys[at]))),
+                Self::Long(keys) => Arc::new(Int64Array::from_iter_values(positions.iter().map(|&at| keys[at]))),
+                Self::Double(keys) => Arc::new(Float64Array::from_iter_values(positions.iter().map(|&at| keys[at]))),
+                Self::Boolean => Arc::new(BooleanArray::from(
+                    positions.iter().map(|&at| at == 1).collect::<Vec<_>>(),
+                )),
+            }
+        }
+
+        /// The rendered key fields of the key at `position`.
+        fn render_key(&self, position: usize, doc_count: usize) -> Value {
+            match self {
+                Self::Keyword(keys) => json!({"key": keys[position], "doc_count": doc_count}),
+                Self::Long(keys) => json!({"key": keys[position], "doc_count": doc_count}),
+                Self::Double(keys) => json!({"key": keys[position], "doc_count": doc_count}),
+                Self::Boolean => json!({
+                    "key": position,
+                    "key_as_string": if position == 1 { "true" } else { "false" },
+                    "doc_count": doc_count
+                }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn terms_ranking_matches_an_independent_oracle() {
+        let domains = [
+            KeyDomain::Keyword(&["B", "a", "ab", "b", "c", "\u{e9}"]),
+            KeyDomain::Long(&[-40, -3, 0, 7, 12, 900]),
+            KeyDomain::Double(&[-2.5, -0.75, 0.5, 1.25, 3.0, 10.0]),
+            KeyDomain::Boolean,
+        ];
+        // Each order with its criteria as (by count, ascending), most significant first.
+        let orders: [(Value, &[(bool, bool)]); 6] = [
+            (json!({"_count": "desc"}), &[(true, false)]),
+            (json!({"_count": "asc"}), &[(true, true)]),
+            (json!({"_key": "asc"}), &[(false, true)]),
+            (json!({"_key": "desc"}), &[(false, false)]),
+            (
+                json!([{"_count": "asc"}, {"_key": "desc"}]),
+                &[(true, true), (false, false)],
+            ),
+            (json!([{"_count": "desc"}]), &[(true, false)]),
+        ];
+        let fixture = SearchFixture::new().await;
+        let session = fixture.open_session("tenant-a").await;
+        let scope = AggregationScope {
+            session: &session,
+            max_buckets: read_default_max_buckets(),
+        };
+        let mut random = StdRng::seed_from_u64(20_261_011);
+        let mut tied_rounds = 0;
+        for domain in &domains {
+            for (order, criteria) in &orders {
+                let key_count = domain.count_keys();
+                let row_count = random.random_range(12..40);
+                let positions: Vec<usize> = (0..row_count).map(|_| random.random_range(0..key_count)).collect();
+                let mut counts = vec![0_usize; key_count];
+                for &position in &positions {
+                    counts[position] += 1;
+                }
+                let present_positions: Vec<usize> = (0..key_count).filter(|&position| counts[position] > 0).collect();
+                // `size` below the distinct keys, so the ranking cuts at least one.
+                assert!(
+                    present_positions.len() >= 2,
+                    "the round draws at least two keys: {counts:?}"
+                );
+                let size = random.random_range(1..present_positions.len());
+                let mut oracle = present_positions.clone();
+                // A sort by key position is a sort by key, since each domain lists its keys in
+                // ascending order; the key ascending ends every tie.
+                oracle.sort_by(|&left, &right| {
+                    criteria
+                        .iter()
+                        .map(|&(is_by_count, is_ascending)| {
+                            let ordering = if is_by_count {
+                                counts[left].cmp(&counts[right])
+                            } else {
+                                left.cmp(&right)
+                            };
+                            if is_ascending { ordering } else { ordering.reverse() }
+                        })
+                        .find(|ordering| ordering.is_ne())
+                        .unwrap_or_else(|| left.cmp(&right))
+                });
+                if present_positions.iter().any(|&left| {
+                    present_positions
+                        .iter()
+                        .any(|&right| left != right && counts[left] == counts[right])
+                }) {
+                    tied_rounds += 1;
+                }
+                let answered_positions: Vec<usize> = oracle[..size].to_vec();
+                let other_doc_count: usize = oracle[size..].iter().map(|&position| counts[position]).sum();
+                let expected = build_terms_list(
+                    u64::try_from(other_doc_count).expect("a count"),
+                    &Value::Array(
+                        answered_positions
+                            .iter()
+                            .map(|&position| domain.render_key(position, counts[position]))
+                            .collect(),
+                    ),
+                );
+                let rows = RecordBatch::try_from_iter(vec![("k", domain.build_column(&positions))]).expect("rows");
+                let tree =
+                    parse_aggregations(&json!({"ranked": {"terms": {"field": "k", "size": size, "order": order}}}))
+                        .expect("a terms");
+
+                let answer = execute_aggregations(scan_rows(rows), &tree, &scope)
+                    .await
+                    .expect("the aggregations answer");
+
+                assert_eq!(
+                    Value::Object(answer),
+                    json!({"ranked": expected}),
+                    "order {order}, size {size}, counts {counts:?}"
+                );
+            }
+        }
+        // The property is only as strong as its ties: at least half the rounds hold equal counts.
+        assert!(tied_rounds >= 12, "{tied_rounds} of 24 rounds hold tied counts");
+    }
+
     /// Render `error` and check it is a `400 illegal_argument_exception` naming `aggregation`.
     async fn assert_unsupported_aggregation(error: OpenSearchError, aggregation: &str) {
         let (status, body) = render_envelope(error).await;
@@ -1112,8 +1936,9 @@ mod tests {
         row_limit: usize,
     ) -> (Vec<RecordBatch>, Vec<RecordBatch>) {
         let context = SessionContext::new();
-        let levels = plan_levels(chain).expect("the levels");
-        let group_plan = plan_bucket_groups(scan_rows(rows), &levels).expect("the group plan");
+        let rows = scan_rows(rows);
+        let levels = plan_levels(chain, &rows).expect("the levels");
+        let group_plan = plan_bucket_groups(rows, &levels).expect("the group plan");
         let groups = context
             .execute_logical_plan(group_plan.clone())
             .await

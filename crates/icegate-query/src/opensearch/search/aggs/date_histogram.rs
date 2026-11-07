@@ -580,6 +580,7 @@ mod tests {
         let tree = parse_aggregations(&json!({"h": {"date_histogram": body}})).expect("a date_histogram");
         match &tree.aggregations[0].kind {
             AggregationKind::DateHistogram(spec) => BucketRounding::from_spec(spec).expect("a rounding"),
+            AggregationKind::Terms(_) => panic!("the test wrote a date_histogram aggregation"),
         }
     }
 

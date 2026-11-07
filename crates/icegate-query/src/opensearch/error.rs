@@ -141,6 +141,21 @@ impl OpenSearchError {
         .with_metadata("index", index)
     }
 
+    /// A regular expression `include` or `exclude`, named by `filter_key`, of an aggregation over
+    /// a field holding encoded ids, which take a list of hex ids instead (`400`,
+    /// `illegal_argument_exception`): `aggregation` carries the request's name for it and
+    /// `field_storage` is `encoded_id`.
+    pub(crate) fn pattern_on_encoded_ids(aggregation: &str, filter_key: &str) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!(
+                "[{filter_key}] of [{aggregation}] is a regular expression; its field holds encoded ids, which \
+                 take a list of hex ids, not a pattern"
+            ),
+        )
+        .with_metadata("field_storage", "encoded_id")
+    }
+
     /// An aggregation whose chain of nested bucket aggregations is deeper than this listener
     /// plans (`400`, `illegal_argument_exception`); `aggregation` carries the request's name for
     /// the outermost one and `limit` the most levels one chain may nest.
@@ -275,6 +290,22 @@ impl OpenSearchError {
             )
             .with_metadata("max_buckets", max),
         )
+    }
+
+    /// An aggregation the searched indices cannot answer together, such as one over a field
+    /// typed differently across them (`400`). Buckets of keys of different types would otherwise
+    /// share one list.
+    pub(crate) fn aggregation_execution(reason: &str) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "aggregation_execution_exception", reason)
+    }
+
+    /// An aggregation over `field`, which the searched indices give more than one type, mapped or
+    /// stored (`400`, `aggregation_execution_exception`). `field` and `indices_by_type` (each type
+    /// name mapped to the array of indices giving the field that type) are carried for a client.
+    pub(crate) fn aggregation_field_conflict(field: &str, reason: &str, indices_by_type: Map<String, Value>) -> Self {
+        Self::aggregation_execution(reason)
+            .with_metadata("field", field)
+            .with_metadata("indices_by_type", Value::Object(indices_by_type))
     }
 
     /// `_count` addressed to the data indices `index_names`, a comma-joined list (`400`), which
@@ -804,5 +835,47 @@ mod tests {
              reached [4]. Narrow the time range or the interval, or raise \
              opensearch.search.max_buckets."
         );
+    }
+
+    #[tokio::test]
+    async fn aggregation_execution_renders_its_reason_in_error_and_root_cause() {
+        let (status, body) = render_envelope(OpenSearchError::aggregation_execution(
+            "[severity_text] cannot be aggregated: it is [keyword] in [logs] and [long] in [audit_events]",
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "aggregation_execution_exception");
+        assert_eq!(
+            body["error"]["root_cause"][0]["type"],
+            "aggregation_execution_exception"
+        );
+        assert_eq!(
+            body["error"]["reason"],
+            "[severity_text] cannot be aggregated: it is [keyword] in [logs] and [long] in [audit_events]"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregation_field_conflict_carries_the_field_and_the_indices_of_each_type_in_error_and_root_cause() {
+        let mut indices_by_type = Map::new();
+        indices_by_type.insert("keyword".to_string(), json!(["logs"]));
+        indices_by_type.insert("long".to_string(), json!(["audit_events", "audit_trail"]));
+
+        let (status, body) = render_envelope(OpenSearchError::aggregation_field_conflict(
+            "severity_text",
+            "[severity_text] cannot be aggregated",
+            indices_by_type,
+        ))
+        .await;
+
+        let expected_indices = json!({"keyword": ["logs"], "long": ["audit_events", "audit_trail"]});
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        for cause in [&body["error"], &body["error"]["root_cause"][0]] {
+            assert_eq!(cause["type"], "aggregation_execution_exception");
+            assert_eq!(cause["reason"], "[severity_text] cannot be aggregated");
+            assert_eq!(cause["field"], "severity_text");
+            assert_eq!(cause["indices_by_type"], expected_indices);
+        }
     }
 }

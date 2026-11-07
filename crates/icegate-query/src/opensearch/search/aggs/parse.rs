@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
+use super::terms::{TermsSpec, parse_terms};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::{
     MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MILLISECOND, MICROS_PER_MINUTE, MICROS_PER_SECOND,
@@ -36,8 +37,7 @@ const OUT_OF_SCOPE_KINDS: [&str; 6] = [
 const OUT_OF_SCOPE_PIPELINES: [&str; 1] = ["extended_stats_bucket"];
 
 /// Kinds of the aggregation surface that are not planned yet.
-const NOT_YET_PLANNED_KINDS: [&str; 27] = [
-    "terms",
+const NOT_YET_PLANNED_KINDS: [&str; 26] = [
     "histogram",
     "range",
     "date_range",
@@ -89,6 +89,8 @@ pub(crate) struct NamedAggregation {
 pub(crate) enum AggregationKind {
     /// Buckets of a date field by time interval.
     DateHistogram(DateHistogramSpec),
+    /// One bucket per distinct value of a field.
+    Terms(TermsSpec),
 }
 
 impl AggregationKind {
@@ -96,6 +98,7 @@ impl AggregationKind {
     pub(crate) fn field(&self) -> &str {
         match self {
             Self::DateHistogram(spec) => &spec.field,
+            Self::Terms(spec) => &spec.field,
         }
     }
 }
@@ -230,6 +233,7 @@ fn parse_named_aggregation(name: &str, body: &Value) -> Result<NamedAggregation,
 fn parse_kind(name: &str, kind_name: &str, value: &Value) -> Result<AggregationKind, OpenSearchError> {
     match kind_name {
         "date_histogram" => Ok(AggregationKind::DateHistogram(parse_date_histogram(name, value)?)),
+        "terms" => Ok(AggregationKind::Terms(parse_terms(name, value)?)),
         _ if OUT_OF_SCOPE_KINDS.contains(&kind_name)
             || OUT_OF_SCOPE_PIPELINES.contains(&kind_name)
             || kind_name.starts_with("geo_") =>
@@ -449,19 +453,38 @@ pub(super) fn read_epoch_millis(name: &str, key: &str, value: &Value) -> Result<
     })
 }
 
-fn expect_object<'a>(name: &str, key: &str, value: &'a Value) -> Result<&'a Map<String, Value>, OpenSearchError> {
+/// `value` as an object.
+///
+/// # Errors
+///
+/// `400 parsing_exception` naming `key` of `name` for any other value.
+pub(super) fn expect_object<'a>(
+    name: &str,
+    key: &str,
+    value: &'a Value,
+) -> Result<&'a Map<String, Value>, OpenSearchError> {
     value
         .as_object()
         .ok_or_else(|| OpenSearchError::parsing(format!("[{key}] of [{name}] must be an object")))
 }
 
-fn expect_string<'a>(name: &str, key: &str, value: &'a Value) -> Result<&'a str, OpenSearchError> {
+/// `value` as a string.
+///
+/// # Errors
+///
+/// `400 parsing_exception` naming `key` of `name` for any other value.
+pub(super) fn expect_string<'a>(name: &str, key: &str, value: &'a Value) -> Result<&'a str, OpenSearchError> {
     value
         .as_str()
         .ok_or_else(|| OpenSearchError::parsing(format!("[{key}] of [{name}] must be a string")))
 }
 
-fn expect_count(name: &str, key: &str, value: &Value) -> Result<u64, OpenSearchError> {
+/// `value` as a non-negative integer.
+///
+/// # Errors
+///
+/// `400 parsing_exception` naming `key` of `name` for any other value.
+pub(super) fn expect_count(name: &str, key: &str, value: &Value) -> Result<u64, OpenSearchError> {
     value
         .as_u64()
         .ok_or_else(|| OpenSearchError::parsing(format!("[{key}] of [{name}] must be a non-negative integer")))
@@ -474,17 +497,160 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::json;
 
+    use super::super::terms::{TermsFilter, TermsOrder, TermsSpec};
     use super::{
         AggregationKind, AggregationTree, CalendarUnit, DateHistogramSpec, HistogramInterval, classify_legacy_interval,
         parse_aggregations,
     };
     use crate::opensearch::error::render_envelope;
+    use crate::opensearch::search::request::SortOrder;
 
     /// The spec of the first top-level aggregation, which the test wrote as a `date_histogram`.
     fn read_date_histogram_spec(tree: &AggregationTree) -> &DateHistogramSpec {
         match &tree.aggregations[0].kind {
             AggregationKind::DateHistogram(spec) => spec,
+            AggregationKind::Terms(_) => panic!("the test wrote a date_histogram aggregation"),
         }
+    }
+
+    /// The spec of the first top-level aggregation, which the test wrote as a `terms`.
+    fn read_terms_spec(tree: &AggregationTree) -> &TermsSpec {
+        match &tree.aggregations[0].kind {
+            AggregationKind::Terms(spec) => spec,
+            AggregationKind::DateHistogram(_) => panic!("the test wrote a terms aggregation"),
+        }
+    }
+
+    #[tokio::test]
+    async fn terms_accepts_size_order_include_exclude_missing_and_ignored_hints() {
+        let tree = parse_aggregations(&json!({"levels": {"terms": {
+            "field": "severity_text", "size": 500, "order": {"_key": "asc"},
+            "include": "ERR.*", "exclude": ["DEBUG", "TRACE"], "missing": "unknown", "min_doc_count": 0,
+            "execution_hint": "map", "shard_size": 10, "collect_mode": "breadth_first"
+        }}}))
+        .expect("a full terms aggregation");
+        let defaults = parse_aggregations(&json!({"levels": {"terms": {"field": "severity_text"}}}))
+            .expect("a terms aggregation with defaults");
+
+        let spec = read_terms_spec(&tree);
+        assert_eq!(spec.field, "severity_text");
+        assert_eq!(spec.size, 500);
+        assert!(matches!(spec.order.as_slice(), [TermsOrder::Key(SortOrder::Asc)]));
+        let Some(TermsFilter::Pattern(include)) = &spec.include else {
+            panic!("include is a pattern");
+        };
+        assert!(include.is_match("ERROR"));
+        assert!(!include.is_match("AN ERROR"), "the pattern is anchored");
+        assert!(
+            matches!(&spec.exclude, Some(TermsFilter::Values(values)) if *values == vec![json!("DEBUG"), json!("TRACE")])
+        );
+        assert_eq!(spec.missing, Some(json!("unknown")));
+        assert_eq!(spec.min_doc_count, 0);
+        let defaults = read_terms_spec(&defaults);
+        assert_eq!(defaults.size, 10);
+        assert!(matches!(
+            defaults.order.as_slice(),
+            [TermsOrder::Count(SortOrder::Desc)]
+        ));
+        assert_eq!(defaults.min_doc_count, 1);
+        assert!(defaults.include.is_none() && defaults.exclude.is_none() && defaults.missing.is_none());
+
+        // Each refused body with the error type it is refused with.
+        for (body, expected_type) in [
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "size": 0}}}),
+                "illegal_argument_exception",
+            ),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "show_term_doc_count_error": true}}}),
+                "parsing_exception",
+            ),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "include": {"partition": 0, "num_partitions": 2}}}}),
+                "illegal_argument_exception",
+            ),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "size": "10"}}}),
+                "parsing_exception",
+            ),
+            (json!({"levels": {"terms": "severity_text"}}), "parsing_exception"),
+            (json!({"levels": {"terms": {"size": 5}}}), "parsing_exception"),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "missing": ["unknown"]}}}),
+                "parsing_exception",
+            ),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "missing": null}}}),
+                "parsing_exception",
+            ),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "order": []}}}),
+                "parsing_exception",
+            ),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "order": {}}}}),
+                "parsing_exception",
+            ),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "order": "_count"}}}),
+                "parsing_exception",
+            ),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "order": ["_count"]}}}),
+                "parsing_exception",
+            ),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "order": {"_count": "up"}}}}),
+                "parsing_exception",
+            ),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "include": 7}}}),
+                "parsing_exception",
+            ),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "exclude": [{"value": "a"}]}}}),
+                "parsing_exception",
+            ),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "include": "a&b"}}}),
+                "parsing_exception",
+            ),
+            (
+                json!({"levels": {"terms": {"field": "severity_text", "min_doc_count": -1}}}),
+                "parsing_exception",
+            ),
+        ] {
+            let error = parse_aggregations(&body).expect_err("refused");
+            let (status, envelope) = render_envelope(error).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(envelope["error"]["type"], expected_type, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn terms_order_parses_as_an_object_or_an_array() {
+        let object = parse_aggregations(&json!({"t": {"terms": {"field": "f", "order": {"_count": "asc"}}}}))
+            .expect("an object order");
+        let array = parse_aggregations(
+            &json!({"t": {"terms": {"field": "f", "order": [{"_count": "DESC"}, {"_key": "asc"}]}}}),
+        )
+        .expect("an array order");
+
+        assert!(matches!(
+            read_terms_spec(&object).order.as_slice(),
+            [TermsOrder::Count(SortOrder::Asc)]
+        ));
+        assert!(matches!(
+            read_terms_spec(&array).order.as_slice(),
+            [TermsOrder::Count(SortOrder::Desc), TermsOrder::Key(SortOrder::Asc)]
+        ));
+
+        let error = parse_aggregations(&json!({"t": {"terms": {"field": "f", "order": {"1": "desc"}}}}))
+            .expect_err("a metric order is not planned yet");
+        let (status, envelope) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(envelope["error"]["type"], "illegal_argument_exception");
+        assert_eq!(envelope["error"]["aggregation"], "t");
     }
 
     #[tokio::test]
