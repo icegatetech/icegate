@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::Json;
@@ -195,7 +196,8 @@ enum SortPlan<'r> {
     /// A field's values of a sortable `kind`, read at `source_path` (a multi-field reads its
     /// parent's values), the best one per `order`.
     Field {
-        /// The field the request named: a refusal names it, not the path holding its values.
+        /// The field the request named: a refusal of a stored value names it, not the path
+        /// holding its values.
         field: &'r str,
         /// How the stored values read.
         kind: FieldKind,
@@ -238,8 +240,9 @@ enum SortKey<'s> {
 /// # Errors
 ///
 /// - `illegal_argument_exception` for aggregations, a mapping type or an `unmapped_type` the
-///   evaluator does not support, a sort field of different kinds across `indices`, or a stored
-///   value that does not read as its sort field's kind;
+///   evaluator does not support, a sort field of different kinds across `indices`, two sort clauses
+///   reading one source of an index, naming the first such index of `indices`, or a stored value
+///   that does not read as its sort field's kind;
 /// - `query_shard` for a sort on a field the mapping lacks without `unmapped_type`, or on a text,
 ///   object or nested field;
 /// - the errors of [`find_system_indices`] and [`matches_document`].
@@ -261,7 +264,7 @@ pub(crate) fn search_system_indices(
         .collect::<Result<Vec<Vec<SortPlan<'_>>>, OpenSearchError>>()?;
     verify_sort_field_kinds(&concrete_indices, &sort_plans, &request.sort)?;
     let mut keyed_hits = Vec::new();
-    for (&(index_name, index), sort_plan) in concrete_indices.iter().zip(&sort_plans) {
+    for (&(index_name, index), clause_plans) in concrete_indices.iter().zip(&sort_plans) {
         for (id, document) in index.documents() {
             if matches_document(
                 &request.query,
@@ -277,7 +280,7 @@ pub(crate) fn search_system_indices(
                     document,
                 };
                 let position = keyed_hits.len();
-                let keys = sort_plan
+                let keys = clause_plans
                     .iter()
                     .map(|plan| compute_sort_key(&hit, *plan, position))
                     .collect::<Result<Vec<SortKey<'_>>, OpenSearchError>>()?;
@@ -346,13 +349,15 @@ fn order_page_hits(keyed_hits: &mut [KeyedHit<'_>], request: &SearchRequest) {
 ///
 /// `query_shard` naming `index_name` for a field the mapping lacks without `unmapped_type`, or a
 /// text, object or nested field; `illegal_argument_exception` for a mapping type or an
-/// `unmapped_type` the evaluator does not support.
+/// `unmapped_type` the evaluator does not support; and, once every clause has its plan, the error
+/// of [`verify_sort_sources`].
 fn plan_sort<'r>(
     mappings: &Value,
     index_name: &str,
     sort: &'r [SortClause],
 ) -> Result<Vec<SortPlan<'r>>, OpenSearchError> {
-    sort.iter()
+    let clause_plans = sort
+        .iter()
         .map(|clause| match clause {
             SortClause::Score { .. } => Ok(SortPlan::Score),
             SortClause::Doc { .. } => Ok(SortPlan::Doc),
@@ -363,11 +368,50 @@ fn plan_sort<'r>(
                 unmapped_type,
             } => plan_field_sort(mappings, index_name, field, *order, unmapped_type.as_deref()),
         })
-        .collect()
+        .collect::<Result<Vec<SortPlan<'r>>, OpenSearchError>>()?;
+    verify_sort_sources(&clause_plans, index_name)?;
+    Ok(clause_plans)
+}
+
+/// Refuse two plans of one `sort` that read one source of the index `index_name`.
+///
+/// Each clause copies what it reads into every hit's `sort`, and `max_answer_bytes` acts only on a
+/// rendered page, so a repeated clause would multiply the page's stored bytes before the bound
+/// could refuse them. One read per source keeps the stored bytes of a hit to two renderings: once
+/// in `_source` and once in `sort`. `_score` and `_doc` read no stored bytes and may repeat.
+///
+/// A source is what a plan reads, not how the request spelled it, so a field and its multi-field
+/// are one read. The document id is tracked apart from the paths because it is no stored value: a
+/// mapping can declare `_id`, and `_id.raw` then reads a stored key that is not the id. A path is
+/// compared without its trailing dots because [`collect_source_values`] reaches one value through
+/// spellings that differ only in them. The comparison is conservative: such paths are refused even
+/// when they share no value, as `a` and `a..` do, and the refusal names the path without its dots.
+///
+/// # Errors
+///
+/// [`OpenSearchError::repeated_sort_field`] naming `index_name` and `_id` or the path as compared.
+fn verify_sort_sources(clause_plans: &[SortPlan<'_>], index_name: &str) -> Result<(), OpenSearchError> {
+    let mut is_id_read = false;
+    let mut seen_paths = HashSet::with_capacity(clause_plans.len());
+    for plan in clause_plans {
+        match plan {
+            SortPlan::Score | SortPlan::Doc => {}
+            SortPlan::Id if is_id_read => return Err(OpenSearchError::repeated_sort_field(ID_FIELD, index_name)),
+            SortPlan::Id => is_id_read = true,
+            SortPlan::Field { source_path, .. } => {
+                let compared_path = source_path.trim_end_matches('.');
+                // `insert` answers `false` for a value the set already holds.
+                if !seen_paths.insert(compared_path) {
+                    return Err(OpenSearchError::repeated_sort_field(compared_path, index_name));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The sort plan of `field`: its mapped kind, or `unmapped_type` where the mapping lacks it. The
-/// errors are those of [`plan_sort`].
+/// errors are those [`plan_sort`] states for one clause.
 fn plan_field_sort<'r>(
     mappings: &Value,
     index_name: &str,
@@ -615,6 +659,8 @@ fn render_total(total: usize, request: &SearchRequest) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use axum::http::StatusCode;
     use icegate_common::TenantId;
 
@@ -1147,6 +1193,248 @@ mod tests {
         .expect("the field reads as one kind in both indices");
         assert_eq!(read_hit_ids(&same_kind_answer), ["a", "b"]);
         assert_eq!(read_sort_values(&same_kind_answer), [json!([1]), json!([null])]);
+    }
+
+    /// Assert that `sort` on `names` is refused as reading the source `field` of `index` twice.
+    async fn assert_repeated_sort_field(
+        snapshot: &SystemSnapshot,
+        names: &[&str],
+        sort: &Value,
+        field: &str,
+        index: &str,
+    ) {
+        let error = search_named_indices(snapshot, names, &json!({"sort": sort}), "").expect_err("refused");
+
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{sort}");
+        assert_eq!(body["error"]["type"], "illegal_argument_exception", "{sort}");
+        assert_eq!(body["error"]["field"], field, "{sort}");
+        assert_eq!(body["error"]["index"], index, "{sort}");
+    }
+
+    /// The check runs once every clause has its plan, so the clause no mapping can serve is what
+    /// the client hears about, wherever it stands in the `sort`.
+    #[tokio::test]
+    async fn a_clause_the_mapping_cannot_serve_keeps_its_refusal_beside_a_repeated_field() {
+        let snapshot = build_snapshot(&[]);
+        let body = json!({"sort": [{"type": "asc"}, {"type": "desc"}, {"absent": "asc"}]});
+
+        let error = search_kibana_index(&snapshot, &body, "").expect_err("refused");
+
+        let (status, answer) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(answer["error"]["type"], "search_phase_execution_exception");
+        assert_eq!(answer["error"]["root_cause"][0]["type"], "query_shard_exception");
+        assert_eq!(answer["error"]["root_cause"][0]["index"], ".kibana_1");
+    }
+
+    /// A multi-field reads its parent's values, so these clauses read `name` once each however
+    /// they spell it, and the refusal names that path rather than either spelling.
+    #[tokio::test]
+    async fn sort_clauses_reaching_one_field_through_its_multi_fields_are_refused_naming_the_field() {
+        let mut snapshot = SystemSnapshot::default();
+        create_index(
+            &mut snapshot,
+            ".a_1",
+            json!({"properties": {"name": {"type": "keyword", "fields": {
+                "raw": {"type": "keyword"},
+                "other": {"type": "keyword"}
+            }}}}),
+        );
+
+        for sort in [
+            json!([{"name": "asc"}, {"name.raw": "asc"}]),
+            json!([{"name.raw": "asc"}, {"name.other": "desc"}]),
+        ] {
+            assert_repeated_sort_field(&snapshot, &[".a_1"], &sort, "name", ".a_1").await;
+        }
+    }
+
+    /// Both indices collide, so the order of the names alone decides which one the refusal names.
+    #[tokio::test]
+    async fn a_sort_collision_in_several_indices_names_the_first_of_them() {
+        let mappings = json!({"properties": {"name": {"type": "keyword", "fields": {"raw": {"type": "keyword"}}}}});
+        let mut snapshot = SystemSnapshot::default();
+        create_index(&mut snapshot, ".a_1", mappings.clone());
+        create_index(&mut snapshot, ".b_1", mappings);
+        let sort = json!([{"name": "asc"}, {"name.raw": "asc"}]);
+
+        assert_repeated_sort_field(&snapshot, &[".a_1", ".b_1"], &sort, "name", ".a_1").await;
+        assert_repeated_sort_field(&snapshot, &[".b_1", ".a_1"], &sort, "name", ".b_1").await;
+    }
+
+    /// `_id.raw` is a multi-field of a mapped `_id`, so it reads the stored key `_id`. That is not
+    /// the document id, so the pair is two sources, while the stored key repeated is one.
+    #[tokio::test]
+    async fn the_document_id_and_a_stored_key_spelled_id_are_two_sources() {
+        let mut snapshot = SystemSnapshot::default();
+        create_index(
+            &mut snapshot,
+            ".a_1",
+            json!({"properties": {"_id": {"type": "keyword", "fields": {"raw": {"type": "keyword"}}}}}),
+        );
+        write_document(&mut snapshot, ".a_1", "document-id", &json!({"_id": "stored-key"}));
+
+        let answer = search_named_indices(
+            &snapshot,
+            &[".a_1"],
+            &json!({"sort": [{"_id": "asc"}, {"_id.raw": "asc"}]}),
+            "",
+        )
+        .expect("searches");
+
+        assert_eq!(read_sort_values(&answer), [json!(["document-id", "stored-key"])]);
+        assert_repeated_sort_field(
+            &snapshot,
+            &[".a_1"],
+            &json!([{"_id.raw": "asc"}, {"_id.raw": "desc"}]),
+            "_id",
+            ".a_1",
+        )
+        .await;
+    }
+
+    /// A sort clause on `field` that needs no mapping.
+    fn build_keyword_clause(field: &str) -> Value {
+        json!({field: {"unmapped_type": "keyword"}})
+    }
+
+    /// A path also ends at a trailing dot, so `type.` reaches the value of `type`, and `absent..`
+    /// the value of the stored key `absent.`, which `absent.` reaches too. Each spelling is first
+    /// shown to reach the value, so these rows are real collisions rather than unusual names.
+    #[tokio::test]
+    async fn a_trailing_dot_does_not_make_a_sort_field_a_second_source() {
+        let snapshot = build_snapshot(&[("a", json!({"type": "dashboard", "absent.": "stored-key"}))]);
+        for (field, expected_value) in [
+            ("type.", "dashboard"),
+            ("absent.", "stored-key"),
+            ("absent..", "stored-key"),
+        ] {
+            let answer =
+                search_kibana_index(&snapshot, &json!({"sort": [build_keyword_clause(field)]}), "").expect("searches");
+            assert_eq!(read_sort_values(&answer), [json!([expected_value])], "{field}");
+        }
+        let cases = [
+            (json!([{"type": "asc"}, build_keyword_clause("type.")]), "type"),
+            (json!([build_keyword_clause("type."), {"type": "desc"}]), "type"),
+            (
+                json!([build_keyword_clause("absent."), build_keyword_clause("absent..")]),
+                "absent",
+            ),
+        ];
+
+        for (sort, field) in cases {
+            assert_repeated_sort_field(&snapshot, &[".kibana_1"], &sort, field, ".kibana_1").await;
+        }
+    }
+
+    /// The comparison drops trailing dots and nothing else. `a` and `a..` read different keys here,
+    /// so their refusal comes from the comparison and not from a shared value, and it names the
+    /// path without its dots. A leading dot spells another key, so `.a` beside `a` is two reads.
+    #[tokio::test]
+    async fn sort_paths_differing_in_trailing_dots_are_refused_and_in_a_leading_dot_are_served() {
+        let snapshot = build_snapshot(&[(
+            "a",
+            json!({"a": "plain-key", "a.": "trailing-dot-key", ".a": "leading-dot-key"}),
+        )]);
+        for (field, expected_value) in [("a", "plain-key"), ("a..", "trailing-dot-key")] {
+            let answer =
+                search_kibana_index(&snapshot, &json!({"sort": [build_keyword_clause(field)]}), "").expect("searches");
+            assert_eq!(read_sort_values(&answer), [json!([expected_value])], "{field}");
+        }
+
+        let leading_dot_answer = search_kibana_index(
+            &snapshot,
+            &json!({"sort": [build_keyword_clause("a"), build_keyword_clause(".a")]}),
+            "",
+        )
+        .expect("searches");
+
+        assert_eq!(
+            read_sort_values(&leading_dot_answer),
+            [json!(["plain-key", "leading-dot-key"])]
+        );
+        assert_repeated_sort_field(
+            &snapshot,
+            &[".kibana_1"],
+            &json!([build_keyword_clause("a"), build_keyword_clause("a..")]),
+            "a",
+            ".kibana_1",
+        )
+        .await;
+    }
+
+    /// Every string of up to `max_length` bytes over `a`, `b` and `.`, counted in base three.
+    fn list_path_texts(max_length: u32) -> Vec<String> {
+        (0..=max_length)
+            .flat_map(|length| {
+                (0..3_usize.pow(length)).map(move |number| {
+                    (0..length)
+                        .map(|digit| ['a', 'b', '.'][number / 3_usize.pow(digit) % 3])
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
+    /// An object holding each of `keys` as an array of a text unique in the document and, for
+    /// `depth` more levels, the same keys again. The array keeps both under one key: the source
+    /// reader flattens it, so one path can end at the text and another can pass through to a child.
+    fn build_keyed_source(keys: &[String], key_sequence: &str, depth: usize) -> Value {
+        let entries = keys.iter().map(|key| {
+            let stored_text = format!("{key_sequence}/{key}");
+            let child = if depth == 0 {
+                Value::Null
+            } else {
+                build_keyed_source(keys, &stored_text, depth - 1)
+            };
+            (key.clone(), json!([stored_text, child]))
+        });
+        Value::Object(entries.collect())
+    }
+
+    /// The reader itself is the oracle: whatever spellings reach one stored text, the check must
+    /// refuse every two of them. Keys of up to two bytes at three levels spell paths of up to eight
+    /// bytes, and nine leaves room for a trailing dot on each.
+    #[test]
+    fn every_two_paths_reaching_one_stored_value_are_refused() {
+        let source = build_keyed_source(&list_path_texts(2), "", 2);
+        let paths = list_path_texts(9);
+        let mut reading_paths: HashMap<&str, Vec<&str>> = HashMap::new();
+        for path in &paths {
+            let mut values = Vec::new();
+            collect_source_values(&source, path, &mut values);
+            for stored_text in values.into_iter().filter_map(Value::as_str) {
+                reading_paths.entry(stored_text).or_default().push(path);
+            }
+        }
+        let plan_field_read = |source_path| SortPlan::Field {
+            field: source_path,
+            kind: FieldKind::Keyword,
+            source_path,
+            order: SortOrder::Asc,
+        };
+
+        // The fixture reaches the condition at the first level and at the third, whose longer
+        // spelling takes the ninth byte of the bound.
+        assert_eq!(reading_paths["/a"], ["a", "a."]);
+        assert_eq!(reading_paths["/aa/bb/ab"], ["aa.bb.ab", "aa.bb.ab."]);
+        for readers in reading_paths.values() {
+            for (position, first_path) in readers.iter().enumerate() {
+                for second_path in &readers[position + 1..] {
+                    let clause_plans = [plan_field_read(*first_path), plan_field_read(*second_path)];
+                    let error = verify_sort_sources(&clause_plans, ".a_1").expect_err("both read one value");
+
+                    let cause = error.render_cause();
+                    assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{first_path} {second_path}");
+                    assert_eq!(
+                        cause["type"], "illegal_argument_exception",
+                        "{first_path} {second_path}"
+                    );
+                    assert_eq!(cause["index"], ".a_1", "{first_path} {second_path}");
+                }
+            }
+        }
     }
 
     #[test]

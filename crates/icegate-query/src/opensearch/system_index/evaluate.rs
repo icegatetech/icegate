@@ -199,7 +199,9 @@ pub(crate) fn find_mapped_field(mappings: &Value, path: &str) -> Result<Option<D
 }
 
 /// Collect the non-null values at the dotted `path` under `node`. Arrays are flattened, and a
-/// key that itself contains dots is found as well as nested objects.
+/// key that itself contains dots is found as well as nested objects. A trailing dot ends the path
+/// as its last byte does, so `a.` reads the key `a` beside the key `a.`, and `a..` the key `a.`
+/// beside the key `a..`.
 pub(crate) fn collect_source_values<'a>(node: &'a Value, path: &str, values: &mut Vec<&'a Value>) {
     match node {
         Value::Null => {}

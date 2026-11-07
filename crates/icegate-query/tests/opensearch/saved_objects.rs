@@ -2488,28 +2488,23 @@ async fn a_search_resolving_to_data_indices_is_a_400() -> TestResult {
     Ok(())
 }
 
-/// Each sort clause copies a stored value into every hit, so a body far smaller than one document
-/// multiplies the answer. With `_source` off the sort values are the only stored bytes: one clause
-/// fits the bound and a second doubles them past it. Lengths stay unstated because `took` varies.
+/// A sort value is a copy of stored bytes, so it counts toward the bound as `_source` does. Without
+/// a sort the two padded documents fit; the clause adds each one's padded `config.buildNum` to its
+/// hit, which carries the answer past the bound. The answer's exact length stays unstated because
+/// `took` varies.
 #[tokio::test]
-async fn a_search_answer_multiplied_past_max_answer_bytes_by_its_sort_clauses_is_refused() -> TestResult {
+async fn a_search_answer_carried_past_max_answer_bytes_by_its_sort_values_is_refused() -> TestResult {
     let server = start_server_with_answer_bound(6000).await?;
     let clause = json!({"config.buildNum": {"unmapped_type": "keyword"}});
 
-    let (fitting_status, fitting_answer) = send_request(
-        &server,
-        Method::POST,
-        TENANT_A,
-        "/.kibana/_search",
-        Some(&json!({"_source": false, "sort": [clause]})),
-    )
-    .await?;
+    let (fitting_status, fitting_answer) =
+        send_request(&server, Method::POST, TENANT_A, "/.kibana/_search", Some(&json!({}))).await?;
     let (refused_status, refused_answer) = send_request(
         &server,
         Method::POST,
         TENANT_A,
         "/.kibana/_search",
-        Some(&json!({"_source": false, "sort": [clause, clause]})),
+        Some(&json!({"sort": [clause]})),
     )
     .await?;
 
@@ -2517,6 +2512,128 @@ async fn a_search_answer_multiplied_past_max_answer_bytes_by_its_sort_clauses_is
     assert_eq!(fitting_answer["hits"]["total"], json!({"value": 2, "relation": "eq"}));
     assert_eq!(refused_status, StatusCode::BAD_REQUEST);
     assert_answer_bound_refusal(&refused_answer["error"]);
+    server.shutdown().await;
+    Ok(())
+}
+
+/// The index holds no document, so the refusal cannot depend on a read.
+#[tokio::test]
+async fn a_sort_reading_one_source_field_twice_is_refused() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    let cases = [
+        (json!([{"type": "asc"}, {"type": "asc"}]), "type"),
+        (json!([{"type": "asc"}, {"type": "desc"}]), "type"),
+        (
+            json!([{"config.buildNum": "asc"}, {"type": "asc"}, {"config.buildNum": "desc"}]),
+            "config.buildNum",
+        ),
+        (json!([{"_id": "asc"}, {"_id": "desc"}]), "_id"),
+        (
+            json!([{"absent": {"unmapped_type": "keyword"}}, {"absent": {"unmapped_type": "long"}}]),
+            "absent",
+        ),
+    ];
+
+    for (sort, field) in cases {
+        let (status, answer) = send_request(
+            &server,
+            Method::POST,
+            TENANT_A,
+            "/.kibana/_search",
+            Some(&json!({"sort": sort})),
+        )
+        .await?;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{sort}");
+        assert_eq!(answer["error"]["type"], "illegal_argument_exception", "{sort}");
+        assert_eq!(
+            answer["error"]["reason"],
+            format!("the sort reads the field [{field}] of index [.kibana_1] more than once"),
+            "{sort}"
+        );
+        assert_eq!(answer["error"]["field"], field, "{sort}");
+        assert_eq!(answer["error"]["index"], ".kibana_1", "{sort}");
+    }
+    server.shutdown().await;
+    Ok(())
+}
+
+/// `_score` and `_doc` read no stored bytes, and two fields read two sources. `config:b` sorts first
+/// on `type` and comes first in `_id` order, so every row orders the two hits alike.
+#[tokio::test]
+async fn a_sort_on_distinct_fields_or_repeated_scores_and_positions_is_served() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    create_kibana_index(&server, TENANT_A).await?;
+    put_saved_object(&server, TENANT_A, "dashboard:a", &json!({"type": "dashboard"})).await?;
+    put_saved_object(&server, TENANT_A, "config:b", &json!({"type": "config"})).await?;
+    let cases = [
+        (
+            json!([{"type": "asc"}, {"_id": "asc"}]),
+            [json!(["config", "config:b"]), json!(["dashboard", "dashboard:a"])],
+        ),
+        (json!(["_score", "_score"]), [json!([1.0, 1.0]), json!([1.0, 1.0])]),
+        (
+            json!([{"_doc": "asc"}, {"_doc": "desc"}]),
+            [json!([0, 0]), json!([1, 1])],
+        ),
+    ];
+
+    for (sort, expected_sort_values) in cases {
+        let (status, answer) = send_request(
+            &server,
+            Method::POST,
+            TENANT_A,
+            "/.kibana/_search",
+            Some(&json!({"sort": sort})),
+        )
+        .await?;
+
+        assert_eq!(status, StatusCode::OK, "{sort}: {answer}");
+        let sort_values: Vec<Value> = answer["hits"]["hits"]
+            .as_array()
+            .ok_or("hits.hits is an array")?
+            .iter()
+            .map(|hit| hit["sort"].clone())
+            .collect();
+        assert_eq!(sort_values, expected_sort_values, "{sort}");
+    }
+    server.shutdown().await;
+    Ok(())
+}
+
+/// `name` and `name.raw` are one read where `name.raw` is a multi-field, and two where the mapping
+/// declares neither, so the same clauses are served on `.b_1` alone. The named index does not depend
+/// on where the expression puts it.
+#[tokio::test]
+async fn a_sort_collision_in_one_index_refuses_the_search_naming_that_index() -> TestResult {
+    let (server, _catalog) = TestServer::start().await;
+    let multi_field_index = json!({
+        "mappings": {"properties": {"name": {"type": "keyword", "fields": {"raw": {"type": "keyword"}}}}},
+        "settings": {}
+    });
+    let plain_index = json!({"mappings": {"properties": {}}, "settings": {}});
+    for (path, index) in [("/.a_1", &multi_field_index), ("/.b_1", &plain_index)] {
+        let (created_status, created_body) = send_request(&server, Method::PUT, TENANT_A, path, Some(index)).await?;
+        assert!(created_status.is_success(), "{path}: {created_status} {created_body}");
+    }
+    let body = json!({"sort": [
+        {"name": {"unmapped_type": "keyword"}},
+        {"name.raw": {"unmapped_type": "keyword"}}
+    ]});
+
+    let (served_status, served_answer) =
+        send_request(&server, Method::POST, TENANT_A, "/.b_1/_search", Some(&body)).await?;
+
+    assert_eq!(served_status, StatusCode::OK, "{served_answer}");
+    for path in ["/.a_1,.b_1/_search", "/.b_1,.a_1/_search"] {
+        let (status, answer) = send_request(&server, Method::POST, TENANT_A, path, Some(&body)).await?;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {answer}");
+        assert_eq!(answer["error"]["type"], "illegal_argument_exception", "{path}");
+        assert_eq!(answer["error"]["field"], "name", "{path}");
+        assert_eq!(answer["error"]["index"], ".a_1", "{path}");
+    }
     server.shutdown().await;
     Ok(())
 }

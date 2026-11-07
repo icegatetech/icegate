@@ -195,6 +195,16 @@ impl OpenSearchError {
         .with_metadata("id", id)
     }
 
+    /// One `sort` reads the source `field` of `index` more than once (`400`), which `field` and
+    /// `index` carry for a client.
+    pub(crate) fn repeated_sort_field(field: &str, index: &str) -> Self {
+        Self::illegal_argument(format!(
+            "the sort reads the field [{field}] of index [{index}] more than once"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("index", index)
+    }
+
     /// The system index `index` already exists (`400`).
     pub(crate) fn resource_already_exists(index: &str) -> Self {
         Self::new(
