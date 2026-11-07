@@ -3,16 +3,20 @@
 //! GET in both arms (not modified for the current `ETag`, the changed object for an outdated one),
 //! a last-modified time on objects written by plain put, create, and update (garbage collection
 //! measures supersession age from it), and a GET of a missing key answering not-found (a cold start
-//! reads no state from it).
+//! reads no state from it); a listing reports the `Last-Modified` second HEAD reports, and deleting
+//! a missing key succeeds or answers not-found.
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::{TimeDelta, Utc};
+use chrono::{SubsecRound as _, TimeDelta, Utc};
+use futures::TryStreamExt as _;
 use icegate_common::testing::{S3TestContainer, create_s3_bucket, create_s3_object_store};
-use object_store::{GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion, path::Path};
+use object_store::{
+    GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion, path::Path,
+};
 use tokio::sync::Barrier;
 use tokio::task::JoinSet;
 
@@ -271,5 +275,47 @@ async fn a_get_of_a_missing_key_is_not_found() {
     assert!(
         matches!(missing_answer, Err(object_store::Error::NotFound { .. })),
         "{missing_answer:?}"
+    );
+}
+
+// Garbage collection compares listed successor times with the clock probe's HEAD time, which has
+// whole-second resolution, so a listing must report the same second.
+#[tokio::test]
+async fn listing_a_prefix_reports_the_last_modified_second_head_reports() {
+    let (_container, store) = start_store().await;
+    for path in ["a:b/snap-1", "a:b/snap-2", "a:b/current"] {
+        store
+            .put(&Path::from(path), Bytes::from_static(b"{}").into())
+            .await
+            .expect("put");
+    }
+
+    let listed_objects: Vec<ObjectMeta> = store
+        .list(Some(&Path::from("a:b")))
+        .try_collect()
+        .await
+        .expect("the prefix lists");
+
+    assert_eq!(listed_objects.len(), 3, "{listed_objects:?}");
+    for metadata in listed_objects {
+        let head = store.head(&metadata.location).await.expect("head");
+        assert_eq!(
+            metadata.last_modified.trunc_subsecs(0),
+            head.last_modified,
+            "{}",
+            metadata.location
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_a_missing_key_answers_ok_or_not_found() {
+    let (_container, store) = start_store().await;
+
+    let outcome = store.delete(&Path::from("a:b/snap-missing")).await;
+
+    assert!(
+        matches!(outcome, Ok(()) | Err(object_store::Error::NotFound { .. })),
+        "{outcome:?}"
     );
 }

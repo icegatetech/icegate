@@ -2,14 +2,17 @@
 //! `build_system_object_store` from a storage configuration as a deployment states it.
 #![allow(clippy::expect_used)]
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::TryStreamExt as _;
 use futures::future::join_all;
 use icegate_common::testing::{S3TestContainer, create_s3_bucket, create_s3_object_store};
 use icegate_common::{S3Config, StorageBackend, StorageConfig};
 use icegate_query::QueryConfig;
-use icegate_query::opensearch::build_system_object_store;
+use icegate_query::engine::QueryEngineConfig;
+use icegate_query::opensearch::{OpenSearchConfig, SystemIndicesConfig, build_system_object_store};
 use object_store::path::Path;
 use object_store::{GetOptions, ObjectStore, ObjectStoreExt as _};
 use reqwest::{Method, StatusCode};
@@ -28,16 +31,13 @@ const COUNTER_WRITERS_PER_ROUND: usize = 8;
 /// Bound for one round, so a hung write fails the test instead of the run.
 const COUNTER_ROUND_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Start RustFS with an empty bucket and the query configuration a deployment storing its tables
-/// in that bucket carries, with the listener enabled. The container guard must outlive every
-/// store built from the configuration.
-async fn start_rustfs() -> (S3TestContainer, QueryConfig) {
-    let container = S3TestContainer::start().await.expect("rustfs container starts");
-    create_s3_bucket(container.endpoint(), BUCKET).await.expect("bucket created");
+/// The query configuration a deployment storing its tables in `bucket` of `container` carries,
+/// with the listener enabled.
+fn build_rustfs_query_config(container: &S3TestContainer, bucket: &str) -> QueryConfig {
     let mut config = QueryConfig {
         storage: StorageConfig {
             backend: StorageBackend::S3(S3Config {
-                bucket: BUCKET.to_string(),
+                bucket: bucket.to_string(),
                 region: "us-east-1".to_string(),
                 endpoint: Some(container.endpoint().to_string()),
                 access_key_id: Some(container.username().to_string()),
@@ -47,6 +47,16 @@ async fn start_rustfs() -> (S3TestContainer, QueryConfig) {
         ..QueryConfig::default()
     };
     config.opensearch.enabled = true;
+    config
+}
+
+/// Start RustFS with an empty bucket and the query configuration a deployment storing its tables
+/// in that bucket carries, with the listener enabled. The container guard must outlive every
+/// store built from the configuration.
+async fn start_rustfs() -> (S3TestContainer, QueryConfig) {
+    let container = S3TestContainer::start().await.expect("rustfs container starts");
+    create_s3_bucket(container.endpoint(), BUCKET).await.expect("bucket created");
+    let config = build_rustfs_query_config(&container, BUCKET);
     (container, config)
 }
 
@@ -323,4 +333,108 @@ async fn concurrent_increment_counters_across_two_replicas_end_at_exactly_n() {
     }
     replica_a.shutdown().await;
     replica_b.shutdown().await;
+}
+
+/// The snapshot objects listed under `tenant_prefix`.
+async fn list_snapshot_names(
+    store: &Arc<dyn ObjectStore>,
+    tenant_prefix: &Path,
+) -> object_store::Result<BTreeSet<String>> {
+    let listed_objects: Vec<object_store::ObjectMeta> = store.list(Some(tenant_prefix)).try_collect().await?;
+    Ok(listed_objects
+        .into_iter()
+        .filter_map(|metadata| metadata.location.filename().map(str::to_string))
+        .filter(|name| name.starts_with("snap-"))
+        .collect())
+}
+
+/// A write lets a background pass start once the scroll lifetime has passed; the pass deletes the
+/// first snapshot object once its successor is older than the retention (the scroll lifetime
+/// plus the engine's default query deadline, which the harness runs with), measured on RustFS's
+/// clock at whole seconds. The test therefore waits that retention out in real time: the store's
+/// clock is what it exercises.
+#[tokio::test]
+async fn garbage_collection_lists_and_deletes_under_a_colon_tenant_segment() {
+    const SCROLL_LIFETIME_SECS: u64 = 1;
+    let retention = Duration::from_secs(SCROLL_LIFETIME_SECS + QueryEngineConfig::default().max_query_duration_secs);
+    let container = S3TestContainer::start().await.expect("the RustFS container starts");
+    let bucket = "opensearch-gc";
+    create_s3_bucket(container.endpoint(), bucket)
+        .await
+        .expect("the bucket is created");
+    let system_store = build_system_object_store(&build_rustfs_query_config(&container, bucket))
+        .expect("the production constructor builds the store");
+    let config = OpenSearchConfig {
+        system_indices: SystemIndicesConfig {
+            max_scroll_lifetime_secs: SCROLL_LIFETIME_SECS,
+            ..SystemIndicesConfig::default()
+        },
+        ..OpenSearchConfig::default()
+    };
+    let (server, _catalog) = TestServer::start_with_system_store(config, system_store).await;
+    let observer = create_s3_object_store(container.endpoint(), bucket).expect("an observing client");
+    let tenant = "a:b";
+    let tenant_prefix = Path::from(SystemIndicesConfig::DEFAULT_LOCATION_PREFIX).join(tenant);
+    let send_tenant_request =
+        |method: Method, path: &str, body: Value| server.request(method, Some(tenant), path).json(&body).send();
+
+    let creation_response = send_tenant_request(
+        Method::PUT,
+        "/.kibana_1",
+        json!({"mappings": {"properties": {"type": {"type": "keyword"}}}}),
+    )
+    .await
+    .expect("answered");
+    assert_eq!(creation_response.status(), StatusCode::OK);
+    let first_names = list_snapshot_names(&observer, &tenant_prefix)
+        .await
+        .expect("the tenant prefix lists");
+    assert_eq!(first_names.len(), 1, "{first_names:?}");
+    let first_write_response = send_tenant_request(Method::PUT, "/.kibana_1/_doc/a", json!({"type": "a"}))
+        .await
+        .expect("answered");
+    assert_eq!(first_write_response.status(), StatusCode::CREATED);
+    // Outlive the retention, with two seconds for `Last-Modified`'s whole-second granularity.
+    tokio::time::sleep(retention + Duration::from_secs(2)).await;
+    let second_write_response = send_tenant_request(Method::PUT, "/.kibana_1/_doc/b", json!({"type": "b"}))
+        .await
+        .expect("answered");
+    assert_eq!(second_write_response.status(), StatusCode::CREATED);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut remaining_names = list_snapshot_names(&observer, &tenant_prefix)
+        .await
+        .expect("the tenant prefix lists");
+    while !remaining_names.is_disjoint(&first_names) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first snapshot object was never collected: {remaining_names:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        remaining_names = list_snapshot_names(&observer, &tenant_prefix)
+            .await
+            .expect("the tenant prefix lists");
+    }
+    assert_eq!(
+        remaining_names.len(),
+        2,
+        "the two newer snapshot objects stay: {remaining_names:?}"
+    );
+    for kept_name in ["current", "gc-probe"] {
+        observer
+            .head(&tenant_prefix.clone().join(kept_name))
+            .await
+            .unwrap_or_else(|error| panic!("{kept_name} stays under the colon tenant: {error}"));
+    }
+    let (status, document) = {
+        let response = server
+            .request(Method::GET, Some(tenant), "/.kibana_1/_doc/a")
+            .send()
+            .await
+            .expect("answered");
+        (response.status(), response.json::<Value>().await.expect("JSON"))
+    };
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(document["_source"], json!({"type": "a"}));
+    server.shutdown().await;
 }

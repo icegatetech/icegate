@@ -2,10 +2,11 @@
 //!
 //! Compiled only under `cfg(test)`; nothing here is part of the crate's API.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::fmt;
 use std::future::pending;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,6 +17,8 @@ use datafusion::arrow::array::{
 };
 use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
+use futures::stream::BoxStream;
+use futures::{StreamExt as _, TryStreamExt as _};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, Namespace, NamespaceIdent, Result as IcebergResult, TableCommit, TableCreation, TableIdent};
@@ -28,6 +31,12 @@ use icegate_common::schema::{
 use icegate_common::{
     CatalogBackend, CatalogBuilder, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, MemoryPressure,
     MemoryPressureConfig, MemoryPressureSampler, SPANS_TABLE, TenantId, UsageReader, icegate_table_ident,
+};
+use object_store::memory::InMemory;
+use object_store::path::Path;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt as _,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -435,4 +444,260 @@ pub fn build_in_memory_system_index_store() -> Arc<SystemIndexStore> {
             max_scroll_lifetime: Duration::from_mins(15),
         },
     ))
+}
+
+/// How many times a test yields to a background garbage-collection pass: far more than one pass
+/// over a handful of objects takes, each of whose requests [`ClockedObjectStore`] yields once.
+pub const PASS_YIELD_BUDGET: usize = 1_000;
+
+/// Yields as often as a started pass is given to finish, so a pass started before this call has
+/// done its work after it. On tokio's paused clock no timer fires meanwhile.
+pub async fn yield_to_background_passes() {
+    for _ in 0..PASS_YIELD_BUDGET {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Yields until `condition` holds, checking it before every yield, and panics with
+/// `failure_message` once [`PASS_YIELD_BUDGET`] checks have failed.
+pub async fn wait_for_condition<F, Fut>(mut condition: F, failure_message: &str)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    for _ in 0..PASS_YIELD_BUDGET {
+        if condition().await {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("{failure_message}");
+}
+
+/// An object store over `InMemory` whose `Last-Modified` times come from a test clock.
+///
+/// Every put and copy is stamped with the clock's time when it lands, and every GET, HEAD and
+/// listing reports that stamp, so tests state the store's clock instead of sleeping. Every put and
+/// GET yields to the scheduler first, so operations of two futures joined in one task interleave as
+/// those of two replicas do. It also refuses writes, deletes and listings of chosen paths, can
+/// answer a chosen GET or delete as not-found after deleting the object, which is what a read or a
+/// delete racing another deleter observes, and can write chosen objects just before a chosen GET,
+/// which is what a read racing another writer observes.
+#[derive(Debug)]
+pub struct ClockedObjectStore {
+    /// Holds the objects.
+    inner: InMemory,
+    /// The store's clock.
+    now: Mutex<DateTime<Utc>>,
+    /// The `Last-Modified` of every path written, shared with the listing streams.
+    stamps: Arc<Mutex<HashMap<Path, DateTime<Utc>>>>,
+    /// Paths whose writes are refused.
+    paths_refused_on_put: Mutex<HashSet<Path>>,
+    /// Paths whose next GET or HEAD answers not-found.
+    paths_missing_on_get: Mutex<HashSet<Path>>,
+    /// Paths whose next delete answers not-found, shared with the delete streams.
+    paths_missing_on_delete: Arc<Mutex<HashSet<Path>>>,
+    /// Paths whose deletes are refused, shared with the delete streams.
+    paths_refused_on_delete: Arc<Mutex<HashSet<Path>>>,
+    /// Prefixes whose listings are refused.
+    prefixes_refused_on_list: Mutex<HashSet<Path>>,
+    /// The writes the next GET or HEAD of a path makes before it is served, in order.
+    puts_on_next_get: Mutex<HashMap<Path, Vec<(Path, PutPayload)>>>,
+}
+
+impl ClockedObjectStore {
+    /// A store whose clock reads `now` until [`Self::set_time`] moves it.
+    pub fn new(now: DateTime<Utc>) -> Self {
+        Self {
+            inner: InMemory::new(),
+            now: Mutex::new(now),
+            stamps: Arc::new(Mutex::new(HashMap::new())),
+            paths_refused_on_put: Mutex::new(HashSet::new()),
+            paths_missing_on_get: Mutex::new(HashSet::new()),
+            paths_missing_on_delete: Arc::new(Mutex::new(HashSet::new())),
+            paths_refused_on_delete: Arc::new(Mutex::new(HashSet::new())),
+            prefixes_refused_on_list: Mutex::new(HashSet::new()),
+            puts_on_next_get: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Set the store's clock; later writes carry `now` as their `Last-Modified`.
+    pub fn set_time(&self, now: DateTime<Utc>) {
+        *self.now.lock().expect("clock") = now;
+    }
+
+    /// Refuse every later write to `path` with a transient error.
+    pub fn refuse_puts_to(&self, path: Path) {
+        self.paths_refused_on_put.lock().expect("refused puts").insert(path);
+    }
+
+    /// Refuse every later delete of `path` with a transient error, keeping the object.
+    pub fn refuse_deletes_of(&self, path: Path) {
+        self.paths_refused_on_delete.lock().expect("refused deletes").insert(path);
+    }
+
+    /// Refuse every later listing of exactly `prefix` with a transient error.
+    pub fn refuse_listings_of(&self, prefix: Path) {
+        self.prefixes_refused_on_list.lock().expect("refused listings").insert(prefix);
+    }
+
+    /// Answer the next GET or HEAD of `path` with not-found, after deleting the object.
+    pub fn report_next_get_as_missing(&self, path: Path) {
+        self.paths_missing_on_get.lock().expect("missing reads").insert(path);
+    }
+
+    /// Answer the next delete of `path` with not-found, after deleting the object.
+    pub fn report_next_delete_as_missing(&self, path: Path) {
+        self.paths_missing_on_delete.lock().expect("missing deletes").insert(path);
+    }
+
+    /// Write `payload` to `location`, stamped with the clock's time, just before the next GET or
+    /// HEAD of `trigger` is served. Several calls for one trigger write in call order.
+    pub fn put_on_next_get(&self, trigger: Path, location: Path, payload: PutPayload) {
+        self.puts_on_next_get
+            .lock()
+            .expect("puts on get")
+            .entry(trigger)
+            .or_default()
+            .push((location, payload));
+    }
+
+    /// Record the clock's time as the `Last-Modified` of `path`.
+    fn record_stamp(&self, path: &Path) {
+        let now = *self.now.lock().expect("clock");
+        self.stamps.lock().expect("stamps").insert(path.clone(), now);
+    }
+
+    /// Whether listings of exactly `prefix` are refused.
+    fn is_listing_refused(&self, prefix: &Path) -> bool {
+        self.prefixes_refused_on_list.lock().expect("refused listings").contains(prefix)
+    }
+}
+
+impl fmt::Display for ClockedObjectStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "ClockedObjectStore({})", self.inner)
+    }
+}
+
+/// Replace `metadata.last_modified` with the stamp the double recorded for its path.
+fn apply_stamp(stamps: &Mutex<HashMap<Path, DateTime<Utc>>>, mut metadata: ObjectMeta) -> ObjectMeta {
+    // Read into a local, so the lock is released before the metadata changes.
+    let stamp = stamps.lock().expect("stamps").get(&metadata.location).copied();
+    if let Some(stamp) = stamp {
+        metadata.last_modified = stamp;
+    }
+    metadata
+}
+
+/// The transient error the double answers a refused `request` of `path` with.
+fn build_refusal(request: &str, path: &Path) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "ClockedObjectStore",
+        source: format!("{request} {path} are refused").into(),
+    }
+}
+
+#[async_trait]
+impl ObjectStore for ClockedObjectStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        tokio::task::yield_now().await;
+        if self.paths_refused_on_put.lock().expect("refused puts").contains(location) {
+            return Err(build_refusal("writes to", location));
+        }
+        let result = self.inner.put_opts(location, payload, options).await?;
+        self.record_stamp(location);
+        Ok(result)
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        tokio::task::yield_now().await;
+        let triggered_puts = self.puts_on_next_get.lock().expect("puts on get").remove(location);
+        for (triggered_location, payload) in triggered_puts.into_iter().flatten() {
+            self.inner.put(&triggered_location, payload).await?;
+            self.record_stamp(&triggered_location);
+        }
+        let is_reported_missing = self.paths_missing_on_get.lock().expect("missing reads").remove(location);
+        if is_reported_missing {
+            self.inner.delete(location).await?;
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "deleted by another deleter".into(),
+            });
+        }
+        let mut result = self.inner.get_opts(location, options).await?;
+        result.meta = apply_stamp(&self.stamps, result.meta);
+        Ok(result)
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<Path>>,
+    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        let paths_refused_on_delete = Arc::clone(&self.paths_refused_on_delete);
+        let paths_missing_on_delete = Arc::clone(&self.paths_missing_on_delete);
+        // A refused path reaches `InMemory` as an error item, which it passes through undeleted.
+        let admitted_locations = locations
+            .map(move |location| {
+                let path = location?;
+                if paths_refused_on_delete.lock().expect("refused deletes").contains(&path) {
+                    return Err(build_refusal("deletes of", &path));
+                }
+                Ok(path)
+            })
+            .boxed();
+        self.inner
+            .delete_stream(admitted_locations)
+            .map(move |delete_outcome| {
+                let path = delete_outcome?;
+                if paths_missing_on_delete.lock().expect("missing deletes").remove(&path) {
+                    return Err(object_store::Error::NotFound {
+                        path: path.to_string(),
+                        source: "deleted by another deleter".into(),
+                    });
+                }
+                Ok(path)
+            })
+            .boxed()
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        if let Some(refused_prefix) = prefix.filter(|prefix| self.is_listing_refused(prefix)) {
+            return futures::stream::iter([Err(build_refusal("listings of", refused_prefix))]).boxed();
+        }
+        let stamps = Arc::clone(&self.stamps);
+        self.inner
+            .list(prefix)
+            .map_ok(move |metadata| apply_stamp(&stamps, metadata))
+            .boxed()
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        let mut result = self.inner.list_with_delimiter(prefix).await?;
+        result.objects = result
+            .objects
+            .into_iter()
+            .map(|metadata| apply_stamp(&self.stamps, metadata))
+            .collect();
+        Ok(result)
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await?;
+        self.record_stamp(to);
+        Ok(())
+    }
 }

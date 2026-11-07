@@ -11,6 +11,7 @@ mod client;
 mod codec;
 pub(crate) mod documents;
 pub(crate) mod evaluate;
+mod gc;
 pub(crate) mod scroll;
 pub(crate) mod search;
 mod snapshot;

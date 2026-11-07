@@ -59,6 +59,7 @@ use super::client::SystemObjectStore;
 use super::codec::{
     DecodedSnapshotObject, EncodedSnapshotObject, SnapshotLineage, decode_snapshot_object, encode_snapshot_object,
 };
+use super::gc::collect_superseded_snapshots;
 use super::snapshot::{SystemOperation, SystemOutcome, SystemSnapshot};
 use crate::opensearch::error::OpenSearchError;
 
@@ -78,7 +79,10 @@ pub(crate) struct SystemIndexLimits {
     pub(crate) cache_max_bytes: usize,
     /// How long one batch of writes may retry before answering `503`: the query deadline.
     pub(crate) write_deadline: Duration,
-    /// The longest `scroll` keep-alive a search may ask for (`max_scroll_lifetime_secs`).
+    /// The longest `scroll` keep-alive a search may ask for (`max_scroll_lifetime_secs`). Garbage
+    /// collection keeps a superseded snapshot object for this long plus `write_deadline` after its
+    /// newest successor was written, and a replica starts at most one pass per tenant per this
+    /// long.
     pub(crate) max_scroll_lifetime: Duration,
 }
 
@@ -345,6 +349,18 @@ struct StoreShared {
     /// The sender of the write queue of each tenant whose write loop runs. A loop removes its own
     /// entry under this lock when it goes idle, so the map holds only tenants with a running loop.
     queue_senders: Mutex<HashMap<String, mpsc::UnboundedSender<QueuedOperation>>>,
+    /// When the passes of each tenant last started on this replica.
+    collection_schedule: Mutex<CollectionSchedule>,
+}
+
+/// When this replica started its garbage-collection passes.
+struct CollectionSchedule {
+    /// When the store was created: a tenant's first pass waits the scroll lifetime from here.
+    created_at: Instant,
+    /// The start of the latest pass, per tenant. Holds one small entry for every tenant whose
+    /// writes on this replica started a pass, kept for the replica's life: it grows with the
+    /// number of tenants, never with the write rate.
+    last_pass_at: HashMap<String, Instant>,
 }
 
 impl SystemIndexStore {
@@ -357,6 +373,10 @@ impl SystemIndexStore {
                 limits,
                 cache: Mutex::new(SnapshotCache::new(limits.cache_max_bytes)),
                 queue_senders: Mutex::new(HashMap::new()),
+                collection_schedule: Mutex::new(CollectionSchedule {
+                    created_at: Instant::now(),
+                    last_pass_at: HashMap::new(),
+                }),
             }),
         }
     }
@@ -619,6 +639,27 @@ async fn decode_pointer_answer(result: GetResult) -> Result<(String, String), Op
     Ok((etag, pointer.snapshot_name))
 }
 
+/// The pointer of `tenant` as the object store holds it now, without the cache: its `ETag` and
+/// the snapshot name it names; `None` when it is absent.
+///
+/// # Errors
+///
+/// Returns `500` when the object store fails or the pointer is corrupt.
+pub(super) async fn read_tenant_pointer(
+    system_object_store: &SystemObjectStore,
+    tenant: &TenantId,
+) -> Result<Option<(String, String)>, OpenSearchError> {
+    match system_object_store
+        .object_store()
+        .get(&system_object_store.pointer_path(tenant))
+        .await
+    {
+        Ok(result) => decode_pointer_answer(result).await.map(Some),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(error) => Err(OpenSearchError::internal(format!("cannot read the pointer: {error}"))),
+    }
+}
+
 impl StoreShared {
     /// The cache, locked.
     fn lock_cache(&self) -> MutexGuard<'_, SnapshotCache> {
@@ -648,6 +689,41 @@ impl StoreShared {
         if is_own_entry {
             queue_senders.remove(tenant.as_ref());
         }
+    }
+
+    /// Start a garbage-collection pass for `tenant` in the background once this replica's
+    /// previous pass for it started at least `max_scroll_lifetime` ago (the first pass waits that
+    /// long from the store's creation). `current_snapshot_name` is the snapshot the pointer was
+    /// just swapped to. A pass runs beside the write loop, never inside it, so a write never waits
+    /// for one; a failed pass is logged and the next due swap starts another.
+    fn schedule_collection(&self, tenant: &TenantId, current_snapshot_name: &str) {
+        let now = Instant::now();
+        {
+            let mut schedule = lock_mutex(&self.collection_schedule);
+            let previous_pass_at = schedule
+                .last_pass_at
+                .get(tenant.as_ref())
+                .copied()
+                .unwrap_or(schedule.created_at);
+            if now.duration_since(previous_pass_at) < self.limits.max_scroll_lifetime {
+                return;
+            }
+            schedule.last_pass_at.insert(tenant.as_ref().to_string(), now);
+        }
+        let system_object_store = self.system_object_store.clone();
+        let tenant = tenant.clone();
+        let current_snapshot_name = current_snapshot_name.to_string();
+        let retention = self.limits.max_scroll_lifetime.saturating_add(self.limits.write_deadline);
+        tokio::spawn(async move {
+            match collect_superseded_snapshots(&system_object_store, &tenant, &current_snapshot_name, retention).await {
+                Ok(collected_count) => {
+                    tracing::debug!(%tenant, collected_count, "collected superseded system-index snapshot objects");
+                }
+                Err(error) => {
+                    tracing::warn!(%tenant, ?error, "system-index garbage collection failed; a later write retries it");
+                }
+            }
+        });
     }
 
     /// The tenant's pointer state, revalidating the cached one with a conditional GET.
@@ -685,21 +761,6 @@ impl StoreShared {
             return Ok(state);
         }
         self.load_pointer_state(tenant, Some((etag, snapshot_name))).await
-    }
-
-    /// The pointer as the store holds it now, without revalidation: its `ETag` and the snapshot
-    /// name it names; `None` when it is absent.
-    async fn read_pointer(&self, tenant: &TenantId) -> Result<Option<(String, String)>, OpenSearchError> {
-        match self
-            .system_object_store
-            .object_store()
-            .get(&self.system_object_store.pointer_path(tenant))
-            .await
-        {
-            Ok(result) => decode_pointer_answer(result).await.map(Some),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(error) => Err(OpenSearchError::internal(format!("cannot read the pointer: {error}"))),
-        }
     }
 
     /// The state `pointer` (its `ETag` and snapshot name, `None` when absent) names, loading its
@@ -926,6 +987,7 @@ impl StoreShared {
             )));
         };
         self.lock_cache().store_state(tenant, attempt.to_pointer_state(etag));
+        self.schedule_collection(tenant, &attempt.snapshot_name);
         Ok(attempt.outcomes)
     }
 
@@ -948,7 +1010,7 @@ impl StoreShared {
         // The walk looks for the conflicted attempt among the candidates; it is the last one.
         let has_conflicted_attempt = conflicted_attempt.is_some();
         lost_attempts.extend(conflicted_attempt);
-        let current_pointer = match self.read_pointer(tenant).await {
+        let current_pointer = match read_tenant_pointer(&self.system_object_store, tenant).await {
             Ok(current_pointer) => current_pointer,
             Err(error) => {
                 tracing::warn!(%tenant, ?error, "the system-index pointer could not be reloaded; retrying");
@@ -969,6 +1031,7 @@ impl StoreShared {
                 && *snapshot_name == *landed_attempt.snapshot_name
             {
                 self.lock_cache().store_state(tenant, landed_attempt.to_pointer_state(etag));
+                self.schedule_collection(tenant, &landed_attempt.snapshot_name);
             }
             return Ok(Some(landed_attempt.outcomes));
         }
@@ -1149,6 +1212,7 @@ mod tests {
         AliasAction, DocumentChange, DocumentUpdate, DocumentWrite, OpType, ReturnedSources, WriteConcurrency,
         WriteResult, WrittenDocument,
     };
+    use crate::test_support::{wait_for_condition, yield_to_background_passes};
 
     const LOCATION: &str = "s3://opensearch-test/opensearch-system";
     const TENANT_A: &str = "tenant-a";
@@ -1668,6 +1732,46 @@ mod tests {
         );
         assert_eq!(double.list_pointer_swaps(), ["create"]);
         assert_eq!(double.list_snapshot_names(TENANT_A).await.len(), 1);
+    }
+
+    /// A swap whose answer was lost is settled by the walk that finds it landed, never by a swap
+    /// answer, so that walk must start the tenant's due garbage-collection pass. A started pass
+    /// writes the tenant's clock probe first; tokio's paused clock is the replica's.
+    #[tokio::test(start_paused = true)]
+    async fn a_swap_detected_as_landed_after_its_answer_was_lost_starts_a_due_collection_pass() {
+        let limits = build_limits();
+        let (double, scripted_replica, _other_replica) = build_replicas(limits);
+        let tenant = build_tenant(TENANT_A);
+        let probe_path = Path::from(format!("opensearch-system/{TENANT_A}/gc-probe"));
+        scripted_replica
+            .write(&tenant, build_index_creation(".kibana_1"))
+            .await
+            .expect("the first write");
+        yield_to_background_passes().await;
+        assert!(
+            matches!(
+                double.memory_store.head(&probe_path).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "no pass before the scroll lifetime has passed since the store started"
+        );
+        tokio::time::advance(limits.max_scroll_lifetime).await;
+        double.push_swap_faults([PointerSwapFault::LoseAnswer(None)]);
+
+        let outcome = scripted_replica.write(&tenant, build_index_creation(".kibana_2")).await;
+
+        assert_eq!(
+            outcome.expect("detected as landed"),
+            build_creation_outcome(".kibana_2")
+        );
+        assert_eq!(double.list_pointer_swaps(), ["create", "update"]);
+        let memory_store = &double.memory_store;
+        let probe_path = &probe_path;
+        wait_for_condition(
+            move || async move { memory_store.head(probe_path).await.is_ok() },
+            "the settled swap never started a pass",
+        )
+        .await;
     }
 
     /// The conflict answers a request sent again after its first try installed the attempt, on a
