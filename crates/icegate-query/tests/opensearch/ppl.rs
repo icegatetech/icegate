@@ -19,8 +19,8 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::data::{
-    Cell, LogRow, OperationRow, PriceRow, Row, commit_log_rows, commit_operation_rows, commit_price_rows, commit_rows,
-    create_exact_name_table, required_string,
+    Cell, LogRow, OperationRow, PriceRow, Row, RowWriteError, commit_log_rows, commit_operation_rows,
+    commit_price_rows, commit_rows, create_exact_name_table, required_string,
 };
 use super::harness::{ServerOptions, TestServer};
 use super::search::NearlyFullMemory;
@@ -1451,5 +1451,987 @@ async fn each_refused_expression_is_a_400_with_its_stated_reason() {
         "UNSUPPORTED_OPERATION",
     );
     assert_eq!(cast_answer.body["error"]["context"]["function"], json!("cast as date"));
+    server.shutdown().await;
+}
+
+/// The aggregation rows of `acme`, with one `globex` row beside them in the same batch:
+///
+/// | body | timestamp (UTC) | service_name | severity_text |
+/// |---|---|---|---|
+/// | a1 | 2026-10-04 23:59:59 (Sunday) | api | ERROR |
+/// | a2 | 2026-10-05 00:00:00 (Monday) | api | INFO |
+/// | a3 | 2026-10-05 10:30:45.25 | web | INFO |
+/// | a4 | 2026-10-07 13:15:00 (Wednesday) | NULL | ERROR |
+/// | a5 | 2026-12-31 23:00:00 | db | NULL |
+/// | a6 | 2027-01-01 00:00:00 | api | INFO |
+/// | a7 | 2026-03-31 12:00:00 | web | WARN |
+/// | g1 (globex) | 2026-10-05 00:00:00 | api | ERROR |
+async fn seed_aggregation_logs(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteError> {
+    let row = |tenant_id: &'static str,
+               body: &'static str,
+               timestamp_micros: i64,
+               service_name: Option<&'static str>,
+               severity_text: Option<&'static str>| LogRow {
+        tenant_id,
+        timestamp_micros,
+        service_name,
+        severity_text,
+        body: Some(body),
+        resource_attributes: &[],
+        log_attributes: &[],
+    };
+    let rows_written = [
+        row(TENANT, "a1", 1_791_158_399_000_000, Some("api"), Some("ERROR")),
+        row(TENANT, "a2", 1_791_158_400_000_000, Some("api"), Some("INFO")),
+        row(TENANT, "a3", 1_791_196_245_250_000, Some("web"), Some("INFO")),
+        row(TENANT, "a4", 1_791_378_900_000_000, None, Some("ERROR")),
+        row(TENANT, "a5", 1_798_758_000_000_000, Some("db"), None),
+        row(TENANT, "a6", 1_798_761_600_000_000, Some("api"), Some("INFO")),
+        row(TENANT, "a7", 1_774_958_400_000_000, Some("web"), Some("WARN")),
+        row(OTHER_TENANT, "g1", 1_791_158_400_000_000, Some("api"), Some("ERROR")),
+    ];
+    commit_log_rows(catalog, &rows_written).await
+}
+
+/// One `acme` operation per value of `input_tokens`, one microsecond apart from noon, in order.
+async fn seed_token_operations(catalog: &Arc<dyn Catalog>, input_tokens: &[Option<i64>]) -> Result<(), RowWriteError> {
+    let rows_written: Vec<OperationRow<'_>> = (0_i64..)
+        .zip(input_tokens)
+        .map(|(offset, tokens)| OperationRow {
+            input_tokens: *tokens,
+            ..build_test_operation_row(TENANT, NOON_MICROS + offset, None)
+        })
+        .collect();
+    commit_operation_rows(catalog, &rows_written).await
+}
+
+#[tokio::test]
+async fn stats_without_by_on_empty_input_answers_one_row() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    let answer = run_query(
+        &server,
+        "source=logs | where severity_text = 'NONE' | stats count() as n, dc(service_name) as d, \
+         values(service_name) as v, min(body) as m",
+    )
+    .await;
+    assert_eq!(read_column_names(&answer), vec!["n", "d", "v", "m"]);
+    assert_eq!(read_rows(&answer), &json!([[0, 0, [], null]]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn stats_by_span_buckets_fixed_units_from_the_epoch() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    let answer = run_query(&server, "source=logs | stats count() as n by span(timestamp, 12h)").await;
+    assert_eq!(read_column_names(&answer), vec!["n", "span(timestamp,12h)"]);
+    assert_eq!(
+        read_rows(&answer),
+        &json!([
+            [1, "2026-03-31 12:00:00"],
+            [1, "2026-10-04 12:00:00"],
+            [2, "2026-10-05 00:00:00"],
+            [1, "2026-10-07 12:00:00"],
+            [1, "2026-12-31 12:00:00"],
+            [1, "2027-01-01 00:00:00"]
+        ])
+    );
+    // 7-minute buckets count from 1970-01-01T00:00Z, not from the hour: 10:30:45.25 falls in the
+    // bucket starting at 10:24.
+    let answer = run_query(
+        &server,
+        "source=logs | where body = 'a3' | stats count() as n by span(timestamp, 7m) as bucket",
+    )
+    .await;
+    assert_eq!(read_rows(&answer), &json!([[1, "2026-10-05 10:24:00"]]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn week_month_quarter_and_year_spans_align_to_utc_calendar_starts() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    let cases = [
+        // Weeks start on Monday: a1 (Sunday 10-04) belongs to the week of Monday 09-28.
+        (
+            "1w",
+            json!([
+                [1, "2026-03-30 00:00:00"],
+                [1, "2026-09-28 00:00:00"],
+                [3, "2026-10-05 00:00:00"],
+                [2, "2026-12-28 00:00:00"]
+            ]),
+        ),
+        // 7d is a fixed span from the epoch (a Thursday), not a week.
+        (
+            "7d",
+            json!([
+                [1, "2026-03-26 00:00:00"],
+                [4, "2026-10-01 00:00:00"],
+                [2, "2026-12-31 00:00:00"]
+            ]),
+        ),
+        (
+            "1M",
+            json!([
+                [1, "2026-03-01 00:00:00"],
+                [4, "2026-10-01 00:00:00"],
+                [1, "2026-12-01 00:00:00"],
+                [1, "2027-01-01 00:00:00"]
+            ]),
+        ),
+        // Two-month buckets count from January 1970: Jan-Feb, Mar-Apr, …, Sep-Oct, Nov-Dec.
+        (
+            "2M",
+            json!([
+                [1, "2026-03-01 00:00:00"],
+                [4, "2026-09-01 00:00:00"],
+                [1, "2026-11-01 00:00:00"],
+                [1, "2027-01-01 00:00:00"]
+            ]),
+        ),
+        (
+            "1q",
+            json!([
+                [1, "2026-01-01 00:00:00"],
+                [5, "2026-10-01 00:00:00"],
+                [1, "2027-01-01 00:00:00"]
+            ]),
+        ),
+        ("1y", json!([[6, "2026-01-01 00:00:00"], [1, "2027-01-01 00:00:00"]])),
+    ];
+    for (span, expected) in cases {
+        let query = format!("source=logs | stats count() as n by span(timestamp, {span}) as bucket");
+        let answer = run_query(&server, &query).await;
+        assert_eq!(read_rows(&answer), &expected, "span {span}");
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn every_span_unit_spelling_of_the_pinned_lexer_has_its_stated_meaning() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    // a3 is 2026-10-05 10:30:45.25, a Monday.
+    let spellings = [
+        (&["ms", "MS", "millisecond"][..], "2026-10-05 10:30:45.25"),
+        (
+            &["s", "S", "sec", "secs", "second", "seconds"][..],
+            "2026-10-05 10:30:45",
+        ),
+        (&["m", "min", "MINS", "minute", "minutes"][..], "2026-10-05 10:30:00"),
+        (&["h", "hr", "hrs", "hour", "Hours"][..], "2026-10-05 10:00:00"),
+        (&["d", "D", "day", "days"][..], "2026-10-05 00:00:00"),
+        (&["w", "week", "weeks"][..], "2026-10-05 00:00:00"),
+        (&["M", "mon", "month", "months"][..], "2026-10-01 00:00:00"),
+        (&["q", "qtr", "qtrs", "quarter", "quarters"][..], "2026-10-01 00:00:00"),
+        (&["y", "Y", "year", "years"][..], "2026-01-01 00:00:00"),
+    ];
+    for (units, expected) in spellings {
+        for unit in units {
+            let query =
+                format!("source=logs | where body = 'a3' | stats count() as n by span(timestamp, 1{unit}) as bucket");
+            let answer = run_query(&server, &query).await;
+            assert_eq!(read_rows(&answer), &json!([[1, expected]]), "unit {unit}");
+        }
+    }
+    // a4 is a Wednesday: a day bucket and a week bucket differ.
+    for (unit, expected) in [("d", "2026-10-07 00:00:00"), ("w", "2026-10-05 00:00:00")] {
+        let query =
+            format!("source=logs | where body = 'a4' | stats count() as n by span(timestamp, 1{unit}) as bucket");
+        let answer = run_query(&server, &query).await;
+        assert_eq!(read_rows(&answer), &json!([[1, expected]]), "unit {unit}");
+    }
+    // The lexer admits these spellings in a span length; they name no unit a span buckets by.
+    for unit in ["us", "cs", "ds", "milliseconds", "yr", "yrs"] {
+        let query = format!("source=logs | stats count() as n by span(timestamp, 1{unit})");
+        let answer = run_query(&server, &query).await;
+        assert_ppl_error(
+            &answer,
+            StatusCode::BAD_REQUEST,
+            "SemanticCheckException",
+            "SEMANTIC_ERROR",
+        );
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unknown_span_unit_is_a_400() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    seed_token_operations(&catalog, &[Some(1)])
+        .await
+        .expect("seed token operations");
+    for query in [
+        "source=logs | stats count() by span(timestamp, 1yr)",
+        "source=logs | stats count() by span(timestamp, 1.5h)",
+        "source=logs | stats count() by span(timestamp, 10)",
+        "source=logs | stats count() by span(timestamp, 0h)",
+        "source=operations | stats count() by span(input_tokens, 1h)",
+        // 4e9 days overflow i64 microseconds: refused, not wrapped.
+        "source=logs | stats count() by span(timestamp, 4000000000d)",
+        // 1e20 is a whole number at or above 2^63: refused, not saturated to i64::MAX.
+        "source=operations | stats count() by span(input_tokens, 100000000000000000000)",
+    ] {
+        let answer = run_query(&server, query).await;
+        assert_ppl_error(
+            &answer,
+            StatusCode::BAD_REQUEST,
+            "SemanticCheckException",
+            "SEMANTIC_ERROR",
+        );
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn bucket_nullable_keeps_or_drops_null_groups_as_stated() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    let nullable_answer = run_query(&server, "source=logs | stats count() as n by service_name").await;
+    assert_eq!(
+        read_rows(&nullable_answer),
+        &json!([[1, null], [3, "api"], [1, "db"], [2, "web"]])
+    );
+    let explicit_answer = run_query(
+        &server,
+        "source=logs | stats bucket_nullable=true count() as n by service_name",
+    )
+    .await;
+    assert_eq!(read_rows(&explicit_answer), read_rows(&nullable_answer));
+    let dropped_answer = run_query(
+        &server,
+        "source=logs | stats bucket_nullable=false count() as n by service_name",
+    )
+    .await;
+    assert_eq!(read_rows(&dropped_answer), &json!([[3, "api"], [1, "db"], [2, "web"]]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn chained_stats_where_stats_composes() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    // Per severity: ERROR 2, INFO 3, WARN 1, NULL 1; two groups have more than one row.
+    let answer = run_query(
+        &server,
+        "source=logs | stats count() as n by severity_text | where n > 1 | stats count() as groups, sum(n) as rows",
+    )
+    .await;
+    assert_eq!(read_rows(&answer), &json!([[2, 5]]));
+    server.shutdown().await;
+}
+
+/// 3000 `acme` operations: `request_model` is `model-<i mod 2000>`, `operation_name` is `chat`
+/// for even `i` and `embed` for odd `i`, plus one operation without a model.
+async fn seed_model_operations(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteError> {
+    let models: Vec<String> = (0..3000).map(|index| format!("model-{}", index % 2000)).collect();
+    let mut rows_written: Vec<OperationRow<'_>> = (0_i64..)
+        .zip(&models)
+        .map(|(index, model)| OperationRow {
+            operation_name: if index % 2 == 0 { "chat" } else { "embed" },
+            request_model: Some(model.as_str()),
+            ..build_test_operation_row(TENANT, NOON_MICROS + index, None)
+        })
+        .collect();
+    rows_written.push(build_test_operation_row(TENANT, NOON_MICROS + 3000, None));
+    commit_operation_rows(catalog, &rows_written).await
+}
+
+#[tokio::test]
+async fn dc_is_exact() {
+    let (server, catalog) = TestServer::start().await;
+    seed_model_operations(&catalog).await.expect("seed model operations");
+    let total_answer = run_query(
+        &server,
+        "source=operations | stats dc(request_model) as d, count() as n",
+    )
+    .await;
+    assert_eq!(read_rows(&total_answer), &json!([[2000, 3001]]));
+    // 2000 is even, so the parity of i and of i mod 2000 agree: each name sees 1000 models.
+    let grouped_answer = run_query(
+        &server,
+        "source=operations | stats distinct_count(request_model) as d by operation_name",
+    )
+    .await;
+    assert_eq!(read_rows(&grouped_answer), &json!([[1000, "chat"], [1000, "embed"]]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn values_is_distinct_sorted_null_free_and_uncapped() {
+    let (server, catalog) = TestServer::start().await;
+    // Both tables are written before the first query: the engine reads table metadata from a
+    // catalog view it refreshes on an interval, so rows committed after a query may not show yet.
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    seed_model_operations(&catalog).await.expect("seed model operations");
+    let grouped_answer = run_query(
+        &server,
+        "source=logs | stats values(service_name) as v by severity_text",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&grouped_answer),
+        &json!([
+            [["db"], null],
+            [["api"], "ERROR"],
+            [["api", "web"], "INFO"],
+            [["web"], "WARN"]
+        ])
+    );
+    let ungrouped_answer = run_query(&server, "source=operations | stats values(request_model) as v").await;
+    let values = read_rows(&ungrouped_answer)[0][0].as_array().expect("values list");
+    assert_eq!(values.len(), 2000);
+    // Byte order: "model-0" < "model-1" < "model-10" < … < "model-999".
+    assert_eq!(&values[..3], &[json!("model-0"), json!("model-1"), json!("model-10")]);
+    assert_eq!(values.last(), Some(&json!("model-999")));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn dedup_keeps_the_first_row_of_the_incoming_order_and_keepempty_keeps_null_keys() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    let latest_per_service = run_query(
+        &server,
+        "source=logs | sort - timestamp | dedup service_name | fields service_name, timestamp",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&latest_per_service),
+        &json!([
+            ["api", "2027-01-01 00:00:00"],
+            ["db", "2026-12-31 23:00:00"],
+            ["web", "2026-10-05 10:30:45.25"]
+        ])
+    );
+    let null_kept_answer = run_query(
+        &server,
+        "source=logs | sort - timestamp | dedup service_name keepempty=true | fields service_name, timestamp",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&null_kept_answer),
+        &json!([
+            ["api", "2027-01-01 00:00:00"],
+            ["db", "2026-12-31 23:00:00"],
+            [null, "2026-10-07 13:15:00"],
+            ["web", "2026-10-05 10:30:45.25"]
+        ])
+    );
+    let two_per_severity = run_query(
+        &server,
+        "source=logs | sort timestamp | dedup 2 severity_text | fields severity_text, body",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&two_per_severity),
+        &json!([
+            ["WARN", "a7"],
+            ["ERROR", "a1"],
+            ["INFO", "a2"],
+            ["INFO", "a3"],
+            ["ERROR", "a4"]
+        ])
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn dedup_keeps_the_first_rows_of_the_sort_after_its_column_is_renamed_removed_or_replaced() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    // Newest first: a6 (api), a5 (db), a4 (NULL), a3 (web), a2 (api), a1 (api), a7 (web). Each
+    // query keeps the latest row per service whatever a command between the sort and the dedup
+    // did to `timestamp`: api a6, db a5, web a3, in that order, and no hidden column shows.
+    let cases = [
+        (
+            "source=logs | sort - timestamp | rename timestamp as ts | dedup service_name | fields service_name, body",
+            ["service_name", "body"],
+        ),
+        (
+            "source=logs | sort - timestamp | rename timestamp as timestamp | dedup service_name | fields service_name, body",
+            ["service_name", "body"],
+        ),
+        (
+            "source=logs | sort - timestamp | rename timestamp as @timestamp | dedup service_name | fields service_name, body",
+            ["service_name", "body"],
+        ),
+        (
+            "source=logs | sort - timestamp | fields service_name, body | dedup service_name",
+            ["service_name", "body"],
+        ),
+        (
+            "source=logs | sort - timestamp | fields - timestamp | dedup service_name | fields service_name, body",
+            ["service_name", "body"],
+        ),
+        (
+            "source=logs | sort - timestamp | eval timestamp = body | dedup service_name | fields service_name, body",
+            ["service_name", "body"],
+        ),
+        (
+            "source=logs | sort - timestamp | eval timestamp = body | fields service_name, body | dedup service_name",
+            ["service_name", "body"],
+        ),
+        (
+            "source=logs | sort - timestamp | bin timestamp span=1d | dedup service_name | fields service_name, body",
+            ["service_name", "body"],
+        ),
+        // `timestamp` now holds the body.
+        (
+            "source=logs | sort - timestamp | rename body as timestamp | dedup service_name | fields service_name, timestamp",
+            ["service_name", "timestamp"],
+        ),
+    ];
+    for (query, column_names) in cases {
+        let answer = run_query(&server, query).await;
+        assert_eq!(read_column_names(&answer), column_names, "query {query:?}");
+        assert_eq!(
+            read_rows(&answer),
+            &json!([["api", "a6"], ["db", "a5"], ["web", "a3"]]),
+            "query {query:?}"
+        );
+    }
+    // Without a final `fields`, the output is the source columns but `timestamp`, in table order.
+    let removed_sort_answer = run_query(
+        &server,
+        "source=logs | sort - timestamp | fields - timestamp | dedup service_name",
+    )
+    .await;
+    let expected_names: Vec<String> = logs_schema()
+        .expect("logs schema")
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| field.name.clone())
+        .filter(|name| name != COL_TENANT_ID && name != COL_TIMESTAMP)
+        .collect();
+    assert_eq!(read_column_names(&removed_sort_answer), expected_names);
+    // A later sort sets a new order: the first body per service, ascending.
+    let resorted_answer = run_query(
+        &server,
+        "source=logs | sort - timestamp | fields service_name, body | sort body | dedup service_name",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&resorted_answer),
+        &json!([["api", "a1"], ["web", "a3"], ["db", "a5"]])
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_field_name_starting_with_the_reserved_prefix_is_a_400_naming_it() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    // The plans' own columns start with this prefix, among them the hidden sort columns that no
+    // output shows: a field so named would vanish from the answer or read one of them.
+    let cases = [
+        (
+            "source=logs | eval __ppl_order_x = 1 | fields body, __ppl_order_x",
+            "__ppl_order_x",
+        ),
+        (
+            "source=logs | sort - timestamp | rename body as __ppl_order_0 | dedup service_name",
+            "__ppl_order_0",
+        ),
+        (
+            "source=logs | sort - timestamp | fields service_name, body | fields __ppl_order_0",
+            "__ppl_order_0",
+        ),
+        ("source=logs | where __ppl_main = 'x'", "__ppl_main"),
+    ];
+    for (query, name) in cases {
+        let answer = run_query(&server, query).await;
+        assert_ppl_error(
+            &answer,
+            StatusCode::BAD_REQUEST,
+            "SemanticCheckException",
+            "SEMANTIC_ERROR",
+        );
+        assert_eq!(
+            answer.body["error"]["reason"],
+            json!(format!("field name [{name}] starts with the reserved prefix [__ppl_]")),
+            "query {query}"
+        );
+    }
+    // A name that only contains the prefix is a field like any other.
+    let unreserved_answer = run_query(
+        &server,
+        "source=logs | where body = 'a3' | eval my__ppl_order_x = 1 | fields body, my__ppl_order_x",
+    )
+    .await;
+    assert_eq!(read_column_names(&unreserved_answer), vec!["body", "my__ppl_order_x"]);
+    assert_eq!(read_rows(&unreserved_answer), &json!([["a3", 1]]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn top_and_rare_rank_values_as_stated() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    let top_answer = run_query(&server, "source=logs | top 2 service_name").await;
+    assert_eq!(read_column_names(&top_answer), vec!["service_name", "count"]);
+    assert_eq!(read_rows(&top_answer), &json!([["api", 3], ["web", 2]]));
+    // Ties rank by the field value, ascending with NULL last.
+    let rare_answer = run_query(&server, "source=logs | rare service_name").await;
+    assert_eq!(
+        read_rows(&rare_answer),
+        &json!([["db", 1], [null, 1], ["web", 2], ["api", 3]])
+    );
+    let grouped_answer = run_query(&server, "source=logs | top 1 severity_text by service_name").await;
+    assert_eq!(
+        read_column_names(&grouped_answer),
+        vec!["service_name", "severity_text", "count"]
+    );
+    assert_eq!(
+        read_rows(&grouped_answer),
+        &json!([
+            [null, "ERROR", 1],
+            ["api", "INFO", 2],
+            ["db", null, 1],
+            ["web", "INFO", 1]
+        ])
+    );
+    let options_answer = run_query(
+        &server,
+        "source=logs | top 5 countfield='hits' usenull=false service_name",
+    )
+    .await;
+    assert_eq!(read_column_names(&options_answer), vec!["service_name", "hits"]);
+    assert_eq!(read_rows(&options_answer), &json!([["api", 3], ["web", 2], ["db", 1]]));
+    let hidden_count_answer = run_query(&server, "source=logs | top 1 showcount=false service_name").await;
+    assert_eq!(read_rows(&hidden_count_answer), &json!([["api"]]));
+    let clash_answer = run_query(&server, "source=logs | eval count = 1 | top service_name").await;
+    assert_ppl_error(
+        &clash_answer,
+        StatusCode::BAD_REQUEST,
+        "SemanticCheckException",
+        "SEMANTIC_ERROR",
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn timechart_puts_time_first_then_the_by_field_then_the_aggregate_without_filling_empty_buckets() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    let by_service_answer = run_query(
+        &server,
+        "source=logs | timechart timefield=timestamp span=1d count() by service_name",
+    )
+    .await;
+    assert_eq!(
+        read_column_names(&by_service_answer),
+        vec!["timestamp", "service_name", "count()"]
+    );
+    // No bucket for 2026-10-06, which holds no row; the NULL series is `NULL`.
+    assert_eq!(
+        read_rows(&by_service_answer),
+        &json!([
+            ["2026-03-31 00:00:00", "web", 1],
+            ["2026-10-04 00:00:00", "api", 1],
+            ["2026-10-05 00:00:00", "api", 1],
+            ["2026-10-05 00:00:00", "web", 1],
+            ["2026-10-07 00:00:00", "NULL", 1],
+            ["2026-12-31 00:00:00", "db", 1],
+            ["2027-01-01 00:00:00", "api", 1]
+        ])
+    );
+    let total_answer = run_query(
+        &server,
+        "source=logs | timechart timefield=timestamp span=1y count() as n",
+    )
+    .await;
+    assert_eq!(read_column_names(&total_answer), vec!["timestamp", "n"]);
+    assert_eq!(
+        read_rows(&total_answer),
+        &json!([["2026-01-01 00:00:00", 6], ["2027-01-01 00:00:00", 1]])
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn timechart_with_more_series_than_its_limit_groups_the_rest_as_the_stated_rule() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    // Series totals over all buckets: api 3, web 2, db 1; limit=1 keeps api. web and db merge
+    // into OTHER (count merges by sum); the NULL series is `NULL`. Labels sort byte-wise.
+    let other_answer = run_query(
+        &server,
+        "source=logs | timechart timefield=timestamp span=1y limit=1 count() by service_name",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&other_answer),
+        &json!([
+            ["2026-01-01 00:00:00", "NULL", 1],
+            ["2026-01-01 00:00:00", "OTHER", 3],
+            ["2026-01-01 00:00:00", "api", 2],
+            ["2027-01-01 00:00:00", "api", 1]
+        ])
+    );
+    // useother=false drops every series beyond the limit, the NULL series included.
+    let dropped_answer = run_query(
+        &server,
+        "source=logs | timechart timefield=timestamp span=1y limit=1 useother=false count() by service_name",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&dropped_answer),
+        &json!([["2026-01-01 00:00:00", "api", 2], ["2027-01-01 00:00:00", "api", 1]])
+    );
+    // Series rank by the sum of the aggregation, so a limit over a string aggregation is refused;
+    // limit=0 ranks nothing and keeps the answer.
+    let string_ranked_answer = run_query(
+        &server,
+        "source=logs | timechart timefield=timestamp span=1y limit=1 min(body) by service_name",
+    )
+    .await;
+    assert_ppl_error(
+        &string_ranked_answer,
+        StatusCode::BAD_REQUEST,
+        "SemanticCheckException",
+        "SEMANTIC_ERROR",
+    );
+    let details = string_ranked_answer.body["error"]["details"].as_str().expect("details");
+    assert!(details.contains("[min(body)]"), "details {details}");
+    let string_unranked_answer = run_query(
+        &server,
+        "source=logs | timechart timefield=timestamp span=1y limit=0 min(body) by service_name",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&string_unranked_answer),
+        &json!([
+            ["2026-01-01 00:00:00", "api", "a1"],
+            ["2026-01-01 00:00:00", "db", "a5"],
+            ["2026-01-01 00:00:00", "web", "a3"],
+            ["2026-01-01 00:00:00", null, "a4"],
+            ["2027-01-01 00:00:00", "api", "a6"]
+        ])
+    );
+    // limit=0 keeps every series under its own value; the NULL series stays null.
+    let unlimited_answer = run_query(
+        &server,
+        "source=logs | timechart timefield=timestamp span=1y limit=0 count() by service_name",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&unlimited_answer),
+        &json!([
+            ["2026-01-01 00:00:00", "api", 2],
+            ["2026-01-01 00:00:00", "db", 1],
+            ["2026-01-01 00:00:00", "web", 2],
+            ["2026-01-01 00:00:00", null, 1],
+            ["2027-01-01 00:00:00", "api", 1]
+        ])
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn timechart_on_a_native_index_without_timefield_is_field_not_found() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    let missing_field_answer = run_query(&server, "source=logs | timechart span=1d count()").await;
+    assert_ppl_error(
+        &missing_field_answer,
+        StatusCode::BAD_REQUEST,
+        "SemanticCheckException",
+        "FIELD_NOT_FOUND",
+    );
+    assert_eq!(
+        missing_field_answer.body["error"]["context"]["field"],
+        json!("@timestamp")
+    );
+    let renamed_answer = run_query(
+        &server,
+        "source=logs | rename timestamp as @timestamp | timechart span=1M count()",
+    )
+    .await;
+    assert_eq!(read_column_names(&renamed_answer), vec!["@timestamp", "count()"]);
+    assert_eq!(
+        read_rows(&renamed_answer),
+        &json!([
+            ["2026-03-01 00:00:00", 1],
+            ["2026-10-01 00:00:00", 4],
+            ["2026-12-01 00:00:00", 1],
+            ["2027-01-01 00:00:00", 1]
+        ])
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn span_time_columns_are_never_null() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    // `t` is NULL on every row but the two ERROR rows; those rows form no bucket.
+    let answer = run_query(
+        &server,
+        "source=logs | eval t = case(severity_text = 'ERROR', timestamp) | stats count() as n by span(t, 1d) as day",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&answer),
+        &json!([[1, "2026-10-04 00:00:00"], [1, "2026-10-07 00:00:00"]])
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_numeric_span_over_null_forms_a_null_group_unless_bucket_nullable_is_false() {
+    let (server, catalog) = TestServer::start().await;
+    seed_token_operations(
+        &catalog,
+        &[Some(15), Some(25), Some(-5), Some(130), None, Some(25), Some(7)],
+    )
+    .await
+    .expect("seed token operations");
+    // An integer span truncates toward zero: -5 and 7 share the bucket 0.
+    let nullable_answer = run_query(
+        &server,
+        "source=operations | stats count() as n by span(input_tokens, 10)",
+    )
+    .await;
+    assert_eq!(read_column_names(&nullable_answer), vec!["n", "span(input_tokens,10)"]);
+    assert_eq!(
+        read_rows(&nullable_answer),
+        &json!([[1, null], [2, 0], [1, 10], [2, 20], [1, 130]])
+    );
+    let dropped_answer = run_query(
+        &server,
+        "source=operations | stats bucket_nullable=false count() as n by span(input_tokens, 10)",
+    )
+    .await;
+    assert_eq!(read_rows(&dropped_answer), &json!([[2, 0], [1, 10], [2, 20], [1, 130]]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn bin_buckets_numeric_and_time_values() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    // The last value is 2^53 + 1, which an `f64` cannot hold.
+    seed_token_operations(
+        &catalog,
+        &[
+            Some(15),
+            Some(25),
+            Some(-5),
+            Some(130),
+            None,
+            Some(25),
+            Some(7),
+            Some(9_007_199_254_740_993),
+        ],
+    )
+    .await
+    .expect("seed token operations");
+    let numbers_answer = run_query(
+        &server,
+        "source=operations | sort timestamp | bin input_tokens span=10 | fields input_tokens",
+    )
+    .await;
+    assert_eq!(
+        numbers_answer.body["schema"],
+        json!([{"name": "input_tokens", "type": "string"}])
+    );
+    assert_eq!(
+        read_rows(&numbers_answer),
+        &json!([
+            ["10-20"],
+            ["20-30"],
+            ["-10-0"],
+            ["130-140"],
+            [null],
+            ["20-30"],
+            ["0-10"],
+            ["9007199254740990-9007199254741000"]
+        ])
+    );
+    // Integers bin exactly: 2^53 + 1 is its own bin of width 1.
+    let exact_answer = run_query(
+        &server,
+        "source=operations | where input_tokens > 1000 | bin input_tokens span=1 | fields input_tokens",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&exact_answer),
+        &json!([["9007199254740993-9007199254740994"]])
+    );
+    // a3 is 2026-10-05 10:30:45.25; 2026-10-05 is day 20731 after the epoch, so its 2-day bin
+    // starts on day 20730.
+    let cases = [
+        ("250ms", json!("2026-10-05 10:30:45.25")),
+        ("1h", json!("2026-10-05 10:00:00")),
+        ("2", json!("2026-10-05 10:00:00")),
+        ("2d", json!("2026-10-04 00:00:00")),
+        ("1M", json!("2026-10")),
+        // 5e9 µs (83 min 20 s) buckets from the epoch: 10:30:45.25 is 20:45.25 into the bucket.
+        ("5000000000us", json!("2026-10-05 10:10:00")),
+        // a3 is day 20731 and month 681 after the epoch, fewer than these lengths, so its bins
+        // start at the epoch's day and month; 106751991 days and 3443612 months are the longest
+        // spans whose bins stay inside the timestamp range.
+        ("50000000d", json!("1970-01-01 00:00:00")),
+        ("106751991d", json!("1970-01-01 00:00:00")),
+        ("3443612M", json!("1970-01")),
+    ];
+    for (span, expected) in cases {
+        let query = format!("source=logs | where body = 'a3' | bin timestamp span={span} | fields timestamp");
+        let answer = run_query(&server, &query).await;
+        assert_eq!(read_rows(&answer), &json!([[expected]]), "span {span}");
+    }
+    for query in [
+        "source=logs | bin timestamp span=1w",
+        "source=operations | bin input_tokens span=2.5",
+        "source=logs | bin timestamp bins=3",
+        // 1e20 is a whole number at or above 2^63: refused, not saturated to i64::MAX.
+        "source=operations | bin input_tokens span=100000000000000000000",
+        // 5e9 hours overflow i64 microseconds.
+        "source=logs | bin timestamp span=5000000000h",
+        // One day or month past the longest calendar spans.
+        "source=logs | bin timestamp span=106751992d",
+        "source=logs | bin timestamp span=3443613M",
+    ] {
+        let answer = run_query(&server, query).await;
+        assert_ppl_error(
+            &answer,
+            StatusCode::BAD_REQUEST,
+            "SemanticCheckException",
+            "SEMANTIC_ERROR",
+        );
+    }
+    // 5e18 fits an i64 but its double does not: the bin bounds would wrap.
+    let wrapping_width_answer =
+        run_query(&server, "source=operations | bin input_tokens span=5000000000000000000").await;
+    assert_ppl_error(
+        &wrapping_width_answer,
+        StatusCode::BAD_REQUEST,
+        "SemanticCheckException",
+        "SEMANTIC_ERROR",
+    );
+    let details = wrapping_width_answer.body["error"]["details"].as_str().expect("details");
+    assert!(details.contains("[5000000000000000000]"), "details {details}");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_bin_past_the_64_bit_range_renders_exact_bounds_and_an_unrepresentable_quotient_fails_at_execution() {
+    let (server, catalog) = TestServer::start().await;
+    // In timestamp order: the two 64-bit integer limits, then three `chat` doubles, the last past
+    // i64::MAX; then two doubles whose quotient by 10 floors to no 64-bit integer, `embed` 1e300
+    // and `rerank` NaN.
+    let operation_at =
+        |offset: i64, temperature: Option<f64>| build_test_operation_row(TENANT, NOON_MICROS + offset, temperature);
+    let rows_written = [
+        OperationRow {
+            input_tokens: Some(i64::MAX),
+            ..operation_at(0, None)
+        },
+        OperationRow {
+            input_tokens: Some(i64::MIN),
+            ..operation_at(1, None)
+        },
+        operation_at(2, Some(-0.5)),
+        operation_at(3, Some(25.5)),
+        operation_at(4, Some(1e19)),
+        OperationRow {
+            operation_name: "embed",
+            ..operation_at(5, Some(1e300))
+        },
+        OperationRow {
+            operation_name: "rerank",
+            ..operation_at(6, Some(f64::NAN))
+        },
+    ];
+    commit_operation_rows(&catalog, &rows_written).await.expect("commit operations");
+    // The bin of i64::MAX ends past it; the bin of i64::MIN starts past it.
+    let integer_answer = run_query(
+        &server,
+        "source=operations | where isnotnull(input_tokens) | sort timestamp | bin input_tokens span=10 \
+         | fields input_tokens",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&integer_answer),
+        &json!([
+            ["9223372036854775800-9223372036854775810"],
+            ["-9223372036854775810--9223372036854775800"]
+        ])
+    );
+    // Width 1: the bin of i64::MAX ends at 2^63.
+    let unit_width_answer = run_query(
+        &server,
+        "source=operations | where input_tokens > 0 | bin input_tokens span=1 | fields input_tokens",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&unit_width_answer),
+        &json!([["9223372036854775807-9223372036854775808"]])
+    );
+    // Doubles floor their quotient: -0.5 bins below zero; 1e19 lies past i64::MAX, its quotient
+    // 1e18 does not.
+    let double_answer = run_query(
+        &server,
+        "source=operations | where operation_name = 'chat' and isnotnull(temperature) | sort timestamp \
+         | bin temperature span=10 | fields temperature",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&double_answer),
+        &json!([["-10-0"], ["20-30"], ["10000000000000000000-10000000000000000010"]])
+    );
+    // 1e299 (the floored quotient of 1e300) and NaN are no 64-bit integer: the query fails at
+    // execution instead of answering a bin.
+    for operation_name in ["embed", "rerank"] {
+        let unrepresentable_answer = run_query(
+            &server,
+            &format!(
+                "source=operations | where operation_name = '{operation_name}' | bin temperature span=10 \
+                 | fields temperature"
+            ),
+        )
+        .await;
+        assert_ppl_error(
+            &unrepresentable_answer,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "IllegalStateException",
+            "EXECUTION_ERROR",
+        );
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn percentile_values_lie_within_the_stated_tolerance() {
+    let (server, catalog) = TestServer::start().await;
+    let tokens: Vec<Option<i64>> = (1..=100).map(Some).collect();
+    seed_token_operations(&catalog, &tokens).await.expect("seed token operations");
+    let answer = run_query(
+        &server,
+        "source=operations | stats percentile(input_tokens, 50) as p50, p90(input_tokens) as p90, \
+         percentile_approx(input_tokens, 25) as p25, median(input_tokens) as median",
+    )
+    .await;
+    assert_eq!(
+        answer.body["schema"],
+        json!([
+            {"name": "p50", "type": "double"},
+            {"name": "p90", "type": "double"},
+            {"name": "p25", "type": "double"},
+            {"name": "median", "type": "double"}
+        ])
+    );
+    // Exact quantiles of 1..=100 by linear interpolation: 50.5, 90.1, 25.75. The percentile is
+    // approximate; the stated tolerance is 2.0.
+    let row = &read_rows(&answer)[0];
+    for (index, exact) in [(0, 50.5), (1, 90.1), (2, 25.75), (3, 50.5)] {
+        let value = row[index].as_f64().expect("percentile value");
+        assert!((value - exact).abs() <= 2.0, "column {index}: {value} vs {exact}");
+    }
     server.shutdown().await;
 }

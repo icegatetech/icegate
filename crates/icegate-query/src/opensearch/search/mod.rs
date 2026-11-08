@@ -5,7 +5,7 @@
 //! serialized on the blocking pool within `max_answer_bytes`. `_msearch` ([`msearch`]) runs several
 //! such searches from one NDJSON body and answers each with its own status.
 
-mod aggs;
+pub(crate) mod aggs;
 pub(crate) mod doc_id;
 mod execute;
 mod hits;

@@ -15,6 +15,7 @@ use datafusion::functions::expr_fn::{
     abs, btrim, ceil, coalesce, floor, lower, ltrim, md5, nullif, octet_length, regexp_replace, round, rtrim, strpos,
     substr, substring, to_char, upper,
 };
+use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
 use datafusion::functions_nested::expr_fn::{
     array_any_match, array_element, array_filter, array_length, array_slice, array_to_string, array_transform,
 };
@@ -23,6 +24,7 @@ use datafusion::logical_expr::{Expr, ExprSchemable, Operator, binary_expr, cast,
 
 use super::ast::{ArithmeticOperator, CastTarget};
 use super::error::PplError;
+use crate::opensearch::search::aggs::build_multi_quantile_udf;
 use crate::opensearch::search::doc_id::{
     MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MILLISECOND, MICROS_PER_MINUTE, MICROS_PER_SECOND, MICROS_PER_WEEK,
 };
@@ -177,6 +179,78 @@ pub(crate) fn lower_function_call(
             function: other.to_string(),
         }),
     }
+}
+
+/// How an aggregation of `stats` is computed.
+#[derive(Debug, Clone)]
+pub(crate) enum PlannedAggregate {
+    /// An aggregate of the grouped aggregation itself.
+    Grouped(Expr),
+    /// A percentile: a multi-quantile aggregate of the grouped aggregation whose one element is
+    /// the value.
+    Percentile(Expr),
+    /// The exact count of distinct non-NULL values of the expression, computed in its own
+    /// two-level branch.
+    DistinctCount(Expr),
+    /// The distinct non-NULL values of the expression, sorted, computed in its own branch.
+    DistinctValues(Expr),
+}
+
+/// Plan the aggregate `name` over lowered `arguments`: `count()` counts rows; `count(x)`,
+/// `sum`, `avg`, `min` and `max` skip NULL (`min` and `max` compare strings byte-wise); `dc`
+/// counts distinct values exactly; `values` collects them, distinct, sorted and NULL-free, with
+/// no cap; `percentile(x, p)` is approximate, `p` in 0..=100.
+///
+/// # Errors
+///
+/// Returns [`PplError::UnsupportedFunction`] for another aggregate, and [`PplError::Semantic`]
+/// for a wrong number of arguments or a percentile outside 0..=100.
+pub(crate) fn plan_aggregate_call(name: &str, arguments: Vec<Expr>) -> Result<PlannedAggregate, PplError> {
+    match name {
+        "count" => match <[Expr; 0]>::try_from(arguments) {
+            Ok([]) => Ok(PlannedAggregate::Grouped(count(lit(1_i64)))),
+            Err(arguments) => {
+                let [value] = take_arguments(name, arguments)?;
+                Ok(PlannedAggregate::Grouped(count(value)))
+            }
+        },
+        "sum" => Ok(PlannedAggregate::Grouped(sum(take_value(name, arguments)?))),
+        "avg" => Ok(PlannedAggregate::Grouped(avg(take_value(name, arguments)?))),
+        "min" => Ok(PlannedAggregate::Grouped(min(take_value(name, arguments)?))),
+        "max" => Ok(PlannedAggregate::Grouped(max(take_value(name, arguments)?))),
+        "dc" | "distinct_count" => Ok(PlannedAggregate::DistinctCount(take_value(name, arguments)?)),
+        "values" => Ok(PlannedAggregate::DistinctValues(take_value(name, arguments)?)),
+        "percentile" | "percentile_approx" => {
+            let [value, percent] = take_arguments(name, arguments)?;
+            let percent = match percent {
+                Expr::Literal(ScalarValue::Float64(Some(percent)), _) => percent,
+                #[allow(clippy::cast_precision_loss)]
+                Expr::Literal(ScalarValue::Int64(Some(percent)), _) => percent as f64,
+                _ => {
+                    return Err(PplError::Semantic {
+                        reason: "percentile takes a numeric literal percent".to_string(),
+                    });
+                }
+            };
+            if !(0.0..=100.0).contains(&percent) {
+                return Err(PplError::Semantic {
+                    reason: format!("percentile [{percent}] is outside 0..=100"),
+                });
+            }
+            Ok(PlannedAggregate::Percentile(
+                build_multi_quantile_udf().call(vec![cast(value, DataType::Float64), lit(percent)]),
+            ))
+        }
+        other => Err(PplError::UnsupportedFunction {
+            function: other.to_string(),
+        }),
+    }
+}
+
+/// The one argument of an aggregate that takes exactly one.
+fn take_value(function: &str, arguments: Vec<Expr>) -> Result<Expr, PplError> {
+    let [value] = take_arguments(function, arguments)?;
+    Ok(value)
 }
 
 /// Whether `name` is an array function whose second argument is a lambda over the elements of

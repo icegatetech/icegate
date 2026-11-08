@@ -9,39 +9,81 @@ use antlr4rust::rule_context::CustomRuleContext;
 use antlr4rust::token::Token;
 use antlr4rust::tree::{ParseTree, Tree};
 use icegate_query_grammar::ppl::{
-    BetweenContextAttrs, BooleanLiteralContextAttrs, CaseFunctionCallContextAll, CaseFunctionCallContextAttrs,
-    CommandsContextAll, CommandsContextAttrs, CompareExprContextAttrs, ComparisonOperatorContextAll,
-    ComparisonOperatorContextAttrs, DataTypeFunctionCallContextAttrs, DefaultSortFieldContextAttrs,
-    EvalClauseContextAll, EvalClauseContextAttrs, EvalCommandContextAttrs, EvalFunctionCallContextAttrs,
-    ExpressionContextAll, FieldExprContextAttrs, FieldExpressionContextAll, FieldExpressionContextAttrs,
-    FieldsCommandBodyContextAll, FieldsCommandBodyContextAttrs, FieldsCommandContextAttrs, FromClauseContextAll,
-    FromClauseContextAttrs, FunctionArgContextAll, FunctionArgContextAttrs, FunctionArgExpressionContextAttrs,
-    FunctionArgsContextAll, FunctionArgsContextAttrs, FunctionCallContextAll, FunctionCallContextAttrs,
-    FunctionCallExprContextAttrs, IdentContextAll, IdentContextAttrs, IdentsAsQualifiedNameContextAttrs,
-    IdentsAsTableQualifiedNameContextAttrs, IdentsAsWildcardQualifiedNameContextAttrs, InExprContextAttrs,
-    IntegerLiteralContextAll, IsNullPredicateContextAttrs, LambdaContextAll, LambdaContextAttrs,
-    LambdaExprContextAttrs, LiteralValueContextAll, LiteralValueContextAttrs, LiteralValueExprContextAttrs,
-    LogicalExprContextAttrs, LogicalExpressionContextAll, LogicalNotContextAttrs, NestedValueExprContextAttrs,
-    NullNotnullContextAttrs, PplCommandsContextAll, PplCommandsContextAttrs, PplStatementContextAttrs,
-    PrefixSortFieldContextAttrs, QualifiedNameContextAll, QueryStatementContextAll, QueryStatementContextAttrs,
+    BetweenContextAttrs, BinCommandContextAll, BinCommandContextAttrs, BinSpanValueContextAll,
+    BooleanLiteralContextAttrs, BucketNullableArgContextAll, ByClauseContextAttrs, BySpanClauseContextAll,
+    BySpanClauseContextAttrs, CaseFunctionCallContextAll, CaseFunctionCallContextAttrs, CommandsContextAll,
+    CommandsContextAttrs, CompareExprContextAttrs, ComparisonOperatorContextAll, ComparisonOperatorContextAttrs,
+    CountEvalFunctionCallContextAttrs, DataTypeFunctionCallContextAttrs, DedupCommandContextAll,
+    DedupCommandContextAttrs, DefaultSortFieldContextAttrs, DistinctCountFunctionCallContextAttrs,
+    EvalClauseContextAll, EvalClauseContextAttrs, EvalCommandContextAttrs, EvalExpressionContextAttrs,
+    EvalFunctionCallContextAttrs, ExpressionContextAll, FieldExprContextAttrs, FieldExpressionContextAll,
+    FieldExpressionContextAttrs, FieldListContextAll, FieldListContextAttrs, FieldsCommandBodyContextAll,
+    FieldsCommandBodyContextAttrs, FieldsCommandContextAttrs, FromClauseContextAll, FromClauseContextAttrs,
+    FunctionArgContextAll, FunctionArgContextAttrs, FunctionArgExpressionContextAttrs, FunctionArgsContextAll,
+    FunctionArgsContextAttrs, FunctionCallContextAll, FunctionCallContextAttrs, FunctionCallExprContextAttrs,
+    IdentContextAll, IdentContextAttrs, IdentsAsQualifiedNameContextAttrs, IdentsAsTableQualifiedNameContextAttrs,
+    IdentsAsWildcardQualifiedNameContextAttrs, InExprContextAttrs, IntegerLiteralContextAll,
+    IsNullPredicateContextAttrs, LambdaContextAll, LambdaContextAttrs, LambdaExprContextAttrs, LiteralValueContextAll,
+    LiteralValueContextAttrs, LiteralValueExprContextAttrs, LogicalExprContextAttrs, LogicalExpressionContextAll,
+    LogicalNotContextAttrs, NestedValueExprContextAttrs, NullNotnullContextAttrs, NumericSpanValueContextAttrs,
+    PercentileApproxFunctionCallContextAttrs, PercentileShortcutFunctionCallContextAttrs, PplCommandsContextAll,
+    PplCommandsContextAttrs, PplStatementContextAttrs, PrefixSortFieldContextAttrs, QualifiedNameContextAll,
+    QueryStatementContextAll, QueryStatementContextAttrs, RareTopCommandContextAll, RareTopCommandContextAttrs,
     RenameClauseContextAll, RenameCommandContextAttrs, RenameFieldExpressionContextAll,
     RenameFieldExpressionContextAttrs, RootContextAttrs, SearchCommandContextAll, SearchFromContextAttrs,
     SelectFieldExpressionContextAll, SelectFieldExpressionContextAttrs, SortCommandContextAttrs, SortFieldContextAll,
-    SortFieldExpressionContextAll, SortFieldExpressionContextAttrs, SortbyClauseContextAttrs, StringLiteralContextAll,
+    SortFieldExpressionContextAll, SortFieldExpressionContextAttrs, SortbyClauseContextAttrs, SpanClauseContextAttrs,
+    SpanLiteralContextAll, SpanLiteralContextAttrs, StatsAggTermContextAll, StatsAggTermContextAttrs,
+    StatsArgsContextAttrs, StatsByClauseContextAll, StatsByClauseContextAttrs, StatsCommandContextAll,
+    StatsCommandContextAttrs, StatsFunctionCallContextAttrs, StatsFunctionContextAll, StringLiteralContextAll,
     SuffixSortFieldContextAttrs, TableCommandContextAttrs, TableIdentContextAll, TableIdentContextAttrs,
     TableOrSubqueryClauseContextAttrs, TableQualifiedNameContextAll, TableSourceClauseContextAttrs,
-    TableSourceContextAll, TableSourceContextAttrs, TimestampFunctionCallContextAttrs, ValueExprContextAttrs,
-    ValueExpressionContextAll, ValueListContextAttrs, WcFieldListContextAttrs, WcQualifiedNameContextAll,
-    WhereCommandContextAttrs, WildcardContextAll, WildcardContextAttrs, parse_ppl_root, ruleNames,
+    TableSourceContextAll, TableSourceContextAttrs, TimechartCommandContextAll, TimechartCommandContextAttrs,
+    TimechartParameterContextAttrs, TimestampFunctionCallContextAttrs, ValueExprContextAttrs,
+    ValueExpressionContextAll, ValueListContextAttrs, ValuesAggFunctionCallContextAttrs, ValuesAggFunctionContextAttrs,
+    WcFieldExpressionContextAttrs, WcFieldListContextAttrs, WcQualifiedNameContextAll, WhereCommandContextAttrs,
+    WildcardContextAll, WildcardContextAttrs, parse_ppl_root, ruleNames,
 };
 
 use super::ast::{
-    ArithmeticOperator, CastTarget, CompareOperator, PplCommand, PplExpr, PplLiteral, PplQuery, PplSortKey, PplSource,
+    ArithmeticOperator, BinCommand, BinSpan, CastTarget, CompareOperator, DedupCommand, PplCommand, PplExpr,
+    PplGroupKey, PplLiteral, PplQuery, PplSortKey, PplSource, RankCommand, SpanUnit, StatsCommand, TimechartCommand,
 };
 use super::error::PplError;
+use super::plan::RESERVED_NAME_PREFIX;
 
 /// How many rows `head` keeps when it names no number.
 const DEFAULT_HEAD_COUNT: usize = 10;
+
+/// How many value combinations `top` and `rare` keep per group when they name no number.
+const DEFAULT_RANK_COUNT: usize = 10;
+
+/// How many series `timechart` keeps before grouping the rest as `OTHER`.
+const DEFAULT_TIMECHART_LIMIT: usize = 10;
+
+/// The span length of a `timechart` that sets no `span`, counted in
+/// [`DEFAULT_TIMECHART_SPAN_UNIT`].
+const DEFAULT_TIMECHART_SPAN_LENGTH: f64 = 1.0;
+
+/// The span unit of a `timechart` that sets no `span`.
+const DEFAULT_TIMECHART_SPAN_UNIT: SpanUnit = SpanUnit::Minute;
+
+/// How many rows of each field combination `dedup` keeps when it names no number.
+const DEFAULT_DEDUP_COUNT: usize = 1;
+
+/// The greatest time span length a span key holds: the AST carries a span length as an `f64`,
+/// which holds every whole number up to this one exactly, so a longer length could bucket by a
+/// width other than the one written.
+const MAX_EXACT_SPAN_LENGTH: i64 = 1 << f64::MANTISSA_DIGITS;
+
+/// The field a `span` or `timechart` buckets when it names none.
+const IMPLICIT_TIME_FIELD: &str = "@timestamp";
+
+/// The count column of `top` and `rare` when `countfield` names none.
+const DEFAULT_COUNT_FIELD: &str = "count";
+
+/// `bucket_nullable` when a command sets none: rows with a NULL group key form a group of their own.
+const DEFAULT_BUCKET_NULLABLE: bool = true;
 
 /// Parse `text` into a [`PplQuery`].
 ///
@@ -54,7 +96,7 @@ const DEFAULT_HEAD_COUNT: usize = 10;
 /// [`PplError::UnsupportedCommand`] / [`PplError::UnsupportedFunction`] naming a command or
 /// function IceGate does not plan, and [`PplError::Semantic`] for a construct the grammar accepts
 /// but whose meaning IceGate refuses (a negative `head`, a sort key with both a sign and a
-/// direction).
+/// direction, a field name with the reserved prefix).
 pub(crate) fn parse_ppl(text: &str) -> Result<PplQuery, PplError> {
     let root = parse_ppl_root(text)?;
     let Some(statement) = root.pplStatement() else {
@@ -217,7 +259,544 @@ fn build_command(command: &CommandsContextAll<'_>) -> Result<PplCommand, PplErro
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(PplCommand::Rename(renames));
     }
+    if let Some(stats) = command.statsCommand() {
+        return Ok(PplCommand::Stats(build_stats(&stats)?));
+    }
+    if let Some(rank) = command.rareTopCommand() {
+        let is_top = rank.TOP().is_some();
+        let rank = build_rank(&rank, if is_top { "top" } else { "rare" })?;
+        return Ok(if is_top {
+            PplCommand::Top(rank)
+        } else {
+            PplCommand::Rare(rank)
+        });
+    }
+    if let Some(dedup) = command.dedupCommand() {
+        return Ok(PplCommand::Dedup(build_dedup(&dedup)?));
+    }
+    if let Some(timechart) = command.timechartCommand() {
+        return Ok(PplCommand::Timechart(build_timechart(&timechart)?));
+    }
+    if let Some(bin) = command.binCommand() {
+        return Ok(PplCommand::Bin(build_bin(&bin)?));
+    }
     Err(build_unsupported_command_error(&name_first_child_rule(command)))
+}
+
+/// A `stats` command; its `partitions`, `allnum`, `delim` and `dedup_splitvalues` options are
+/// refused, and the last `bucket_nullable` written wins.
+fn build_stats(stats: &StatsCommandContextAll<'_>) -> Result<StatsCommand, PplError> {
+    if stats.dedupSplitArg().is_some() {
+        return Err(build_unsupported_option_error("stats", "dedup_splitvalues"));
+    }
+    let mut is_bucket_nullable = DEFAULT_BUCKET_NULLABLE;
+    if let Some(arguments) = stats.statsArgs() {
+        if !arguments.partitionsArg_all().is_empty() {
+            return Err(build_unsupported_option_error("stats", "partitions"));
+        }
+        if !arguments.allnumArg_all().is_empty() {
+            return Err(build_unsupported_option_error("stats", "allnum"));
+        }
+        if !arguments.delimArg_all().is_empty() {
+            return Err(build_unsupported_option_error("stats", "delim"));
+        }
+        for argument in arguments.bucketNullableArg_all() {
+            is_bucket_nullable = read_bucket_nullable(&argument)?;
+        }
+    }
+    let aggregations = stats
+        .statsAggTerm_all()
+        .iter()
+        .map(|term| build_aggregation(term))
+        .collect::<Result<Vec<_>, _>>()?;
+    let by = match stats.statsByClause() {
+        Some(clause) => build_group_keys(&clause)?,
+        None => Vec::new(),
+    };
+    Ok(StatsCommand {
+        aggregations,
+        by,
+        is_bucket_nullable,
+    })
+}
+
+/// The value of a `bucket_nullable=<bool>` argument.
+fn read_bucket_nullable(argument: &BucketNullableArgContextAll<'_>) -> Result<bool, PplError> {
+    let value = argument
+        .bucket_nullable
+        .as_deref()
+        .ok_or_else(|| build_missing_part_error("bucket_nullable"))?;
+    Ok(value.TRUE().is_some())
+}
+
+/// One aggregation with its output name: the alias, or the call's text without whitespace.
+fn build_aggregation(term: &StatsAggTermContextAll<'_>) -> Result<(String, PplExpr), PplError> {
+    let function = term.statsFunction().ok_or_else(|| build_missing_part_error("aggregation"))?;
+    let name = match term.alias.as_deref() {
+        Some(alias) => {
+            let alias_name = alias.wcQualifiedName().ok_or_else(|| build_missing_part_error("alias"))?;
+            name_wildcard_path(&alias_name)?
+        }
+        None => function.get_text(),
+    };
+    Ok((name, build_aggregate_call(&function)?))
+}
+
+/// An aggregate call as a [`PplExpr::FunctionCall`]: `count()` without arguments,
+/// `count(eval(<predicate>))` with an `eval` call argument, `percentile(x, p)` for every
+/// percentile spelling (`p95(x)`, `perc99.5(x)`, `percentile_approx(x, 95)`, `median(x)`), and
+/// `dc(x)` for every distinct count spelling. The planner decides which calls it plans.
+fn build_aggregate_call(function: &StatsFunctionContextAll<'_>) -> Result<PplExpr, PplError> {
+    let call = |name: &str, arguments: Vec<PplExpr>| PplExpr::FunctionCall {
+        name: name.to_string(),
+        arguments,
+    };
+    match function {
+        StatsFunctionContextAll::CountAllFunctionCallContext(_) => Ok(call("count", Vec::new())),
+        StatsFunctionContextAll::CountEvalFunctionCallContext(count) => {
+            let predicate = count
+                .evalExpression()
+                .and_then(|eval| eval.logicalExpression())
+                .ok_or_else(|| build_missing_part_error("count(eval())"))?;
+            Ok(call(
+                "count",
+                vec![call("eval", vec![build_logical_expression(&predicate)?])],
+            ))
+        }
+        StatsFunctionContextAll::PercentileShortcutFunctionCallContext(shortcut) => {
+            let token = shortcut
+                .PERCENTILE_SHORTCUT()
+                .ok_or_else(|| build_missing_part_error("percentile"))?
+                .get_text();
+            let digits = token.trim_start_matches(|character: char| character.is_ascii_alphabetic());
+            let percent = digits.parse::<f64>().map_err(|_| PplError::Semantic {
+                reason: format!("[{token}] names no percentile"),
+            })?;
+            let value = shortcut
+                .valueExpression()
+                .ok_or_else(|| build_missing_part_error("percentile"))?;
+            Ok(call(
+                "percentile",
+                vec![build_value(&value)?, PplExpr::Literal(PplLiteral::Double(percent))],
+            ))
+        }
+        StatsFunctionContextAll::DistinctCountFunctionCallContext(distinct) => {
+            let value = distinct.valueExpression().ok_or_else(|| build_missing_part_error("dc"))?;
+            Ok(call("dc", vec![build_value(&value)?]))
+        }
+        StatsFunctionContextAll::ValuesAggFunctionCallContext(values) => {
+            let value = values
+                .valuesAggFunction()
+                .and_then(|function| function.valueExpression())
+                .ok_or_else(|| build_missing_part_error("values"))?;
+            Ok(call("values", vec![build_value(&value)?]))
+        }
+        StatsFunctionContextAll::PercentileApproxFunctionCallContext(percentile) => {
+            let function = percentile
+                .percentileApproxFunction()
+                .ok_or_else(|| build_missing_part_error("percentile"))?;
+            let value = function
+                .aggField
+                .as_deref()
+                .ok_or_else(|| build_missing_part_error("percentile"))?;
+            let percent = function
+                .percent
+                .as_deref()
+                .ok_or_else(|| build_missing_part_error("percentile"))?;
+            let percent = percent.get_text().parse::<f64>().map_err(|_| PplError::Semantic {
+                reason: format!("[{}] is not a percentile", percent.get_text()),
+            })?;
+            Ok(call(
+                "percentile",
+                vec![build_value(value)?, PplExpr::Literal(PplLiteral::Double(percent))],
+            ))
+        }
+        StatsFunctionContextAll::StatsFunctionCallContext(named) => {
+            let name = named
+                .statsFunctionName()
+                .ok_or_else(|| build_missing_part_error("aggregation"))?
+                .get_text()
+                .to_ascii_lowercase();
+            let arguments = match named.functionArgs() {
+                Some(arguments) => build_arguments(&arguments)?,
+                None => Vec::new(),
+            };
+            if name == "median" {
+                let mut arguments = arguments;
+                arguments.push(PplExpr::Literal(PplLiteral::Double(50.0)));
+                return Ok(call("percentile", arguments));
+            }
+            Ok(call(&name, arguments))
+        }
+        StatsFunctionContextAll::TakeAggFunctionCallContext(_) => Err(build_unsupported_function_error("take")),
+        StatsFunctionContextAll::PerFunctionCallContext(per) => Err(refuse_function_call(per)),
+        StatsFunctionContextAll::Error(_) => Err(PplError::Internal {
+            reason: "an unlabeled aggregation".to_string(),
+        }),
+    }
+}
+
+/// The group keys of a `by` clause: the span key first, then the fields in the order written.
+fn build_group_keys(clause: &StatsByClauseContextAll<'_>) -> Result<Vec<PplGroupKey>, PplError> {
+    let mut keys = Vec::new();
+    if let Some(span) = clause.bySpanClause() {
+        keys.push(build_span_key(&span)?);
+    }
+    if let Some(fields) = clause.fieldList() {
+        for field in fields.fieldExpression_all() {
+            keys.push(PplGroupKey::Field(name_field(&field)?));
+        }
+    }
+    Ok(keys)
+}
+
+/// The `span(…) [as <alias>]` key; a clause without a field buckets the implicit time field.
+fn build_span_key(clause: &BySpanClauseContextAll<'_>) -> Result<PplGroupKey, PplError> {
+    let span = clause.spanClause().ok_or_else(|| build_missing_part_error("span"))?;
+    let field = match span.fieldExpression() {
+        Some(field) => name_field(&field)?,
+        None => IMPLICIT_TIME_FIELD.to_string(),
+    };
+    let value = span.value.as_deref().ok_or_else(|| build_missing_part_error("span"))?;
+    let (length, unit) = read_span_literal(value)?;
+    let alias = clause
+        .alias
+        .as_deref()
+        .map(|alias| join_qualified_name(alias).and_then(check_field_name))
+        .transpose()?;
+    Ok(PplGroupKey::Span {
+        field,
+        length,
+        unit,
+        alias,
+    })
+}
+
+/// A span or bin length as written, before its unit spelling is resolved.
+enum SpanText {
+    /// A bare number above 0.
+    Numeric(f64),
+    /// A positive whole number of the unit spelled `unit_text`.
+    Time {
+        /// The number of units.
+        length: i64,
+        /// The unit as written.
+        unit_text: String,
+    },
+}
+
+/// Split a span or bin literal into its length and its unit spelling.
+///
+/// # Errors
+///
+/// Returns [`PplError::Semantic`] for a bare number that is not a finite number above 0, a
+/// fractional length with a unit (`1.5h`, `1.5d`), a zero length, and a length beyond `i64`.
+/// Whether the width of a length in its unit fits is checked where the width is computed.
+fn split_span_text(literal: &SpanLiteralContextAll<'_>) -> Result<SpanText, PplError> {
+    let text = literal.get_text();
+    if literal.INTEGER_LITERAL().is_some() || literal.DECIMAL_LITERAL().is_some() {
+        let length = text.parse::<f64>().map_err(|_| build_invalid_span_error(&text))?;
+        if length <= 0.0 || !length.is_finite() {
+            return Err(build_invalid_span_error(&text));
+        }
+        return Ok(SpanText::Numeric(length));
+    }
+    if literal.SPANLENGTH().is_none() {
+        return Err(PplError::Semantic {
+            reason: format!("span length [{text}] must be a whole number of units"),
+        });
+    }
+    let unit_start = text.find(|character: char| !character.is_ascii_digit()).unwrap_or(text.len());
+    let (length_digits, unit_text) = text.split_at(unit_start);
+    // The lexer's SPANLENGTH starts with at least one digit, so only an overflow fails here.
+    let length = length_digits.parse::<i64>().map_err(|_| build_out_of_range_span_error(&text))?;
+    if length == 0 {
+        return Err(build_invalid_span_error(&text));
+    }
+    Ok(SpanText::Time {
+        length,
+        unit_text: unit_text.to_string(),
+    })
+}
+
+/// A span length and its unit: a bare number is a numeric span; `<digits><unit>` a time span of
+/// [`parse_span_unit`], whose length is at most [`MAX_EXACT_SPAN_LENGTH`].
+fn read_span_literal(literal: &SpanLiteralContextAll<'_>) -> Result<(f64, SpanUnit), PplError> {
+    Ok(match split_span_text(literal)? {
+        SpanText::Numeric(length) => (length, SpanUnit::Numeric),
+        SpanText::Time { length, unit_text } => {
+            if length > MAX_EXACT_SPAN_LENGTH {
+                return Err(build_out_of_range_span_error(&literal.get_text()));
+            }
+            let unit = parse_span_unit(&unit_text)?;
+            // Exact: the length is at most `MAX_EXACT_SPAN_LENGTH`.
+            #[allow(clippy::cast_precision_loss)]
+            let length = length as f64;
+            (length, unit)
+        }
+    })
+}
+
+/// The unit a `span` or `timechart` length names. `M` (months) and `m` (minutes) match
+/// case-sensitively and every other spelling in any case; the spellings the lexer admits in a
+/// span length but no span buckets by are refused. The `Spans` section of `ppl/README.md` lists
+/// the spellings.
+///
+/// # Errors
+///
+/// Returns [`PplError::Semantic`] naming a spelling outside that list.
+pub(crate) fn parse_span_unit(text: &str) -> Result<SpanUnit, PplError> {
+    match text {
+        "M" => return Ok(SpanUnit::Month),
+        "m" => return Ok(SpanUnit::Minute),
+        _ => {}
+    }
+    let unit = match text.to_ascii_lowercase().as_str() {
+        "ms" | "millisecond" => SpanUnit::Millisecond,
+        "s" | "sec" | "secs" | "second" | "seconds" => SpanUnit::Second,
+        "min" | "mins" | "minute" | "minutes" => SpanUnit::Minute,
+        "h" | "hr" | "hrs" | "hour" | "hours" => SpanUnit::Hour,
+        "d" | "day" | "days" => SpanUnit::Day,
+        "w" | "week" | "weeks" => SpanUnit::Week,
+        "mon" | "month" | "months" => SpanUnit::Month,
+        "q" | "qtr" | "qtrs" | "quarter" | "quarters" => SpanUnit::Quarter,
+        "y" | "year" | "years" => SpanUnit::Year,
+        _ => {
+            return Err(PplError::Semantic {
+                reason: format!("[{text}] is not a span unit"),
+            });
+        }
+    };
+    Ok(unit)
+}
+
+/// The unit a `bin` span names. `M` (months), `m` (minutes), `us`, `cs` and `ds` match
+/// case-sensitively and every other spelling in any case; week, quarter and year spellings do not
+/// bin and are refused. The `Bin` section of `ppl/README.md` lists the spellings.
+///
+/// # Errors
+///
+/// Returns [`PplError::Semantic`] naming a spelling outside that list.
+pub(crate) fn parse_bin_unit(text: &str) -> Result<SpanUnit, PplError> {
+    match text {
+        "M" => return Ok(SpanUnit::Month),
+        "m" => return Ok(SpanUnit::Minute),
+        "us" => return Ok(SpanUnit::Microsecond),
+        "cs" => return Ok(SpanUnit::Centisecond),
+        "ds" => return Ok(SpanUnit::Decisecond),
+        _ => {}
+    }
+    let unit = match text.to_ascii_lowercase().as_str() {
+        "ms" => SpanUnit::Millisecond,
+        "s" | "sec" | "secs" | "second" | "seconds" => SpanUnit::Second,
+        "min" | "mins" | "minute" | "minutes" => SpanUnit::Minute,
+        "h" | "hr" | "hrs" | "hour" | "hours" => SpanUnit::Hour,
+        "d" | "day" | "days" => SpanUnit::Day,
+        "mon" | "month" | "months" => SpanUnit::Month,
+        _ => {
+            return Err(PplError::Semantic {
+                reason: format!("[{text}] is not a bin span unit"),
+            });
+        }
+    };
+    Ok(unit)
+}
+
+/// A `top` or `rare` command, `command` naming which in its refusals; a count below 1 and
+/// `showperc` / `percentfield` are refused.
+fn build_rank(rank: &RareTopCommandContextAll<'_>, command: &str) -> Result<RankCommand, PplError> {
+    let count = rank
+        .number
+        .as_deref()
+        .map(|number| read_positive_count(number, command))
+        .transpose()?
+        .unwrap_or(DEFAULT_RANK_COUNT);
+    let mut rank_command = RankCommand {
+        count,
+        fields: build_field_list(rank.fieldList().as_deref())?,
+        by: build_field_list(rank.byClause().and_then(|by| by.fieldList()).as_deref())?,
+        count_field: DEFAULT_COUNT_FIELD.to_string(),
+        is_count_shown: true,
+        is_null_kept: true,
+    };
+    for option in rank.rareTopOption_all() {
+        if let Some(count_field) = option.countField.as_deref() {
+            rank_command.count_field = check_field_name(unquote_string(count_field))?;
+        }
+        if let Some(shows_count) = option.showCount.as_deref() {
+            rank_command.is_count_shown = shows_count.TRUE().is_some();
+        }
+        if let Some(uses_null) = option.useNull.as_deref() {
+            rank_command.is_null_kept = uses_null.TRUE().is_some();
+        }
+        if option.showPerc.is_some() {
+            return Err(build_unsupported_option_error(command, "showperc"));
+        }
+        if option.percentField.is_some() {
+            return Err(build_unsupported_option_error(command, "percentfield"));
+        }
+    }
+    Ok(rank_command)
+}
+
+/// The field names of a field list, in order; an absent list is empty.
+fn build_field_list(list: Option<&FieldListContextAll<'_>>) -> Result<Vec<String>, PplError> {
+    list.map_or_else(
+        || Ok(Vec::new()),
+        |list| list.fieldExpression_all().iter().map(|field| name_field(field)).collect(),
+    )
+}
+
+/// A `dedup` command; `consecutive=true` and a count below 1 are refused.
+fn build_dedup(dedup: &DedupCommandContextAll<'_>) -> Result<DedupCommand, PplError> {
+    if dedup
+        .consecutive
+        .as_deref()
+        .is_some_and(|consecutive| consecutive.TRUE().is_some())
+    {
+        return Err(build_unsupported_option_error("dedup", "consecutive=true"));
+    }
+    let count = dedup
+        .number
+        .as_deref()
+        .map(|number| read_positive_count(number, "dedup"))
+        .transpose()?
+        .unwrap_or(DEFAULT_DEDUP_COUNT);
+    Ok(DedupCommand {
+        count,
+        fields: build_field_list(dedup.fieldList().as_deref())?,
+        keeps_empty: dedup.keepempty.as_deref().is_some_and(|keeps| keeps.TRUE().is_some()),
+    })
+}
+
+/// A `timechart` command, its parameters applied in the order written over the defaults; a span
+/// without a time unit is refused.
+fn build_timechart(timechart: &TimechartCommandContextAll<'_>) -> Result<TimechartCommand, PplError> {
+    let term = timechart.statsAggTerm().ok_or_else(|| build_missing_part_error("timechart"))?;
+    let mut command = TimechartCommand {
+        time_field: IMPLICIT_TIME_FIELD.to_string(),
+        span_length: DEFAULT_TIMECHART_SPAN_LENGTH,
+        span_unit: DEFAULT_TIMECHART_SPAN_UNIT,
+        limit: DEFAULT_TIMECHART_LIMIT,
+        uses_other: true,
+        aggregation: build_aggregation(&term)?,
+        by: timechart.fieldExpression().as_deref().map(name_field).transpose()?,
+    };
+    for parameter in timechart.timechartParameter_all() {
+        if parameter.LIMIT().is_some() {
+            let limit = parameter
+                .integerLiteral()
+                .ok_or_else(|| build_missing_part_error("timechart limit"))?;
+            command.limit = read_count(&limit, "timechart limit")?;
+        } else if parameter.SPAN().is_some() {
+            let span = parameter
+                .spanLiteral()
+                .ok_or_else(|| build_missing_part_error("timechart span"))?;
+            let (length, unit) = read_span_literal(&span)?;
+            if unit == SpanUnit::Numeric {
+                return Err(PplError::Semantic {
+                    reason: format!("timechart span [{}] needs a time unit", span.get_text()),
+                });
+            }
+            command.span_length = length;
+            command.span_unit = unit;
+        } else if parameter.USEOTHER().is_some() {
+            command.uses_other = match parameter.booleanLiteral() {
+                Some(value) => value.TRUE().is_some(),
+                None => read_flag_identifier(&parameter.get_text())?,
+            };
+        } else if parameter.TIMEFIELD().is_some() {
+            let time_field = match (parameter.ident(), parameter.stringLiteral()) {
+                (Some(ident), _) => unquote_identifier(&ident),
+                (None, Some(text)) => unquote_string(&text),
+                (None, None) => return Err(build_missing_part_error("timechart timefield")),
+            };
+            command.time_field = check_field_name(time_field)?;
+        }
+    }
+    Ok(command)
+}
+
+/// `useother=t` / `useother=f`: an identifier value read as a boolean.
+fn read_flag_identifier(parameter: &str) -> Result<bool, PplError> {
+    let value = parameter.rsplit('=').next().unwrap_or_default().to_ascii_lowercase();
+    match value.as_str() {
+        "t" | "true" => Ok(true),
+        "f" | "false" => Ok(false),
+        _ => Err(PplError::Semantic {
+            reason: format!("[{parameter}] is not true or false"),
+        }),
+    }
+}
+
+/// A `bin` command; `as`, every option but `span`, and a `bin` without `span` are refused.
+fn build_bin(bin: &BinCommandContextAll<'_>) -> Result<BinCommand, PplError> {
+    if bin.alias.is_some() {
+        return Err(build_unsupported_option_error("bin", "as"));
+    }
+    let field = bin.fieldExpression().ok_or_else(|| build_missing_part_error("bin"))?;
+    let mut span = None;
+    for option in bin.binOption_all() {
+        let Some(value) = option.span.as_deref() else {
+            let name = option.start().get_text().to_ascii_lowercase();
+            return Err(build_unsupported_option_error("bin", &name));
+        };
+        span = Some(read_bin_span(value)?);
+    }
+    let span = span.ok_or_else(|| PplError::Semantic {
+        reason: "bin needs span=<width>".to_string(),
+    })?;
+    Ok(BinCommand {
+        field: name_field(&field)?,
+        span,
+    })
+}
+
+/// A `bin` width: a number, or `<digits><unit>` of [`parse_bin_unit`].
+fn read_bin_span(value: &BinSpanValueContextAll<'_>) -> Result<BinSpan, PplError> {
+    let BinSpanValueContextAll::NumericSpanValueContext(numeric) = value else {
+        return Err(build_unsupported_option_error("bin", "span=log"));
+    };
+    let literal = numeric.spanLiteral().ok_or_else(|| build_missing_part_error("bin span"))?;
+    Ok(match split_span_text(&literal)? {
+        SpanText::Numeric(width) => BinSpan::Numeric(width),
+        SpanText::Time { length, unit_text } => BinSpan::Time {
+            length,
+            unit: parse_bin_unit(&unit_text)?,
+        },
+    })
+}
+
+/// A count that must be at least 1 (`dedup N`, `top N`).
+fn read_positive_count(literal: &IntegerLiteralContextAll<'_>, command: &str) -> Result<usize, PplError> {
+    let count = read_count(literal, command)?;
+    if count == 0 {
+        return Err(PplError::Semantic {
+            reason: format!("{command} takes a count of at least 1"),
+        });
+    }
+    Ok(count)
+}
+
+/// The refusal of a span or bin length that is zero, negative or not a finite number.
+fn build_invalid_span_error(text: &str) -> PplError {
+    PplError::Semantic {
+        reason: format!("span length [{text}] must be positive"),
+    }
+}
+
+/// The refusal of a span or bin length, written as `text`, beyond the range its command holds.
+fn build_out_of_range_span_error(text: &str) -> PplError {
+    PplError::Semantic {
+        reason: format!("span length [{text}] is out of range"),
+    }
+}
+
+/// The refusal of an option `command` accepts in the grammar but IceGate does not plan.
+fn build_unsupported_option_error(command: &str, option: &str) -> PplError {
+    PplError::Semantic {
+        reason: format!("{command} option [{option}] is not supported"),
+    }
 }
 
 fn build_assignment(clause: &EvalClauseContextAll<'_>) -> Result<(String, PplExpr), PplError> {
@@ -273,8 +852,9 @@ fn name_select_field(field: &SelectFieldExpressionContextAll<'_>) -> Result<Stri
         .map_or_else(|| Ok("*".to_string()), |name| name_wildcard_path(&name))
 }
 
-/// The dotted path of a wildcard-capable name. `*` inside an identifier is the wildcard; the
-/// grammar's `%` wildcard form is refused, so a pattern means one thing.
+/// The dotted path of a wildcard-capable field name or pattern. `*` inside an identifier is the
+/// wildcard; the grammar's `%` wildcard form is refused, so a pattern means one thing. A reserved
+/// name is refused too ([`check_field_name`]).
 fn name_wildcard_path(name: &WcQualifiedNameContextAll<'_>) -> Result<String, PplError> {
     let WcQualifiedNameContextAll::IdentsAsWildcardQualifiedNameContext(name) = name else {
         return Err(PplError::Internal {
@@ -286,7 +866,7 @@ fn name_wildcard_path(name: &WcQualifiedNameContextAll<'_>) -> Result<String, Pp
         .iter()
         .map(|part| name_wildcard(part))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(parts.join("."))
+    check_field_name(parts.join("."))
 }
 
 fn name_wildcard(wildcard: &WildcardContextAll<'_>) -> Result<String, PplError> {
@@ -706,10 +1286,28 @@ fn build_literal(literal: &LiteralValueContextAll<'_>) -> Result<PplLiteral, Ppl
     Err(refuse_function_call(literal))
 }
 
-/// The dotted path of a field reference, backticks removed.
+/// The dotted path of a field reference, backticks removed; a reserved name is refused
+/// ([`check_field_name`]).
 fn name_field(field: &FieldExpressionContextAll<'_>) -> Result<String, PplError> {
     let name = field.qualifiedName().ok_or_else(|| build_missing_part_error("field"))?;
-    join_qualified_name(&name)
+    check_field_name(join_qualified_name(&name)?)
+}
+
+/// `name`, a field name a query writes (a reference, a pattern, an `eval` or `rename` target, an
+/// alias, a field parameter), when it is not reserved.
+///
+/// # Errors
+///
+/// Returns [`PplError::Semantic`], naming it, for a name that starts with
+/// [`RESERVED_NAME_PREFIX`]: the planner names its own columns with that prefix, so such a field
+/// would collide with one of them or vanish with the hidden ones.
+fn check_field_name(name: String) -> Result<String, PplError> {
+    if name.starts_with(RESERVED_NAME_PREFIX) {
+        return Err(PplError::Semantic {
+            reason: format!("field name [{name}] starts with the reserved prefix [{RESERVED_NAME_PREFIX}]"),
+        });
+    }
+    Ok(name)
 }
 
 fn join_qualified_name(name: &QualifiedNameContextAll<'_>) -> Result<String, PplError> {
@@ -841,11 +1439,11 @@ mod tests {
                 "query {query:?}"
             );
         }
-        // `take` is an aggregation of `stats`, which this planner does not plan yet.
+        // `take` is an aggregation of `stats` in the grammar; its refusal names it.
         assert_eq!(
             parse_ppl("source=logs | stats take(body, 5)"),
-            Err(PplError::UnsupportedCommand {
-                command: "stats".to_string()
+            Err(PplError::UnsupportedFunction {
+                function: "take".to_string()
             })
         );
     }
@@ -953,5 +1551,257 @@ mod tests {
                 "query {query:?} is a semantic error"
             );
         }
+    }
+
+    #[test]
+    fn span_unit_spellings_map_to_their_units() {
+        let cases = [
+            ("ms", SpanUnit::Millisecond),
+            ("MS", SpanUnit::Millisecond),
+            ("millisecond", SpanUnit::Millisecond),
+            ("s", SpanUnit::Second),
+            ("S", SpanUnit::Second),
+            ("sec", SpanUnit::Second),
+            ("secs", SpanUnit::Second),
+            ("second", SpanUnit::Second),
+            ("seconds", SpanUnit::Second),
+            ("m", SpanUnit::Minute),
+            ("min", SpanUnit::Minute),
+            ("MINS", SpanUnit::Minute),
+            ("minute", SpanUnit::Minute),
+            ("minutes", SpanUnit::Minute),
+            ("h", SpanUnit::Hour),
+            ("hr", SpanUnit::Hour),
+            ("hrs", SpanUnit::Hour),
+            ("hour", SpanUnit::Hour),
+            ("Hours", SpanUnit::Hour),
+            ("d", SpanUnit::Day),
+            ("D", SpanUnit::Day),
+            ("day", SpanUnit::Day),
+            ("days", SpanUnit::Day),
+            ("w", SpanUnit::Week),
+            ("week", SpanUnit::Week),
+            ("weeks", SpanUnit::Week),
+            ("M", SpanUnit::Month),
+            ("mon", SpanUnit::Month),
+            ("month", SpanUnit::Month),
+            ("months", SpanUnit::Month),
+            ("q", SpanUnit::Quarter),
+            ("qtr", SpanUnit::Quarter),
+            ("qtrs", SpanUnit::Quarter),
+            ("quarter", SpanUnit::Quarter),
+            ("quarters", SpanUnit::Quarter),
+            ("y", SpanUnit::Year),
+            ("Y", SpanUnit::Year),
+            ("year", SpanUnit::Year),
+            ("years", SpanUnit::Year),
+        ];
+        for (spelling, unit) in cases {
+            assert_eq!(parse_span_unit(spelling), Ok(unit), "spelling {spelling:?}");
+        }
+        for spelling in ["us", "cs", "ds", "milliseconds", "yr", "yrs", "fortnight"] {
+            assert!(
+                matches!(parse_span_unit(spelling), Err(PplError::Semantic { .. })),
+                "spelling {spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bin_unit_spellings_map_to_their_units() {
+        let cases = [
+            ("us", SpanUnit::Microsecond),
+            ("ms", SpanUnit::Millisecond),
+            ("MS", SpanUnit::Millisecond),
+            ("cs", SpanUnit::Centisecond),
+            ("ds", SpanUnit::Decisecond),
+            ("s", SpanUnit::Second),
+            ("secs", SpanUnit::Second),
+            ("m", SpanUnit::Minute),
+            ("mins", SpanUnit::Minute),
+            ("h", SpanUnit::Hour),
+            ("hrs", SpanUnit::Hour),
+            ("d", SpanUnit::Day),
+            ("days", SpanUnit::Day),
+            ("M", SpanUnit::Month),
+            ("mon", SpanUnit::Month),
+            ("months", SpanUnit::Month),
+        ];
+        for (spelling, unit) in cases {
+            assert_eq!(parse_bin_unit(spelling), Ok(unit), "spelling {spelling:?}");
+        }
+        for spelling in ["US", "CS", "w", "q", "y", "yr"] {
+            assert!(
+                matches!(parse_bin_unit(spelling), Err(PplError::Semantic { .. })),
+                "spelling {spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refused_aggregating_command_options_are_semantic_errors_with_their_stated_reasons() {
+        // One case per refusal the builder states; the reasons are IceGate's wording.
+        let cases = [
+            (
+                "source=logs | dedup 2 service_name consecutive=true",
+                "dedup option [consecutive=true] is not supported",
+            ),
+            (
+                "source=logs | dedup 0 service_name",
+                "dedup takes a count of at least 1",
+            ),
+            ("source=logs | top 0 service_name", "top takes a count of at least 1"),
+            ("source=logs | rare 0 service_name", "rare takes a count of at least 1"),
+            (
+                "source=logs | bin severity_number span=10 as b",
+                "bin option [as] is not supported",
+            ),
+            ("source=logs | bin severity_number", "bin needs span=<width>"),
+            (
+                "source=logs | bin timestamp span=1.5h",
+                "span length [1.5h] must be a whole number of units",
+            ),
+            (
+                "source=logs | bin timestamp span=1.5d",
+                "span length [1.5d] must be a whole number of units",
+            ),
+            (
+                "source=logs | stats count() by span(timestamp, 1.5h)",
+                "span length [1.5h] must be a whole number of units",
+            ),
+            (
+                "source=logs | bin timestamp span=10000000000000000000h",
+                "span length [10000000000000000000h] is out of range",
+            ),
+            // 2^63 days, one more than the greatest 64-bit length.
+            (
+                "source=logs | bin timestamp span=9223372036854775808d",
+                "span length [9223372036854775808d] is out of range",
+            ),
+            (
+                "source=logs | stats count() by span(timestamp, 10000000000000000000M)",
+                "span length [10000000000000000000M] is out of range",
+            ),
+            // One more than 2^53 months: the span length would not be the one written.
+            (
+                "source=logs | stats count() by span(timestamp, 9007199254740993M)",
+                "span length [9007199254740993M] is out of range",
+            ),
+            (
+                "source=logs | stats partitions=2 count()",
+                "stats option [partitions] is not supported",
+            ),
+            (
+                "source=logs | stats allnum=true count()",
+                "stats option [allnum] is not supported",
+            ),
+            (
+                "source=logs | stats delim=',' count()",
+                "stats option [delim] is not supported",
+            ),
+            (
+                "source=logs | stats count() dedup_splitvalues=true",
+                "stats option [dedup_splitvalues] is not supported",
+            ),
+            (
+                "source=logs | top showperc=true service_name",
+                "top option [showperc] is not supported",
+            ),
+            (
+                "source=logs | top percentfield='p' service_name",
+                "top option [percentfield] is not supported",
+            ),
+            (
+                "source=logs | rare percentfield='p' service_name",
+                "rare option [percentfield] is not supported",
+            ),
+        ];
+        for (query, reason) in cases {
+            assert_eq!(
+                parse_ppl(query),
+                Err(PplError::Semantic {
+                    reason: reason.to_string()
+                }),
+                "query {query:?}"
+            );
+        }
+        // A bare integer too long for f64 reads as infinity, which is not a width.
+        let overflowing_digits = "9".repeat(400);
+        for query in [
+            format!("source=logs | bin severity_number span={overflowing_digits}"),
+            format!("source=logs | stats count() by span(severity_number, {overflowing_digits})"),
+        ] {
+            assert_eq!(
+                parse_ppl(&query),
+                Err(PplError::Semantic {
+                    reason: format!("span length [{overflowing_digits}] must be positive")
+                }),
+                "query {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_name_starting_with_the_reserved_prefix_is_refused_wherever_a_query_writes_one() {
+        // One case per place a query writes a field name: a reference, a pattern, a target, an
+        // alias, a parameter value.
+        let cases = [
+            ("source=logs | where __ppl_x = 'a'", "__ppl_x"),
+            ("source=logs | eval y = lower(__ppl_x)", "__ppl_x"),
+            ("source=logs | eval __ppl_x = 1", "__ppl_x"),
+            ("source=logs | eval `__ppl_x` = 1", "__ppl_x"),
+            ("source=logs | rename body as __ppl_x", "__ppl_x"),
+            ("source=logs | rename __ppl_x as body", "__ppl_x"),
+            ("source=logs | fields body, __ppl_x", "__ppl_x"),
+            ("source=logs | fields - __ppl_*", "__ppl_*"),
+            ("source=logs | sort - __ppl_x", "__ppl_x"),
+            ("source=logs | stats count() as __ppl_x", "__ppl_x"),
+            ("source=logs | stats count() by __ppl_x", "__ppl_x"),
+            ("source=logs | stats count() by span(__ppl_x, 1h)", "__ppl_x"),
+            (
+                "source=logs | stats count() by span(timestamp, 1h) as __ppl_x",
+                "__ppl_x",
+            ),
+            ("source=logs | top __ppl_x", "__ppl_x"),
+            ("source=logs | rare body by __ppl_x", "__ppl_x"),
+            ("source=logs | top countfield='__ppl_x' body", "__ppl_x"),
+            ("source=logs | dedup __ppl_x", "__ppl_x"),
+            ("source=logs | timechart timefield=__ppl_x count()", "__ppl_x"),
+            ("source=logs | timechart timefield='__ppl_x' count()", "__ppl_x"),
+            (
+                "source=logs | timechart timefield=timestamp count() by __ppl_x",
+                "__ppl_x",
+            ),
+            ("source=logs | bin __ppl_x span=1", "__ppl_x"),
+        ];
+        for (query, name) in cases {
+            assert_eq!(
+                parse_ppl(query),
+                Err(PplError::Semantic {
+                    reason: format!("field name [{name}] starts with the reserved prefix [__ppl_]")
+                }),
+                "query {query:?}"
+            );
+        }
+        // Only a name that starts with the prefix is reserved; a MAP key under a column may carry it.
+        assert_eq!(
+            parse_ppl("source=logs | eval my__ppl_x = 1 | where log_attributes.__ppl_x = 'a'"),
+            Ok(PplQuery {
+                source: PplSource::Index {
+                    expression: "logs".to_string()
+                },
+                commands: vec![
+                    PplCommand::Eval(vec![(
+                        "my__ppl_x".to_string(),
+                        PplExpr::Literal(PplLiteral::Integer(1))
+                    )]),
+                    PplCommand::Where(PplExpr::Compare {
+                        operator: CompareOperator::Equal,
+                        left: Box::new(PplExpr::Field("log_attributes.__ppl_x".to_string())),
+                        right: Box::new(PplExpr::Literal(PplLiteral::String("a".to_string()))),
+                    }),
+                ],
+            })
+        );
     }
 }

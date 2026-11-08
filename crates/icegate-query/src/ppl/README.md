@@ -57,6 +57,11 @@ case-sensitive. A source on system indices is a 400.
 | `head [N] [from M]` | Skips M rows, then keeps N (`DEFAULT_HEAD_COUNT` in `build.rs` when N is omitted). |
 | `eval <field> = <expression>, …` | Applies the assignments in order, each seeing the fields of the ones before it. An assignment to an existing field replaces it in place; a new field is appended. |
 | `rename <field> as <name>, …` | Applies the pairs in order; each field keeps its position under its new name, and a field already holding the new name is removed. A wildcard pattern or `*` is a 400. |
+| `stats <aggregation>, … [by [span(…)] <field>, …]` | See [Aggregations](#aggregations). |
+| `top [N] <field>, … [by <field>, …]`, `rare …` | Per group, the N most (`top`) or least (`rare`) frequent value combinations with their count. See [Ranking](#ranking). |
+| `dedup [N] <field>, … [keepempty=true]` | Keeps the first N rows (`DEFAULT_DEDUP_COUNT` in `build.rs` when N is omitted) of each combination of the fields, in the incoming order. Rows with a NULL field are dropped, or with `keepempty=true` all kept. `consecutive=true` and N below 1 are a 400. |
+| `timechart [span=<length><unit>] [limit=N] [useother=bool] [timefield=<field>] <aggregation> [by <field>]` | See [Timechart](#timechart). |
+| `bin <field> span=<length>[<unit>]` | See [Bin](#bin). |
 
 The output columns of a source are the table's columns in table order. A field reference is
 resolved against the columns of the pipeline at that point, case-sensitively; a name that
@@ -67,8 +72,11 @@ matches none is a 400 `FIELD_NOT_FOUND`, except for the promoted resource attrib
 A field reference resolves, in this order, to a lambda parameter in scope, the column of that
 exact name, a resource attribute the source's profile promotes to a column, or a key of a MAP
 column written `<column>.<key>` (the key may itself contain dots; an absent key is NULL).
+A field name that starts with `RESERVED_NAME_PREFIX` of `plan.rs`, the prefix of the plans' own
+columns, is a 400 `SEMANTIC_ERROR` naming it wherever the query writes it: a reference, a
+`fields` pattern, an `eval` or `rename` target, an alias, `timefield` or `countfield`.
 A promoted resource attribute whose column an earlier command removed, renamed, or replaced
-(a `rename` onto its name, an `eval` assigning it) is a 400 `SEMANTIC_ERROR`, and so is a
+(a `rename` onto its name, an `eval` or `bin` assigning it) is a 400 `SEMANTIC_ERROR`, and so is a
 promoted attribute that the source indices disagree on (a column in some, not in others).
 Several source indices are combined with UNION ALL over the union of their columns, in the order
 the columns first appear; a column an index lacks is NULL in its rows, and a column typed
@@ -131,6 +139,113 @@ otherwise, a NULL argument gives NULL, and a wrong number of arguments is a 400.
 Array functions return NULL for a NULL list. `exists`, `forall`, `filter` and `transform` take a
 list and a lambda of one parameter; another first or second argument, and a lambda anywhere
 else, is a 400.
+
+## Aggregations
+
+`stats` returns one row per group: the aggregations in order, then the `span` key, then the
+`by` fields, ordered by the keys in that order, ascending with NULL first. Without keys it
+returns exactly one row, also for no input rows. An aggregation's column is named by its alias,
+or by its text as written (`count()`).
+
+| Aggregation | Contract |
+|---|---|
+| `count()` | The number of rows. |
+| `count(x)`, `sum`, `avg`, `min`, `max` | Skip NULL; `min` and `max` compare strings byte-wise. |
+| `count(eval(<predicate>))` | The number of rows whose predicate is true. |
+| `dc(x)`, `distinct_count(x)` | The exact number of distinct non-NULL values. |
+| `values(x)` | The distinct non-NULL values, sorted, with no cap; an empty list for a group without one. |
+| `percentile(x, p)`, `percentile_approx(x, p)`, `p<N>(x)`, `perc<N>(x)`, `median(x)` | An estimate of the `p`th percentile (`p` in 0..=100, `median` is 50) as a `double`; `tests/opensearch/ppl.rs` states the tolerance it is held to. |
+
+`stats` options: `bucket_nullable=false` drops the rows whose `by` key or `span` key is NULL (by
+default they form a group); `partitions`, `allnum`, `delim` and `dedup_splitvalues` are a 400. A
+row whose time-`span` field is NULL is always dropped, so a time-span column is never NULL; a
+numeric span over a NULL value is a NULL key like any other. Every other aggregation (`take`
+among them) is a 400 naming it.
+
+### Spans
+
+`span(<field>, <length><unit>) [as <alias>]` buckets a field; its default column name is
+`span(<field>,<length><unit>)`.
+
+- A numeric span of an integer field truncates toward zero (`(x / n) * n`); of any other numeric
+  field it floors (`floor(x / n) * n`). A unit on a numeric field, and a whole-number length on
+  an integer field beyond the 64-bit integer range, are a 400.
+- A time span takes a positive whole length and a unit. Fixed units (milliseconds to days) bucket
+  from the Unix epoch; weeks start on Mondays; months, quarters and years start on the first day
+  of their calendar period counted from January 1970; all in UTC. A fractional length, a zero
+  length, a length above `MAX_EXACT_SPAN_LENGTH` in `build.rs`, a length whose bucket width
+  (in microseconds, or in months for months, quarters and years), doubled, overflows the 64-bit
+  range, and a bare number on a timestamp are a 400.
+- Units: `M` is months and `m` minutes, matched case-sensitively; every other spelling matches in
+  any case: `ms`, `millisecond`; `s`, `sec`, `secs`, `second`, `seconds`; `min`, `mins`,
+  `minute`, `minutes`; `h`, `hr`, `hrs`, `hour`, `hours`; `d`, `day`, `days`; `w`, `week`,
+  `weeks`; `mon`, `month`, `months`; `q`, `qtr`, `qtrs`, `quarter`, `quarters`; `y`, `year`,
+  `years`. The pinned lexer also admits `us`, `cs`, `ds`, `milliseconds`, `yr` and `yrs` in a
+  span length; no span buckets by them, so they are a 400 naming the spelling.
+
+### Ranking
+
+`top` and `rare` count each combination of the fields per group of the `by` fields and keep the
+N most or least frequent (default `DEFAULT_RANK_COUNT` in `build.rs`). Ties rank by the field
+values, ascending with NULL last. Output: the `by` fields, the fields, then the count column
+(`countfield`, default `DEFAULT_COUNT_FIELD` in `build.rs`; `showcount=false` hides it), rows
+ordered by the `by` fields, then rank. NULL values form a combination unless `usenull=false`.
+A `countfield` that names an existing column is a 400, and so are `showperc`, `percentfield`
+and N below 1.
+
+### Timechart
+
+`timechart` aggregates per time bucket and series. Its columns are the time field, the `by`
+field when given, then the aggregation; rows are ordered by time, then series with NULL last;
+empty buckets are not filled. The time field is `timefield`, or the implicit one
+(`IMPLICIT_TIME_FIELD` in `build.rs`), which a native index does not have: there the query
+renames its time column or names `timefield`, and otherwise gets the 400 `FIELD_NOT_FOUND`
+naming the implicit field. `span` takes the span units above; without it the span is
+`DEFAULT_TIMECHART_SPAN_LENGTH` units of `DEFAULT_TIMECHART_SPAN_UNIT` (both in `build.rs`).
+
+With a `by` field and a `limit` above 0 (default `DEFAULT_TIMECHART_LIMIT` in `build.rs`), the
+`limit` series with the greatest sum of the aggregation over all buckets keep their name, ties by
+name ascending; the other series merge into the series `OTHER_SERIES` of `plan.rs`, or are
+dropped with `useother=false`. Merged rows are re-aggregated per bucket with `min` for `min`,
+`max` for `max`, `avg` for `avg` and `sum` for every other aggregation. A NULL series is labelled
+`NULL_SERIES` of `plan.rs`; with `useother=false` the NULL series is dropped together with the
+series beyond the limit. Because the series rank by a sum, an aggregation that is not numeric
+(`min(body)`, `values(x)`) is a 400 there. `limit=0` ranks nothing: it keeps every series under
+its own value, and a NULL series stays NULL.
+
+### Bin
+
+`bin` replaces a field's value with its bin.
+
+- Numbers bin to `<start>-<end>` strings of a whole-number width (`floor(x / w) * w`), integers
+  exactly and other numbers through a double quotient. The bounds are exact also where a bin
+  reaches past a 64-bit integer limit. A fractional width, a fractional length with a unit
+  (`1.5h`) and a width that, doubled, overflows the 64-bit range are a 400. A non-integer value
+  whose quotient `floor(x / w)` is NaN or beyond the 64-bit integer range fails the query at
+  execution with a 500 `EXECUTION_ERROR`.
+- Timestamps bin to the bucket start: fixed units (microseconds to hours, and a bare number,
+  which is hours) from the Unix epoch, days to midnight UTC of day `floor(d / n) * n` after the
+  epoch, and months to the `yyyy-MM` string of month `floor(i / n) * n` after January 1970, so an
+  instant before the epoch bins to a start at or before it. A time length is a positive 64-bit
+  integer. A fixed-unit length whose width in microseconds, doubled, overflows the 64-bit range
+  is a 400, and so is a day or month length above `MAX_DAY_BIN_LENGTH` or `MAX_MONTH_BIN_LENGTH`
+  (`ppl/plan.rs`), past which a bin before the epoch would start outside the timestamp range.
+- Units: `M` (months), `m` (minutes), `us`, `cs` and `ds`, matched case-sensitively; `ms`; `s`,
+  `sec`, `secs`, `second`, `seconds`; `min`, `mins`, `minute`, `minutes`; `h`, `hr`, `hrs`,
+  `hour`, `hours`; `d`, `day`, `days`; `mon`, `month`, `months` in any case. Weeks, quarters and
+  years do not bin and are a 400.
+- `bin … as <name>`, a `bin` without `span`, and the options `bins`, `minspan`, `aligntime`,
+  `start`, `end` and a `log` span are a 400.
+
+### Row order after aggregation
+
+`dedup` keeps rows in the incoming order: after a `sort` it keeps the first rows of that order,
+and without one the order is the scan's, so which rows of a combination are kept is unspecified.
+The order of a `sort` holds until the next `sort` or aggregation, whatever comes between: a
+`rename` of a sorted column carries the order to the new name, and a `fields`, `eval`, `bin` or
+`rename` that removes or replaces a sorted column keeps the sorted values in a hidden column
+that `dedup` orders by and the output never shows. `stats`, `top`, `rare` and `timechart` define
+their own output order, so a `sort` before them does not carry past them.
 
 ## Limits
 

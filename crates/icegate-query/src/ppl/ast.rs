@@ -53,6 +53,155 @@ pub(crate) enum PplCommand {
     /// `rename <field> as <name>, …`: renames in place; a field already named `<name>` is
     /// replaced.
     Rename(Vec<(String, String)>),
+    /// `stats <aggregation>, … [by <key>, …]`.
+    Stats(StatsCommand),
+    /// `top [N] <field>, … [by <field>, …]`: the N most frequent value combinations per group.
+    Top(RankCommand),
+    /// `rare [N] <field>, … [by <field>, …]`: the N least frequent value combinations per group.
+    Rare(RankCommand),
+    /// `dedup [N] <field>, … [keepempty=<bool>]`.
+    Dedup(DedupCommand),
+    /// `timechart [span=…] [limit=…] [useother=…] [timefield=…] <aggregation> [by <field>]`.
+    Timechart(TimechartCommand),
+    /// `bin <field> span=<span>`.
+    Bin(BinCommand),
+}
+
+/// A `stats` command.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StatsCommand {
+    /// The aggregations in order, each with its output name: the alias, or the text of the call
+    /// as written without whitespace (`count()`, `avg(duration)`).
+    pub(crate) aggregations: Vec<(String, PplExpr)>,
+    /// The group keys: the span key first, then the `by` fields in the order written.
+    pub(crate) by: Vec<PplGroupKey>,
+    /// Whether rows whose key is NULL form a group (`bucket_nullable`, true by default).
+    pub(crate) is_bucket_nullable: bool,
+}
+
+/// A group key of `stats`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PplGroupKey {
+    /// A field; the output column is named after it.
+    Field(String),
+    /// `span(<field>, <length><unit>) [as <alias>]`: the bucket a value falls in.
+    Span {
+        /// The bucketed field; the builder's implicit time field when the clause names none.
+        field: String,
+        /// The bucket length, a positive whole number for a time unit.
+        length: f64,
+        /// The unit of `length`.
+        unit: SpanUnit,
+        /// The output column name, when the clause names one.
+        alias: Option<String>,
+    },
+}
+
+/// The unit of a span length.
+///
+/// Fixed units bucket from the Unix epoch; `Week` buckets start on Mondays and `Month`,
+/// `Quarter` and `Year` on the first day of their calendar period, all in UTC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpanUnit {
+    /// No unit: the length is a number and the field numeric.
+    Numeric,
+    /// Microseconds (`bin` only).
+    Microsecond,
+    /// Milliseconds.
+    Millisecond,
+    /// Hundredths of a second (`bin` only).
+    Centisecond,
+    /// Tenths of a second (`bin` only).
+    Decisecond,
+    /// Seconds.
+    Second,
+    /// Minutes.
+    Minute,
+    /// Hours.
+    Hour,
+    /// Days.
+    Day,
+    /// Weeks starting on Monday.
+    Week,
+    /// Calendar months.
+    Month,
+    /// Calendar quarters.
+    Quarter,
+    /// Calendar years.
+    Year,
+}
+
+/// A `top` or `rare` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RankCommand {
+    /// How many value combinations to keep per group (the builder's default when unnamed).
+    pub(crate) count: usize,
+    /// The ranked fields.
+    pub(crate) fields: Vec<String>,
+    /// The group fields (`by`).
+    pub(crate) by: Vec<String>,
+    /// The name of the count column (`countfield`, the builder's default when unnamed).
+    pub(crate) count_field: String,
+    /// Whether the count column is returned (`showcount`, true by default).
+    pub(crate) is_count_shown: bool,
+    /// Whether NULL values form a combination (`usenull`, true by default).
+    pub(crate) is_null_kept: bool,
+}
+
+/// A `dedup` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DedupCommand {
+    /// How many rows to keep per combination of the fields (one when unnamed).
+    pub(crate) count: usize,
+    /// The fields whose combinations are deduplicated.
+    pub(crate) fields: Vec<String>,
+    /// Whether rows with a NULL field are kept, all of them (`keepempty`); otherwise they are
+    /// dropped.
+    pub(crate) keeps_empty: bool,
+}
+
+/// A `timechart` command.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TimechartCommand {
+    /// The time field (`timefield`, the builder's implicit time field by default).
+    pub(crate) time_field: String,
+    /// The bucket length (`span`, the builder's default when unnamed).
+    pub(crate) span_length: f64,
+    /// The unit of `span_length`.
+    pub(crate) span_unit: SpanUnit,
+    /// How many series to keep before the rest become the other-series row (`limit`, the
+    /// builder's default when unnamed; 0 keeps every series).
+    pub(crate) limit: usize,
+    /// Whether the series beyond `limit` are kept as the other-series row (`useother`, true by
+    /// default) rather than dropped.
+    pub(crate) uses_other: bool,
+    /// The one aggregation, with its output name.
+    pub(crate) aggregation: (String, PplExpr),
+    /// The series field (`by`).
+    pub(crate) by: Option<String>,
+}
+
+/// A `bin` command.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BinCommand {
+    /// The binned field; the bin replaces its value in place.
+    pub(crate) field: String,
+    /// The bin width.
+    pub(crate) span: BinSpan,
+}
+
+/// The width of a `bin`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum BinSpan {
+    /// A numeric width: numbers bin to `<start>-<end>` ranges; on a timestamp field, hours.
+    Numeric(f64),
+    /// A time width.
+    Time {
+        /// The number of units.
+        length: i64,
+        /// The unit.
+        unit: SpanUnit,
+    },
 }
 
 /// One key of a `sort` command.
