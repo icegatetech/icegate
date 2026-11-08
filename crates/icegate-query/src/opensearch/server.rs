@@ -80,6 +80,7 @@ pub async fn run_with_port_tx(
             Arc::clone(&system_index_store),
             CatalogSettings {
                 field_discovery_window: Duration::from_secs(config.field_discovery_window_secs),
+                max_query_memory_bytes: config.max_query_memory_bytes,
             },
         ),
         system_store: system_index_store,

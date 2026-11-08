@@ -90,6 +90,7 @@ data:
       version: {{ .Values.query.opensearch.version | quote }}
       cluster_name: {{ .Values.query.opensearch.clusterName | quote }}
       max_request_body_bytes: {{ .Values.query.opensearch.maxRequestBodyBytes | int }}
+      max_query_memory_bytes: {{ .Values.query.opensearch.maxQueryMemoryBytes | int }}
       field_discovery_window_secs: {{ .Values.query.opensearch.fieldDiscoveryWindowSecs | int }}
       system_indices:
         {{- with .Values.query.opensearch.systemIndices.location }}

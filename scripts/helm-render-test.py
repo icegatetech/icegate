@@ -365,14 +365,16 @@ LONG_FULLNAME_CASES = (  # (description, global.fullnameOverride, expected migra
 # query.yaml it must render into, under the names the binary reads. Both are
 # literals, so the check is not a second reading of the template. The values go in
 # through `--set-json`, which reads a number as a float the way a values file does,
-# so the body limit and the three system-index byte bounds, all above a million, also
-# pin the `| int` that keeps each out of the exponent form the binary refuses.
+# so the body limit, the per-query memory limit and the three system-index byte
+# bounds, all above a million, also pin the `| int` that keeps each out of the
+# exponent form the binary refuses.
 OPENSEARCH_VALUES = {
     "enabled": True,
     "port": 9201,
     "version": "3.10.1",
     "clusterName": "c1",
     "maxRequestBodyBytes": 1048577,
+    "maxQueryMemoryBytes": 1073741825,
     "fieldDiscoveryWindowSecs": 3601,
     "systemIndices": {
         "location": "s3://saved-objects/tenants",
@@ -390,6 +392,7 @@ OPENSEARCH_SECTION = {
     "version": "3.10.1",
     "cluster_name": "c1",
     "max_request_body_bytes": 1048577,
+    "max_query_memory_bytes": 1073741825,
     "field_discovery_window_secs": 3601,
     "system_indices": {
         "location": "s3://saved-objects/tenants",

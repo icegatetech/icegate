@@ -278,6 +278,10 @@ query:
     clusterName: icegate
     # -- Largest request body the listener accepts, in bytes. It also bounds how much of a refused request's body is drained.
     maxRequestBodyBytes: 33554432
+    # -- Bytes of memory one OpenSearch query may hold. The listener's sessions draw from a
+    # pool of this size, spilling to temporary files stays enabled, and a query needing more
+    # answers 400 naming the limit. Other protocols are unbounded.
+    maxQueryMemoryBytes: 1073741824
     # -- How far back, in seconds, field discovery (_field_caps, _mapping) looks for attribute-map keys.
     fieldDiscoveryWindowSecs: 86400
     ## Per-tenant store of the dot-prefixed system indices (saved objects).

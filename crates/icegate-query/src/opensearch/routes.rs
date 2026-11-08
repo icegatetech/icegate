@@ -250,6 +250,7 @@ mod tests {
                 Arc::clone(&system_store),
                 CatalogSettings {
                     field_discovery_window: Duration::from_secs(60),
+                    max_query_memory_bytes: 1_073_741_824,
                 },
             ),
             system_store,

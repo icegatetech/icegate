@@ -24,6 +24,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::TableReference;
 use datafusion::datasource::{TableProvider, provider_as_source};
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, TableType};
 use datafusion::prelude::SessionContext;
 use iceberg::expr::Predicate;
@@ -98,6 +99,9 @@ pub(crate) enum FieldListing {
 pub(crate) struct CatalogSettings {
     /// How far back from the request field discovery looks for MAP keys.
     pub(crate) field_discovery_window: Duration,
+    /// Size of the memory pool each session of the listener gets for itself; every plan the
+    /// session runs, concurrent ones included, draws from it (`opensearch.max_query_memory_bytes`).
+    pub(crate) max_query_memory_bytes: usize,
 }
 
 /// Resolves indices and fields against the tables and the system indices a tenant may read.
@@ -146,7 +150,10 @@ impl IndexCatalog {
     /// Returns `500` when the session cannot be created, the tenant scope cannot be installed, or
     /// the IceGate namespace is missing from the catalog.
     pub(crate) async fn open_session(&self, tenant: &TenantId) -> Result<TenantSession, OpenSearchError> {
-        let context = self.engine.create_session().await?;
+        let context = self
+            .engine
+            .create_session_with_memory_limit(self.settings.max_query_memory_bytes)
+            .await?;
         let catalog_name = &self.engine.config().catalog_name;
         install_tenant_scope(&context, catalog_name, tenant)
             .map_err(|error| OpenSearchError::internal(error.to_string()))?;
@@ -357,10 +364,26 @@ impl TenantSession {
     ///
     /// # Errors
     ///
-    /// Returns the planning or execution failure as the envelope `From<QueryError>` maps it to.
+    /// Returns `400 illegal_argument_exception` naming the per-query memory limit when the
+    /// session's memory pool refuses a reservation; any other planning or execution failure as
+    /// the envelope `From<QueryError>` maps it to.
     pub(crate) async fn collect(&self, plan: LogicalPlan) -> Result<Vec<RecordBatch>, OpenSearchError> {
-        let frame = self.context.execute_logical_plan(plan).await.map_err(QueryError::from)?;
-        Ok(frame.collect().await.map_err(QueryError::from)?)
+        let frame = self
+            .context
+            .execute_logical_plan(plan)
+            .await
+            .map_err(|error| self.map_execution_error(error))?;
+        frame.collect().await.map_err(|error| self.map_execution_error(error))
+    }
+
+    /// Map a planning or execution failure of this session to the envelope. The memory pool
+    /// refusing a reservation, at any depth of the error chain, is the client's 400 naming the
+    /// per-query limit; any other failure keeps the mapping of `QueryError`.
+    fn map_execution_error(&self, error: DataFusionError) -> OpenSearchError {
+        if matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)) {
+            return OpenSearchError::memory_limit_exceeded(self.settings.max_query_memory_bytes);
+        }
+        OpenSearchError::from(QueryError::from(error))
     }
 
     /// The tenant's system-index state, read from the store on the first call of this session.
@@ -689,7 +712,10 @@ mod tests {
             Arc::clone(engine),
             Arc::new(QueryMetrics::new(&provider.meter("map_key_enumeration_test"))),
             crate::test_support::build_in_memory_system_index_store(),
-            CatalogSettings { field_discovery_window },
+            CatalogSettings {
+                field_discovery_window,
+                max_query_memory_bytes: 1_073_741_824,
+            },
         )
     }
 

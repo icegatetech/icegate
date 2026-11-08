@@ -752,6 +752,7 @@ impl SearchFixture {
             build_in_memory_system_index_store(),
             CatalogSettings {
                 field_discovery_window: Duration::from_hours(24),
+                max_query_memory_bytes: 1_073_741_824,
             },
         );
         Self {

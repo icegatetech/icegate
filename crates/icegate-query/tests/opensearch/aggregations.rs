@@ -10,8 +10,8 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::data::{
-    build_log_row_at_minute, build_wal_log_row_at_minute, commit_log_rows, create_exact_name_table, required_string,
-    write_wal_segment,
+    build_log_row_at_minute, build_service_log_row_at_minute, build_wal_log_row_at_minute, commit_log_rows,
+    create_exact_name_table, required_string, write_wal_segment,
 };
 use super::harness::TestServer;
 use super::requests::send_request;
@@ -280,5 +280,54 @@ async fn terms_over_ids_stored_differently_across_indices_is_an_aggregation_exec
         answer["error"]["indices_by_type"],
         json!({"FixedSizeBinary(16)": ["logs"], "Utf8": ["audit_trace"]})
     );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_search_exceeding_the_query_memory_limit_is_a_400_naming_the_limit() {
+    let config = OpenSearchConfig {
+        enabled: true,
+        max_query_memory_bytes: 1024,
+        ..OpenSearchConfig::default()
+    };
+    let (server, catalog) = TestServer::start_with_config(config).await;
+
+    // 2000 distinct service names, one row each: the grouped aggregate's state alone is far
+    // above 1 KiB, whatever the batch layout, so the pool refuses it.
+    let services: Vec<String> = (0..2000).map(|index| format!("service-{index:04}")).collect();
+    let rows: Vec<_> = services
+        .iter()
+        .zip(0_i64..)
+        .map(|(service, minute)| {
+            build_service_log_row_at_minute(
+                TENANT_A,
+                minute,
+                service.as_str(),
+                "INFO",
+                "a row of the memory-limit test",
+            )
+        })
+        .collect();
+    commit_log_rows(&catalog, &rows).await.expect("commit the rows");
+
+    let (status, body) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/logs/_search",
+        Some(&json!({
+            "size": 0,
+            "aggs": {"services": {"terms": {"field": "service_name", "size": 10}}}
+        })),
+    )
+    .await
+    .expect("send the search");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["status"], 400);
+    assert_eq!(body["error"]["type"], "illegal_argument_exception");
+    assert_eq!(body["error"]["root_cause"][0]["type"], "illegal_argument_exception");
+    assert_eq!(body["error"]["limit"], 1024);
+
     server.shutdown().await;
 }

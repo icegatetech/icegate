@@ -63,6 +63,18 @@ impl OpenSearchError {
         Self::new(StatusCode::BAD_REQUEST, "illegal_argument_exception", reason)
     }
 
+    /// The 400 a query gets when the listener's per-query memory pool cannot grant a
+    /// reservation even after spilling: `illegal_argument_exception` naming the limit
+    /// and the configuration key that sets it, with `limit` carrying the limit in bytes
+    /// for a client.
+    pub(crate) fn memory_limit_exceeded(limit_bytes: usize) -> Self {
+        Self::illegal_argument(format!(
+            "the query needs more memory than the per-query limit of [{limit_bytes}] bytes \
+             (opensearch.max_query_memory_bytes)"
+        ))
+        .with_metadata("limit", limit_bytes)
+    }
+
     /// The process sheds load under memory pressure: `503`, `memory_pressure_exception`,
     /// retryable.
     pub(crate) fn memory_pressure() -> Self {
@@ -877,5 +889,16 @@ mod tests {
             assert_eq!(cause["field"], "severity_text");
             assert_eq!(cause["indices_by_type"], expected_indices);
         }
+    }
+
+    #[tokio::test]
+    async fn the_memory_limit_error_is_an_illegal_argument_naming_the_limit() {
+        let (status, body) = render_envelope(OpenSearchError::memory_limit_exceeded(1_048_576)).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        assert_eq!(body["error"]["root_cause"][0]["type"], "illegal_argument_exception");
+        assert_eq!(body["error"]["limit"], 1_048_576);
+        assert_eq!(body["error"]["root_cause"][0]["limit"], 1_048_576);
     }
 }

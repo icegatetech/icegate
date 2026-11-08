@@ -134,6 +134,7 @@
             "version": { "type": "string", "description": "Version reported by GET / and /_nodes: canonical MAJOR.MINOR.PATCH, major 3." },
             "clusterName": { "type": "string", "minLength": 1, "description": "Cluster name reported by GET /, /_nodes and /_cluster/health." },
             "maxRequestBodyBytes": { "type": "integer", "minimum": 1, "description": "Largest request body accepted, in bytes." },
+            "maxQueryMemoryBytes": { "type": "integer", "minimum": 1, "description": "Bytes of memory one OpenSearch query may hold; a query needing more answers 400." },
             "fieldDiscoveryWindowSecs": { "type": "integer", "minimum": 1, "description": "Field-discovery window, in seconds." },
             "systemIndices": {
               "type": ["object", "null"],

@@ -18,6 +18,8 @@ const DEFAULT_VERSION: &str = "3.9.0";
 const DEFAULT_CLUSTER_NAME: &str = "icegate";
 /// Default request body limit, in bytes.
 const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Default of [`OpenSearchConfig::max_query_memory_bytes`].
+const DEFAULT_MAX_QUERY_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 /// Default field-discovery window, in seconds.
 const DEFAULT_FIELD_DISCOVERY_WINDOW_SECS: u64 = 24 * 60 * 60;
 /// The only major version IceGate emulates.
@@ -58,6 +60,12 @@ pub struct OpenSearchConfig {
     /// Largest request body the listener accepts. It also bounds how much of a refused request's
     /// body is drained, so the client reads the refusal instead of a reset.
     pub max_request_body_bytes: usize,
+    /// Bytes of memory one request of this listener may hold: each request's session gets its
+    /// own pool of this size, which every plan the session runs (concurrent ones included)
+    /// draws from; spilling to temporary files stays enabled, and a query that still needs
+    /// more is refused with a 400 naming this limit. Sessions of the other protocols are
+    /// unbounded. Validated non-zero while the listener is enabled.
+    pub max_query_memory_bytes: usize,
     /// How far back, in seconds, field discovery (`_field_caps`, `_mapping`) looks for
     /// attribute-map keys. A key seen only before the window, or only in the WAL, is not listed;
     /// a path naming it still resolves.
@@ -75,8 +83,8 @@ impl OpenSearchConfig {
     /// # Errors
     ///
     /// Returns [`QueryError::Config`] for a blank host or cluster name, a zero
-    /// `max_request_body_bytes` or `field_discovery_window_secs`, or a
-    /// [`version`](Self::version) outside its documented form, and every error of
+    /// `max_request_body_bytes`, `max_query_memory_bytes` or `field_discovery_window_secs`, or
+    /// a [`version`](Self::version) outside its documented form, and every error of
     /// [`SearchLimitsConfig::validate`] and [`SystemIndicesConfig::validate`].
     pub fn validate(&self) -> Result<()> {
         if !self.enabled {
@@ -91,6 +99,11 @@ impl OpenSearchConfig {
         if self.max_request_body_bytes == 0 {
             return Err(QueryError::Config(
                 "OpenSearch max_request_body_bytes must be greater than zero".into(),
+            ));
+        }
+        if self.max_query_memory_bytes == 0 {
+            return Err(QueryError::Config(
+                "OpenSearch max_query_memory_bytes must be greater than zero".into(),
             ));
         }
         if self.field_discovery_window_secs == 0 {
@@ -113,6 +126,7 @@ impl Default for OpenSearchConfig {
             version: DEFAULT_VERSION.to_string(),
             cluster_name: DEFAULT_CLUSTER_NAME.to_string(),
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+            max_query_memory_bytes: DEFAULT_MAX_QUERY_MEMORY_BYTES,
             field_discovery_window_secs: DEFAULT_FIELD_DISCOVERY_WINDOW_SECS,
             system_indices: SystemIndicesConfig::default(),
             search: SearchLimitsConfig::default(),
@@ -424,6 +438,7 @@ mod tests {
     fn validate_accepts_limits_of_one_when_enabled() {
         let config = OpenSearchConfig {
             max_request_body_bytes: 1,
+            max_query_memory_bytes: 1,
             field_discovery_window_secs: 1,
             ..build_enabled_config()
         };
@@ -465,6 +480,7 @@ mod tests {
             "version": "3.10.1",
             "cluster_name": "c1",
             "max_request_body_bytes": 1_048_577,
+            "max_query_memory_bytes": 1_073_741_825,
             "field_discovery_window_secs": 3601,
             "system_indices": {
                 "location": "s3://saved-objects/tenants",
@@ -486,6 +502,7 @@ mod tests {
         assert_eq!(config.version, "3.10.1");
         assert_eq!(config.cluster_name, "c1");
         assert_eq!(config.max_request_body_bytes, 1_048_577);
+        assert_eq!(config.max_query_memory_bytes, 1_073_741_825);
         assert_eq!(config.field_discovery_window_secs, 3601);
         assert_eq!(
             config.system_indices.location.as_deref(),
@@ -689,5 +706,31 @@ mod tests {
         assert!(matches!(config.validate(), Err(QueryError::Config(_))));
         config.search.max_buckets = 1;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn the_query_memory_limit_defaults_to_one_gibibyte() {
+        assert_eq!(
+            OpenSearchConfig::default().max_query_memory_bytes,
+            DEFAULT_MAX_QUERY_MEMORY_BYTES
+        );
+        assert_eq!(DEFAULT_MAX_QUERY_MEMORY_BYTES, 1_073_741_824);
+    }
+
+    #[test]
+    fn validate_rejects_a_zero_query_memory_limit_when_enabled() {
+        let config = OpenSearchConfig {
+            enabled: true,
+            max_query_memory_bytes: 0,
+            ..OpenSearchConfig::default()
+        };
+        assert!(matches!(config.validate(), Err(QueryError::Config(_))));
+
+        let disabled = OpenSearchConfig {
+            enabled: false,
+            max_query_memory_bytes: 0,
+            ..OpenSearchConfig::default()
+        };
+        disabled.validate().expect("a disabled listener validates nothing");
     }
 }
