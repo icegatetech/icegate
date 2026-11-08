@@ -168,13 +168,14 @@ impl OpenSearchError {
         .with_metadata("field_storage", "encoded_id")
     }
 
-    /// An aggregation whose chain of nested bucket aggregations is deeper than this listener
-    /// plans (`400`, `illegal_argument_exception`); `aggregation` carries the request's name for
-    /// the outermost one and `limit` the most levels one chain may nest.
+    /// A request holding more bucket aggregations, nested or not, than one aggregate groups by
+    /// (`400`, `illegal_argument_exception`); `aggregation` carries the request's name for the
+    /// top-level aggregation whose buckets pass the limit and `limit` the most bucket
+    /// aggregations one request may hold.
     pub(crate) fn aggregation_depth_exceeded(aggregation: &str, limit: usize) -> Self {
         Self::unsupported_aggregation(
             aggregation,
-            format!("[{aggregation}] nests more than {limit} bucket levels"),
+            format!("a request may hold at most {limit} bucket aggregations; [{aggregation}] passes it"),
         )
         .with_metadata("limit", limit)
     }

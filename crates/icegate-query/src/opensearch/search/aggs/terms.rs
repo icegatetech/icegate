@@ -1,7 +1,8 @@
 //! `terms`: one bucket per distinct value of a field.
 //!
-//! A level is ranked by its `order` (by default the document count, descending), ties broken by
-//! the key ascending, so the buckets answered never depend on scan order. `include` and `exclude`
+//! A level is ranked by its `order` (by default the document count, descending; a metric
+//! sub-aggregation may rank it), ties broken by the key ascending, so the buckets answered never
+//! depend on scan order. `include` and `exclude`
 //! drop keys before ranking, `missing` stands in for a row without the field, and `min_doc_count`
 //! drops buckets with fewer documents. `min_doc_count: 0` answers only keys present in the
 //! matching rows: no bucket is answered for a value seen only outside them.
@@ -11,12 +12,12 @@ use std::cmp::Ordering;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::ScalarValue;
 use datafusion::functions::expr_fn::regexp_like;
-use datafusion::logical_expr::{Expr, SortExpr, in_list, lit};
+use datafusion::logical_expr::{Expr, in_list, lit};
 use regex::Regex;
 use serde_json::{Map, Value};
 
 use super::assemble::BucketKey;
-use super::parse::{IGNORED_EXECUTION_KEYS, expect_count, expect_object, expect_string};
+use super::parse::{IGNORED_EXECUTION_KEYS, MetricPath, expect_count, expect_object, expect_string, parse_metric_path};
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::MICROS_PER_MILLISECOND;
@@ -52,6 +53,15 @@ pub(crate) enum TermsOrder {
     Count(SortOrder),
     /// By key: byte order for keywords and ids, numeric order for numbers and dates.
     Key(SortOrder),
+    /// By a metric sub-aggregation of the level (`<id>`, `<id>.<stat>`, `<id>-orderAgg`). A
+    /// bucket the metric has no value for ranks after every bucket that has one, in both
+    /// directions.
+    Metric {
+        /// The ordering metric and, for a multi-value metric, its statistic.
+        path: MetricPath,
+        /// The direction of the ranking.
+        order: SortOrder,
+    },
 }
 
 /// The keys `include` admits or `exclude` drops.
@@ -69,12 +79,11 @@ pub(crate) enum TermsFilter {
 /// # Errors
 ///
 /// `400 parsing_exception` for a body that is not an object, a missing `field`, an unknown key
-/// (named under `construct`), a value of the wrong JSON type, a malformed `order` or direction,
-/// and a pattern past the length or group-depth limit of [`translate_lucene_regex`] (the limit
-/// under `limit`) or using `&`, `~` or a named automaton (under `construct`);
-/// `400 illegal_argument_exception` for `size: 0`, a partitioned `include` or `exclude`, an order
-/// by anything but `_count` or `_key` (naming the aggregation under `aggregation`), and a pattern
-/// that is not a valid regular expression.
+/// (named under `construct`), a value of the wrong JSON type, a malformed `order` or direction, a
+/// malformed metric order path ([`parse_metric_path`]), and a pattern past the length or
+/// group-depth limit of [`translate_lucene_regex`] (the limit under `limit`) or using `&`, `~` or
+/// a named automaton (under `construct`); `400 illegal_argument_exception` for `size: 0`, a
+/// partitioned `include` or `exclude`, and a pattern that is not a valid regular expression.
 pub(super) fn parse_terms(name: &str, value: &Value) -> Result<TermsSpec, OpenSearchError> {
     let body = expect_object(name, "terms", value)?;
     let mut field = None;
@@ -134,8 +143,8 @@ fn parse_size(name: &str, value: &Value) -> Result<usize, OpenSearchError> {
     Ok(usize::try_from(size).unwrap_or(usize::MAX))
 }
 
-/// `order`: one object or an array of objects, each mapping `_count` or `_key` to a direction,
-/// in significance order. An empty order is refused rather than read as the default.
+/// `order`: one object or an array of objects, each mapping `_count`, `_key` or a metric path to
+/// a direction, in significance order. An empty order is refused rather than read as the default.
 fn parse_order(name: &str, value: &Value) -> Result<Vec<TermsOrder>, OpenSearchError> {
     let refuse_order =
         || OpenSearchError::parsing(format!("[order] of [{name}] must be an object or an array of objects"));
@@ -154,12 +163,10 @@ fn parse_order(name: &str, value: &Value) -> Result<Vec<TermsOrder>, OpenSearchE
             order.push(match path.as_str() {
                 "_count" => TermsOrder::Count(direction),
                 "_key" => TermsOrder::Key(direction),
-                other => {
-                    return Err(OpenSearchError::unsupported_aggregation(
-                        name,
-                        format!("ordering the terms of [{name}] by [{other}] is not supported yet"),
-                    ));
-                }
+                other => TermsOrder::Metric {
+                    path: parse_metric_path(other)?,
+                    order: direction,
+                },
             });
         }
     }
@@ -342,40 +349,48 @@ fn admit_keys(
     }
 }
 
-/// The ranking of a level as SQL sort keys: the requested order, then the key ascending unless
-/// the request already orders by key.
-pub(super) fn build_rank_order(spec: &TermsSpec, key: &Expr, doc_count: &Expr) -> Vec<SortExpr> {
-    let mut sorts: Vec<SortExpr> = spec
-        .order
-        .iter()
-        .map(|order| match order {
-            TermsOrder::Count(direction) => doc_count.clone().sort(is_ascending(*direction), false),
-            TermsOrder::Key(direction) => key.clone().sort(is_ascending(*direction), false),
-        })
-        .collect();
-    if !spec.order.iter().any(|order| matches!(order, TermsOrder::Key(_))) {
-        sorts.push(key.clone().sort(true, false));
-    }
-    sorts
+/// One candidate bucket of a `terms` level, as the ranking reads it.
+#[derive(Clone, Copy)]
+pub(super) struct RankedBucket<'a> {
+    /// The bucket's key.
+    pub(super) key: &'a BucketKey,
+    /// The bucket's document count.
+    pub(super) doc_count: u64,
+    /// Per criterion of the level's `order`, the bucket's value of the ordering metric: `None`
+    /// for `_count` and `_key`, and for a bucket the metric has no value for. An absent entry
+    /// reads as `None`, so the slice may be empty when no criterion orders by a metric.
+    pub(super) order_values: &'a [Option<f64>],
 }
 
-/// The ranking of [`build_rank_order`] in Rust, for ordering the answered buckets.
-pub(super) fn compare_buckets(spec: &TermsSpec, left: (&BucketKey, u64), right: (&BucketKey, u64)) -> Ordering {
-    for order in &spec.order {
+/// The ranking of a `terms` level: the requested criteria in turn, then the key ascending, so
+/// the buckets answered never depend on scan order.
+pub(super) fn compare_buckets(spec: &TermsSpec, left: RankedBucket<'_>, right: RankedBucket<'_>) -> Ordering {
+    for (position, order) in spec.order.iter().enumerate() {
         let ordering = match order {
-            TermsOrder::Count(direction) => apply_direction(left.1.cmp(&right.1), *direction),
-            TermsOrder::Key(direction) => apply_direction(left.0.cmp(right.0), *direction),
+            TermsOrder::Count(direction) => apply_direction(left.doc_count.cmp(&right.doc_count), *direction),
+            TermsOrder::Key(direction) => apply_direction(left.key.cmp(right.key), *direction),
+            TermsOrder::Metric { order: direction, .. } => compare_order_values(
+                left.order_values.get(position).copied().flatten(),
+                right.order_values.get(position).copied().flatten(),
+                *direction,
+            ),
         };
         if ordering != Ordering::Equal {
             return ordering;
         }
     }
-    left.0.cmp(right.0)
+    left.key.cmp(right.key)
 }
 
-/// Whether `order` sorts ascending.
-const fn is_ascending(order: SortOrder) -> bool {
-    matches!(order, SortOrder::Asc)
+/// Two values of an ordering metric in `direction`; a missing value ranks after every present
+/// one in both directions.
+fn compare_order_values(left: Option<f64>, right: Option<f64>, direction: SortOrder) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => apply_direction(left.total_cmp(&right), direction),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 /// `ordering`, ascending, turned into the order `direction` asks for.

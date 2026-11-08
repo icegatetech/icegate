@@ -3,6 +3,7 @@
 
 mod assemble;
 mod date_histogram;
+mod metrics;
 mod parse;
 mod plan;
 mod render;

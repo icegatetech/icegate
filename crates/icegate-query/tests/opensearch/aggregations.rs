@@ -4,7 +4,7 @@
 
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 use icegate_common::LOGS_TABLE;
-use icegate_common::schema::{COL_SEVERITY_TEXT, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID};
+use icegate_common::schema::{COL_DURATION_MICROS, COL_SEVERITY_TEXT, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID};
 use icegate_query::opensearch::OpenSearchConfig;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -329,5 +329,52 @@ async fn a_search_exceeding_the_query_memory_limit_is_a_400_naming_the_limit() {
     assert_eq!(body["error"]["root_cause"][0]["type"], "illegal_argument_exception");
     assert_eq!(body["error"]["limit"], 1024);
 
+    server.shutdown().await;
+}
+
+/// `spans` maps `duration_micros` as a long; the exact-name table `durations_as_text` maps it as
+/// a keyword. The table is created before the listener's first session, so the first catalog
+/// listing holds it.
+#[tokio::test]
+async fn a_metric_or_histogram_over_a_field_typed_differently_across_indices_is_an_aggregation_execution_400() {
+    let (server, catalog) = TestServer::start().await;
+    create_exact_name_table(
+        &catalog,
+        "durations_as_text",
+        vec![
+            required_string(1, COL_TENANT_ID),
+            NestedField::required(2, COL_TIMESTAMP, Type::Primitive(PrimitiveType::Timestamp)),
+            NestedField::optional(3, COL_DURATION_MICROS, Type::Primitive(PrimitiveType::String)),
+        ],
+    )
+    .await
+    .expect("create durations_as_text");
+
+    for aggregation in [
+        json!({"avg": {"field": "duration_micros"}}),
+        json!({"histogram": {"field": "duration_micros", "interval": 100}}),
+    ] {
+        let (status, answer) = send_request(
+            &server,
+            Method::POST,
+            TENANT_A,
+            "/spans,durations_as_text/_search",
+            Some(&json!({"size": 0, "aggs": {"by_duration": aggregation.clone()}})),
+        )
+        .await
+        .expect("search request");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{aggregation}");
+        assert_eq!(
+            answer["error"]["type"], "aggregation_execution_exception",
+            "{aggregation}"
+        );
+        assert_eq!(answer["error"]["field"], COL_DURATION_MICROS, "{aggregation}");
+        assert_eq!(
+            answer["error"]["indices_by_type"],
+            json!({"keyword": ["durations_as_text"], "long": ["spans"]}),
+            "{aggregation}"
+        );
+    }
     server.shutdown().await;
 }

@@ -8,10 +8,12 @@
 //! whose `construct` names it; a kind of the surface that this listener does not plan yet is a
 //! `400 illegal_argument_exception` whose `aggregation_type` names it.
 
+use std::fmt::Display;
 use std::time::Duration;
 
 use serde_json::{Map, Value};
 
+use super::metrics::MetricSpec;
 use super::terms::{TermsSpec, parse_terms};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::{
@@ -19,6 +21,7 @@ use crate::opensearch::search::doc_id::{
 };
 use crate::opensearch::search::hits::DateRenderFormat;
 use crate::query_dsl::date_math::{TimeZoneSpec, parse_time_zone};
+use crate::query_dsl::literal::parse_java_double;
 
 /// Keys every kind accepts and ignores: they tune per-shard execution.
 pub(super) const IGNORED_EXECUTION_KEYS: [&str; 3] = ["execution_hint", "shard_size", "collect_mode"];
@@ -37,18 +40,11 @@ const OUT_OF_SCOPE_KINDS: [&str; 6] = [
 const OUT_OF_SCOPE_PIPELINES: [&str; 1] = ["extended_stats_bucket"];
 
 /// Kinds of the aggregation surface that are not planned yet.
-const NOT_YET_PLANNED_KINDS: [&str; 26] = [
-    "histogram",
+const NOT_YET_PLANNED_KINDS: [&str; 19] = [
     "range",
     "date_range",
     "filters",
     "filter",
-    "avg",
-    "sum",
-    "min",
-    "max",
-    "value_count",
-    "stats",
     "cardinality",
     "percentiles",
     "percentile_ranks",
@@ -91,6 +87,20 @@ pub(crate) enum AggregationKind {
     DateHistogram(DateHistogramSpec),
     /// One bucket per distinct value of a field.
     Terms(TermsSpec),
+    /// Fixed-width buckets of a numeric field.
+    Histogram(HistogramSpec),
+    /// The mean of the bucket's values.
+    Avg(MetricSpec),
+    /// The sum of the bucket's values; a bucket without values renders 0.
+    Sum(MetricSpec),
+    /// The smallest value; over a date, epoch milliseconds plus `value_as_string`.
+    Min(MetricSpec),
+    /// The largest value; over a date, epoch milliseconds plus `value_as_string`.
+    Max(MetricSpec),
+    /// How many values of the field the bucket holds.
+    ValueCount(MetricSpec),
+    /// `count`, `min`, `max`, `avg` and `sum` together.
+    Stats(MetricSpec),
 }
 
 impl AggregationKind {
@@ -99,6 +109,13 @@ impl AggregationKind {
         match self {
             Self::DateHistogram(spec) => &spec.field,
             Self::Terms(spec) => &spec.field,
+            Self::Histogram(spec) => &spec.field,
+            Self::Avg(spec)
+            | Self::Sum(spec)
+            | Self::Min(spec)
+            | Self::Max(spec)
+            | Self::ValueCount(spec)
+            | Self::Stats(spec) => &spec.field,
         }
     }
 }
@@ -124,6 +141,33 @@ pub(crate) struct DateHistogramSpec {
     /// The epoch milliseconds (a JSON integer or a string of digits) a row without the field is
     /// bucketed at; such a row joins no bucket when absent.
     pub(crate) missing: Option<Value>,
+}
+
+/// A `histogram` request.
+#[derive(Debug, PartialEq)]
+pub(crate) struct HistogramSpec {
+    /// The numeric field bucketed.
+    pub(crate) field: String,
+    /// The bucket width, positive and finite. A value's bucket is `floor(value / interval)`,
+    /// rendered at `bucket × interval`.
+    pub(crate) interval: f64,
+    /// Buckets with fewer documents are not answered. `0`, the default, also answers the empty
+    /// buckets between the first and the last bucket, widened to `extended_bounds`.
+    pub(crate) min_doc_count: u64,
+    /// `(min, max)` the answered buckets reach when `min_doc_count` is `0`; the bounds widen the
+    /// range and never narrow it.
+    pub(crate) extended_bounds: Option<(f64, f64)>,
+}
+
+/// A `terms` order key naming a metric: a sub-aggregation name and, for a multi-value metric,
+/// the statistic after the first `.`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MetricPath {
+    /// The name of the ordering sub-aggregation (`1`, `2-orderAgg`, `score_stats`).
+    pub(crate) aggregation: String,
+    /// The statistic of a multi-value metric (`max` in `score_stats.max`); `None` for a
+    /// single-value metric.
+    pub(crate) statistic: Option<String>,
 }
 
 /// The width of a `date_histogram` bucket.
@@ -234,6 +278,15 @@ fn parse_kind(name: &str, kind_name: &str, value: &Value) -> Result<AggregationK
     match kind_name {
         "date_histogram" => Ok(AggregationKind::DateHistogram(parse_date_histogram(name, value)?)),
         "terms" => Ok(AggregationKind::Terms(parse_terms(name, value)?)),
+        "histogram" => Ok(AggregationKind::Histogram(parse_histogram(name, value)?)),
+        "avg" => Ok(AggregationKind::Avg(parse_metric(name, kind_name, value, true)?)),
+        "sum" => Ok(AggregationKind::Sum(parse_metric(name, kind_name, value, true)?)),
+        "min" => Ok(AggregationKind::Min(parse_metric(name, kind_name, value, true)?)),
+        "max" => Ok(AggregationKind::Max(parse_metric(name, kind_name, value, true)?)),
+        "value_count" => Ok(AggregationKind::ValueCount(parse_metric(
+            name, kind_name, value, false,
+        )?)),
+        "stats" => Ok(AggregationKind::Stats(parse_metric(name, kind_name, value, false)?)),
         _ if OUT_OF_SCOPE_KINDS.contains(&kind_name)
             || OUT_OF_SCOPE_PIPELINES.contains(&kind_name)
             || kind_name.starts_with("geo_") =>
@@ -291,7 +344,7 @@ fn parse_date_histogram(name: &str, value: &Value) -> Result<DateHistogramSpec, 
             "time_zone" => time_zone = Some(parse_time_zone(expect_string(name, key, value)?)?),
             "offset" => offset_micros = parse_offset(name, expect_string(name, key, value)?)?,
             "min_doc_count" => min_doc_count = expect_count(name, key, value)?,
-            "extended_bounds" => extended_bounds = Some(parse_extended_bounds(name, value)?),
+            "extended_bounds" => extended_bounds = Some(parse_extended_bounds(name, value, read_epoch_millis)?),
             "format" => format = Some(DateRenderFormat::parse(expect_string(name, key, value)?)?),
             "missing" => {
                 read_epoch_millis(name, key, value)?;
@@ -408,14 +461,25 @@ fn parse_offset(name: &str, text: &str) -> Result<i64, OpenSearchError> {
         })
 }
 
-fn parse_extended_bounds(name: &str, value: &Value) -> Result<(i64, i64), OpenSearchError> {
+/// `extended_bounds`: both `min` and `max`, each read by `read_bound`, `min <= max`.
+///
+/// # Errors
+///
+/// `400 parsing_exception` for a malformed object, a missing bound, an unknown key (named under
+/// `construct`), and the errors of `read_bound`; `400 illegal_argument_exception` when `min`
+/// exceeds `max`.
+fn parse_extended_bounds<T: PartialOrd + Display>(
+    name: &str,
+    value: &Value,
+    read_bound: impl Fn(&str, &str, &Value) -> Result<T, OpenSearchError>,
+) -> Result<(T, T), OpenSearchError> {
     let bounds = expect_object(name, "extended_bounds", value)?;
     let mut min = None;
     let mut max = None;
     for (key, bound) in bounds {
         match key.as_str() {
-            "min" => min = Some(read_epoch_millis(name, "extended_bounds.min", bound)?),
-            "max" => max = Some(read_epoch_millis(name, "extended_bounds.max", bound)?),
+            "min" => min = Some(read_bound(name, "extended_bounds.min", bound)?),
+            "max" => max = Some(read_bound(name, "extended_bounds.max", bound)?),
             unknown => {
                 return Err(OpenSearchError::unsupported_construct(
                     unknown,
@@ -433,6 +497,148 @@ fn parse_extended_bounds(name: &str, value: &Value) -> Result<(i64, i64), OpenSe
             "[extended_bounds] of [{name}] needs both [min] and [max]"
         ))),
     }
+}
+
+/// Parse a `terms` order key that names a metric: `<id>`, `<id>.<stat>`, or `<id>-orderAgg` (an
+/// ordinary name). The statistic is what follows the first `.`.
+///
+/// # Errors
+///
+/// `400 parsing_exception` for an empty name or statistic, a `>` path into a deeper aggregation
+/// (a level orders only by a direct metric sub-aggregation), and a bracketed percentile selector.
+pub(crate) fn parse_metric_path(text: &str) -> Result<MetricPath, OpenSearchError> {
+    if text.contains('>') {
+        return Err(OpenSearchError::parsing(format!(
+            "order path [{text}] names a nested aggregation; order by a direct metric sub-aggregation"
+        )));
+    }
+    if text.contains('[') {
+        return Err(OpenSearchError::parsing(format!(
+            "order path [{text}] selects a percentile, which is not supported"
+        )));
+    }
+    let (aggregation, statistic) = text
+        .split_once('.')
+        .map_or((text, None), |(aggregation, statistic)| (aggregation, Some(statistic)));
+    if aggregation.is_empty() || statistic.is_some_and(str::is_empty) {
+        return Err(OpenSearchError::parsing(format!(
+            "order path [{text}] must name a sub-aggregation and, after a dot, a statistic"
+        )));
+    }
+    Ok(MetricPath {
+        aggregation: aggregation.to_string(),
+        statistic: statistic.map(str::to_string),
+    })
+}
+
+/// A plain metric (`avg`, `sum`, `min`, `max`, `value_count`, `stats`): `field`, and `missing`
+/// when `is_missing_accepted`.
+///
+/// # Errors
+///
+/// `400 parsing_exception` for a body that is not an object, a missing `field`, a value of the
+/// wrong JSON type, and an unknown key (named under `construct`).
+fn parse_metric(
+    name: &str,
+    kind_name: &str,
+    value: &Value,
+    is_missing_accepted: bool,
+) -> Result<MetricSpec, OpenSearchError> {
+    let body = expect_object(name, kind_name, value)?;
+    let mut field = None;
+    let mut missing = None;
+    for (key, value) in body {
+        match key.as_str() {
+            "field" => field = Some(expect_string(name, key, value)?.to_string()),
+            "missing" if is_missing_accepted => missing = Some(read_lenient_number(name, key, value)?),
+            ignored if IGNORED_EXECUTION_KEYS.contains(&ignored) => {}
+            unknown => {
+                return Err(OpenSearchError::unsupported_construct(
+                    unknown,
+                    format!("[{kind_name}] of [{name}] does not support [{unknown}]"),
+                ));
+            }
+        }
+    }
+    Ok(MetricSpec {
+        field: field.ok_or_else(|| OpenSearchError::parsing(format!("[{kind_name}] of [{name}] requires [field]")))?,
+        missing,
+    })
+}
+
+/// A `histogram`: `field`, `interval`, `min_doc_count` (absent means 0) and `extended_bounds`.
+///
+/// # Errors
+///
+/// `400 parsing_exception` for a malformed body, a missing `field` or `interval`, a value of the
+/// wrong JSON type, and an unknown key (named under `construct`); `400
+/// illegal_argument_exception` for an `interval` that is not positive and for `extended_bounds`
+/// whose `min` exceeds its `max`.
+fn parse_histogram(name: &str, value: &Value) -> Result<HistogramSpec, OpenSearchError> {
+    let body = expect_object(name, "histogram", value)?;
+    let mut field = None;
+    let mut interval = None;
+    let mut min_doc_count = 0;
+    let mut extended_bounds = None;
+    for (key, value) in body {
+        match key.as_str() {
+            "field" => field = Some(expect_string(name, key, value)?.to_string()),
+            "interval" => interval = Some(read_strict_number(name, key, value)?),
+            "min_doc_count" => min_doc_count = expect_count(name, key, value)?,
+            "extended_bounds" => extended_bounds = Some(parse_extended_bounds(name, value, read_strict_number)?),
+            ignored if IGNORED_EXECUTION_KEYS.contains(&ignored) => {}
+            unknown => {
+                return Err(OpenSearchError::unsupported_construct(
+                    unknown,
+                    format!("[histogram] of [{name}] does not support [{unknown}]"),
+                ));
+            }
+        }
+    }
+    let interval =
+        interval.ok_or_else(|| OpenSearchError::parsing(format!("[histogram] of [{name}] requires [interval]")))?;
+    if interval <= 0.0 {
+        return Err(OpenSearchError::illegal_argument(format!(
+            "[interval] of [{name}] must be greater than 0, got [{interval}]"
+        )));
+    }
+    Ok(HistogramSpec {
+        field: field.ok_or_else(|| OpenSearchError::parsing(format!("[histogram] of [{name}] requires [field]")))?,
+        interval,
+        min_doc_count,
+        extended_bounds,
+    })
+}
+
+/// A finite JSON number or a string holding one. The contract takes both forms for a metric's
+/// `missing` (and, in later kinds, for percents and moving-window sizes) only.
+///
+/// # Errors
+///
+/// `400 parsing_exception` naming `key` for any other value.
+pub(super) fn read_lenient_number(name: &str, key: &str, value: &Value) -> Result<f64, OpenSearchError> {
+    let number = match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => parse_java_double(text),
+        Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
+    };
+    number.filter(|number| number.is_finite()).ok_or_else(|| {
+        OpenSearchError::parsing(format!(
+            "[{key}] of [{name}] must be a number or a numeric string, got [{value}]"
+        ))
+    })
+}
+
+/// A finite JSON number; a string, even a numeric one, is refused.
+///
+/// # Errors
+///
+/// `400 parsing_exception` naming `key` for any other value.
+pub(super) fn read_strict_number(name: &str, key: &str, value: &Value) -> Result<f64, OpenSearchError> {
+    value
+        .as_f64()
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| OpenSearchError::parsing(format!("[{key}] of [{name}] must be a number, got [{value}]")))
 }
 
 /// Epoch milliseconds written as a JSON integer or a string of ASCII digits.
@@ -495,30 +701,31 @@ mod tests {
     use std::time::Duration;
 
     use axum::http::StatusCode;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
+    use super::super::metrics::MetricSpec;
     use super::super::terms::{TermsFilter, TermsOrder, TermsSpec};
     use super::{
-        AggregationKind, AggregationTree, CalendarUnit, DateHistogramSpec, HistogramInterval, classify_legacy_interval,
-        parse_aggregations,
+        AggregationKind, AggregationTree, CalendarUnit, DateHistogramSpec, HistogramInterval, HistogramSpec,
+        MetricPath, classify_legacy_interval, parse_aggregations, parse_metric_path,
     };
-    use crate::opensearch::error::render_envelope;
+    use crate::opensearch::error::{OpenSearchError, render_envelope};
     use crate::opensearch::search::request::SortOrder;
 
     /// The spec of the first top-level aggregation, which the test wrote as a `date_histogram`.
     fn read_date_histogram_spec(tree: &AggregationTree) -> &DateHistogramSpec {
-        match &tree.aggregations[0].kind {
-            AggregationKind::DateHistogram(spec) => spec,
-            AggregationKind::Terms(_) => panic!("the test wrote a date_histogram aggregation"),
-        }
+        let AggregationKind::DateHistogram(spec) = &tree.aggregations[0].kind else {
+            panic!("the test wrote a date_histogram aggregation");
+        };
+        spec
     }
 
     /// The spec of the first top-level aggregation, which the test wrote as a `terms`.
     fn read_terms_spec(tree: &AggregationTree) -> &TermsSpec {
-        match &tree.aggregations[0].kind {
-            AggregationKind::Terms(spec) => spec,
-            AggregationKind::DateHistogram(_) => panic!("the test wrote a terms aggregation"),
-        }
+        let AggregationKind::Terms(spec) = &tree.aggregations[0].kind else {
+            panic!("the test wrote a terms aggregation");
+        };
+        spec
     }
 
     #[tokio::test]
@@ -627,8 +834,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn terms_order_parses_as_an_object_or_an_array() {
+    #[test]
+    fn terms_order_parses_as_an_object_or_an_array() {
         let object = parse_aggregations(&json!({"t": {"terms": {"field": "f", "order": {"_count": "asc"}}}}))
             .expect("an object order");
         let array = parse_aggregations(
@@ -644,13 +851,6 @@ mod tests {
             read_terms_spec(&array).order.as_slice(),
             [TermsOrder::Count(SortOrder::Desc), TermsOrder::Key(SortOrder::Asc)]
         ));
-
-        let error = parse_aggregations(&json!({"t": {"terms": {"field": "f", "order": {"1": "desc"}}}}))
-            .expect_err("a metric order is not planned yet");
-        let (status, envelope) = render_envelope(error).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(envelope["error"]["type"], "illegal_argument_exception");
-        assert_eq!(envelope["error"]["aggregation"], "t");
     }
 
     #[tokio::test]
@@ -737,14 +937,14 @@ mod tests {
 
     #[tokio::test]
     async fn an_aggregation_served_later_is_a_400_naming_it() {
-        let error = parse_aggregations(&json!({"1": {"avg": {"field": "duration_micros"}}}))
-            .expect_err("avg is not planned yet");
+        let error = parse_aggregations(&json!({"1": {"serial_diff": {"buckets_path": "_count"}}}))
+            .expect_err("serial_diff is not planned yet");
 
         let (status, body) = render_envelope(error).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "illegal_argument_exception");
         assert_eq!(body["error"]["aggregation"], "1");
-        assert_eq!(body["error"]["aggregation_type"], "avg");
+        assert_eq!(body["error"]["aggregation_type"], "serial_diff");
     }
 
     #[tokio::test]
@@ -931,5 +1131,170 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(envelope["error"]["type"], "illegal_argument_exception", "{body}");
         }
+    }
+
+    /// The kind of the first top-level aggregation of `aggregations`.
+    fn parse_first_kind(aggregations: &Value) -> Result<AggregationKind, OpenSearchError> {
+        let mut tree = parse_aggregations(aggregations)?;
+        Ok(tree.aggregations.swap_remove(0).kind)
+    }
+
+    /// Assert that `aggregations` is refused with a 400 whose error type is `expected_type`, and
+    /// return the rendered `error` object.
+    async fn assert_refusal(aggregations: Value, expected_type: &str) -> Value {
+        let error = parse_first_kind(&aggregations).expect_err("the body must be refused");
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{aggregations}");
+        assert_eq!(body["error"]["type"], expected_type, "{aggregations}");
+        body["error"].clone()
+    }
+
+    #[tokio::test]
+    async fn numbers_and_numeric_strings_are_accepted_exactly_where_the_contract_allows() {
+        // A metric's `missing` takes a JSON number or a numeric string.
+        let Ok(AggregationKind::Avg(numeric_missing)) =
+            parse_first_kind(&json!({"a": {"avg": {"field": "duration_micros", "missing": 0}}}))
+        else {
+            panic!("an avg with a numeric missing parses to Avg");
+        };
+        assert_eq!(
+            numeric_missing,
+            MetricSpec {
+                field: "duration_micros".to_string(),
+                missing: Some(0.0)
+            }
+        );
+        let Ok(AggregationKind::Max(textual_missing)) =
+            parse_first_kind(&json!({"a": {"max": {"field": "duration_micros", "missing": "1.5"}}}))
+        else {
+            panic!("a max with a numeric-string missing parses to Max");
+        };
+        assert_eq!(
+            textual_missing,
+            MetricSpec {
+                field: "duration_micros".to_string(),
+                missing: Some(1.5)
+            }
+        );
+        let Ok(AggregationKind::Histogram(histogram)) = parse_first_kind(&json!({"h": {"histogram": {
+            "field": "duration_micros", "interval": 100, "min_doc_count": 0,
+            "extended_bounds": {"min": 0, "max": 600}
+        }}})) else {
+            panic!("a histogram parses to Histogram");
+        };
+        assert_eq!(
+            histogram,
+            HistogramSpec {
+                field: "duration_micros".to_string(),
+                interval: 100.0,
+                min_doc_count: 0,
+                extended_bounds: Some((0.0, 600.0)),
+            }
+        );
+        let Ok(AggregationKind::Histogram(defaults)) =
+            parse_first_kind(&json!({"h": {"histogram": {"field": "duration_micros", "interval": 2.5}}}))
+        else {
+            panic!("a histogram with defaults parses to Histogram");
+        };
+        assert_eq!(
+            defaults,
+            HistogramSpec {
+                field: "duration_micros".to_string(),
+                interval: 2.5,
+                min_doc_count: 0,
+                extended_bounds: None
+            }
+        );
+
+        // Any other JSON type is a parsing_exception.
+        for refused in [
+            json!({"a": {"sum": {"field": "duration_micros", "missing": "abc"}}}),
+            json!({"a": {"min": {"field": "duration_micros", "missing": true}}}),
+            // `interval`, `min_doc_count`, `extended_bounds` and `size` take numbers only.
+            json!({"h": {"histogram": {"field": "duration_micros", "interval": "100"}}}),
+            json!({"h": {"histogram": {"field": "duration_micros", "interval": 100, "min_doc_count": "1"}}}),
+            json!({"h": {"histogram": {
+                "field": "duration_micros", "interval": 100, "extended_bounds": {"min": "0", "max": 600}
+            }}}),
+            json!({"t": {"terms": {"field": "service_name", "size": "10"}}}),
+        ] {
+            assert_refusal(refused, "parsing_exception").await;
+        }
+        // `stats` and `value_count` take no `missing`; no metric takes `precision`: an unknown key
+        // is a parsing_exception naming it under `construct`.
+        for (refused, construct) in [
+            (
+                json!({"a": {"stats": {"field": "duration_micros", "missing": 0}}}),
+                "missing",
+            ),
+            (
+                json!({"a": {"value_count": {"field": "duration_micros", "missing": 0}}}),
+                "missing",
+            ),
+            (
+                json!({"a": {"avg": {"field": "duration_micros", "precision": 1}}}),
+                "precision",
+            ),
+            (
+                json!({"h": {"histogram": {"field": "duration_micros", "interval": 1, "offset": 1}}}),
+                "offset",
+            ),
+            (
+                json!({"h": {"histogram": {
+                    "field": "duration_micros", "interval": 1, "extended_bounds": {"min": 0, "max": 1, "step": 1}
+                }}}),
+                "step",
+            ),
+        ] {
+            let error = assert_refusal(refused, "parsing_exception").await;
+            assert_eq!(error["construct"], construct);
+        }
+        // A number of the right type and an invalid value is an illegal argument.
+        for refused in [
+            json!({"h": {"histogram": {"field": "duration_micros", "interval": 0}}}),
+            json!({"h": {"histogram": {"field": "duration_micros", "interval": -5}}}),
+            json!({"h": {"histogram": {
+                "field": "duration_micros", "interval": 100, "extended_bounds": {"min": 600, "max": 0}
+            }}}),
+        ] {
+            assert_refusal(refused, "illegal_argument_exception").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn metric_order_paths_parse_ids_statistics_and_order_aggregations() {
+        let path = |aggregation: &str, statistic: Option<&str>| MetricPath {
+            aggregation: aggregation.to_string(),
+            statistic: statistic.map(str::to_string),
+        };
+        assert_eq!(parse_metric_path("1").expect("an id"), path("1", None));
+        assert_eq!(
+            parse_metric_path("2-orderAgg").expect("an order aggregation"),
+            path("2-orderAgg", None)
+        );
+        assert_eq!(
+            parse_metric_path("score_stats.max").expect("a statistic"),
+            path("score_stats", Some("max"))
+        );
+        assert_eq!(
+            parse_metric_path("1.95").expect("a dotted percent"),
+            path("1", Some("95"))
+        );
+        for refused in ["", ".max", "score_stats.", "outer>inner", "1[50.0]"] {
+            let error = parse_metric_path(refused).expect_err("the path must be refused");
+            let (status, body) = render_envelope(error).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+            assert_eq!(body["error"]["type"], "parsing_exception", "{refused}");
+        }
+
+        let Ok(AggregationKind::Terms(spec)) = parse_first_kind(&json!({"services": {"terms": {
+            "field": "service_name", "order": {"1": "desc"}
+        }}})) else {
+            panic!("a terms aggregation parses to Terms");
+        };
+        assert!(matches!(
+            spec.order.as_slice(),
+            [TermsOrder::Metric { path: ordering, order: SortOrder::Desc }] if *ordering == path("1", None)
+        ));
     }
 }
