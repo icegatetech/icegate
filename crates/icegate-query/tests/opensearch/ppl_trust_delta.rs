@@ -2025,3 +2025,280 @@ mod append {
         server.shutdown().await;
     }
 }
+
+/// Hex id literals: folded to the column's fixed width for every comparison, refused when invalid, pushed
+/// into both scans, ordered as bytes.
+mod hex_ids {
+    use icegate_common::schema::{COL_PARENT_SPAN_ID, COL_SPAN_ID, COL_TRACE_ID};
+
+    use super::super::test_rows::build_first_byte_id;
+    use super::*;
+
+    const TRACE_01: [u8; 16] = build_first_byte_id(0x01);
+    const TRACE_7F: [u8; 16] = build_first_byte_id(0x7f);
+    const TRACE_80: [u8; 16] = build_first_byte_id(0x80);
+    const TRACE_FF: [u8; 16] = build_first_byte_id(0xff);
+    const SPAN_01: [u8; 8] = build_first_byte_id(0x01);
+    const SPAN_02: [u8; 8] = build_first_byte_id(0x02);
+    const SPAN_03: [u8; 8] = build_first_byte_id(0x03);
+    const SPAN_04: [u8; 8] = build_first_byte_id(0x04);
+    const SPAN_05: [u8; 8] = build_first_byte_id(0x05);
+
+    /// The same ids as hex, written out by hand.
+    const HEX_01: &str = "01000000000000000000000000000000";
+    const HEX_7F: &str = "7f000000000000000000000000000000";
+    const HEX_7F_UPPER: &str = "7F000000000000000000000000000000";
+    const HEX_80: &str = "80000000000000000000000000000000";
+    const HEX_FF: &str = "ff000000000000000000000000000000";
+    const SPAN_HEX_01: &str = "0100000000000000";
+    const SPAN_HEX_02: &str = "0200000000000000";
+    const SPAN_HEX_03: &str = "0300000000000000";
+
+    fn build_id_span_row<'a>(
+        tenant: &'a str,
+        micros: i64,
+        name: &'a str,
+        trace_id: &'a [u8],
+        span_id: &'a [u8],
+    ) -> Row<'a> {
+        let mut row = build_span_row(tenant, micros, "checkout", name);
+        row.cells.push((COL_TRACE_ID, Cell::Bytes(trace_id)));
+        row.cells.push((COL_SPAN_ID, Cell::Bytes(span_id)));
+        row
+    }
+
+    /// Spans `one`–`four` of tenant A at noon, in Iceberg and in the WAL, and tenant B's `b-two` with
+    /// `two`'s ids in the same WAL file. `two` is the child of `one`.
+    ///
+    /// # Errors
+    ///
+    /// The write error of the Iceberg commit or of the WAL segment.
+    async fn seed_id_spans(server: &TestServer, catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteError> {
+        let mut two = build_id_span_row(TENANT_A, NOON, "two", &TRACE_7F, &SPAN_02);
+        two.cells.push((COL_PARENT_SPAN_ID, Cell::Bytes(&SPAN_01)));
+        commit_rows(
+            catalog,
+            SPANS_TABLE,
+            &[build_id_span_row(TENANT_A, NOON, "one", &TRACE_01, &SPAN_01), two],
+        )
+        .await?;
+        write_wal_segment(
+            &server.wal_store,
+            catalog,
+            SPANS_TABLE,
+            1,
+            &[
+                build_id_span_row(TENANT_A, NOON, "three", &TRACE_80, &SPAN_03),
+                build_id_span_row(TENANT_A, NOON, "four", &TRACE_FF, &SPAN_04),
+                build_id_span_row(TENANT_B, NOON, "b-two", &TRACE_7F, &SPAN_02),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn string_literals_compared_with_id_columns_fold_to_fixed_binary_for_each_operator() {
+        let (server, catalog) = TestServer::start().await;
+        seed_id_spans(&server, &catalog).await.expect("seed spans");
+        for (condition, expected_rows) in [
+            (format!("trace_id = '{HEX_7F}'"), json!([["two"]])),
+            (format!("trace_id = '{HEX_7F_UPPER}'"), json!([["two"]])),
+            (format!("'{HEX_7F}' = trace_id"), json!([["two"]])),
+            (format!("trace_id != '{HEX_7F}'"), json!([["four"], ["one"], ["three"]])),
+            (format!("trace_id < '{HEX_7F}'"), json!([["one"]])),
+            (format!("trace_id <= '{HEX_7F}'"), json!([["one"], ["two"]])),
+            (format!("trace_id > '{HEX_7F}'"), json!([["four"], ["three"]])),
+            (format!("trace_id >= '{HEX_80}'"), json!([["four"], ["three"]])),
+            (
+                format!("trace_id in ('{HEX_01}', '{HEX_FF}')"),
+                json!([["four"], ["one"]]),
+            ),
+            (format!("span_id = '{SPAN_HEX_03}'"), json!([["three"]])),
+            (format!("parent_span_id = '{SPAN_HEX_01}'"), json!([["two"]])),
+        ] {
+            let query = format!("source=spans | where {condition} | fields name | sort name");
+            assert_eq!(
+                run_ppl(&server, TENANT_A, &query).await["datarows"],
+                expected_rows,
+                "{query}"
+            );
+        }
+        let rendered_query = format!("source=spans | where trace_id = '{HEX_7F}' | fields trace_id, span_id");
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &rendered_query).await["datarows"],
+            json!([[HEX_7F, SPAN_HEX_02]])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_hex_or_a_wrong_length_is_a_400() {
+        // Reads no rows: the refusal comes while planning, so no other tenant's row could change it.
+        let (server, _catalog) = TestServer::start().await;
+        let quoted_hex_7f = format!("'{HEX_7F}'");
+        for (condition, fragments) in [
+            (
+                "trace_id = 'zz000000000000000000000000000000'".to_string(),
+                [
+                    COL_TRACE_ID,
+                    "'zz000000000000000000000000000000'",
+                    "not an even-length hex string",
+                ],
+            ),
+            (
+                "trace_id != '7f00'".to_string(),
+                [COL_TRACE_ID, "'7f00'", "expected 16 bytes, got 2"],
+            ),
+            (
+                format!("span_id = '{HEX_7F}'"),
+                [COL_SPAN_ID, &quoted_hex_7f, "expected 8 bytes, got 16"],
+            ),
+            (
+                format!("trace_id in ('{HEX_01}', 'abc')"),
+                [COL_TRACE_ID, "'abc'", "not an even-length hex string"],
+            ),
+            (
+                "'xyz' < trace_id".to_string(),
+                [COL_TRACE_ID, "'xyz'", "not an even-length hex string"],
+            ),
+        ] {
+            let query = format!("source=spans | where {condition}");
+            let refused_reply = refuse_ppl(&server, TENANT_A, &query).await;
+            assert_semantic_refusal_naming(&refused_reply, &fragments);
+        }
+        server.shutdown().await;
+    }
+
+    /// Only a string literal folds: an id compared with a column, a number or a listed number of another type
+    /// is refused, naming the id field and both PPL types.
+    #[tokio::test]
+    async fn an_id_compared_with_a_non_string_literal_operand_of_another_type_is_a_400() {
+        // Reads no rows: the refusal comes while planning, so no other tenant's row could change it.
+        let (server, _catalog) = TestServer::start().await;
+        for (condition, id_field, id_width, other_type) in [
+            ("trace_id = service_name", COL_TRACE_ID, 16, "string"),
+            ("span_id = 5", COL_SPAN_ID, 8, "bigint"),
+            ("name != parent_span_id", COL_PARENT_SPAN_ID, 8, "string"),
+            ("trace_id in (1, 2)", COL_TRACE_ID, 16, "bigint"),
+        ] {
+            let query = format!("source=spans | where {condition}");
+            let refused_reply = refuse_ppl(&server, TENANT_A, &query).await;
+            assert_semantic_refusal(
+                &refused_reply,
+                &format!(
+                    "comparing the id field [{id_field}] (type string, {id_width} bytes written as hex) with a value \
+                     of type {other_type} is not supported; compare an id with another id or with a string literal \
+                     of hex digits"
+                ),
+            );
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_trace_id_literal_reaches_the_wal_and_iceberg_scans_as_fixed_binary() {
+        const MIXED_TRACE: [u8; 16] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+        ];
+        const MIXED_HEX: &str = "0123456789abcdeffedcba9876543210";
+        // The WAL scan prints a fixed-size binary literal as the hex of its first ten bytes and `...`; the
+        // case it prints is not this contract.
+        const MIXED_HEX_IN_WAL_FILTER: &str = " = 0123456789abcdeffedc...";
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[build_id_span_row(TENANT_A, NOON, "committed", &MIXED_TRACE, &SPAN_01)],
+        )
+        .await
+        .expect("commit spans");
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            SPANS_TABLE,
+            1,
+            &[
+                build_id_span_row(TENANT_A, NOON, "hot", &MIXED_TRACE, &SPAN_02),
+                build_id_span_row(TENANT_B, NOON, "b-hot", &MIXED_TRACE, &SPAN_03),
+            ],
+        )
+        .await
+        .expect("write spans segment");
+        let query = format!("source=spans | where trace_id = '{MIXED_HEX}' | fields name | sort name");
+
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &query).await["datarows"],
+            json!([["committed"], ["hot"]])
+        );
+
+        let (_logical_plan, physical_plan) = explain_ppl(&server, TENANT_A, &query).await;
+        let iceberg_scan_lines = find_plan_lines(&physical_plan, "IcegateIcebergScan");
+        assert_eq!(iceberg_scan_lines.len(), 1, "{physical_plan}");
+        // The case in which the scan prints the datum is not this contract.
+        let iceberg_predicate = iceberg_scan_lines[0]
+            .split_once("predicate:[")
+            .map_or("", |(_, rest)| rest)
+            .to_ascii_lowercase();
+        assert!(
+            iceberg_predicate.contains("trace_id") && iceberg_predicate.contains(MIXED_HEX),
+            "the Iceberg scan prunes on the fixed-width id:\n{physical_plan}"
+        );
+        let wal_scan_lines = find_plan_lines(&physical_plan, "DataSourceExec");
+        assert_eq!(wal_scan_lines.len(), 1, "{physical_plan}");
+        let wal_predicate = wal_scan_lines[0].split_once("predicate=").map_or("", |(_, rest)| rest);
+        let wal_filter = wal_predicate
+            .split_once(", pruning_predicate=")
+            .map_or(wal_predicate, |(filter, _)| filter);
+        assert!(
+            wal_filter.split(" AND ").any(|conjunct| conjunct.starts_with("trace_id@")
+                && conjunct.to_ascii_lowercase().ends_with(MIXED_HEX_IN_WAL_FILTER)),
+            "the WAL scan compares the column with the fixed-width id:\n{physical_plan}"
+        );
+        assert!(
+            !wal_predicate.contains("CAST(trace_id"),
+            "no cast of the column:\n{physical_plan}"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn keyset_comparisons_on_hex_ids_follow_byte_order() {
+        let (server, catalog) = TestServer::start().await;
+        seed_id_spans(&server, &catalog).await.expect("seed spans");
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            SPANS_TABLE,
+            2,
+            &[build_id_span_row(
+                TENANT_A,
+                NOON - SECOND,
+                "earlier",
+                &TRACE_01,
+                &SPAN_05,
+            )],
+        )
+        .await
+        .expect("write spans segment");
+
+        // A signed byte comparison would put `80…` and `ff…` before `01…`; byte order puts them last. Tenant
+        // B's `b-two` at noon shares `two`'s trace id and would add a fifth row if tenant A read it.
+        let query_sorted_by_trace_id =
+            "source=spans | where timestamp = '2026-10-08 12:00:00' | sort trace_id | fields name";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, query_sorted_by_trace_id).await["datarows"],
+            json!([["one"], ["two"], ["three"], ["four"]])
+        );
+        // The page after (noon, `7f…`) in `- timestamp, trace_id` order.
+        let next_page_query = format!(
+            "source=spans | where timestamp < '2026-10-08 12:00:00' \
+             or (timestamp = '2026-10-08 12:00:00' and trace_id > '{HEX_7F}') \
+             | sort - timestamp, trace_id | fields name, trace_id | head 3"
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &next_page_query).await["datarows"],
+            json!([["three", HEX_80], ["four", HEX_FF], ["earlier", HEX_01]])
+        );
+        server.shutdown().await;
+    }
+}

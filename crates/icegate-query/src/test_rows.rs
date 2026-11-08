@@ -3,8 +3,11 @@
 //! One file serves two test layers: the crate's inline tests declare it as a `cfg(test)`
 //! module, and the `OpenSearch` integration binary includes the same file by path, because an
 //! integration binary cannot reach the crate's `cfg(test)` modules. It therefore names only
-//! external crates, never `crate::`. Every `pub` item has a reader in both layers; the rest
-//! serve the `pub` items only.
+//! external crates, never `crate::`. Every `pub` item has a reader in both layers, either
+//! directly or through another `pub` item: [`build_rows_batch`], [`select_write_config`] and
+//! [`commit_written_files`] are called directly only by the crate's inline tests, and the
+//! integration layer reaches them through [`commit_rows`], [`commit_batch`] and
+//! [`write_wal_segment`]. The rest serve the `pub` items only.
 //!
 //! Tables are created from `icegate_common::schema`, Iceberg appends go through the production
 //! Parquet writer with the table's production bloom-filter columns and encodings, and every
@@ -197,13 +200,21 @@ pub fn build_operation_row<'a>(
     Row { tenant, cells }
 }
 
+/// An id of `N` bytes whose first byte is `first` and whose other bytes are zero, for a
+/// `FixedSizeBinary(N)` id column cell.
+pub const fn build_first_byte_id<const N: usize>(first: u8) -> [u8; N] {
+    let mut id = [0_u8; N];
+    id[0] = first;
+    id
+}
+
 /// Build one batch of `rows` over `schema`. Panics when a cell names a column `schema` lacks or
 /// carries a value of another type, so a renamed column fails the test that names it.
 ///
 /// # Errors
 ///
 /// Fails when Arrow refuses a column or the batch.
-fn build_rows_batch(schema: &SchemaRef, rows: &[Row<'_>]) -> Result<RecordBatch, RowWriteError> {
+pub fn build_rows_batch(schema: &SchemaRef, rows: &[Row<'_>]) -> Result<RecordBatch, RowWriteError> {
     for row in rows {
         for (column, _) in &row.cells {
             assert!(
@@ -374,7 +385,7 @@ fn build_rows_column(field: &Field, rows: &[Row<'_>]) -> Result<ArrayRef, RowWri
 /// The production writer settings of `table_name`: its bloom-filter columns and column
 /// encodings, with sizes far above what a test writes. A name outside [`PRODUCTION_TABLES`]
 /// (an exact-name table a test creates) is written with none.
-fn select_write_config(table_name: &str) -> WriteConfig {
+pub fn select_write_config(table_name: &str) -> WriteConfig {
     let (bloom_filter_columns, column_encodings) = PRODUCTION_TABLES
         .iter()
         .find(|table| table.name == table_name)
@@ -399,7 +410,7 @@ pub async fn read_arrow_schema(catalog: &Arc<dyn Catalog>, table_name: &str) -> 
 }
 
 /// Append `data_files` to `table` as one snapshot recording [`COMMITTED_WAL_OFFSET`].
-async fn commit_written_files(
+pub async fn commit_written_files(
     catalog: &Arc<dyn Catalog>,
     table: &Table,
     data_files: Vec<DataFile>,

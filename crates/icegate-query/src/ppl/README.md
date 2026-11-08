@@ -116,8 +116,9 @@ types when the two share one PPL name).
 
 - Decimal columns read as `double`, the one numeric type PPL reports for them.
 - Strings compare and sort byte-wise (code-point order), never by locale.
-- A fixed-size binary id renders as lowercase hex; comparing it with a value of another type is a
-  400, because the engine would compare bytes, not the hex the client sees.
+- A fixed-size binary id renders as lowercase hex. A string literal compared with an id is read as
+  hex (see [Id literals](#id-literals)); comparing an id with any other value that is not an id is a
+  400 `SEMANTIC_ERROR` naming the id field and both PPL types.
 - Timestamps are microseconds in UTC. A timestamp literal is `yyyy-MM-dd`, or
   `yyyy-MM-dd HH:mm:ss` (a `T` may separate date and time) with a fraction no finer than a
   microsecond; any other form, and a finer fraction, is a 400. See
@@ -450,3 +451,15 @@ filter, so a PPL query never reads another tenant's rows. `tests/opensearch/ppl.
 with two tenants written in the same batch. Every join side, every subsearch and every `append`
 branch resolves through that same session; `tests/opensearch/ppl_trust_delta.rs` pins it with
 both tenants' rows in one WAL segment.
+
+## Id literals
+
+A string literal compared (`=`, `!=`, `<`, `>`, `<=`, `>=`, `in (…)`) with a fixed-width id (`trace_id`,
+`span_id`, `parent_span_id`) is read as hex, either case, and folded to the id's own fixed-width binary value
+before planning; the literal may stand on either side and the query stays standard PPL (`trace_id = '<hex>'`).
+Invalid hex or a wrong number of bytes is a 400 naming the column and the literal. Any other value compared
+with an id, or listed in an `in (…)` against one, must itself be an id: a value of another type (a number, a
+string column) is a 400 naming the id field and both PPL types. The folded value reaches
+both the WAL scan and the Iceberg scan, so row groups are pruned by statistics and bloom filters. Ids render as
+lowercase hex, and lowercase hex order is byte order: `<` / `>` on an id agree with `sort` on it, which keyset
+paging relies on.

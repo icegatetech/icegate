@@ -6,6 +6,7 @@
 //! command then transforms the plan of the commands before it; a field reference resolves
 //! against the columns of the plan at that point.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -46,6 +47,7 @@ use super::functions::{
     FunctionContext, PlannedAggregate, is_higher_order_function, lower_arithmetic, lower_cast, lower_function_call,
     match_string_literal, parse_timestamp_literal, plan_aggregate_call,
 };
+use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::opensearch::catalog::{
     FieldListing, FieldType, FieldValue, IndexEntry, IndexExpression, IndexField, IndexOptions, IndexTarget, Profile,
     TenantSession,
@@ -2253,7 +2255,7 @@ fn lower_expression(expression: &PplExpr, scope: &ExpressionScope<'_>) -> Result
             let left = lower_expression(left, scope)?;
             let right = lower_expression(right, scope)?;
             let (left, right) = coerce_timestamp_operands(left, right, scope.schema)?;
-            refuse_id_comparison(&left, &right, scope)?;
+            let (left, right) = coerce_fixed_binary_operands(left, right, scope.schema)?;
             Ok(match operator {
                 CompareOperator::Equal => left.eq(right),
                 CompareOperator::NotEqual => left.not_eq(right),
@@ -2320,6 +2322,7 @@ fn lower_expression(expression: &PplExpr, scope: &ExpressionScope<'_>) -> Result
                 value = folded_value;
                 listed_values.push(item);
             }
+            let listed_values = coerce_fixed_binary_list(&value, listed_values, scope.schema)?;
             Ok(value.in_list(listed_values, *is_negated))
         }
         PplExpr::Between {
@@ -2480,24 +2483,6 @@ fn build_promoted_conflict_error(name: &str) -> PplError {
     }
 }
 
-/// Refuse comparing a fixed-size binary id with a value of another type: the engine would
-/// compare the value's bytes, not the hex the id renders as.
-fn refuse_id_comparison(left: &Expr, right: &Expr, scope: &ExpressionScope<'_>) -> Result<(), PplError> {
-    let left_type = left.get_type(scope.schema)?;
-    let right_type = right.get_type(scope.schema)?;
-    let is_id = |data_type: &DataType| matches!(data_type, DataType::FixedSizeBinary(_));
-    if is_id(&left_type) == is_id(&right_type) {
-        return Ok(());
-    }
-    let id = if is_id(&left_type) { left } else { right };
-    Err(PplError::Semantic {
-        reason: format!(
-            "comparing the id field [{}] with a value of another type is not supported",
-            id.schema_name()
-        ),
-    })
-}
-
 /// Folds a string literal compared with a timestamp operand into a microsecond timestamp literal,
 /// read by [`parse_timestamp_literal`] and carrying the operand's zone.
 ///
@@ -2530,6 +2515,138 @@ fn fold_string_operand(operand: Expr, other: &Expr, schema: &DFSchema) -> Result
         Some(parse_timestamp_literal(text)?),
         time_zone,
     )))
+}
+
+/// Folds a string literal compared with a `FixedSizeBinary(n)` operand (`trace_id`, `span_id`,
+/// `parent_span_id`) into that operand's own `FixedSizeBinary(n)` literal; the literal may stand on either
+/// side.
+///
+/// A string literal is how a client writes an id. Reading it as the column's own type keeps the comparison a
+/// literal comparison on the column, which both scans prune with: the WAL Parquet scan compares the column
+/// directly, and the Iceberg predicate converter turns the scalar into a `Fixed` datum that min/max
+/// statistics and bloom filters test.
+///
+/// Any other operand compared with an id is returned unchanged when it is an id itself, and refused
+/// otherwise with a 400 that names the id field and both PPL types ([`build_id_comparison_refusal`]), so the
+/// client learns which field the comparison is about. A pair without an id is returned unchanged. The type of
+/// every operand but a string literal is computed, once: the refusal needs it.
+///
+/// # Errors
+///
+/// `PplError::Semantic` naming the column and the literal when the literal is not hex or decodes to another
+/// width ([`PplError::invalid_id_literal`]); naming the id field and both types when the other operand is
+/// of another type; and when the type of an operand cannot be computed against `schema` (an ill-typed
+/// expression of the query).
+pub(crate) fn coerce_fixed_binary_operands(
+    left: Expr,
+    right: Expr,
+    schema: &DFSchema,
+) -> Result<(Expr, Expr), PplError> {
+    let left_operand = read_compared_operand(&left, schema)?;
+    let right_operand = read_compared_operand(&right, schema)?;
+    if let ComparedOperand::Typed(DataType::FixedSizeBinary(id_width)) = left_operand {
+        let folded_right = fold_id_counterpart(&right_operand, &left, id_width)?;
+        return Ok((left, folded_right.unwrap_or(right)));
+    }
+    if let ComparedOperand::Typed(DataType::FixedSizeBinary(id_width)) = right_operand {
+        let folded_left = fold_id_counterpart(&left_operand, &right, id_width)?;
+        return Ok((folded_left.unwrap_or(left), right));
+    }
+    Ok((left, right))
+}
+
+/// Folds the string literals of an `in (…)` list compared with a `FixedSizeBinary(n)` operand, and refuses
+/// an item of another type, as [`coerce_fixed_binary_operands`] does for one comparison; every other item,
+/// and every item compared with an operand that is not an id, is returned unchanged.
+///
+/// # Errors
+///
+/// As [`coerce_fixed_binary_operands`], for the first invalid item.
+pub(crate) fn coerce_fixed_binary_list(
+    operand: &Expr,
+    items: Vec<Expr>,
+    schema: &DFSchema,
+) -> Result<Vec<Expr>, PplError> {
+    let DataType::FixedSizeBinary(id_width) = operand.get_type(schema)? else {
+        return Ok(items);
+    };
+    items
+        .into_iter()
+        .map(|item| {
+            let folded_item = fold_id_counterpart(&read_compared_operand(&item, schema)?, operand, id_width)?;
+            Ok(folded_item.unwrap_or(item))
+        })
+        .collect()
+}
+
+/// One operand of a comparison, as the id fold reads it.
+enum ComparedOperand<'e> {
+    /// A string literal, with its text.
+    StringLiteral(&'e str),
+    /// Any other operand, with its type.
+    Typed(DataType),
+}
+
+/// `operand` as a string literal, or else with its type computed against `schema`.
+fn read_compared_operand<'e>(operand: &'e Expr, schema: &DFSchema) -> Result<ComparedOperand<'e>, PplError> {
+    Ok(match match_string_literal(operand) {
+        Some(text) => ComparedOperand::StringLiteral(text),
+        None => ComparedOperand::Typed(operand.get_type(schema)?),
+    })
+}
+
+/// What `counterpart`, compared with `id_operand` of type `FixedSizeBinary(id_width)`, becomes: `Some`
+/// literal decoded by [`decode_id_literal`] for a string literal, `None` (unchanged) for another id.
+///
+/// # Errors
+///
+/// The invalid-literal 400 of [`decode_id_literal`], and [`build_id_comparison_refusal`] for a value of
+/// any other type.
+fn fold_id_counterpart(
+    counterpart: &ComparedOperand<'_>,
+    id_operand: &Expr,
+    id_width: i32,
+) -> Result<Option<Expr>, PplError> {
+    match counterpart {
+        ComparedOperand::StringLiteral(text) => {
+            decode_id_literal(text, id_operand, &DataType::FixedSizeBinary(id_width)).map(Some)
+        }
+        ComparedOperand::Typed(DataType::FixedSizeBinary(_)) => Ok(None),
+        ComparedOperand::Typed(counterpart_type) => {
+            Err(build_id_comparison_refusal(id_operand, id_width, counterpart_type))
+        }
+    }
+}
+
+/// The 400 for an id compared with a value that is neither a string literal nor an id. It names the
+/// id field (as [`name_id_operand`]), the id's PPL type and its width of `id_width` bytes, and the PPL type
+/// of the other value.
+fn build_id_comparison_refusal(id_operand: &Expr, id_width: i32, counterpart_type: &DataType) -> PplError {
+    let id_name = name_id_operand(id_operand);
+    PplError::Semantic {
+        reason: format!(
+            "comparing the id field [{id_name}] (type {}, {id_width} bytes written as hex) with a value of \
+             type {} is not supported; compare an id with another id or with a string literal of hex digits",
+            name_ppl_type(&id_name, &DataType::FixedSizeBinary(id_width)),
+            name_ppl_type("value", counterpart_type),
+        ),
+    }
+}
+
+/// The name a refusal gives an id operand: its column name, or its expression for any other operand.
+fn name_id_operand(id_operand: &Expr) -> Cow<'_, str> {
+    match id_operand {
+        Expr::Column(column) => Cow::Borrowed(&column.name),
+        other => Cow::Owned(other.schema_name().to_string()),
+    }
+}
+
+/// The `id_type` literal the hex `text` denotes, compared with `id_operand`. The refusal names
+/// `id_operand` as [`name_id_operand`] does.
+fn decode_id_literal(text: &str, id_operand: &Expr, id_type: &DataType) -> Result<Expr, PplError> {
+    decode_fixed_binary_literal(text, id_type)
+        .map(lit)
+        .map_err(|error| PplError::invalid_id_literal(&name_id_operand(id_operand), text, &error))
 }
 
 /// Build `builder` without its hidden columns ([`drop_hidden_columns`]), run the analyzer so a type
@@ -3276,7 +3393,7 @@ mod tests {
         Between, Expr, LogicalPlan, LogicalPlanBuilder, LogicalTableSource, col, ident, lit,
     };
     use datafusion::prelude::SessionContext;
-    use icegate_common::schema::COL_TENANT_ID;
+    use icegate_common::schema::{COL_BODY, COL_SPAN_ID, COL_TENANT_ID, COL_TRACE_ID};
     use icegate_common::{OPERATIONS_TABLE, TenantId};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use rand::rngs::StdRng;
@@ -3284,8 +3401,9 @@ mod tests {
 
     use super::{
         ExpressionScope, PplColumn, PplType, ROW_ORDINAL_COLUMN, aggregate_rows, bin_time, bucket_time,
-        build_describe_plan, coerce_timestamp_operands, drop_hidden_columns, hide_touched_sort_keys, lower_expression,
-        plan_fillnull, plan_ppl, project_source_columns, select_fields, union_branches,
+        build_describe_plan, coerce_fixed_binary_list, coerce_fixed_binary_operands, coerce_timestamp_operands,
+        drop_hidden_columns, hide_touched_sort_keys, lower_expression, plan_fillnull, plan_ppl, project_source_columns,
+        select_fields, union_branches,
     };
     use crate::opensearch::catalog::FieldType;
     use crate::opensearch::context::RequestContext;
@@ -3293,7 +3411,7 @@ mod tests {
     use crate::ppl::error::PplError;
     use crate::ppl::functions::{FunctionContext, lower_function_call};
     use crate::ppl::parse_ppl;
-    use crate::test_rows::{FINISH_REASONS, build_operation_row};
+    use crate::test_rows::{FINISH_REASONS, build_first_byte_id, build_operation_row};
     use crate::test_support::{SearchFixture, TestCell};
 
     const TENANT_A: &str = "tenant-a";
@@ -4178,5 +4296,264 @@ mod tests {
             read_names(&drop_hidden_columns(hidden_rows).expect("the drop plans")),
             vec!["body", "severity_text"]
         );
+    }
+
+    /// `trace_id` as `FixedSizeBinary(16)`, `span_id` as `FixedSizeBinary(8)` and a string column.
+    fn build_id_columns_schema() -> DFSchema {
+        DFSchema::try_from(Schema::new(vec![
+            Field::new(COL_TRACE_ID, DataType::FixedSizeBinary(16), false),
+            Field::new(COL_SPAN_ID, DataType::FixedSizeBinary(8), false),
+            Field::new(COL_BODY, DataType::Utf8, true),
+        ]))
+        .expect("schema")
+    }
+
+    #[test]
+    fn string_literals_fold_to_the_operands_fixed_width_on_either_side() {
+        let schema = build_id_columns_schema();
+        let trace_bytes = vec![0x7f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let folded_trace = lit(ScalarValue::FixedSizeBinary(16, Some(trace_bytes)));
+
+        let (left, right) =
+            coerce_fixed_binary_operands(col(COL_TRACE_ID), lit("7f000000000000000000000000000000"), &schema)
+                .expect("fold");
+        assert_eq!((left, right), (col(COL_TRACE_ID), folded_trace.clone()));
+
+        let (left, right) =
+            coerce_fixed_binary_operands(lit("7F000000000000000000000000000000"), col(COL_TRACE_ID), &schema)
+                .expect("fold");
+        assert_eq!((left, right), (folded_trace, col(COL_TRACE_ID)));
+
+        let (left, right) = coerce_fixed_binary_operands(col(COL_BODY), lit("7f"), &schema).expect("no fold");
+        assert_eq!((left, right), (col(COL_BODY), lit("7f")));
+
+        let items = coerce_fixed_binary_list(
+            &col(COL_SPAN_ID),
+            vec![lit("0100000000000000"), lit("ABCDEF0123456789")],
+            &schema,
+        )
+        .expect("fold the list");
+        assert_eq!(
+            items,
+            vec![
+                lit(ScalarValue::FixedSizeBinary(8, Some(vec![0x01, 0, 0, 0, 0, 0, 0, 0]))),
+                lit(ScalarValue::FixedSizeBinary(
+                    8,
+                    Some(vec![0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89])
+                )),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_invalid_or_wrong_width_id_literal_is_a_semantic_error_naming_column_and_literal() {
+        let schema = build_id_columns_schema();
+        for (column, literal, detail) in [
+            (
+                COL_TRACE_ID,
+                "zz000000000000000000000000000000",
+                "not an even-length hex string",
+            ),
+            (COL_TRACE_ID, "abc", "not an even-length hex string"),
+            (COL_TRACE_ID, "7f00", "expected 16 bytes, got 2"),
+            (
+                COL_SPAN_ID,
+                "7f000000000000000000000000000000",
+                "expected 8 bytes, got 16",
+            ),
+        ] {
+            let result = coerce_fixed_binary_operands(col(column), lit(literal), &schema);
+            assert!(
+                matches!(&result, Err(PplError::Semantic { reason })
+                    if reason.contains(column) && reason.contains(&format!("'{literal}'")) && reason.contains(detail)),
+                "{column} = '{literal}': {result:?}"
+            );
+        }
+        let listed_result = coerce_fixed_binary_list(
+            &col(COL_TRACE_ID),
+            vec![lit("01000000000000000000000000000000"), lit("xyz")],
+            &schema,
+        );
+        assert!(
+            matches!(&listed_result, Err(PplError::Semantic { reason }) if reason.contains(COL_TRACE_ID) && reason.contains("'xyz'")),
+            "{listed_result:?}"
+        );
+    }
+
+    #[test]
+    fn an_id_compared_with_a_value_of_another_type_is_refused_naming_the_id_and_both_types() {
+        let schema = build_id_columns_schema();
+        let trace_refusal = "comparing the id field [trace_id] (type string, 16 bytes written as hex) with a value of \
+                             type string is not supported; compare an id with another id or with a string literal \
+                             of hex digits";
+        let span_refusal = "comparing the id field [span_id] (type string, 8 bytes written as hex) with a value of \
+                            type bigint is not supported; compare an id with another id or with a string literal \
+                            of hex digits";
+        for (left, right, expected_reason) in [
+            (col(COL_TRACE_ID), col(COL_BODY), trace_refusal),
+            (lit(5_i64), col(COL_SPAN_ID), span_refusal),
+        ] {
+            let result = coerce_fixed_binary_operands(left, right, &schema);
+            assert_eq!(
+                result,
+                Err(PplError::Semantic {
+                    reason: expected_reason.to_string()
+                })
+            );
+        }
+        let listed_result =
+            coerce_fixed_binary_list(&col(COL_SPAN_ID), vec![lit("0100000000000000"), lit(5_i64)], &schema);
+        assert_eq!(
+            listed_result,
+            Err(PplError::Semantic {
+                reason: span_refusal.to_string()
+            })
+        );
+
+        let (left, right) =
+            coerce_fixed_binary_operands(col(COL_TRACE_ID), col(COL_SPAN_ID), &schema).expect("an id pair plans");
+        assert_eq!((left, right), (col(COL_TRACE_ID), col(COL_SPAN_ID)));
+    }
+
+    /// The tenant of the bloom-filter fixture. It writes one tenant only: a second tenant's file would add
+    /// row groups to the metric, and the integration tests pin tenant isolation of id literals.
+    const BLOOM_TENANT: &str = "tenant-bloom";
+
+    /// Rows per row group: the six fixture rows land in three row groups.
+    const ROWS_PER_ROW_GROUP: usize = 2;
+
+    /// Value of metric `name` on the `IcegateIcebergScan` line of an executed plan's display.
+    fn extract_iceberg_scan_metric(plan: &str, name: &str) -> String {
+        let scan_lines: Vec<&str> = plan.lines().filter(|line| line.contains("IcegateIcebergScan")).collect();
+        assert_eq!(scan_lines.len(), 1, "expected one Iceberg scan in {plan}");
+        let prefix = format!("{name}=");
+        let start = scan_lines[0]
+            .find(&prefix)
+            .unwrap_or_else(|| panic!("metric `{name}` missing from {}", scan_lines[0]))
+            + prefix.len();
+        let value = &scan_lines[0][start..];
+        let end = value.find([',', ']']).unwrap_or(value.len());
+        value[..end].to_string()
+    }
+
+    /// Row groups whose bloom filters prove a PPL id literal absent are skipped, and the rows returned are
+    /// exactly the matching ones. Every row group's min/max range contains `T5` and `T7`, so only the bloom
+    /// filter phase can drop them; the `3 total` of every expected metric proves all three reached it.
+    #[tokio::test]
+    async fn a_trace_id_literal_prunes_row_groups_by_bloom_filter() {
+        use datafusion::physical_plan::collect;
+        use datafusion::physical_plan::display::DisplayableExecutionPlan;
+        use icegate_common::iceberg_write::{CommonRecordBatchStream, WriteConfig, write_record_batches_to_parquet};
+        use icegate_common::schema::COL_TIMESTAMP;
+        use icegate_common::{CancellationToken, LOGS_TABLE, icegate_table_ident};
+
+        use crate::test_rows::{build_rows_batch, commit_written_files, select_write_config};
+        use crate::test_support::TestRow;
+
+        let fixture = SearchFixture::new().await;
+        let table = fixture
+            .catalog
+            .load_table(&icegate_table_ident(LOGS_TABLE))
+            .await
+            .expect("load logs");
+        let arrow_schema = fixture.read_arrow_schema(LOGS_TABLE).await;
+        // Row groups in write order: (T1,S1) (T9,S9) | (T2,S2) (T8,S8) | (T3,S3) (T7,S7). Timestamps rise in
+        // the same order, so the grouping holds whatever order within the file the writer keeps.
+        let ids: Vec<([u8; 16], [u8; 8])> = [1_u8, 9, 2, 8, 3, 7]
+            .into_iter()
+            .map(|first| (build_first_byte_id(first), build_first_byte_id(first)))
+            .collect();
+        let rows: Vec<TestRow<'_>> = ids
+            .iter()
+            .zip(0_i64..)
+            .map(|((trace_id, span_id), position)| TestRow {
+                tenant: BLOOM_TENANT,
+                cells: vec![
+                    (COL_TIMESTAMP, TestCell::Micros(NOON_MICROS + position)),
+                    (COL_TRACE_ID, TestCell::Bytes(trace_id)),
+                    (COL_SPAN_ID, TestCell::Bytes(span_id)),
+                ],
+            })
+            .collect();
+        let batches: CommonRecordBatchStream =
+            Box::pin(futures::stream::iter([Ok(
+                build_rows_batch(&arrow_schema, &rows).expect("fixture batch")
+            )]));
+        let config = WriteConfig {
+            row_group_size: ROWS_PER_ROW_GROUP,
+            ..select_write_config(LOGS_TABLE)
+        };
+        let written_files = write_record_batches_to_parquet(table.clone(), config, batches, &CancellationToken::new())
+            .await
+            .expect("parquet write");
+        commit_written_files(&fixture.catalog, &table, written_files.data_files)
+            .await
+            .expect("commit append");
+
+        let session = fixture.open_session(BLOOM_TENANT).await;
+        let request = RequestContext {
+            tenant: TenantId::new(BLOOM_TENANT).expect("tenant"),
+            now: build_fixed_now(),
+        };
+        let context = fixture.engine.create_session().await.expect("session");
+        for (condition, expected_span_ids, expected_pruning) in [
+            (
+                "trace_id = '07000000000000000000000000000000'",
+                vec![build_first_byte_id::<8>(7).to_vec()],
+                "3 total → 1 matched",
+            ),
+            (
+                "trace_id = '05000000000000000000000000000000'",
+                vec![],
+                "3 total → 0 matched",
+            ),
+            (
+                "trace_id in ('02000000000000000000000000000000', '07000000000000000000000000000000')",
+                vec![
+                    build_first_byte_id::<8>(2).to_vec(),
+                    build_first_byte_id::<8>(7).to_vec(),
+                ],
+                "3 total → 2 matched",
+            ),
+            // The row group holding `T7` is dropped by the `span_id` bloom filter: either column proving
+            // absence is enough.
+            (
+                "trace_id = '07000000000000000000000000000000' and span_id = '0500000000000000'",
+                vec![],
+                "3 total → 0 matched",
+            ),
+        ] {
+            let query = parse_ppl(&format!("source=logs | where {condition} | fields span_id")).expect("parse");
+            let ppl_plan = plan_ppl(&query, &session, &request, "bloom-cluster").await.expect("plan");
+            let physical_plan = context
+                .state()
+                .create_physical_plan(&ppl_plan.plan)
+                .await
+                .expect("physical plan");
+            let batches = collect(Arc::clone(&physical_plan), context.task_ctx()).await.expect("execute");
+            let mut span_ids: Vec<Vec<u8>> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch.column(0).as_fixed_size_binary();
+                    (0..column.len()).map(|row| column.value(row).to_vec()).collect::<Vec<_>>()
+                })
+                .collect();
+            span_ids.sort();
+            assert_eq!(span_ids, expected_span_ids, "rows of `{condition}`");
+
+            let executed_plan = DisplayableExecutionPlan::with_metrics(physical_plan.as_ref())
+                .indent(true)
+                .to_string();
+            assert_eq!(
+                extract_iceberg_scan_metric(&executed_plan, "row_groups_pruned_bloom_filter"),
+                expected_pruning,
+                "bloom filter pruning of `{condition}`"
+            );
+            assert_eq!(
+                extract_iceberg_scan_metric(&executed_plan, "bloom_filter_read_errors"),
+                "0",
+                "bloom filter read errors of `{condition}`"
+            );
+        }
     }
 }

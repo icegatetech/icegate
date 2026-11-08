@@ -4,6 +4,7 @@
 use datafusion::error::DataFusionError;
 use icegate_query_grammar::SyntaxError;
 
+use crate::engine::fixed_binary::FixedBinaryLiteralError;
 use crate::opensearch::error::{OpenSearchError, OpenSearchErrorKind};
 
 /// Why a PPL query cannot be answered.
@@ -145,6 +146,16 @@ impl From<DataFusionError> for PplError {
             _ => Self::Internal {
                 reason: error.strip_backtrace(),
             },
+        }
+    }
+}
+
+impl PplError {
+    /// The 400 for a string literal compared with a fixed-width id column that is not a value of that
+    /// column: not hex, or another number of bytes. It names the column and the literal as written.
+    pub(crate) fn invalid_id_literal(column: &str, literal: &str, error: &FixedBinaryLiteralError) -> Self {
+        Self::Semantic {
+            reason: format!("'{literal}' is not a valid {column}: {error}; write the id as hex, two digits per byte"),
         }
     }
 }
