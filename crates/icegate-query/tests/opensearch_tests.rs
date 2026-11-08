@@ -11,6 +11,7 @@
 //! - `discover`: Discover-style document table, histogram, single-document and context views
 //! - `fields`: `_field_caps`, `_mapping` and `_mapping/field`
 //! - `grafana_logs`: Grafana-logs-style `_msearch` logs query, logs volume and variables
+//! - `grafana_metrics`: metrics-editor-style aggregation and variable requests
 //! - `harness`: the listener over a temporary warehouse, and a reqwest client
 //! - `indices`: `_resolve/index` and `<index>/_settings`
 //! - `listener`: the listener's start-up
@@ -23,5 +24,6 @@
 //!   aggregations and unions
 //! - `system_indices`: index-level system-index endpoints and their tenant boundary
 //! - `system_store_rustfs`: the system-index store against RustFS through the production constructor
+//! - `visualize`: Visualize-style aggregation requests, one per acceptance type
 
 mod opensearch;

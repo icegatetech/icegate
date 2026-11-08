@@ -7,6 +7,7 @@ mod data;
 mod discover;
 mod fields;
 mod grafana_logs;
+mod grafana_metrics;
 mod harness;
 mod indices;
 mod listener;
@@ -20,3 +21,4 @@ mod system_indices;
 mod system_store_rustfs;
 #[path = "../../src/test_rows.rs"]
 mod test_rows;
+mod visualize;
