@@ -123,7 +123,8 @@ impl From<OpenSearchError> for PplError {
             | OpenSearchErrorKind::QueryShard
             | OpenSearchErrorKind::SearchContextMissing
             | OpenSearchErrorKind::ResultWindowTooLarge
-            | OpenSearchErrorKind::TooManyBuckets => Self::Internal {
+            | OpenSearchErrorKind::TooManyBuckets
+            | OpenSearchErrorKind::StatusNotFound => Self::Internal {
                 reason: error.reason().to_string(),
             },
         }
@@ -216,5 +217,11 @@ mod tests {
             let reason = error.reason().to_string();
             assert_eq!(PplError::from(error), PplError::Internal { reason });
         }
+    }
+
+    #[test]
+    fn a_status_not_found_error_becomes_a_ppl_internal_error() {
+        let error = PplError::from(OpenSearchError::status_not_found("no ML config [abc]"));
+        assert!(matches!(error, PplError::Internal { .. }), "{error:?}");
     }
 }

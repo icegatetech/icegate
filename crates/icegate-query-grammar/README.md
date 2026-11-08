@@ -133,3 +133,8 @@ visitor, which nothing uses, and holds the entry point. `rustfmt.toml` ignores t
 files of `src/ppl/`.
 
 Regeneration is byte-identical: running `gen` twice produces the same files.
+
+`icegate-query` builds its PPL grammar bundle (`opensearch/ppl/grammar_bundle.rs`) from
+`OpenSearchPPLLexer.interp` and `OpenSearchPPLParser.interp`, so regenerating them changes the
+bundle; re-vendoring re-checks that module's `ignoredTokens`, `rulesToVisit` and token-dictionary
+lists against the new tag.

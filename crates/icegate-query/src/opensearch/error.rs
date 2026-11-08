@@ -83,6 +83,8 @@ pub(crate) enum OpenSearchErrorKind {
         /// The per-query memory limit in bytes.
         limit_bytes: usize,
     },
+    /// A plugin resource IceGate does not hold, such as an ML config (404 `status_exception`).
+    StatusNotFound,
 }
 
 /// An error answered in the `OpenSearch` envelope.
@@ -450,6 +452,16 @@ impl OpenSearchError {
             OpenSearchErrorKind::AggregationExecution,
             StatusCode::BAD_REQUEST,
             "aggregation_execution_exception",
+            reason,
+        )
+    }
+
+    /// 404 `status_exception`: a plugin resource IceGate does not hold, such as an ML config.
+    pub(crate) fn status_not_found(reason: impl Into<String>) -> Self {
+        Self::new(
+            OpenSearchErrorKind::StatusNotFound,
+            StatusCode::NOT_FOUND,
+            "status_exception",
             reason,
         )
     }
@@ -1079,6 +1091,7 @@ mod tests {
             OpenSearchErrorKind::TooManyBuckets => 17,
             OpenSearchErrorKind::AggregationExecution => 18,
             OpenSearchErrorKind::MemoryLimitExceeded { .. } => 19,
+            OpenSearchErrorKind::StatusNotFound => 20,
         }
     }
 
@@ -1148,8 +1161,12 @@ mod tests {
                 OpenSearchError::aggregation_execution("x"),
                 OpenSearchErrorKind::AggregationExecution,
             ),
+            (
+                OpenSearchError::status_not_found("x"),
+                OpenSearchErrorKind::StatusNotFound,
+            ),
         ];
-        let mut positions: Vec<usize> = Vec::with_capacity(20);
+        let mut positions: Vec<usize> = Vec::with_capacity(21);
         for (error, kind) in &unit_cases {
             assert_eq!(error.kind(), kind, "error {error:?}");
             positions.push(find_kind_position(kind));
@@ -1170,7 +1187,18 @@ mod tests {
         positions.push(find_kind_position(memory_limit.kind()));
         // Every kind is covered exactly once.
         positions.sort_unstable();
-        assert_eq!(positions, (0..20).collect::<Vec<_>>());
+        assert_eq!(positions, (0..21).collect::<Vec<_>>());
         assert_eq!(OpenSearchError::illegal_argument("bad index").reason(), "bad index");
+    }
+
+    #[tokio::test]
+    async fn status_not_found_renders_a_404_status_exception() {
+        let (status, body) = render_envelope(OpenSearchError::status_not_found("no ML config [abc]")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["status"], 404);
+        assert_eq!(body["error"]["type"], "status_exception");
+        assert_eq!(body["error"]["reason"], "no ML config [abc]");
+        assert_eq!(body["error"]["root_cause"][0]["type"], "status_exception");
+        assert_eq!(body["error"]["root_cause"][0]["reason"], "no ML config [abc]");
     }
 }

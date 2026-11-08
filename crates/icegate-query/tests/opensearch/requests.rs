@@ -1,5 +1,5 @@
-//! Request helpers shared by the system-index and data-index test modules: one JSON request, one
-//! NDJSON request, each answering its status and parsed body, and the result type a test returns.
+//! Request helpers shared by the test modules: one JSON request, one request with a verbatim body,
+//! one NDJSON request, each answering its status and parsed body, and the result type a test returns.
 
 use std::error::Error;
 
@@ -24,7 +24,27 @@ pub async fn send_request(
         Some(body) => request.json(body),
         None => request,
     };
-    let response = request.send().await?;
+    read_answer(request.send().await?).await
+}
+
+/// Send `body` verbatim with an `application/json` content type, whether or not it is valid JSON,
+/// and return the status and the parsed answer (`null` when empty).
+pub async fn send_raw_request(
+    server: &TestServer,
+    method: Method,
+    tenant: &str,
+    path: &str,
+    body: &'static str,
+) -> Result<(StatusCode, Value), Box<dyn Error>> {
+    let request = server
+        .request(method, Some(tenant), path)
+        .header("content-type", "application/json")
+        .body(body);
+    read_answer(request.send().await?).await
+}
+
+/// The status of `response` and its body parsed as JSON (`null` when empty).
+async fn read_answer(response: reqwest::Response) -> Result<(StatusCode, Value), Box<dyn Error>> {
     let status = response.status();
     let bytes = response.bytes().await?;
     let answer = if bytes.is_empty() {

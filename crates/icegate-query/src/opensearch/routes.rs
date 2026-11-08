@@ -17,7 +17,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Extension, Router};
 use icegate_common::{ShedPolicy, shed_when_pressured};
 
-use super::cluster::{cat, datasources, health, info, resolve, settings};
+use super::cluster::{cat, cluster_settings, datasources, health, info, observability, resolve, settings};
 use super::config::OpenSearchConfig;
 use super::error::OpenSearchError;
 use super::fields;
@@ -65,10 +65,16 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
         .route("/", get(info::describe_cluster))
         .route("/_nodes", get(info::list_nodes))
         .route("/_cluster/health", get(health::report_cluster_health))
+        .route("/_cluster/settings", get(cluster_settings::read_cluster_settings))
         .route(
             "/_plugins/_query/_datasources",
             get(datasources::list_query_datasources),
         )
+        .route(
+            "/_plugins/_observability/object",
+            get(observability::list_observability_objects),
+        )
+        .route("/_plugins/_ml/config/{id}", get(observability::read_ml_config))
         .route("/_cat/indices", get(cat::list_cat_indices))
         // The trailing-slash form names no index and answers like `/_cat/indices`. It is routed
         // here alone: no router-wide trailing-slash rule makes any other route answer one.
@@ -126,6 +132,8 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
             post(ppl::execute_ppl_query).layer(Extension(config.ppl.clone())),
         )
         .route("/_plugins/_ppl/_explain", post(ppl::explain_ppl_query))
+        .route("/_plugins/_ppl/_grammar", get(ppl::serve_ppl_grammar))
+        .route("/_plugins/_sql", post(ppl::show_tables))
         .route("/{index}/_msearch", post(search::run_multi_search_on_index))
         .route(
             "/_search/scroll",

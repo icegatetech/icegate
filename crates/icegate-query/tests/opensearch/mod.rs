@@ -13,6 +13,7 @@ mod indices;
 mod listener;
 mod msearch;
 mod ppl;
+mod ppl_endpoints;
 mod ppl_formats;
 mod requests;
 mod rustfs_conditional;
