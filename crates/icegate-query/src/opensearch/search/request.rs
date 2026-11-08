@@ -158,7 +158,7 @@ pub(crate) enum TrackTotalHits {
 }
 
 /// Query-string parameters of `_search`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SearchParameters {
     /// Overrides the body's `size`.
@@ -219,6 +219,26 @@ pub(crate) fn parse_search_request(
         .into_iter()
         .map(|(key, value)| (key, Cow::Owned(value)));
     parse_search_entries(entries, parameters)
+}
+
+/// Parse the members of a search body together with its query-string parameters. A `top_hits`
+/// aggregation parses its own members through it, so they read exactly as `_search` reads them.
+///
+/// # Errors
+///
+/// `parsing_exception` for an unknown member, a member of the wrong type, or a `sort` of more
+/// than [`MAX_SORT_CLAUSES`] clauses; the errors of [`parse_query`]; `illegal_argument_exception`
+/// for a non-empty `script_fields`, an unsupported date format in `fields` or `docvalue_fields`,
+/// an integer `track_total_hits` together with `rest_total_hits_as_int=true` (see
+/// [`resolve_track_total_hits`]), or a malformed `track_total_hits` parameter.
+pub(super) fn parse_search_object(
+    object: Map<String, Value>,
+    parameters: &SearchParameters,
+) -> Result<SearchRequest, OpenSearchError> {
+    parse_search_entries(
+        object.into_iter().map(|(key, value)| (key, Cow::Owned(value))),
+        parameters,
+    )
 }
 
 /// Parse a search body already read as JSON (`null` means `{}`) together with its query-string

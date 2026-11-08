@@ -60,6 +60,7 @@ use super::percentiles::{
 };
 use super::render::render_aggregations;
 use super::terms::{TermsOrder, TermsSpec, build_filter_predicate, build_key_literal};
+use super::top_hits::{TopHitsResults, TopHitsSpec, collect_top_hits};
 use crate::opensearch::catalog::{FieldType, FieldValue, IndexEntry, ResolvedField, TenantSession};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::MICROS_PER_MILLISECOND;
@@ -100,10 +101,22 @@ pub(super) fn name_bucket_filter_column(ordinal: usize) -> String {
     format!("__bucket_filter_{ordinal}")
 }
 
+/// The prefix of the rows-plan columns that carry the searched index's table columns for a
+/// `top_hits`.
+pub(super) const HIT_COLUMN_PREFIX: &str = "__hit_";
+
+/// The rows-plan column carrying the table column `column` for a `top_hits`.
+pub(super) fn name_hit_column(column: &str) -> String {
+    format!("{HIT_COLUMN_PREFIX}{column}")
+}
+
 /// What executing aggregations needs from the request.
 pub(crate) struct AggregationScope<'a> {
     /// The tenant session the plans execute in.
     pub(crate) session: &'a TenantSession,
+    /// The searched indices, in request order: a `top_hits` renders its hits as `_search` hits
+    /// of the one index it reads.
+    pub(crate) entries: &'a [&'a IndexEntry],
     /// The most buckets the request may answer, every level of every aggregation counted.
     pub(crate) max_buckets: usize,
     /// The request's `now`, taken once per request, which `date_range` bounds resolve
@@ -118,6 +131,8 @@ pub(super) enum LayoutNode {
     Bucket(usize),
     /// A metric aggregation, by metric index.
     Metric(usize),
+    /// A `top_hits` aggregation, by its index in [`AggregationLayout::top_hits`].
+    TopHits(usize),
 }
 
 /// The buckets one grouping set computes.
@@ -230,6 +245,16 @@ pub(super) struct MetricSlot<'a> {
     pub(super) granularity: Granularity,
 }
 
+/// A `top_hits` aggregation of the request and the buckets it lists hits for.
+pub(super) struct TopHitsSlot<'a> {
+    /// The aggregation's request name.
+    pub(super) name: &'a str,
+    /// The request.
+    pub(super) spec: &'a TopHitsSpec,
+    /// The granularity whose buckets it lists hits for.
+    pub(super) granularity: Granularity,
+}
+
 /// The request's aggregations in preorder: a parent level precedes its children.
 pub(super) struct AggregationLayout<'a> {
     /// The top-level aggregations, in request order.
@@ -238,6 +263,8 @@ pub(super) struct AggregationLayout<'a> {
     pub(super) levels: Vec<BucketLevel<'a>>,
     /// Every metric aggregation, by metric index.
     pub(super) metrics: Vec<MetricSlot<'a>>,
+    /// Every `top_hits` aggregation, by its index.
+    pub(super) top_hits: Vec<TopHitsSlot<'a>>,
     /// The query of every `filter` and `filters` bucket, in preorder; the position of a query is
     /// the ordinal of its column in the rows plan ([`name_bucket_filter_column`]).
     pub(super) bucket_queries: Vec<&'a Query>,
@@ -251,7 +278,7 @@ impl<'a> AggregationLayout<'a> {
     ///
     /// # Errors
     ///
-    /// `400 parsing_exception` for a metric with sub-aggregations; `400
+    /// `400 parsing_exception` for a metric or a `top_hits` with sub-aggregations; `400
     /// aggregation_execution_exception` for an order path naming no metric sub-aggregation of
     /// its level, or no statistic of that metric; `400 illegal_argument_exception` for more than
     /// `MAX_BUCKET_LEVELS` bucket aggregations in the request (naming the top-level aggregation
@@ -263,6 +290,7 @@ impl<'a> AggregationLayout<'a> {
             top: Vec::with_capacity(tree.aggregations.len()),
             levels: Vec::new(),
             metrics: Vec::new(),
+            top_hits: Vec::new(),
             bucket_queries: Vec::new(),
             now,
         };
@@ -333,6 +361,10 @@ impl<'a> AggregationLayout<'a> {
             AggregationKind::PercentileRanks(spec) => {
                 self.add_metric(aggregation, MetricKind::PercentileRanks, &spec.metric, ancestors)
             }
+            AggregationKind::ExtendedStats(spec) => {
+                self.add_metric(aggregation, MetricKind::ExtendedStats, &spec.metric, ancestors)
+            }
+            AggregationKind::TopHits(spec) => self.add_top_hits(aggregation, spec, ancestors),
         }
     }
 
@@ -401,22 +433,36 @@ impl<'a> AggregationLayout<'a> {
         spec: &'a MetricSpec,
         ancestors: &[usize],
     ) -> Result<LayoutNode, OpenSearchError> {
-        if !aggregation.children.is_empty() {
-            return Err(OpenSearchError::parsing(format!(
-                "aggregation [{}] of type [{}] cannot accept sub-aggregations",
-                aggregation.name,
-                kind.read_type_name()
-            )));
-        }
-        let granularity = ancestors.last().map_or(Granularity::Top, |&level| Granularity::Level(level));
+        refuse_sub_aggregations(aggregation, kind.read_type_name())?;
         self.metrics.push(MetricSlot {
             name: &aggregation.name,
             kind,
             spec,
             aggregation: &aggregation.kind,
-            granularity,
+            granularity: find_leaf_granularity(ancestors),
         });
         Ok(LayoutNode::Metric(self.metrics.len() - 1))
+    }
+
+    /// Add the `top_hits` aggregation `aggregation`, listing hits for the buckets of the
+    /// innermost of `ancestors`, or for every matching row at the top without one.
+    ///
+    /// # Errors
+    ///
+    /// `400 parsing_exception` when `aggregation` has sub-aggregations.
+    fn add_top_hits(
+        &mut self,
+        aggregation: &'a NamedAggregation,
+        spec: &'a TopHitsSpec,
+        ancestors: &[usize],
+    ) -> Result<LayoutNode, OpenSearchError> {
+        refuse_sub_aggregations(aggregation, "top_hits")?;
+        self.top_hits.push(TopHitsSlot {
+            name: &aggregation.name,
+            spec,
+            granularity: find_leaf_granularity(ancestors),
+        });
+        Ok(LayoutNode::TopHits(self.top_hits.len() - 1))
     }
 
     /// The metric each criterion of a `terms` level's order reads, among the level's direct
@@ -442,7 +488,7 @@ impl<'a> AggregationLayout<'a> {
                         .iter()
                         .find_map(|child| match *child {
                             LayoutNode::Metric(metric) if self.metrics[metric].name == path.aggregation => Some(metric),
-                            LayoutNode::Metric(_) | LayoutNode::Bucket(_) => None,
+                            LayoutNode::Metric(_) | LayoutNode::Bucket(_) | LayoutNode::TopHits(_) => None,
                         })
                         .ok_or_else(|| {
                             OpenSearchError::aggregation_execution(&format!(
@@ -480,6 +526,27 @@ impl<'a> AggregationLayout<'a> {
             })
             .collect()
     }
+}
+
+/// The granularity a leaf aggregation (a metric or a `top_hits`) under the levels `ancestors` is
+/// computed at: its parent level's buckets, or the top.
+fn find_leaf_granularity(ancestors: &[usize]) -> Granularity {
+    ancestors.last().map_or(Granularity::Top, |&level| Granularity::Level(level))
+}
+
+/// Refuse sub-aggregations under the leaf aggregation `aggregation` of type `type_name`.
+///
+/// # Errors
+///
+/// `400 parsing_exception` naming the aggregation and its type when it has one.
+fn refuse_sub_aggregations(aggregation: &NamedAggregation, type_name: &str) -> Result<(), OpenSearchError> {
+    if aggregation.children.is_empty() {
+        return Ok(());
+    }
+    Err(OpenSearchError::parsing(format!(
+        "aggregation [{}] of type [{type_name}] cannot accept sub-aggregations",
+        aggregation.name
+    )))
 }
 
 /// A rows-plan column an aggregation reads.
@@ -722,11 +789,14 @@ pub(super) fn plan_aggregations(
             granularity,
         );
     }
-    // A `cardinality` computes no stage statistic, so it alone opens no top-level member.
+    // A `cardinality` computes no stage statistic, so it alone opens no top-level member. A
+    // top-level metric reads the top stage's statistics, a top-level `top_hits` its document
+    // count.
     if layout
         .metrics
         .iter()
         .any(|slot| slot.granularity == Granularity::Top && !slot.kind.list_statistics().is_empty())
+        || layout.top_hits.iter().any(|slot| slot.granularity == Granularity::Top)
     {
         add_stage_member(&mut stages, Vec::new(), Granularity::Top);
     }
@@ -1011,7 +1081,9 @@ pub(super) fn compute_level_mask(grouped_levels: &[usize], path: &[usize]) -> Re
 /// aggregations are computed by at most one stage aggregate without an unnest, plus one per
 /// distinct chain of levels whose buckets overlap, plus one distinct-count branch per granularity
 /// holding a `cardinality` ([`plan_aggregations`]); every plan runs in `scope.session`, so the
-/// plans share its memory pool and its limit.
+/// plans share its memory pool and its limit. A `top_hits` runs after assembly, over the buckets
+/// the response renders ([`collect_top_hits`]); `rows` then also carries the searched index's
+/// table columns.
 ///
 /// # Errors
 ///
@@ -1019,7 +1091,7 @@ pub(super) fn compute_level_mask(grouped_levels: &[usize], path: &[usize]) -> Re
 /// `400 too_many_buckets_exception` past `scope.max_buckets`; `400 illegal_argument_exception`
 /// naming a `histogram` whose bucket index for a value or a bound lies past the `i64` range;
 /// the session's execution errors,
-/// the memory limit among them; `500` when planning fails.
+/// the memory limit among them; the errors of [`collect_top_hits`]; `500` when planning fails.
 pub(crate) async fn execute_aggregations(
     rows: LogicalPlan,
     tree: &AggregationTree,
@@ -1027,6 +1099,9 @@ pub(crate) async fn execute_aggregations(
 ) -> Result<Map<String, Value>, OpenSearchError> {
     let layout = AggregationLayout::new(tree, scope.now)?;
     let inputs = resolve_plan_inputs(&layout, rows.schema())?;
+    // Only a tree holding a `top_hits` reads the matching rows again, after assembly. Cloning a
+    // plan copies its root node; its inputs are shared.
+    let hit_rows = (!layout.top_hits.is_empty()).then(|| rows.clone());
     let plans = plan_aggregations(rows, &layout, &inputs)?;
     let session = scope.session;
     let stage_outputs = try_join_all(plans.stages.into_iter().map(
@@ -1053,7 +1128,11 @@ pub(crate) async fn execute_aggregations(
     ));
     let (outputs, distinct_outputs) = futures::try_join!(stage_outputs, distinct_outputs)?;
     let assembled = assemble_aggregations(&layout, outputs, &distinct_outputs, scope.max_buckets)?;
-    render_aggregations(&layout, &inputs, &assembled)
+    let top_hits_results = match hit_rows {
+        Some(hit_rows) => collect_top_hits(&hit_rows, &layout, &inputs, &assembled, scope).await?,
+        None => TopHitsResults::default(),
+    };
+    render_aggregations(&layout, &inputs, &assembled, top_hits_results)
 }
 
 /// One field the aggregations read, resolved in every searched index.
@@ -1075,7 +1154,10 @@ struct AggregationField {
 /// ([`name_bucket_filter_column`]): the bucket query lowered for that index, `false` where it
 /// does not match, so a field the index does not map matches nothing there. The branches are
 /// concatenated with `UNION ALL`; because every branch already has the same column types, no
-/// union coercion takes place. With no index the plan is empty.
+/// union coercion takes place. With no index the plan is empty. A tree holding a `top_hits`
+/// reads one index: each row then also carries every table column of that index under
+/// [`name_hit_column`], and a search of several indices is a `400 illegal_argument_exception`
+/// naming the aggregation under `aggregation`.
 ///
 /// # Errors
 ///
@@ -1093,6 +1175,19 @@ pub(crate) fn plan_aggregation_rows(
     tree: &AggregationTree,
 ) -> Result<LogicalPlan, OpenSearchError> {
     let layout = AggregationLayout::new(tree, now)?;
+    if let Some(slot) = layout.top_hits.first()
+        && entries.len() > 1
+    {
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name()).collect();
+        return Err(OpenSearchError::unsupported_aggregation(
+            slot.name,
+            format!(
+                "[top_hits] [{}] reads one index, and this search reaches [{}]",
+                slot.name,
+                names.join(", ")
+            ),
+        ));
+    }
     let fields = resolve_aggregation_fields(session, entries, tree)?;
     let mut branches = Vec::with_capacity(entries.len());
     for (position, &entry) in entries.iter().enumerate() {
@@ -1106,8 +1201,15 @@ pub(crate) fn plan_aggregation_rows(
             let bucket_match = lower_query(bucket_query, &scope)?;
             projection.push(coalesce(vec![bucket_match, lit(false)]).alias(name_bucket_filter_column(ordinal)));
         }
-        let branch = session
-            .scan_index(entry)?
+        let scan = session.scan_index(entry)?;
+        if !layout.top_hits.is_empty() {
+            // Every table column a hit renders, under a name no aggregated field takes.
+            projection.extend(scan.schema().columns().into_iter().map(|column| {
+                let name = name_hit_column(column.name());
+                Expr::Column(column).alias(name)
+            }));
+        }
+        let branch = scan
             .filter(predicate)
             .and_then(|builder| builder.project(projection))
             .and_then(LogicalPlanBuilder::build)
@@ -1178,7 +1280,7 @@ fn list_aggregations(tree: &AggregationTree) -> Vec<&NamedAggregation> {
 /// numbers (`histogram`, `range`; `avg`, `sum`, `min`, `max`, `stats`, `percentiles` and
 /// `percentile_ranks` also booleans and dates), a `date_histogram` and a `date_range` dates, a
 /// `terms`, a `value_count` and a `cardinality` anything but text and objects; `filter` and
-/// `filters` read no field.
+/// `filters` read no field. `extended_stats` reads numbers only.
 fn check_field_for_aggregation(
     aggregation: &NamedAggregation,
     field_name: &str,
@@ -1232,6 +1334,7 @@ fn check_field_for_aggregation(
         AggregationKind::Stats(_) if !is_metric_input => refuse("stats"),
         AggregationKind::Percentiles(_) if !is_metric_input => refuse("percentiles"),
         AggregationKind::PercentileRanks(_) if !is_metric_input => refuse("percentile_ranks"),
+        AggregationKind::ExtendedStats(_) if !is_number => refuse("extended_stats"),
         AggregationKind::ValueCount(_) if is_text_or_object => refuse("value_count"),
         AggregationKind::Cardinality(_) if is_text_or_object => refuse("cardinality"),
         AggregationKind::DateHistogram(_)
@@ -1249,7 +1352,9 @@ fn check_field_for_aggregation(
         | AggregationKind::Range(_)
         | AggregationKind::DateRange(_)
         | AggregationKind::Filters(_)
-        | AggregationKind::Filter(_) => Ok(()),
+        | AggregationKind::Filter(_)
+        | AggregationKind::ExtendedStats(_)
+        | AggregationKind::TopHits(_) => Ok(()),
     }
 }
 
@@ -1301,8 +1406,9 @@ fn choose_row_data_type(aggregation: &NamedAggregation, resolved: &[Option<Resol
         | AggregationKind::Max(_)
         | AggregationKind::Stats(_)
         | AggregationKind::Percentiles(_)
-        | AggregationKind::PercentileRanks(_) => DataType::Float64,
-        AggregationKind::Filters(_) | AggregationKind::Filter(_) => return None,
+        | AggregationKind::PercentileRanks(_)
+        | AggregationKind::ExtendedStats(_) => DataType::Float64,
+        AggregationKind::Filters(_) | AggregationKind::Filter(_) | AggregationKind::TopHits(_) => return None,
     };
     Some(resolved.iter().flatten().find_map(map_field_data_type).unwrap_or(fallback))
 }
@@ -1401,6 +1507,7 @@ mod tests {
         let session = fixture.open_session("tenant-a").await;
         let scope = AggregationScope {
             session: &session,
+            entries: &[],
             max_buckets,
             now: read_request_now(),
         };
@@ -1509,6 +1616,7 @@ mod tests {
         let rows = plan_aggregation_rows(&session, &[entry], &query, now, &tree).expect("the rows plan");
         let scope = AggregationScope {
             session: &session,
+            entries: &[entry],
             max_buckets: read_default_max_buckets(),
             now,
         };
@@ -2451,6 +2559,7 @@ mod tests {
         let rows = plan_aggregation_rows(&session, &[entry], &query, now, &tree).expect("the rows plan");
         let scope = AggregationScope {
             session: &session,
+            entries: &[entry],
             max_buckets: read_default_max_buckets(),
             now,
         };
@@ -2591,6 +2700,7 @@ mod tests {
         let session = fixture.open_session("tenant-a").await;
         let scope = AggregationScope {
             session: &session,
+            entries: &[],
             max_buckets: read_default_max_buckets(),
             now: read_request_now(),
         };
@@ -4730,5 +4840,120 @@ mod bucket_tree_tests {
                 .expect("walk the plan");
         }
         assert_eq!(digest_count, 2);
+    }
+
+    #[tokio::test]
+    async fn extended_stats_under_terms_answer_the_hand_computed_moments_per_bucket() {
+        // api: 100, 200, 300, 600 (the hand computation of the metrics.rs unit test);
+        // web: one row without a duration, so its statistics are empty.
+        let rows = [
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), Some(100), None),
+            build_test_row(AT_10_40, Some("api"), Some("INFO"), Some(200), None),
+            build_test_row(AT_11_10, Some("api"), Some("INFO"), Some(300), None),
+            build_test_row(AT_11_30, Some("api"), Some("INFO"), Some(600), None),
+            build_test_row(AT_11_30, Some("web"), Some("ERROR"), None, None),
+        ];
+        let aggregations = run_aggregations(
+            &rows,
+            json!({"services": {
+                "terms": {"field": "service_name", "order": {"_key": "asc"}},
+                "aggs": {"1": {"extended_stats": {"field": "duration_micros", "sigma": 2}}}
+            }}),
+        )
+        .await
+        .expect("aggregate the rows");
+        let api = &aggregations["services"]["buckets"][0]["1"];
+        assert_eq!(api["count"], json!(4));
+        assert_eq!(api["avg"], json!(300.0));
+        assert_eq!(api["sum_of_squares"], json!(500_000.0));
+        assert_eq!(api["variance_population"], json!(35_000.0));
+        assert_eq!(api["variance_sampling"], json!(46_666.666_666_666_664));
+        assert_eq!(api["std_deviation_bounds"]["upper"], json!(674.165_738_677_394_1));
+        assert_eq!(
+            api["std_deviation_bounds"]["lower_sampling"],
+            json!(-132.049_379_893_857_35)
+        );
+        let web = &aggregations["services"]["buckets"][1]["1"];
+        assert_eq!(web["count"], json!(0));
+        assert_eq!(web["sum"], json!(0.0));
+        assert_eq!(web["avg"], json!(null));
+        assert_eq!(web["std_deviation_bounds"]["upper"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn terms_ordered_by_an_extended_stats_statistic_rank_by_it() {
+        // api: 20 four times (max 20, sum 80, sum of squares 1600); web: 35 twice (max 35, sum
+        // 70, sum of squares 2450); db: 45 (max 45, sum 45, sum of squares 2025). Each of the
+        // three statistics ranks the services in a different order, so reading one statistic's
+        // column for another fails.
+        let rows = [
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), Some(20), None),
+            build_test_row(AT_10_15_30_123456, Some("api"), Some("INFO"), Some(20), None),
+            build_test_row(AT_10_40, Some("api"), Some("INFO"), Some(20), None),
+            build_test_row(AT_11_10, Some("api"), Some("INFO"), Some(20), None),
+            build_test_row(AT_10_40, Some("web"), Some("INFO"), Some(35), None),
+            build_test_row(AT_11_10, Some("web"), Some("INFO"), Some(35), None),
+            build_test_row(AT_10_05_00_000999, Some("db"), Some("INFO"), Some(45), None),
+        ];
+        for (order, expected_keys) in [
+            ("1.max", vec![json!("db"), json!("web"), json!("api")]),
+            ("1.sum", vec![json!("api"), json!("web"), json!("db")]),
+            ("1.sum_of_squares", vec![json!("web"), json!("db"), json!("api")]),
+        ] {
+            let aggregations = run_aggregations(
+                &rows,
+                json!({"services": {
+                    "terms": {"field": "service_name", "order": {order: "desc"}},
+                    "aggs": {"1": {"extended_stats": {"field": "duration_micros"}}}
+                }}),
+            )
+            .await
+            .expect("aggregate the rows");
+            assert_eq!(list_bucket_keys(&aggregations["services"]), expected_keys, "{order}");
+        }
+    }
+
+    #[tokio::test]
+    async fn terms_ordered_by_a_derived_extended_stats_statistic_is_an_aggregation_execution_exception() {
+        let rows = [build_test_row(AT_10_40, Some("web"), Some("INFO"), Some(900), None)];
+        let error = run_aggregations(
+            &rows,
+            json!({"services": {
+                "terms": {"field": "service_name", "order": {"1.std_deviation": "desc"}},
+                "aggs": {"1": {"extended_stats": {"field": "duration_micros"}}}
+            }}),
+        )
+        .await
+        .expect_err("std_deviation cannot order");
+        render_refusal(error, "aggregation_execution_exception").await;
+    }
+
+    #[tokio::test]
+    async fn a_top_hits_with_sub_aggregations_is_a_parsing_exception() {
+        let error = run_aggregations(
+            &build_hourly_rows(),
+            json!({"latest": {
+                "top_hits": {},
+                "aggs": {"longest": {"max": {"field": "duration_micros"}}}
+            }}),
+        )
+        .await
+        .expect_err("a top_hits takes no sub-aggregations");
+        render_refusal(error, "parsing_exception").await;
+    }
+
+    #[tokio::test]
+    async fn a_terms_ordered_by_a_top_hits_is_an_aggregation_execution_exception() {
+        // A `top_hits` computes no value a bucket could rank by.
+        let error = run_aggregations(
+            &build_hourly_rows(),
+            json!({"services": {
+                "terms": {"field": "service_name", "order": {"1": "desc"}},
+                "aggs": {"1": {"top_hits": {}}}
+            }}),
+        )
+        .await
+        .expect_err("a top_hits cannot order");
+        render_refusal(error, "aggregation_execution_exception").await;
     }
 }

@@ -51,13 +51,12 @@ pub(crate) fn render_search_response(
     hits: &[SearchHit<'_>],
     request: &SearchRequest,
 ) -> Result<Value, OpenSearchError> {
-    let is_scored = request.sort.iter().all(|clause| matches!(clause, SortClause::Score { .. }));
-    let score = if is_scored { json!(1.0) } else { Value::Null };
-    let rendered_hits = hits
-        .iter()
-        .map(|hit| render_hit(hit, &score, request))
-        .collect::<Result<Vec<_>, _>>()?;
-    let max_score = if rendered_hits.is_empty() { Value::Null } else { score };
+    let rendered_hits = render_hits(hits, request)?;
+    let max_score = if rendered_hits.is_empty() {
+        Value::Null
+    } else {
+        choose_hit_score(request)
+    };
     let mut hits_object = Map::new();
     if let Some(total) = render_total_hits(total, request.rest_total_hits_as_int) {
         hits_object.insert("total".to_string(), total);
@@ -79,6 +78,24 @@ pub(crate) fn render_search_response(
     );
     response.insert("hits".to_string(), Value::Object(hits_object));
     Ok(Value::Object(response))
+}
+
+/// `hits` rendered in their order, each scored by [`choose_hit_score`].
+///
+/// # Errors
+///
+/// Returns `500` when a row holds a value no JSON rendering exists for.
+pub(super) fn render_hits(hits: &[SearchHit<'_>], request: &SearchRequest) -> Result<Vec<Value>, OpenSearchError> {
+    let score = choose_hit_score(request);
+    hits.iter().map(|hit| render_hit(hit, &score, request)).collect()
+}
+
+/// The `_score` of every hit of `request`, which is also the `max_score` of a page that has a
+/// hit: `1.0` when the request sorts on `_score` alone or not at all (every row scores alike),
+/// `null` under any other sort clause.
+pub(super) fn choose_hit_score(request: &SearchRequest) -> Value {
+    let is_scored = request.sort.iter().all(|clause| matches!(clause, SortClause::Score { .. }));
+    if is_scored { json!(1.0) } else { Value::Null }
 }
 
 /// One hit object: `_index`, `_id`, `_version` (with `version`), `_score` (`score`), `_source`

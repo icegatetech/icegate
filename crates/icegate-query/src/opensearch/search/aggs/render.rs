@@ -10,7 +10,10 @@
 //! by key when `keyed`), a `date_range` with its key and its bounds as epoch milliseconds and
 //! strings, named `filters` as an object keyed by name and anonymous ones as an array of bucket
 //! bodies, a `filter` as its single bucket's body. A sub-aggregation answers inside each bucket
-//! under its own name; a metric answers as `render_metric` writes it.
+//! under its own name; a metric answers as `render_metric` writes it, and a `top_hits` as
+//! `render_top_hits` writes it.
+
+use std::cell::RefCell;
 
 use serde_json::{Map, Number, Value, json};
 
@@ -19,10 +22,12 @@ use super::date_histogram::render_key_as_string;
 use super::metrics::render_metric;
 use super::multi_bucket::{FiltersBuckets, render_date_range_bounds, render_range_bounds};
 use super::plan::{AggregationLayout, BucketLevel, LayoutNode, LevelKind, PlanInputs};
+use super::top_hits::{TopHitsResults, render_top_hits};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::MICROS_PER_MILLISECOND;
 
-/// Render every top-level aggregation of `layout`.
+/// Render every top-level aggregation of `layout`. `top_hits_results` holds the hits of every
+/// `top_hits`; each bucket's hits move out as the bucket renders.
 ///
 /// # Errors
 ///
@@ -31,12 +36,14 @@ pub(super) fn render_aggregations(
     layout: &AggregationLayout<'_>,
     inputs: &PlanInputs,
     assembled: &AssembledAggregations,
+    top_hits_results: TopHitsResults,
 ) -> Result<Map<String, Value>, OpenSearchError> {
     let renderer = Renderer {
         layout,
         inputs,
         assembled,
         reader: assembled.create_reader(),
+        top_hits_results: RefCell::new(top_hits_results),
     };
     let mut aggregations = Map::new();
     for &node in &layout.top {
@@ -53,6 +60,9 @@ struct Renderer<'r, 'l> {
     inputs: &'r PlanInputs,
     assembled: &'r AssembledAggregations,
     reader: AggregateReader<'r>,
+    /// The hits of every `top_hits`, moved out bucket by bucket while rendering (`render_node`
+    /// takes `&self`).
+    top_hits_results: RefCell<TopHitsResults>,
 }
 
 impl Renderer<'_, '_> {
@@ -81,6 +91,12 @@ impl Renderer<'_, '_> {
                 self.layout.levels[level].name.to_string(),
                 self.render_level(level, bucket_path)?,
             )),
+            LayoutNode::TopHits(top_hits_index) => {
+                let slot = &self.layout.top_hits[top_hits_index];
+                let hits = self.top_hits_results.borrow_mut().take_bucket_hits(top_hits_index, bucket_path);
+                let doc_count = self.reader.read_doc_count(row)?;
+                Ok((slot.name.to_string(), render_top_hits(slot.spec, hits, doc_count)))
+            }
         }
     }
 

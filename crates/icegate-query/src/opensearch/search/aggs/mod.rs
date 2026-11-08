@@ -11,6 +11,7 @@ mod percentiles;
 mod plan;
 mod render;
 mod terms;
+mod top_hits;
 
 pub(crate) use parse::parse_aggregations;
 pub(crate) use plan::{AggregationScope, execute_aggregations, plan_aggregation_rows};

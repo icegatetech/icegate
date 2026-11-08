@@ -41,7 +41,8 @@ use super::doc_id::{
     is_span_keyed, read_document_timestamp_micros, span_key_hash_udf,
 };
 use super::hits::{
-    SearchHit, render_array_value, render_field_value, render_search_response, render_sort_scalar, summarize_total_hits,
+    SearchHit, render_array_value, render_field_value, render_hits, render_search_response, render_sort_scalar,
+    summarize_total_hits,
 };
 use super::request::{DocValueField, SearchRequest, SortClause, SortOrder, TrackTotalHits};
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
@@ -113,6 +114,7 @@ pub(crate) async fn search_data_indices(
     };
     let scope = AggregationScope {
         session,
+        entries,
         max_buckets: limits.max_buckets,
         now: context.now,
     };
@@ -190,51 +192,104 @@ async fn search_hits(
     );
     let mut candidates: Vec<Candidate<'_>> = pages.into_iter().flat_map(|page| page.candidates).collect();
     sort_candidates(&mut candidates, &sort.keys)?;
-    let is_sorted = !sort.keys.is_empty();
     let page_hits = candidates
         .into_iter()
         .skip(request.from)
         .take(request.size)
-        .map(|candidate| {
-            Ok(PageHit {
-                sort_values: is_sorted.then(|| render_sort_values(&candidate)).transpose()?,
-                field_values: (!field_requests.is_empty())
-                    .then(|| render_field_values(session, &candidate, &field_requests))
-                    .transpose()?,
-                index_name: candidate.entry.name().to_string(),
-                batch: candidate.batch,
-                row: candidate.row,
-                document_id: candidate.document_id,
-            })
-        })
+        .map(|candidate| build_search_hit(session, candidate, &sort, &field_requests))
         .collect::<Result<Vec<PageHit>, OpenSearchError>>()?;
     // The work outlives the borrow of `request`, so it renders against its own copy.
     let rendering_request = request.clone();
     run_blocking_work("rendering data search hits", move || {
         let mut page_hits = page_hits;
-        let hits: Vec<SearchHit<'_>> = page_hits
-            .iter_mut()
-            .map(
-                |PageHit {
-                     index_name,
-                     batch,
-                     row,
-                     document_id,
-                     sort_values,
-                     field_values,
-                 }| SearchHit {
-                    index: index_name,
-                    batch,
-                    row: *row,
-                    document_id,
-                    sort_values: sort_values.take(),
-                    field_values: field_values.take(),
-                },
-            )
-            .collect();
+        let hits: Vec<SearchHit<'_>> = page_hits.iter_mut().map(PageHit::take_search_hit).collect();
         render_search_response(started_at.elapsed(), total, &hits, &rendering_request)
     })
     .await
+}
+
+/// The hit of `candidate`: its index, row and id, its `sort` values when the request sorts, and
+/// its `fields` when the request asks for any.
+///
+/// # Errors
+///
+/// The errors of [`render_sort_values`] and [`render_field_values`].
+fn build_search_hit(
+    session: &TenantSession,
+    candidate: Candidate<'_>,
+    sort: &SortPlan,
+    field_requests: &[&DocValueField],
+) -> Result<PageHit, OpenSearchError> {
+    Ok(PageHit {
+        sort_values: (!sort.keys.is_empty()).then(|| render_sort_values(&candidate)).transpose()?,
+        field_values: (!field_requests.is_empty())
+            .then(|| render_field_values(session, &candidate, field_requests))
+            .transpose()?,
+        index_name: candidate.entry.name().to_string(),
+        batch: candidate.batch,
+        row: candidate.row,
+        document_id: candidate.document_id,
+    })
+}
+
+/// The `_search` hits of `batches`, rows of `entry` that a plan other than `_search`'s read: in
+/// each batch the first `table_column_count` columns are the index's table columns in scan
+/// order, followed by one column per key of `lower_hit_sort(session, entry, &request.sort)`, in
+/// key order; later columns are ignored. Each hit is the one `_search` renders for the row under
+/// `request` (`_index`, `_id`, `_score`, `_source`, `fields`, `sort`), one per row, in batch then
+/// row order.
+///
+/// # Errors
+///
+/// A 400 naming an index without a document-id rule; the sort and `fields` errors of `_search`;
+/// `500` for a `_doc` sort clause, a batch narrower than its table and sort columns, a row
+/// without a canonical encoding or a span key, and a value no JSON rendering exists for.
+pub(super) fn render_index_rows_as_hits(
+    session: &TenantSession,
+    entry: &IndexEntry,
+    request: &SearchRequest,
+    batches: &[RecordBatch],
+    table_column_count: usize,
+) -> Result<Vec<Value>, OpenSearchError> {
+    require_document_identity(session, entry)?;
+    let entries = [entry];
+    let sort = plan_sort(session, &entries, &request.sort)?;
+    let field_requests = plan_field_requests(session, &entries, request)?;
+    // Each key that orders in the plan reads the next column after the table columns.
+    let mut sort_column_positions = table_column_count..;
+    let sort_columns = sort
+        .keys
+        .iter()
+        .map(|key| match key.kind {
+            SortKeyKind::Score => Ok(None),
+            SortKeyKind::Long | SortKeyKind::Double | SortKeyKind::Text | SortKeyKind::Hex(_) => {
+                Ok(sort_column_positions.next())
+            }
+            SortKeyKind::Doc => Err(OpenSearchError::internal(
+                "a _doc order is decided outside the query plan, so no plan carries its column",
+            )),
+        })
+        .collect::<Result<Vec<Option<usize>>, OpenSearchError>>()?;
+    let column_count = table_column_count + sort_columns.iter().flatten().count();
+    if batches.iter().any(|batch| batch.num_columns() < column_count) {
+        return Err(OpenSearchError::internal(format!(
+            "the rows of [{}] hold fewer columns than their {column_count} table and sort columns",
+            entry.name()
+        )));
+    }
+    let scope = BranchScope {
+        session,
+        entry,
+        position: 0,
+        sort: &sort,
+        anchor: None,
+    };
+    let mut page_hits = build_candidates(scope, batches, table_column_count, &sort_columns)?
+        .into_iter()
+        .map(|candidate| build_search_hit(session, candidate, &sort, &field_requests))
+        .collect::<Result<Vec<PageHit>, OpenSearchError>>()?;
+    let hits: Vec<SearchHit<'_>> = page_hits.iter_mut().map(PageHit::take_search_hit).collect();
+    render_hits(&hits, request)
 }
 
 /// One hit of the returned page, owning what its rendering reads, so it moves to the blocking
@@ -252,6 +307,21 @@ struct PageHit {
     sort_values: Option<Vec<Value>>,
     /// The hit's `fields`; `None` when the request asks for none.
     field_values: Option<Map<String, Value>>,
+}
+
+impl PageHit {
+    /// The hit as the renderer reads it, borrowing its index, row and id. Its `sort` and `fields`
+    /// values move out into the returned hit, so a second call yields neither.
+    fn take_search_hit(&mut self) -> SearchHit<'_> {
+        SearchHit {
+            index: &self.index_name,
+            batch: &self.batch,
+            row: self.row,
+            document_id: &self.document_id,
+            sort_values: self.sort_values.take(),
+            field_values: self.field_values.take(),
+        }
+    }
 }
 
 /// A DataFusion planning failure as the envelope `From<QueryError>` maps it to.
@@ -596,6 +666,52 @@ fn plan_sort(
         branch_exprs,
         doc_hash_exprs,
     })
+}
+
+/// One key of a hit order over the rows of one index.
+pub(super) struct HitSortKey {
+    /// The key's sort value as `_search` computes it for the index: a date as epoch
+    /// milliseconds, an integer, a boolean as 0 or 1, a double, a keyword, an id as its bytes.
+    pub(super) value: Expr,
+    /// Whether the key orders ascending; a missing value sorts last in either direction.
+    pub(super) is_ascending: bool,
+}
+
+/// The keys of `clauses` over the rows of `entry`, in priority order, as `_search` orders that
+/// index's hits. A `_score` clause yields no key: every row scores alike.
+///
+/// # Errors
+///
+/// The sort errors of `_search` (a field the index does not map and no `unmapped_type` names, a
+/// field that is not sortable); `500` for a `_doc` clause, whose order is decided outside the
+/// query plan, so no caller may pass one.
+pub(super) fn lower_hit_sort(
+    session: &TenantSession,
+    entry: &IndexEntry,
+    clauses: &[SortClause],
+) -> Result<Vec<HitSortKey>, OpenSearchError> {
+    let SortPlan { keys, branch_exprs, .. } = plan_sort(session, &[entry], clauses)?;
+    let key_expressions = branch_exprs
+        .into_iter()
+        .next()
+        .ok_or_else(|| OpenSearchError::internal("a sort over one index planned no expressions for it"))?;
+    keys.into_iter()
+        .zip(key_expressions)
+        .filter_map(|(key, key_expression)| match key.kind {
+            SortKeyKind::Score => None,
+            SortKeyKind::Doc => Some(Err(OpenSearchError::internal(
+                "a _doc order is decided outside the query plan, so it cannot order hits there",
+            ))),
+            SortKeyKind::Long | SortKeyKind::Double | SortKeyKind::Text | SortKeyKind::Hex(_) => Some(
+                key_expression
+                    .map(|value| HitSortKey {
+                        value,
+                        is_ascending: matches!(key.order, SortOrder::Asc),
+                    })
+                    .ok_or_else(|| OpenSearchError::internal("a field sort key has no SQL expression")),
+            ),
+        })
+        .collect()
 }
 
 /// The low [`DOC_HASH_BITS`] bits of the hash `entry`'s rows carry, in SQL: of the span key on
@@ -1218,11 +1334,28 @@ async fn fetch_rows<'a>(
         .and_then(LogicalPlanBuilder::build)
         .map_err(convert_plan_error)?;
     let batches = scope.session.collect(plan).await?;
+    build_candidates(scope, &batches, table_column_count, &sort_columns)
+}
+
+/// The candidate of every row of `batches`, in batch then row order: the first
+/// `table_column_count` columns of each batch are the index's table columns, and the value of
+/// each sort key sits at its position in `sort_columns`.
+///
+/// # Errors
+///
+/// Returns the errors of [`verify_sort_columns`] and [`build_candidate`], and `500` when a batch
+/// has fewer columns than `table_column_count`.
+fn build_candidates<'a>(
+    scope: BranchScope<'a>,
+    batches: &[RecordBatch],
+    table_column_count: usize,
+    sort_columns: &[Option<usize>],
+) -> Result<Vec<Candidate<'a>>, OpenSearchError> {
     let table_indices: Vec<usize> = (0..table_column_count).collect();
     let mut encoder = CanonicalEncoder::new();
-    let mut candidates = Vec::new();
-    for batch in &batches {
-        verify_sort_columns(batch, &scope.sort.keys, &sort_columns)?;
+    let mut candidates = Vec::with_capacity(batches.iter().map(RecordBatch::num_rows).sum());
+    for batch in batches {
+        verify_sort_columns(batch, &scope.sort.keys, sort_columns)?;
         let rows = Arc::new(
             batch
                 .project(&table_indices)
@@ -1235,7 +1368,7 @@ async fn fetch_rows<'a>(
             timestamp_index: schema.index_of(COL_TIMESTAMP).ok(),
             trace_id_index: schema.index_of(COL_TRACE_ID).ok(),
             span_id_index: schema.index_of(COL_SPAN_ID).ok(),
-            sort_columns: &sort_columns,
+            sort_columns,
         };
         for row in 0..batch.num_rows() {
             candidates.push(build_candidate(scope, &rows, batch, &mut columns, row)?);

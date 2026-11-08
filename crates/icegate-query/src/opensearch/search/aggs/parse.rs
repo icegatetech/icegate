@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-use super::metrics::MetricSpec;
+use super::metrics::{ExtendedStatsSpec, MetricSpec, parse_extended_stats};
 use super::multi_bucket::{
     DateMathRange, DateRangeBound, DateRangeBucketsSpec, FiltersBuckets, FiltersSpec, NumericRange, RangeBucketsSpec,
 };
@@ -21,6 +21,7 @@ use super::percentiles::{
     PercentileRanksSpec, PercentilesSpec, parse_percentile_ranks, parse_percentiles, split_percent_path,
 };
 use super::terms::{TermsSpec, parse_terms};
+use super::top_hits::{TopHitsSpec, parse_top_hits};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::{
     MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MILLISECOND, MICROS_PER_MINUTE, MICROS_PER_SECOND,
@@ -48,9 +49,7 @@ const OUT_OF_SCOPE_KINDS: [&str; 6] = [
 const OUT_OF_SCOPE_PIPELINES: [&str; 1] = ["extended_stats_bucket"];
 
 /// Kinds of the aggregation surface that are not planned yet.
-const NOT_YET_PLANNED_KINDS: [&str; 12] = [
-    "extended_stats",
-    "top_hits",
+const NOT_YET_PLANNED_KINDS: [&str; 10] = [
     "cumulative_sum",
     "derivative",
     "serial_diff",
@@ -108,6 +107,11 @@ pub(crate) enum AggregationKind {
     Percentiles(PercentilesSpec),
     /// Exact shares, in percent, of the bucket's values at or below given values.
     PercentileRanks(PercentileRanksSpec),
+    /// Moments, variances and deviation bounds of the bucket's values.
+    ExtendedStats(ExtendedStatsSpec),
+    /// The first rows of the bucket in a requested order, rendered as `_search` hits; boxed, since
+    /// it holds a whole search request.
+    TopHits(Box<TopHitsSpec>),
     /// Numeric `[from, to)` buckets; a row counts in every range it lies in.
     Range(RangeBucketsSpec),
     /// Date-math `[from, to)` buckets resolved against the request's `now`.
@@ -119,7 +123,8 @@ pub(crate) enum AggregationKind {
 }
 
 impl AggregationKind {
-    /// The field the aggregation reads; `None` for `filter` and `filters`, which read queries.
+    /// The field the aggregation reads; `None` for `filter` and `filters`, which read queries,
+    /// and `top_hits`, which reads whole rows.
     pub(crate) fn field(&self) -> Option<&str> {
         match self {
             Self::DateHistogram(spec) => Some(&spec.field),
@@ -133,10 +138,11 @@ impl AggregationKind {
             | Self::Stats(spec)
             | Self::Cardinality(spec) => Some(&spec.field),
             Self::Percentiles(PercentilesSpec { metric, .. })
-            | Self::PercentileRanks(PercentileRanksSpec { metric, .. }) => Some(&metric.field),
+            | Self::PercentileRanks(PercentileRanksSpec { metric, .. })
+            | Self::ExtendedStats(ExtendedStatsSpec { metric, .. }) => Some(&metric.field),
             Self::Range(spec) => Some(&spec.field),
             Self::DateRange(spec) => Some(&spec.field),
-            Self::Filters(_) | Self::Filter(_) => None,
+            Self::Filters(_) | Self::Filter(_) | Self::TopHits(_) => None,
         }
     }
 }
@@ -316,6 +322,8 @@ fn parse_kind(name: &str, kind_name: &str, value: &Value) -> Result<AggregationK
         )?)),
         "percentiles" => Ok(AggregationKind::Percentiles(parse_percentiles(name, value)?)),
         "percentile_ranks" => Ok(AggregationKind::PercentileRanks(parse_percentile_ranks(name, value)?)),
+        "extended_stats" => Ok(AggregationKind::ExtendedStats(parse_extended_stats(name, value)?)),
+        "top_hits" => Ok(AggregationKind::TopHits(Box::new(parse_top_hits(name, value)?))),
         "range" => Ok(AggregationKind::Range(parse_range(name, value)?)),
         "date_range" => Ok(AggregationKind::DateRange(parse_date_range(name, value)?)),
         "filters" => Ok(AggregationKind::Filters(parse_filters(name, value)?)),

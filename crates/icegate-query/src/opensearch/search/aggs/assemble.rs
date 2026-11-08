@@ -285,14 +285,41 @@ impl AggregateReader<'_> {
         let Some(row) = row else {
             return Ok(ScalarValue::Null);
         };
-        let batch = self
-            .outputs
-            .get(row.stage)
-            .and_then(|output| output.batches.get(row.batch))
-            .ok_or_else(|| OpenSearchError::internal("an aggregated row reference is out of range"))?;
+        let batch = self.find_row_batch(row)?;
         let column = read_column(batch, &name_statistic_column(metric, statistic))?;
         ScalarValue::try_from_array(column.as_ref(), row.row)
             .map_err(|error| OpenSearchError::internal(format!("statistic of metric [{metric}]: {error}")))
+    }
+
+    /// The row count of the bucket whose aggregated row is `row`; 0 for a bucket without one (an
+    /// empty bucket gap filling added).
+    ///
+    /// # Errors
+    ///
+    /// `500` for a row reference or a count the plans cannot have produced.
+    pub(super) fn read_doc_count(&self, row: Option<RowRef>) -> Result<u64, OpenSearchError> {
+        let Some(row) = row else {
+            return Ok(0);
+        };
+        let counts = read_column(self.find_row_batch(row)?, DOC_COUNT_COLUMN)?
+            .as_primitive_opt::<Int64Type>()
+            .ok_or_else(|| OpenSearchError::internal("the document count is not Int64"))?;
+        if row.row >= counts.len() || counts.is_null(row.row) {
+            return Err(OpenSearchError::internal("an aggregated row has no document count"));
+        }
+        u64::try_from(counts.value(row.row)).map_err(|_| OpenSearchError::internal("a negative document count"))
+    }
+
+    /// The batch holding the aggregated row `row`.
+    ///
+    /// # Errors
+    ///
+    /// `500` for a row reference out of the executed plans' range.
+    fn find_row_batch(&self, row: RowRef) -> Result<&RecordBatch, OpenSearchError> {
+        self.outputs
+            .get(row.stage)
+            .and_then(|output| output.batches.get(row.batch))
+            .ok_or_else(|| OpenSearchError::internal("an aggregated row reference is out of range"))
     }
 }
 
@@ -365,7 +392,7 @@ fn list_parent_paths(
 }
 
 /// `parent_path` followed by `key`: the path of a bucket of the level below.
-fn extend_path(parent_path: &[BucketKey], key: &BucketKey) -> Vec<BucketKey> {
+pub(super) fn extend_path(parent_path: &[BucketKey], key: &BucketKey) -> Vec<BucketKey> {
     let mut path = Vec::with_capacity(parent_path.len() + 1);
     path.extend_from_slice(parent_path);
     path.push(key.clone());

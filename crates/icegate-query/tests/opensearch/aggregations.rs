@@ -3,17 +3,19 @@
 #![allow(clippy::expect_used)]
 
 use iceberg::spec::{NestedField, PrimitiveType, Type};
-use icegate_common::LOGS_TABLE;
 use icegate_common::schema::{
-    COL_DURATION_MICROS, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID,
+    COL_DURATION_MICROS, COL_NAME, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP,
+    COL_TRACE_ID,
 };
+use icegate_common::{LOGS_TABLE, SPANS_TABLE};
 use icegate_query::opensearch::OpenSearchConfig;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::data::{
-    Cell, Row, build_log_row_at_minute, build_service_log_row_at_minute, build_wal_log_row_at_minute, commit_log_rows,
-    commit_rows, compute_micros_at_minute, create_exact_name_table, required_string, write_wal_segment,
+    Cell, LogRow, Row, build_log_row_at_minute, build_service_log_row_at_minute, build_wal_log_row_at_minute,
+    commit_log_rows, commit_rows, compute_micros_at_minute, create_exact_name_table, required_string,
+    write_wal_segment,
 };
 use super::harness::TestServer;
 use super::requests::send_request;
@@ -568,5 +570,246 @@ async fn filters_date_ranges_and_cardinality_count_only_the_requesting_tenants_r
             "services": {"value": 3}
         })
     );
+    server.shutdown().await;
+}
+
+/// The instant [`compute_micros_at_minute`] gives minute 0, in epoch milliseconds: the first minute
+/// of the rows the aggregation integration tests write.
+pub(super) const BASE_MILLIS: i64 = compute_micros_at_minute(0) / 1_000;
+
+/// Tenant A logs at 10:01–10:05 (INFO a1, ERROR a2, INFO a3, ERROR a4, INFO a5) and one tenant B
+/// ERROR at 10:06, newer than every tenant A row, so a hit leaking across tenants tops its bucket.
+const fn build_top_hits_logs() -> [LogRow<'static>; 6] {
+    [
+        build_log_row_at_minute(TENANT_A, 1, "INFO", "a1"),
+        build_log_row_at_minute(TENANT_A, 2, "ERROR", "a2"),
+        build_log_row_at_minute(TENANT_A, 3, "INFO", "a3"),
+        build_log_row_at_minute(TENANT_A, 4, "ERROR", "a4"),
+        build_log_row_at_minute(TENANT_A, 5, "INFO", "a5"),
+        build_log_row_at_minute(TENANT_B, 6, "ERROR", "b6"),
+    ]
+}
+
+/// The `body` of every hit of the `top_hits` result `top_hits`, in hit order.
+fn list_hit_bodies(top_hits: &Value) -> Vec<Value> {
+    top_hits["hits"]["hits"]
+        .as_array()
+        .expect("a hits array")
+        .iter()
+        .map(|hit| hit["_source"]["body"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn top_hits_render_through_the_hits_renderer_per_bucket() {
+    let (server, catalog) = TestServer::start().await;
+    // (tenant, minute, service, id byte): trace id = 16 × byte, span id = 8 × byte.
+    let spans: [(&str, i64, &str, u8); 6] = [
+        (TENANT_A, 0, "checkout", 1),
+        (TENANT_A, 1, "checkout", 2),
+        (TENANT_A, 2, "checkout", 3),
+        (TENANT_A, 0, "cart", 4),
+        (TENANT_A, 1, "cart", 5),
+        // tenant-b's latest checkout span would top tenant-a's checkout bucket.
+        (TENANT_B, 3, "checkout", 6),
+    ];
+    let trace_ids: Vec<[u8; 16]> = spans.iter().map(|span| [span.3; 16]).collect();
+    let span_ids: Vec<[u8; 8]> = spans.iter().map(|span| [span.3; 8]).collect();
+    let rows: Vec<Row<'_>> = spans
+        .iter()
+        .enumerate()
+        .map(|(index, &(tenant, minute, service, _))| Row {
+            tenant,
+            cells: vec![
+                (COL_TIMESTAMP, Cell::Micros(compute_micros_at_minute(minute))),
+                (COL_SERVICE_NAME, Cell::Text(service)),
+                (COL_NAME, Cell::Text("GET /cart")),
+                (COL_TRACE_ID, Cell::Bytes(&trace_ids[index])),
+                (COL_SPAN_ID, Cell::Bytes(&span_ids[index])),
+            ],
+        })
+        .collect();
+    write_wal_segment(&server.wal_store, &catalog, SPANS_TABLE, 0, &rows)
+        .await
+        .expect("one WAL segment holding both tenants");
+    let (status, body) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/spans/_search",
+        Some(&json!({
+            "size": 0,
+            "aggs": {"2": {
+                "terms": {"field": "service_name", "order": {"_key": "asc"}},
+                "aggs": {"1": {"top_hits": {
+                    "size": 2,
+                    "sort": [{"timestamp": {"order": "desc"}}],
+                    "_source": {"includes": ["service_name", "name"]},
+                    "docvalue_fields": [{"field": "timestamp", "format": "strict_date_time"}]
+                }}}
+            }}
+        })),
+    )
+    .await
+    .expect("search request");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let buckets = body["aggregations"]["2"]["buckets"].as_array().expect("terms buckets");
+    assert_eq!(buckets.len(), 2);
+    // (service, bucket total, [(id byte, minute)] newest first)
+    let expected = [("cart", 2, [(5_u8, 1_i64), (4, 0)]), ("checkout", 3, [(3, 2), (2, 1)])];
+    for (bucket, (service, total, hits)) in buckets.iter().zip(expected) {
+        assert_eq!(bucket["key"], json!(service));
+        let top = &bucket["1"]["hits"];
+        assert_eq!(top["total"], json!({"value": total, "relation": "eq"}), "{service}");
+        assert_eq!(top["max_score"], json!(null), "{service}");
+        let bucket_hits = top["hits"].as_array().expect("hits array");
+        assert_eq!(bucket_hits.len(), 2, "{service}");
+        for (hit, (id_byte, minute)) in bucket_hits.iter().zip(hits) {
+            // A span's `_id` is the lowercase hex of trace id ‖ span id.
+            assert_eq!(hit["_id"], json!(format!("{id_byte:02x}").repeat(24)), "{service}");
+            assert_eq!(hit["_index"], json!("spans"));
+            assert_eq!(hit["_score"], json!(null));
+            assert_eq!(hit["_source"], json!({"service_name": service, "name": "GET /cart"}));
+            assert_eq!(hit["sort"], json!([BASE_MILLIS + minute * 60_000]));
+            assert_eq!(
+                hit["fields"]["timestamp"],
+                json!([format!("2026-10-08T10:0{minute}:00.000Z")])
+            );
+        }
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn top_hits_at_the_top_and_under_filters_list_a_row_in_every_bucket_it_matches() {
+    let (server, catalog) = TestServer::start().await;
+    commit_log_rows(&catalog, &build_top_hits_logs()).await.expect("commit logs");
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/logs/_search",
+        Some(&json!({
+            "size": 0,
+            "aggs": {
+                "newest": {"top_hits": {
+                    "size": 1,
+                    "sort": [{"timestamp": {"order": "desc"}}],
+                    "_source": {"includes": ["body"]}
+                }},
+                "none": {"top_hits": {"size": 0}},
+                "split": {
+                    "filters": {"filters": {
+                        "all": {"match_all": {}},
+                        "errors": {"term": {"severity_text": "ERROR"}}
+                    }},
+                    "aggs": {"latest": {"top_hits": {
+                        "size": 2,
+                        "sort": [{"timestamp": {"order": "desc"}}],
+                        "_source": {"includes": ["body"]}
+                    }}}
+                }
+            }
+        })),
+    )
+    .await
+    .expect("search request");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let aggregations = &answer["aggregations"];
+    assert_eq!(
+        aggregations["newest"]["hits"]["total"],
+        json!({"value": 5, "relation": "eq"})
+    );
+    assert_eq!(list_hit_bodies(&aggregations["newest"]), [json!("a5")]);
+    assert_eq!(
+        aggregations["none"],
+        json!({"hits": {"total": {"value": 5, "relation": "eq"}, "max_score": null, "hits": []}})
+    );
+    let all = &aggregations["split"]["buckets"]["all"];
+    assert_eq!(all["doc_count"], json!(5));
+    assert_eq!(list_hit_bodies(&all["latest"]), [json!("a5"), json!("a4")]);
+    let errors = &aggregations["split"]["buckets"]["errors"];
+    assert_eq!(errors["doc_count"], json!(2));
+    assert_eq!(errors["latest"]["hits"]["total"], json!({"value": 2, "relation": "eq"}));
+    // a4 belongs to both buckets, so it is a hit of both.
+    assert_eq!(list_hit_bodies(&errors["latest"]), [json!("a4"), json!("a2")]);
+    assert_eq!(
+        errors["latest"]["hits"]["hits"][0]["sort"],
+        json!([compute_micros_at_minute(4) / 1_000])
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn top_hits_under_a_cut_terms_level_list_the_kept_buckets_hits() {
+    let (server, catalog) = TestServer::start().await;
+    commit_log_rows(&catalog, &build_top_hits_logs()).await.expect("commit logs");
+    // `size: 1` in key order keeps ERROR, whose key reaches the branch through the
+    // surviving-bucket join; INFO holds the newest tenant A row.
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/logs/_search",
+        Some(&json!({
+            "size": 0,
+            "aggs": {"severities": {
+                "terms": {"field": "severity_text", "size": 1, "order": {"_key": "asc"}},
+                "aggs": {"latest": {"top_hits": {
+                    "size": 1,
+                    "sort": [{"timestamp": "desc"}],
+                    "_source": {"includes": ["body"]}
+                }}}
+            }}
+        })),
+    )
+    .await
+    .expect("search request");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let severities = &answer["aggregations"]["severities"];
+    assert_eq!(severities["sum_other_doc_count"], json!(3));
+    let buckets = severities["buckets"].as_array().expect("terms buckets");
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0]["key"], json!("ERROR"));
+    assert_eq!(
+        buckets[0]["latest"]["hits"]["total"],
+        json!({"value": 2, "relation": "eq"})
+    );
+    assert_eq!(list_hit_bodies(&buckets[0]["latest"]), [json!("a4")]);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_top_hits_over_two_indices_and_an_extended_stats_over_a_keyword_are_400s_naming_them() {
+    let (server, catalog) = TestServer::start().await;
+    commit_log_rows(&catalog, &build_top_hits_logs()).await.expect("commit logs");
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/logs,spans/_search",
+        Some(&json!({"size": 0, "aggs": {"latest": {"top_hits": {}}}})),
+    )
+    .await
+    .expect("search request");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(answer["error"]["aggregation"], "latest");
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/logs/_search",
+        Some(&json!({"size": 0, "aggs": {"spread": {"extended_stats": {"field": "severity_text"}}}})),
+    )
+    .await
+    .expect("search request");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(answer["error"]["field"], "severity_text");
+    assert_eq!(answer["error"]["field_type"], "keyword");
+    assert_eq!(answer["error"]["index"], "logs");
+    assert_eq!(answer["error"]["aggregation"], "spread");
+    assert_eq!(answer["error"]["aggregation_type"], "extended_stats");
     server.shutdown().await;
 }
