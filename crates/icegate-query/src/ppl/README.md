@@ -69,7 +69,8 @@ index list is an index expression: comma-separated names, `*` wildcards and `-` 
 resolved like the `_search` path with `ignore_unavailable=false`, `allow_no_indices=false` and
 open, non-hidden indices. A name that matches nothing is a 404 `INDEX_NOT_FOUND`; names are
 case-sensitive. A source on system indices is a 400. `describe <index>` is a source of its own:
-see [`describe`](#describe).
+see [`describe`](#describe). `source=[ <subsearch> ] [as t]` reads a subsearch's output: see
+[Subsearches](#subsearches).
 
 ## Commands
 
@@ -351,6 +352,20 @@ subsearch (`[ source=spans | … ] as s`). Without a type the join is inner; a t
   join hints, `max` other than 0, and a repeated `type=` or `max=`. `overwrite=` is accepted and changes
   nothing in the criteria form.
 
+## Subsearches
+
+- **`<expression> in [ <search> | <commands> ]`** is a top-level `and` conjunct of `where`. It is planned as
+  `IN (subquery)`, which becomes a semi-join: each row is kept once however many subsearch rows match it.
+  Pinned by `where_in_a_subsearch_plans_an_uncapped_semi_join_and_keeps_the_sort_order` in
+  `tests/opensearch/ppl_trust_delta.rs`. The subsearch runs through the same tenant scope, returns exactly one
+  column, and is never capped. A semi-join keeps no row order, so rows sorted before the `where` are sorted
+  again after it. `not in [ … ]`, `(a, b) in [ … ]`,
+  and `in [ … ]` under `or` / `not` or outside `where` are a 400.
+- **`source=[ <search> | <commands> ] [as t]`** reads the subsearch's output as the pipeline's source. The alias
+  qualifies its columns for a later `join` (`t.service_name`); other commands use the bare names. An alias on an
+  index source (`source=logs as l`) is a 400; a join names its sides with `left=` / `right=`.
+- **System indices:** a subsearch over a system index is a 400 naming it, like a system-index source.
+
 ## Timestamp literals
 
 A string literal compared with a timestamp field (`=`, `!=`, `<`, `<=`, `>`, `>=`, `between`, `in`),
@@ -396,5 +411,6 @@ contract for every route.
 
 Every source resolves through the requesting tenant's session, whose scan carries the tenant
 filter, so a PPL query never reads another tenant's rows. `tests/opensearch/ppl.rs` pins this
-with two tenants written in the same batch. Every join side resolves through that same session;
-`tests/opensearch/ppl_trust_delta.rs` pins it with both tenants' rows in one WAL segment.
+with two tenants written in the same batch. Every join side and every subsearch resolves through
+that same session; `tests/opensearch/ppl_trust_delta.rs` pins it with both tenants' rows in one WAL
+segment.

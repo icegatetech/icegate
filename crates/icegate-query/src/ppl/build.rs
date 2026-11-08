@@ -28,12 +28,12 @@ use icegate_query_grammar::ppl::{
     FunctionArgContextAttrs, FunctionArgExpressionContextAttrs, FunctionArgsContextAll, FunctionArgsContextAttrs,
     FunctionCallContextAll, FunctionCallContextAttrs, FunctionCallExprContextAttrs, IdentContextAll, IdentContextAttrs,
     IdentsAsQualifiedNameContextAttrs, IdentsAsTableQualifiedNameContextAttrs,
-    IdentsAsWildcardQualifiedNameContextAttrs, InExprContextAttrs, IntegerLiteralContextAll,
-    IsNullPredicateContextAttrs, JoinCommandContextAll, JoinCommandContextAttrs, JoinCriteriaContextAttrs,
-    JoinOptionContextAll, LambdaContextAll, LambdaContextAttrs, LambdaExprContextAttrs, LiteralValueContextAll,
-    LiteralValueContextAttrs, LiteralValueExprContextAttrs, LogicalExprContextAttrs, LogicalExpressionContextAll,
-    LogicalNotContextAttrs, MaxOptionContextAttrs, NestedValueExprContextAttrs, NullNotnullContextAttrs,
-    NumericSpanValueContextAttrs, ParseCommandContextAll, ParseCommandContextAttrs,
+    IdentsAsWildcardQualifiedNameContextAttrs, InExprContextAttrs, InSubqueryExprContext, InSubqueryExprContextAttrs,
+    IntegerLiteralContextAll, IsNullPredicateContextAttrs, JoinCommandContextAll, JoinCommandContextAttrs,
+    JoinCriteriaContextAttrs, JoinOptionContextAll, LambdaContextAll, LambdaContextAttrs, LambdaExprContextAttrs,
+    LiteralValueContextAll, LiteralValueContextAttrs, LiteralValueExprContextAttrs, LogicalExprContextAttrs,
+    LogicalExpressionContextAll, LogicalNotContextAttrs, MaxOptionContextAttrs, NestedValueExprContextAttrs,
+    NullNotnullContextAttrs, NumericSpanValueContextAttrs, ParseCommandContextAll, ParseCommandContextAttrs,
     PercentileApproxFunctionCallContextAttrs, PercentileShortcutFunctionCallContextAttrs, PplCommandsContextAll,
     PplCommandsContextAttrs, PplStatementContextAttrs, PrefixSortFieldContextAttrs, QualifiedNameContextAll,
     QueryStatementContextAll, QueryStatementContextAttrs, RareTopCommandContextAll, RareTopCommandContextAttrs,
@@ -182,12 +182,35 @@ fn build_index_source(from: &FromClauseContextAll<'_>) -> Result<PplSource, PplE
         };
         return Err(build_unsupported_command_error(kind));
     };
-    let Some(sources) = clause.tableSourceClause() else {
-        return Err(build_unsupported_command_error("source=[subsearch]"));
-    };
-    Ok(PplSource::Index {
-        expression: name_table_sources(&sources)?,
-    })
+    build_source_clause(&clause)
+}
+
+/// Builds the source a `source=` clause names: an index expression, or a bracketed subsearch with its
+/// optional `as` alias.
+///
+/// # Errors
+///
+/// `Semantic` for an alias on an index source (`source=logs as l`): no command reads it, and a join names
+/// its sides with `left=` / `right=`; `Semantic` for an alias with the reserved prefix. The subsearch's
+/// own errors.
+fn build_source_clause(clause: &TableOrSubqueryClauseContextAll<'_>) -> Result<PplSource, PplError> {
+    let is_subsearch = clause.subSearch().is_some();
+    let (query, alias) = build_table_or_subquery(clause)?;
+    if is_subsearch {
+        return Ok(PplSource::Subsearch {
+            query: Box::new(query),
+            alias,
+        });
+    }
+    if let (Some(alias), PplSource::Index { expression }) = (&alias, &query.source) {
+        return Err(PplError::Semantic {
+            reason: format!(
+                "`source={expression} as {alias}`: an alias on an index source is not supported; \
+                 name a join's sides with left=<alias> and right=<alias>"
+            ),
+        });
+    }
+    Ok(query.source)
 }
 
 /// The index expression a `tableSourceClause` names: its table sources, comma-separated.
@@ -1384,13 +1407,40 @@ fn build_value(value: &ValueExpressionContextAll<'_>) -> Result<PplExpr, PplErro
             build_lambda(&lambda)
         }
         ValueExpressionContextAll::ForeachPlaceholderExprContext(_) => Err(build_unsupported_command_error("foreach")),
+        ValueExpressionContextAll::InSubqueryExprContext(in_subsearch) => build_in_subsearch(in_subsearch),
         ValueExpressionContextAll::ScalarSubqueryExprContext(_)
-        | ValueExpressionContextAll::InSubqueryExprContext(_)
         | ValueExpressionContextAll::ExistsSubqueryExprContext(_) => Err(build_unsupported_command_error("subsearch")),
         ValueExpressionContextAll::Error(_) => Err(PplError::Internal {
             reason: "an unlabeled value expression".to_string(),
         }),
     }
+}
+
+/// Builds `<expression> in [<subsearch>]`.
+///
+/// # Errors
+///
+/// `Semantic` for `not in [ … ]` and for the tuple form `(a, b) in [ … ]`.
+fn build_in_subsearch(in_subsearch: &InSubqueryExprContext<'_>) -> Result<PplExpr, PplError> {
+    if in_subsearch.NOT().is_some() {
+        return Err(PplError::Semantic {
+            reason: "`not in [subsearch]` is not supported; filter inside the subsearch instead".to_string(),
+        });
+    }
+    let values = in_subsearch.valueExpression_all();
+    let [value] = values.as_slice() else {
+        return Err(PplError::Semantic {
+            reason: format!(
+                "`(a, b) in [subsearch]` is not supported; compare one expression, not {}",
+                values.len()
+            ),
+        });
+    };
+    let subsearch = in_subsearch.subSearch().ok_or_else(|| build_missing_part_error("in"))?;
+    Ok(PplExpr::InSubsearch {
+        expression: Box::new(build_value(value)?),
+        query: Box::new(build_subsearch(&subsearch)?),
+    })
 }
 
 fn build_function_call(call: &FunctionCallContextAll<'_>) -> Result<PplExpr, PplError> {
@@ -2285,6 +2335,88 @@ mod tests {
             ),
             ("source=logs | join hint.left.x=y on a = b spans", "hints"),
             ("source=logs | join [ source=spans ]", "on <"),
+        ] {
+            let result = parse_ppl(text);
+            assert!(
+                matches!(&result, Err(PplError::Semantic { reason }) if reason.contains(expected_name)),
+                "{text}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_subsearches_and_subsearch_sources_build_their_ast_nodes() {
+        let filtered_query =
+            parse_ppl("source=logs | where trace_id in [ source=spans | where name = 'x' | fields trace_id ]")
+                .expect("in subsearch parses");
+        let [PplCommand::Where(PplExpr::InSubsearch { expression, query })] = filtered_query.commands.as_slice() else {
+            panic!("not one where with a subsearch: {:?}", filtered_query.commands);
+        };
+        assert!(
+            matches!(expression.as_ref(), PplExpr::Field(field) if field == "trace_id"),
+            "{expression:?}"
+        );
+        assert!(
+            matches!(&query.source, PplSource::Index { expression } if expression == "spans"),
+            "{:?}",
+            query.source
+        );
+        assert_eq!(query.commands.len(), 2, "{:?}", query.commands);
+
+        let aliased_query =
+            parse_ppl("source=[ source=logs | where body = 'x' ] as t | fields body").expect("source parses");
+        let PplSource::Subsearch {
+            query: inner_query,
+            alias,
+        } = &aliased_query.source
+        else {
+            panic!("not a subsearch source: {:?}", aliased_query.source);
+        };
+        assert_eq!(alias.as_deref(), Some("t"));
+        assert!(
+            matches!(&inner_query.source, PplSource::Index { expression } if expression == "logs"),
+            "{:?}",
+            inner_query.source
+        );
+        assert_eq!(inner_query.commands.len(), 1);
+        assert_eq!(aliased_query.commands.len(), 1);
+
+        let unaliased_query = parse_ppl("search source=[ source=logs ]").expect("source parses");
+        assert!(
+            matches!(&unaliased_query.source, PplSource::Subsearch { alias: None, .. }),
+            "{:?}",
+            unaliased_query.source
+        );
+
+        let plain_source = parse_ppl("source=logs | fields body").expect("source parses");
+        assert!(
+            matches!(&plain_source.source, PplSource::Index { expression } if expression == "logs"),
+            "{:?}",
+            plain_source.source
+        );
+    }
+
+    #[test]
+    fn an_alias_on_an_index_source_is_a_400() {
+        let result = parse_ppl("source=logs as l | fields body");
+        assert!(
+            matches!(&result, Err(PplError::Semantic { reason })
+                if reason.contains("source=logs as l") && reason.contains("left=<alias>")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn not_in_and_tuple_subsearches_are_400s() {
+        for (text, expected_name) in [
+            (
+                "source=logs | where trace_id not in [ source=spans | fields trace_id ]",
+                "not in",
+            ),
+            (
+                "source=logs | where (trace_id, span_id) in [ source=spans | fields trace_id, span_id ]",
+                "(a, b)",
+            ),
         ] {
             let result = parse_ppl(text);
             assert!(

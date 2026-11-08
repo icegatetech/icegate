@@ -1,5 +1,6 @@
-//! The PPL commands trust needs beyond the core: `join`, over real HTTP. Every row is written here with
-//! explicit values, and every expected row is stated by hand from the rules in `ppl/README.md`.
+//! The PPL commands trust needs beyond the core: `join` and subsearches, over real HTTP. Every row is
+//! written here with explicit values, and every expected row is stated by hand from the rules in
+//! `ppl/README.md`.
 #![allow(clippy::expect_used)]
 
 use icegate_common::schema::{COL_NAME, COL_SERVICE_NAME, COL_TIMESTAMP};
@@ -53,6 +54,17 @@ async fn explain_ppl(server: &TestServer, tenant: &str, query: &str) -> (String,
 fn assert_semantic_error(error: &Value) {
     assert_eq!(error["type"], "SemanticCheckException", "{error}");
     assert_eq!(error["code"], "SEMANTIC_ERROR", "{error}");
+}
+
+/// Asserts that `reply` is the semantic refusal and that its reason mentions `expected_text`.
+fn assert_semantic_refusal(reply: &PplReply, expected_text: &str) {
+    let error = &reply.parse_json_body()["error"];
+    assert_semantic_error(error);
+    assert!(
+        error["reason"].as_str().is_some_and(|reason| reason.contains(expected_text)),
+        "{}",
+        reply.text
+    );
 }
 
 /// The lines of `plan` that mention `operator`.
@@ -794,6 +806,344 @@ mod join {
              [ source=spans | fields name, service_name ] \
              | stats count() as n";
         assert_eq!(run_ppl(&server, TENANT_A, query).await["datarows"], json!([[10_050]]));
+        server.shutdown().await;
+    }
+}
+
+/// Subsearches: `where … in [ … ]` as a semi-join and `source=[ … ]`, through the tenant scope, uncapped.
+mod subsearch {
+    use icegate_common::schema::{COL_BODY, COL_SEVERITY_TEXT, COL_TRACE_ID};
+
+    use super::*;
+
+    const TRACE_ONE: [u8; 16] = [0x01; 16];
+    const TRACE_TWO: [u8; 16] = [0x02; 16];
+    const TRACE_THREE: [u8; 16] = [0x03; 16];
+
+    /// A distinct trace id per index: the index in the first eight bytes, big-endian.
+    fn build_indexed_trace_id(index: u64) -> [u8; 16] {
+        let mut id = [0_u8; 16];
+        id[..8].copy_from_slice(&index.to_be_bytes());
+        id
+    }
+
+    fn build_traced_span_row<'a>(tenant: &'a str, trace_id: &'a [u8], name: &'a str) -> Row<'a> {
+        let mut row = build_span_row(tenant, NOON, "checkout", name);
+        row.cells.push((COL_TRACE_ID, Cell::Bytes(trace_id)));
+        row
+    }
+
+    const IN_SUBSEARCH: &str = "source=logs | where trace_id in [ source=spans | where name = 'match' | fields trace_id ] | fields body | sort body";
+
+    /// The rows come sorted before the `where`, and the subsearch sits beside another `and` conjunct: the
+    /// semi-join keeps no row order, so the sort must still hold after it.
+    const SORTED_IN_SUBSEARCH: &str = "source=logs | sort - body \
+         | where body != 'zz' and trace_id in [ source=spans | where name = 'match' | fields trace_id ] \
+         | fields body";
+
+    #[tokio::test]
+    async fn where_in_a_subsearch_plans_an_uncapped_semi_join_and_keeps_the_sort_order() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("l1")), (COL_TRACE_ID, Cell::Bytes(&TRACE_ONE))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("l2")), (COL_TRACE_ID, Cell::Bytes(&TRACE_TWO))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("l3")), (COL_TRACE_ID, Cell::Bytes(&TRACE_THREE))],
+                ),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        // `TRACE_ONE` matches twice in the subsearch and still yields one `l1`.
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[
+                build_traced_span_row(TENANT_A, &TRACE_ONE, "match"),
+                build_traced_span_row(TENANT_A, &TRACE_ONE, "match"),
+                build_traced_span_row(TENANT_A, &TRACE_TWO, "match"),
+                build_traced_span_row(TENANT_A, &TRACE_THREE, "other"),
+            ],
+        )
+        .await
+        .expect("commit spans");
+
+        assert_eq!(
+            run_ppl(&server, TENANT_A, IN_SUBSEARCH).await["datarows"],
+            json!([["l1"], ["l2"]])
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_A, SORTED_IN_SUBSEARCH).await["datarows"],
+            json!([["l2"], ["l1"]])
+        );
+
+        let (_logical_plan, physical_plan) = explain_ppl(&server, TENANT_A, IN_SUBSEARCH).await;
+        let semi_join_count = find_plan_lines(&physical_plan, "HashJoinExec")
+            .into_iter()
+            .filter(|line| line.contains("Semi"))
+            .count();
+        assert_eq!(semi_join_count, 1, "one semi-join:\n{physical_plan}");
+        for limit in ["GlobalLimitExec", "LocalLimitExec", "fetch="] {
+            assert!(
+                find_plan_lines(&physical_plan, limit).is_empty(),
+                "no cap ({limit}):\n{physical_plan}"
+            );
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_in_subsearch_matching_more_than_ten_thousand_rows_is_never_capped() {
+        let (server, catalog) = TestServer::start().await;
+        let trace_ids: Vec<[u8; 16]> = (0..10_053).map(build_indexed_trace_id).collect();
+        let logs: Vec<Row<'_>> = trace_ids
+            .iter()
+            .zip(0_i64..)
+            .map(|(trace_id, offset)| {
+                build_log_row(TENANT_A, NOON + offset, vec![(COL_TRACE_ID, Cell::Bytes(trace_id))])
+            })
+            .collect();
+        commit_rows(&catalog, LOGS_TABLE, &logs).await.expect("commit logs");
+        // Tenant A's subsearch matches the first 10 050 ids; the last three exist only as tenant B spans.
+        let mut spans: Vec<Row<'_>> = trace_ids[..10_050]
+            .iter()
+            .map(|trace_id| build_traced_span_row(TENANT_A, trace_id, "match"))
+            .collect();
+        spans.extend(
+            trace_ids[10_050..]
+                .iter()
+                .map(|trace_id| build_traced_span_row(TENANT_B, trace_id, "match")),
+        );
+        commit_rows(&catalog, SPANS_TABLE, &spans).await.expect("commit spans");
+
+        let query = "source=logs | where trace_id in [ source=spans | where name = 'match' | fields trace_id ] \
+             | stats count() as n";
+        assert_eq!(run_ppl(&server, TENANT_A, query).await["datarows"], json!([[10_050]]));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_subsearch_source_with_an_alias_feeds_the_pipeline() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![
+                        (COL_BODY, Cell::Text("e1")),
+                        (COL_SEVERITY_TEXT, Cell::Text("ERROR")),
+                        (COL_SERVICE_NAME, Cell::Text("checkout")),
+                    ],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![
+                        (COL_BODY, Cell::Text("i1")),
+                        (COL_SEVERITY_TEXT, Cell::Text("INFO")),
+                        (COL_SERVICE_NAME, Cell::Text("checkout")),
+                    ],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![
+                        (COL_BODY, Cell::Text("e2")),
+                        (COL_SEVERITY_TEXT, Cell::Text("ERROR")),
+                        (COL_SERVICE_NAME, Cell::Text("cart")),
+                    ],
+                ),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[build_span_row(TENANT_A, NOON, "checkout", "s-checkout")],
+        )
+        .await
+        .expect("commit spans");
+        let errors = "[ source=logs | where severity_text = 'ERROR' | fields body, service_name ]";
+
+        let count_query = format!("source={errors} as t | stats count() as n");
+        assert_eq!(run_ppl(&server, TENANT_A, &count_query).await["datarows"], json!([[2]]));
+
+        let join_query = format!(
+            "source={errors} as t | inner join right=s on t.service_name = s.service_name \
+             [ source=spans | fields name, service_name ] | fields body, name"
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &join_query).await["datarows"],
+            json!([["e1", "s-checkout"]])
+        );
+
+        let unaliased_query = format!("source={errors} | fields body | sort body");
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &unaliased_query).await["datarows"],
+            json!([["e1"], ["e2"]])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_alias_on_an_index_source_is_a_semantic_400() {
+        let (server, _catalog) = TestServer::start().await;
+        let reply = refuse_ppl(&server, TENANT_A, "source=logs as l | fields body").await;
+        assert_semantic_refusal(&reply, "left=<alias>");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_subsearch_column_of_another_type_is_a_semantic_400() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[build_log_row(TENANT_A, NOON, vec![(COL_BODY, Cell::Text("a"))])],
+        )
+        .await
+        .expect("commit logs");
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[build_span_row(TENANT_A, NOON, "checkout", "s1")],
+        )
+        .await
+        .expect("commit spans");
+        // Positive control: the same subsearch against a string column answers, so the 400 below
+        // comes from the column type alone.
+        run_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | where body in [ source=spans | fields name ]",
+        )
+        .await;
+        // A MAP compared with the subsearch's string column fits no comparison type.
+        let reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | where log_attributes in [ source=spans | fields name ]",
+        )
+        .await;
+        assert_semantic_error(&reply.parse_json_body()["error"]);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_subsearch_never_reads_another_tenants_rows() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("l1")), (COL_SERVICE_NAME, Cell::Text("checkout"))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("l2")), (COL_SERVICE_NAME, Cell::Text("cart"))],
+                ),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        // One WAL segment file: tenant A has a `checkout` span, only tenant B a `cart` span.
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            SPANS_TABLE,
+            0,
+            &[
+                build_span_row(TENANT_A, NOON, "checkout", "a-span"),
+                build_span_row(TENANT_B, NOON, "cart", "b-span"),
+            ],
+        )
+        .await
+        .expect("write spans segment");
+
+        let filtered_query = "source=logs | where service_name in [ source=spans | fields service_name ] | fields body";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, filtered_query).await["datarows"],
+            json!([["l1"]])
+        );
+        let source_query = "source=[ source=spans | fields name ] | fields name";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, source_query).await["datarows"],
+            json!([["a-span"]])
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_B, source_query).await["datarows"],
+            json!([["b-span"]])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn misplaced_wide_and_system_index_subsearches_are_semantic_400s() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[build_log_row(
+                TENANT_A,
+                NOON,
+                vec![(COL_BODY, Cell::Text("l1")), (COL_SERVICE_NAME, Cell::Text("checkout"))],
+            )],
+        )
+        .await
+        .expect("commit logs");
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[build_span_row(TENANT_A, NOON, "checkout", "a-span")],
+        )
+        .await
+        .expect("commit spans");
+
+        let nested_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | where body = 'x' or service_name in [ source=spans | fields service_name ]",
+        )
+        .await;
+        assert_semantic_refusal(&nested_reply, "top-level");
+        let two_column_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | where service_name in [ source=spans | fields name, service_name ]",
+        )
+        .await;
+        assert_semantic_refusal(&two_column_reply, "one column");
+
+        // A subsearch over a system index is refused like a system-index source, naming the index.
+        create_system_index(&server, TENANT_A).await.expect("create the system index");
+        for query in [
+            format!("source=logs | where body in [ source={SYSTEM_INDEX} | fields x ]"),
+            format!("source=[ source={SYSTEM_INDEX} ]"),
+        ] {
+            let system_reply = refuse_ppl(&server, TENANT_A, &query).await;
+            assert_semantic_refusal(&system_reply, SYSTEM_INDEX);
+        }
         server.shutdown().await;
     }
 }

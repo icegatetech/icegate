@@ -22,9 +22,10 @@ use datafusion::functions_aggregate::expr_fn::{array_agg, avg, count, max, min, 
 use datafusion::functions_nested::expr_fn::array_element;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::expr::{Case, Lambda, LambdaVariable};
+use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{
     Between, EmptyRelation, Expr, ExprFunctionExt, ExprSchemable, JoinType, LogicalPlan, LogicalPlanBuilder, Operator,
-    SortExpr, binary_expr, cast, col, ident, lit, not, when,
+    SortExpr, binary_expr, cast, col, ident, in_subquery, lit, not, when,
 };
 use datafusion::optimizer::Analyzer;
 use futures::future::BoxFuture;
@@ -144,7 +145,8 @@ struct Pipeline<'session> {
     /// replaces the columns (an aggregation) ends it.
     source: Option<SourceBinding<'session>>,
     /// The keys of the last `sort`, over the current columns; empty when no `sort` came since the
-    /// source or the last aggregation, where the order is the scan's. `dedup` keeps the first
+    /// source or the last aggregation, where the order is the source's: the scan's for an index
+    /// source, no promised order for a subsearch source. `dedup` keeps the first
     /// rows in this order. A `rename` of a sorted column moves its key to the new name; before a
     /// command removes or replaces a sorted column, the key's values are copied into a hidden
     /// order column (see [`hide_touched_sort_keys`]), so the order outlives the column.
@@ -214,8 +216,9 @@ struct Planning<'a> {
 /// Returns [`PplError::IndexNotFound`] for a source that names no index,
 /// [`PplError::FieldNotFound`] for a reference to no column, [`PplError::UnsupportedFunction`]
 /// for a function outside the library, and [`PplError::Semantic`] for a source on system
-/// indices, a field typed differently across the source indices, or an expression whose types do
-/// not fit.
+/// indices, a field typed differently across the source indices, an expression whose types do
+/// not fit, a subsearch of `in` returning other than one column, or an `in [ … ]` outside a
+/// top-level `and` conjunct of `where`.
 pub(crate) async fn plan_ppl(
     query: &PplQuery,
     session: &TenantSession,
@@ -230,6 +233,18 @@ pub(crate) async fn plan_ppl(
     let mut pipeline = match &query.source {
         PplSource::Index { expression } => plan_index_source(expression, session).await?,
         PplSource::Describe { index } => plan_describe(index, session, context.now, cluster_name).await?,
+        PplSource::Subsearch {
+            query: subsearch,
+            alias,
+        } => {
+            let subsearch_plan = plan_subquery(subsearch, planning).await?;
+            // The subsearch's output is no index's columns and comes in no promised order.
+            Pipeline {
+                builder: qualify_plan(LogicalPlanBuilder::from(subsearch_plan.plan), alias.as_deref())?,
+                source: None,
+                sort_keys: Vec::new(),
+            }
+        }
     };
     for command in &query.commands {
         pipeline = apply_command(pipeline, command, planning).await?;
@@ -389,7 +404,10 @@ async fn apply_command<'session>(
     let schema = Arc::clone(builder.schema());
     let build_scope = || ExpressionScope::new(&schema, source.as_ref(), now);
     let (builder, sort_keys) = match command {
-        PplCommand::Where(predicate) => (builder.filter(lower_expression(predicate, &build_scope())?)?, sort_keys),
+        PplCommand::Where(predicate) => {
+            let builder = plan_where(builder, predicate, &build_scope(), planning, &sort_keys).await?;
+            (builder, sort_keys)
+        }
         PplCommand::Fields { is_exclusion, fields } => {
             let selected_rows = select_fields(builder.clone(), *is_exclusion, fields, &build_scope())?;
             let kept_names: HashSet<&str> = selected_rows
@@ -1735,6 +1753,71 @@ fn rename_fields(
     Ok(builder.project(projection)?)
 }
 
+/// The top-level `and` conjuncts of `expression`, left to right.
+fn collect_conjuncts<'e>(expression: &'e PplExpr, conjuncts: &mut Vec<&'e PplExpr>) {
+    if let PplExpr::And(left, right) = expression {
+        collect_conjuncts(left, conjuncts);
+        collect_conjuncts(right, conjuncts);
+    } else {
+        conjuncts.push(expression);
+    }
+}
+
+/// Plans `where`: the conjunction of its top-level `and` conjuncts, SQL three-valued (a row stays only
+/// where the predicate is true), over the rows of `builder` in their incoming `sort_keys` order.
+///
+/// A conjunct `<expression> in [<subsearch>]` becomes DataFusion's `IN (subquery)`, which the optimizer
+/// rewrites into a semi-join: each row is kept once however many subsearch rows match it. That rewrite is
+/// pinned by `where_in_a_subsearch_plans_an_uncapped_semi_join_and_keeps_the_sort_order` in
+/// `tests/opensearch/ppl_trust_delta.rs`. The subsearch is planned by [`plan_ppl`] through the same tenant
+/// session and nothing caps it. A semi-join keeps no row order, so a filter holding one is followed by a
+/// sort on `sort_keys` when the rows had an order. Splitting the conjuncts first is what lets the
+/// subsearch be planned asynchronously; every other conjunct is lowered by [`lower_expression`].
+///
+/// # Errors
+///
+/// `Semantic` for a subsearch returning other than one column, and (from the plan's type check) for a
+/// subsearch column no comparison type fits; the subsearch's and the lowering's errors; `Internal` for
+/// a where with no conjunct (unreachable: `collect_conjuncts` always yields one).
+async fn plan_where(
+    builder: LogicalPlanBuilder,
+    expression: &PplExpr,
+    scope: &ExpressionScope<'_>,
+    planning: Planning<'_>,
+    sort_keys: &[SortExpr],
+) -> Result<LogicalPlanBuilder, PplError> {
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(expression, &mut conjuncts);
+    let mut predicates = Vec::with_capacity(conjuncts.len());
+    let mut has_subsearch = false;
+    for conjunct in conjuncts {
+        let predicate = if let PplExpr::InSubsearch { expression, query } = conjunct {
+            has_subsearch = true;
+            let subsearch = plan_subquery(query, planning).await?;
+            if subsearch.columns.len() != 1 {
+                return Err(PplError::Semantic {
+                    reason: format!(
+                        "the subsearch of `in` must return one column; it returns {}: end it with `| fields <column>`",
+                        subsearch.columns.len()
+                    ),
+                });
+            }
+            in_subquery(lower_expression(expression, scope)?, Arc::new(subsearch.plan))
+        } else {
+            lower_expression(conjunct, scope)?
+        };
+        predicates.push(predicate);
+    }
+    let predicate = conjunction(predicates).ok_or_else(|| PplError::Internal {
+        reason: "a where without a predicate".to_string(),
+    })?;
+    let filtered_rows = builder.filter(predicate)?;
+    if has_subsearch && !sort_keys.is_empty() {
+        return Ok(filtered_rows.sort(sort_keys.to_vec())?);
+    }
+    Ok(filtered_rows)
+}
+
 /// Lower `expression` to a DataFusion expression over the columns of `scope`.
 fn lower_expression(expression: &PplExpr, scope: &ExpressionScope<'_>) -> Result<Expr, PplError> {
     match expression {
@@ -1837,6 +1920,10 @@ fn lower_expression(expression: &PplExpr, scope: &ExpressionScope<'_>) -> Result
                 value.is_null()
             })
         }
+        PplExpr::InSubsearch { .. } => Err(PplError::Semantic {
+            reason: "`<expression> in [subsearch]` is supported only as a top-level `and` conjunct of `where`"
+                .to_string(),
+        }),
     }
 }
 

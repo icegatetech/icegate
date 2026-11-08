@@ -15,7 +15,7 @@ pub(crate) struct PplQuery {
 }
 
 /// What a query reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PplSource {
     /// `source=<expression>` (also `search source=…` and `index=…`): the indices an index
     /// expression names, comma lists and wildcards included, resolved case-sensitively.
@@ -28,6 +28,13 @@ pub(crate) enum PplSource {
     Describe {
         /// The index expression as written in the query.
         index: String,
+    },
+    /// `source=[<subsearch>] [as <alias>]`: the subsearch's output is the pipeline's input.
+    Subsearch {
+        /// The subsearch.
+        query: Box<PplQuery>,
+        /// Qualifies the subsearch's columns, so a later `join` can name them `<alias>.<field>`.
+        alias: Option<String>,
     },
 }
 
@@ -371,6 +378,14 @@ pub(crate) enum PplExpr {
         value: Box<Self>,
         /// Whether the test is `is not null`.
         is_negated: bool,
+    },
+    /// `<expression> in [<subsearch>]`: true for a row whose value the subsearch's single column holds.
+    /// Planned as a semi-join; the subsearch runs through the same tenant scope and is never capped.
+    InSubsearch {
+        /// The compared value.
+        expression: Box<Self>,
+        /// The subsearch; it must return exactly one column.
+        query: Box<PplQuery>,
     },
 }
 
