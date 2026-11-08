@@ -29,6 +29,7 @@
 //!   aggregations and unions
 //! - `system_indices`: index-level system-index endpoints and their tenant boundary
 //! - `system_store_rustfs`: the system-index store against RustFS through the production constructor
+//! - `trust_parity`: trust's statements, the SQL form over Flight SQL against the PPL form
 //! - `visualize`: Visualize-style aggregation requests, one per acceptance type
 
 mod opensearch;

@@ -26,4 +26,5 @@ mod system_indices;
 mod system_store_rustfs;
 #[path = "../../src/test_rows.rs"]
 mod test_rows;
+mod trust_parity;
 mod visualize;

@@ -162,6 +162,9 @@ pub enum Cell<'a> {
     Decimal(i128),
     /// The elements of a `LIST<string>` column, in stored order; `&[]` is the empty list.
     TextList(&'a [&'a str]),
+    /// The value of an `Int32` column. It holds an `i64` so a literal of any width can be
+    /// written; the column builder checks that it fits.
+    Int(i64),
 }
 
 /// One table row with explicit values: its tenant and the cells it sets. Every other column is
@@ -263,10 +266,15 @@ fn build_rows_column(field: &Field, rows: &[Row<'_>]) -> Result<ArrayRef, RowWri
                 Some(_) => panic!("`{name}` takes Text"),
             }
         }))),
-        DataType::Int32 => {
-            assert_no_cells(rows, name);
-            Arc::new(Int32Array::from_iter(rows.iter().map(|_| is_required.then_some(0))))
-        }
+        DataType::Int32 => Arc::new(Int32Array::from_iter(rows.iter().map(|row| {
+            match find_row_cell(row, name) {
+                Some(Cell::Int(value)) => Some(
+                    i32::try_from(*value).unwrap_or_else(|_| panic!("`{name}`: Int cell {value} does not fit Int32")),
+                ),
+                None => is_required.then_some(0),
+                Some(_) => panic!("`{name}` takes Int"),
+            }
+        }))),
         DataType::Int64 => Arc::new(Int64Array::from_iter(rows.iter().map(|row| {
             match find_row_cell(row, name) {
                 Some(Cell::Long(value)) => Some(*value),

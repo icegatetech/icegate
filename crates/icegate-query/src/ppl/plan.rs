@@ -3385,7 +3385,9 @@ mod tests {
         StringArray, TimestampMicrosecondArray,
     };
     use datafusion::arrow::compute::concat_batches;
-    use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, TimeUnit, TimestampMicrosecondType};
+    use datafusion::arrow::datatypes::{
+        DataType, Field, Int32Type, Int64Type, Schema, TimeUnit, TimestampMicrosecondType,
+    };
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::common::{DFSchema, ScalarValue};
     use datafusion::error::DataFusionError;
@@ -3393,8 +3395,8 @@ mod tests {
         Between, Expr, LogicalPlan, LogicalPlanBuilder, LogicalTableSource, col, ident, lit,
     };
     use datafusion::prelude::SessionContext;
-    use icegate_common::schema::{COL_BODY, COL_SPAN_ID, COL_TENANT_ID, COL_TRACE_ID};
-    use icegate_common::{OPERATIONS_TABLE, TenantId};
+    use icegate_common::schema::{COL_BODY, COL_SPAN_ID, COL_STATUS_CODE, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID};
+    use icegate_common::{OPERATIONS_TABLE, SPANS_TABLE, TenantId};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -3412,7 +3414,7 @@ mod tests {
     use crate::ppl::functions::{FunctionContext, lower_function_call};
     use crate::ppl::parse_ppl;
     use crate::test_rows::{FINISH_REASONS, build_first_byte_id, build_operation_row};
-    use crate::test_support::{SearchFixture, TestCell};
+    use crate::test_support::{SearchFixture, TestCell, TestRow};
 
     const TENANT_A: &str = "tenant-a";
     const TENANT_B: &str = "tenant-b";
@@ -3704,6 +3706,70 @@ mod tests {
             }
         }
         assert_eq!(lists, vec![vec!["stop".to_string(), "length".to_string()]]);
+    }
+
+    /// An `Int32` column written through an `Int` cell reads back as written: a filter on
+    /// `status_code = 2` returns the requesting tenant's failed span and neither its unset span
+    /// (`0`) nor the other tenant's failed span in the same append.
+    #[tokio::test]
+    async fn int_cell_of_an_int32_column_reads_back_through_a_filter() {
+        let failed_span_id: [u8; 8] = build_first_byte_id(1);
+        let unset_span_id: [u8; 8] = build_first_byte_id(2);
+        let other_tenant_span_id: [u8; 8] = build_first_byte_id(3);
+        let fixture = SearchFixture::new().await;
+        fixture
+            .commit_rows(
+                SPANS_TABLE,
+                &[
+                    TestRow {
+                        tenant: TENANT_A,
+                        cells: vec![
+                            (COL_TIMESTAMP, TestCell::Micros(NOON_MICROS)),
+                            (COL_SPAN_ID, TestCell::Bytes(&failed_span_id)),
+                            (COL_STATUS_CODE, TestCell::Int(2)),
+                        ],
+                    },
+                    TestRow {
+                        tenant: TENANT_A,
+                        cells: vec![
+                            (COL_TIMESTAMP, TestCell::Micros(NOON_MICROS)),
+                            (COL_SPAN_ID, TestCell::Bytes(&unset_span_id)),
+                            (COL_STATUS_CODE, TestCell::Int(0)),
+                        ],
+                    },
+                    TestRow {
+                        tenant: TENANT_B,
+                        cells: vec![
+                            (COL_TIMESTAMP, TestCell::Micros(NOON_MICROS)),
+                            (COL_SPAN_ID, TestCell::Bytes(&other_tenant_span_id)),
+                            (COL_STATUS_CODE, TestCell::Int(2)),
+                        ],
+                    },
+                ],
+            )
+            .await;
+        let session = fixture.open_session(TENANT_A).await;
+        let context = RequestContext {
+            tenant: TenantId::new(TENANT_A).expect("a valid tenant"),
+            now: build_fixed_now(),
+        };
+        let query = parse_ppl("source=spans | where status_code = 2 | fields span_id, status_code").expect("query");
+
+        let ppl_plan = plan_ppl(&query, &session, &context, "icegate").await.expect("plan");
+        let batches = session.collect(ppl_plan.plan).await.expect("rows");
+
+        let mut rows: Vec<(Vec<u8>, i32)> = Vec::new();
+        for batch in &batches {
+            let span_ids = batch.column_by_name(COL_SPAN_ID).expect("span_id").as_fixed_size_binary();
+            let status_codes = batch
+                .column_by_name(COL_STATUS_CODE)
+                .expect("status_code")
+                .as_primitive::<Int32Type>();
+            for row in 0..batch.num_rows() {
+                rows.push((span_ids.value(row).to_vec(), status_codes.value(row)));
+            }
+        }
+        assert_eq!(rows, vec![(failed_span_id.to_vec(), 2)]);
     }
 
     #[tokio::test]
@@ -4444,11 +4510,9 @@ mod tests {
         use datafusion::physical_plan::collect;
         use datafusion::physical_plan::display::DisplayableExecutionPlan;
         use icegate_common::iceberg_write::{CommonRecordBatchStream, WriteConfig, write_record_batches_to_parquet};
-        use icegate_common::schema::COL_TIMESTAMP;
         use icegate_common::{CancellationToken, LOGS_TABLE, icegate_table_ident};
 
         use crate::test_rows::{build_rows_batch, commit_written_files, select_write_config};
-        use crate::test_support::TestRow;
 
         let fixture = SearchFixture::new().await;
         let table = fixture

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{
     ArrayRef, MapBuilder, MapFieldNames, StringArray, StringBuilder, TimestampMicrosecondArray, new_null_array,
 };
-use datafusion::arrow::compute::cast;
+use datafusion::arrow::compute::{CastOptions, cast_with_options};
 use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
@@ -24,8 +24,10 @@ use icegate_common::schema::{
 use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE, OPERATIONS_TABLE, PRICES_TABLE};
 use object_store::ObjectStore;
 
-pub use super::test_rows::{COMMITTED_WAL_OFFSET, Cell, Row, RowWriteError, commit_rows, write_wal_segment};
-use super::test_rows::{FINISH_REASONS, TEMPERATURE, build_operation_row, commit_batch, read_arrow_schema};
+pub use super::test_rows::{
+    COMMITTED_WAL_OFFSET, Cell, Row, RowWriteError, commit_batch, commit_rows, read_arrow_schema, write_wal_segment,
+};
+use super::test_rows::{FINISH_REASONS, TEMPERATURE, build_operation_row};
 
 /// 2026-10-08T10:00:00Z in microseconds, the instant [`compute_micros_at_minute`] counts from.
 const TEN_O_CLOCK_MICROS: i64 = 1_791_453_600_000_000;
@@ -368,7 +370,8 @@ fn build_price_row<'a>(row: &PriceRow<'a>) -> Row<'a> {
 /// through [`commit_batch`]: one append with the table's production writer settings, recording
 /// [`COMMITTED_WAL_OFFSET`]. Columns named in `columns` take the given arrays, each `row_count`
 /// long and cast to the column's Arrow type (so a list or timestamp array needs no field-id
-/// metadata); every other column is null, so the caller names every required column. A name in
+/// metadata); every other column is null, so the caller names every required column. The cast is
+/// strict: a value the column's type cannot hold is an error, never a null cell. A name in
 /// `columns` that is no column of `table` is an error, never a silently null column.
 pub async fn commit_table_columns(
     catalog: &Arc<dyn Catalog>,
@@ -380,12 +383,16 @@ pub async fn commit_table_columns(
     if let Some((unknown_name, _)) = columns.iter().find(|(name, _)| arrow_schema.field_with_name(name).is_err()) {
         return Err(format!("[{unknown_name}] is no column of [{table}]").into());
     }
+    let strict_cast = CastOptions {
+        safe: false,
+        ..CastOptions::default()
+    };
     let arrays = arrow_schema
         .fields()
         .iter()
         .map(
             |field| match columns.iter().find(|(name, _)| field.name().as_str() == *name) {
-                Some((_, array)) => cast(array, field.data_type()),
+                Some((_, array)) => cast_with_options(array, field.data_type(), &strict_cast),
                 None => Ok(new_null_array(field.data_type(), row_count)),
             },
         )

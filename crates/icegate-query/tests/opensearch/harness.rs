@@ -44,7 +44,7 @@ const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const READY_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 /// Bound on every request a test sends, so a listener that stops answering fails the test
 /// instead of hanging it.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Location of the in-memory system-index store a harness listener uses unless the test passes
 /// its own store.
 const IN_MEMORY_SYSTEM_LOCATION: &str = "s3://opensearch-test/opensearch-system";
@@ -289,7 +289,7 @@ impl TestServer {
     async fn try_launch(deployment: Arc<Deployment>) -> Result<Self, SetupError> {
         let runtime = build_replica_runtime(&deployment.catalog, &deployment.wal_store, &deployment.options)?;
         // Built before the listener is spawned, so its failure leaves no task running.
-        let client = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build()?;
+        let client = build_request_client()?;
         // Port 0: the OS assigns a free port and the listener reports it, so no probe races
         // another process for it.
         let config = OpenSearchConfig {
@@ -460,10 +460,16 @@ pub fn build_in_memory_system_object_store() -> Result<SystemObjectStore, SetupE
     )?)
 }
 
+/// A client whose every request is bounded by [`REQUEST_TIMEOUT`], so a listener that stops
+/// answering fails the test instead of hanging the run.
+pub fn build_request_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build()
+}
+
 /// Whether the listener at `base_url` answers HTTP within the poll budget. Any answer counts:
 /// without a tenant header it is the `400` refusal. Each probe is bounded on its own, so the
 /// budget bounds the whole wait.
-async fn is_serving(client: &reqwest::Client, base_url: &str) -> bool {
+pub async fn is_serving(client: &reqwest::Client, base_url: &str) -> bool {
     for _ in 0..READY_ATTEMPTS {
         let probe = client.head(format!("{base_url}/")).timeout(READY_PROBE_TIMEOUT);
         if probe.send().await.is_ok() {
