@@ -1,5 +1,5 @@
-//! Plain metric aggregations: `avg`, `sum`, `min`, `max`, `value_count`, `stats` and
-//! `cardinality`.
+//! Metric aggregations: `avg`, `sum`, `min`, `max`, `value_count`, `stats`, `cardinality`,
+//! `percentiles` and `percentile_ranks`.
 //!
 //! A metric is computed by the stage aggregate at the granularity of the level that declares
 //! it, or over every matching row for a top-level metric. Numeric and boolean fields are read as
@@ -7,6 +7,8 @@
 //! microseconds, and a metric's `missing` stands in for an absent value before it is
 //! aggregated. `value_count` counts the values of the field as they are. A `cardinality` is
 //! counted exactly by a branch of its own (`plan.rs`), never by the stage aggregate.
+//! `percentiles` and `percentile_ranks` are computed by aggregates of their own
+//! (`percentiles.rs`), which the stage aggregate plans from the slot's request.
 
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::ScalarValue;
@@ -15,8 +17,9 @@ use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
 use datafusion::logical_expr::{Expr, cast, lit, when};
 use serde_json::{Map, Number, Value};
 
-use super::parse::MetricPath;
-use super::plan::FieldInput;
+use super::parse::{AggregationKind, MetricPath};
+use super::percentiles::{decode_quantiles, decode_rank_counts, render_percentile_ranks, render_percentiles};
+use super::plan::{FieldInput, MetricSlot};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::MICROS_PER_MILLISECOND;
 use crate::opensearch::search::execute::convert_plan_error;
@@ -27,8 +30,8 @@ use crate::opensearch::search::hits::{DateRenderFormat, render_date, validate_da
 pub(crate) struct MetricSpec {
     /// The field whose values the metric reads.
     pub(crate) field: String,
-    /// The value a row without the field contributes. Parsing accepts it on `avg`, `sum`, `min`
-    /// and `max` only, as a JSON number or a numeric string.
+    /// The value a row without the field contributes. Parsing accepts it on `avg`, `sum`, `min`,
+    /// `max` and `percentiles` only, as a JSON number or a numeric string.
     pub(crate) missing: Option<f64>,
 }
 
@@ -49,6 +52,10 @@ pub(super) enum MetricKind {
     Stats,
     /// `cardinality`: the exact number of distinct values.
     Cardinality,
+    /// `percentiles`: approximate quantiles from one t-digest per bucket and value.
+    Percentiles,
+    /// `percentile_ranks`: exact shares of values at or below given values.
+    PercentileRanks,
 }
 
 impl MetricKind {
@@ -62,11 +69,15 @@ impl MetricKind {
             Self::ValueCount => "value_count",
             Self::Stats => "stats",
             Self::Cardinality => "cardinality",
+            Self::Percentiles => "percentiles",
+            Self::PercentileRanks => "percentile_ranks",
         }
     }
 
     /// The statistics the stage aggregate computes per bucket for this metric; none for
-    /// `cardinality`, which a distinct branch counts.
+    /// `cardinality`, which a distinct branch counts. `percentiles` and `percentile_ranks` list
+    /// the one list statistic their own aggregate computes, which the stage plans from the slot's
+    /// request.
     pub(super) const fn list_statistics(self) -> &'static [Statistic] {
         match self {
             Self::Avg => &[Statistic::Avg],
@@ -82,6 +93,8 @@ impl MetricKind {
                 Statistic::Sum,
             ],
             Self::Cardinality => &[],
+            Self::Percentiles => &[Statistic::Quantiles],
+            Self::PercentileRanks => &[Statistic::RankCounts],
         }
     }
 }
@@ -103,6 +116,11 @@ pub(super) enum Statistic {
     /// The exact number of distinct values (`Int64`), counted by a distinct branch, never by the
     /// stage aggregate.
     Distinct,
+    /// The `multi_quantile` estimates of `percentiles`: a list, one per requested percent.
+    Quantiles,
+    /// The `rank_counts` of `percentile_ranks`: a list, the value count and then one count per
+    /// requested value.
+    RankCounts,
 }
 
 impl Statistic {
@@ -115,6 +133,8 @@ impl Statistic {
             Self::Avg => "avg",
             Self::Sum => "sum",
             Self::Distinct => "distinct",
+            Self::Quantiles => "quantiles",
+            Self::RankCounts => "rank_counts",
         }
     }
 }
@@ -132,7 +152,8 @@ pub(super) struct MetricInput {
 ///
 /// # Errors
 ///
-/// `500` for `Distinct`, which no stage aggregate computes.
+/// `500` for `Distinct` (a distinct branch counts it), `Quantiles` (a shared digest) and
+/// `RankCounts` (a `rank_counts` aggregate).
 pub(super) fn plan_statistic(statistic: Statistic, value: Expr) -> Result<Expr, OpenSearchError> {
     match statistic {
         Statistic::Count => Ok(count(value)),
@@ -140,9 +161,9 @@ pub(super) fn plan_statistic(statistic: Statistic, value: Expr) -> Result<Expr, 
         Statistic::Max => Ok(max(value)),
         Statistic::Avg => Ok(avg(value)),
         Statistic::Sum => Ok(sum(value)),
-        Statistic::Distinct => Err(OpenSearchError::internal(
-            "distinct counts are planned by their own branch",
-        )),
+        Statistic::Distinct | Statistic::Quantiles | Statistic::RankCounts => Err(OpenSearchError::internal(format!(
+            "the {statistic:?} statistic is computed by an aggregate of its own, never by plan_statistic"
+        ))),
     }
 }
 
@@ -219,7 +240,9 @@ pub(super) fn resolve_order_statistic(kind: MetricKind, path: &MetricPath) -> Re
             | MetricKind::Max
             | MetricKind::ValueCount
             | MetricKind::Stats
-            | MetricKind::Cardinality,
+            | MetricKind::Cardinality
+            | MetricKind::Percentiles
+            | MetricKind::PercentileRanks,
             _,
         ) => None,
     };
@@ -236,26 +259,29 @@ pub(super) fn resolve_order_statistic(kind: MetricKind, path: &MetricPath) -> Re
     })
 }
 
-/// Render a metric of `kind` for one bucket from its statistics, `read` returning each one
+/// Render the metric of `slot` for one bucket from its statistics, `read` returning each one
 /// (NULL for a bucket without an aggregated row).
 ///
 /// A single-value metric renders `value`: `null` when the bucket has no value, 0 for an empty
 /// `sum`, `value_count` and `cardinality`. `stats` renders `count`, `min`, `max`, `avg` and
 /// `sum` (an empty sum is 0). An extreme of a date field also renders `<key>_as_string` at
-/// millisecond precision.
+/// millisecond precision. `percentiles` and `percentile_ranks` render `values` keyed by percent
+/// or value, or as an array when not keyed.
 ///
 /// # Errors
 ///
 /// `500` for a statistic of another type than its aggregate or distinct branch computes, for a
-/// statistic that is not finite (a sum or mean that overflows), and for a date extreme outside
-/// the range a date renders in.
+/// statistic that is not finite (a sum or mean that overflows, a quantile estimate), for a date
+/// extreme outside the range a date renders in, for a `quantiles` or `rank_counts` list whose
+/// length is not the one its request asks for, and for a slot whose kind and aggregation
+/// disagree, which `AggregationLayout` never builds.
 pub(super) fn render_metric(
-    kind: MetricKind,
+    slot: &MetricSlot<'_>,
     is_date: bool,
     read: &dyn Fn(Statistic) -> Result<ScalarValue, OpenSearchError>,
 ) -> Result<Value, OpenSearchError> {
     let mut object = Map::new();
-    match kind {
+    match slot.kind {
         MetricKind::Avg => {
             object.insert("value".to_string(), render_float(read_float(&read(Statistic::Avg)?)?)?);
         }
@@ -280,8 +306,56 @@ pub(super) fn render_metric(
                 Value::from(read_count(&read(Statistic::Distinct)?)?),
             );
         }
+        MetricKind::Percentiles => {
+            let AggregationKind::Percentiles(spec) = slot.aggregation else {
+                return Err(report_mismatched_slot(slot));
+            };
+            let quantiles = decode_quantiles(&read(Statistic::Quantiles)?)?;
+            check_statistic_length(slot, quantiles.as_ref().map(Vec::len), spec.percents.len())?;
+            return Ok(render_percentiles(spec, quantiles.as_deref()));
+        }
+        MetricKind::PercentileRanks => {
+            let AggregationKind::PercentileRanks(spec) = slot.aggregation else {
+                return Err(report_mismatched_slot(slot));
+            };
+            let counts = decode_rank_counts(&read(Statistic::RankCounts)?)?;
+            // The list holds the count of values, then one count per requested value.
+            check_statistic_length(slot, counts.as_ref().map(Vec::len), spec.values.len() + 1)?;
+            return Ok(render_percentile_ranks(spec, counts.as_deref()));
+        }
     }
     Ok(Value::Object(object))
+}
+
+/// Checks that the list statistic of `slot` holds `expected_length` entries; `length` is `None`
+/// for a bucket without a value, which renders every entry `null`.
+///
+/// # Errors
+///
+/// `500` for a list of another length: rendering it would leave a requested entry `null`, which
+/// claims the bucket has no value.
+fn check_statistic_length(
+    slot: &MetricSlot<'_>,
+    length: Option<usize>,
+    expected_length: usize,
+) -> Result<(), OpenSearchError> {
+    match length {
+        Some(length) if length != expected_length => Err(OpenSearchError::internal(format!(
+            "metric [{}] of type [{}] holds {length} entries where its request asks for {expected_length}",
+            slot.name,
+            slot.kind.read_type_name()
+        ))),
+        Some(_) | None => Ok(()),
+    }
+}
+
+/// The error of a slot whose metric kind and aggregation disagree.
+fn report_mismatched_slot(slot: &MetricSlot<'_>) -> OpenSearchError {
+    OpenSearchError::internal(format!(
+        "metric [{}] is laid out as [{}] over another aggregation",
+        slot.name,
+        slot.kind.read_type_name()
+    ))
 }
 
 /// `value` as a JSON number, or `null` when the bucket has no value.

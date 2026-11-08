@@ -26,6 +26,7 @@ use super::date_histogram::{BucketRounding, fill_empty_buckets};
 use super::distinct::name_distinct_count_column;
 use super::metrics::Statistic;
 use super::parse::{DateHistogramSpec, HistogramSpec};
+use super::percentiles::select_quantile_element;
 use super::plan::{
     AggregationLayout, BucketLevel, DOC_COUNT_COLUMN, Granularity, LEVEL_MASK_COLUMN, LevelKind, OrderMetric,
     list_granularity_levels, name_key_column, name_statistic_column,
@@ -719,7 +720,8 @@ fn select_terms(
 }
 
 /// The value of an ordering metric of the bucket at `path` whose aggregated row is `row`, as a
-/// double; `None` when the bucket has no value for it.
+/// double: the statistic itself, or the element of a list statistic the order names (a percent
+/// of `percentiles`); `None` when the bucket has no value for it.
 ///
 /// # Errors
 ///
@@ -730,7 +732,12 @@ pub(super) fn read_order_value(
     row: RowRef,
     path: &[BucketKey],
 ) -> Result<Option<f64>, OpenSearchError> {
-    convert_order_value(&reader.read_statistic(metric.metric, metric.statistic, Some(row), path)?)
+    let value = reader.read_statistic(metric.metric, metric.statistic, Some(row), path)?;
+    let value = match metric.element {
+        Some(element) => select_quantile_element(&value, element)?,
+        None => value,
+    };
+    convert_order_value(&value)
 }
 
 /// An ordering statistic as a double; `None` when the bucket has no value for it.

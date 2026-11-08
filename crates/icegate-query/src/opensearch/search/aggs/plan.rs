@@ -36,7 +36,7 @@ use datafusion::common::{Column, DFSchema, ScalarValue};
 use datafusion::functions::expr_fn::{coalesce, floor};
 use datafusion::functions_aggregate::expr_fn::count;
 use datafusion::functions_aggregate::grouping::grouping_udaf;
-use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, cast, col, grouping_set, lit, when};
+use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, cast, col, grouping_set, lit, when};
 use futures::future::try_join_all;
 use serde_json::{Map, Value, json};
 
@@ -54,6 +54,9 @@ use super::multi_bucket::{
 };
 use super::parse::{
     AggregationKind, AggregationTree, DateHistogramSpec, HistogramSpec, NamedAggregation, read_epoch_millis,
+};
+use super::percentiles::{
+    PercentilesSpec, SharedDigest, find_percentile_order_element, group_shared_digests, plan_rank_counts_aggregate,
 };
 use super::render::render_aggregations;
 use super::terms::{TermsOrder, TermsSpec, build_filter_predicate, build_key_literal};
@@ -133,6 +136,9 @@ pub(super) struct OrderMetric {
     pub(super) metric: usize,
     /// The statistic of that metric.
     pub(super) statistic: Statistic,
+    /// The element of a list statistic the order reads (a percent of `percentiles`); `None` for
+    /// a scalar statistic.
+    pub(super) element: Option<usize>,
 }
 
 /// The bucket kinds a level makes, with what planning resolved for them.
@@ -216,6 +222,10 @@ pub(super) struct MetricSlot<'a> {
     pub(super) kind: MetricKind,
     /// The field and `missing` it reads.
     pub(super) spec: &'a MetricSpec,
+    /// The aggregation the slot answers. The kinds whose request carries more than a field and
+    /// `missing` (`percentiles`, `percentile_ranks`) are read from it; `kind` names which one it
+    /// is.
+    pub(super) aggregation: &'a AggregationKind,
     /// The granularity the metric is computed at.
     pub(super) granularity: Granularity,
 }
@@ -317,6 +327,12 @@ impl<'a> AggregationLayout<'a> {
             AggregationKind::Cardinality(spec) => {
                 self.add_metric(aggregation, MetricKind::Cardinality, spec, ancestors)
             }
+            AggregationKind::Percentiles(spec) => {
+                self.add_metric(aggregation, MetricKind::Percentiles, &spec.metric, ancestors)
+            }
+            AggregationKind::PercentileRanks(spec) => {
+                self.add_metric(aggregation, MetricKind::PercentileRanks, &spec.metric, ancestors)
+            }
         }
     }
 
@@ -397,6 +413,7 @@ impl<'a> AggregationLayout<'a> {
             name: &aggregation.name,
             kind,
             spec,
+            aggregation: &aggregation.kind,
             granularity,
         });
         Ok(LayoutNode::Metric(self.metrics.len() - 1))
@@ -408,7 +425,8 @@ impl<'a> AggregationLayout<'a> {
     /// # Errors
     ///
     /// `400 aggregation_execution_exception` for an order path naming no direct metric
-    /// sub-aggregation of the level, or no statistic of that metric.
+    /// sub-aggregation of the level, no statistic of that metric, a percent a `percentiles` does
+    /// not compute, or a percent of any other metric.
     fn resolve_order_metrics(
         &self,
         name: &str,
@@ -432,8 +450,32 @@ impl<'a> AggregationLayout<'a> {
                                 path.aggregation
                             ))
                         })?;
-                    let statistic = resolve_order_statistic(self.metrics[metric].kind, path)?;
-                    Ok(Some(OrderMetric { metric, statistic }))
+                    let slot = &self.metrics[metric];
+                    // A percent orders by one element of the `quantiles` list the slot computes.
+                    let order_metric = if let AggregationKind::Percentiles(spec) = slot.aggregation {
+                        OrderMetric {
+                            metric,
+                            statistic: Statistic::Quantiles,
+                            element: Some(find_percentile_order_element(spec, path)?),
+                        }
+                    } else if let Some(percent) = &path.percent {
+                        // Another metric computes no percent; ordering by its own value instead
+                        // would rank the buckets by something the path does not name.
+                        return Err(OpenSearchError::aggregation_execution(&format!(
+                            "order path [{}[{percent}]] selects a percent, which the [{}] aggregation [{}] does \
+                             not compute",
+                            path.aggregation,
+                            slot.kind.read_type_name(),
+                            path.aggregation
+                        )));
+                    } else {
+                        OrderMetric {
+                            metric,
+                            statistic: resolve_order_statistic(slot.kind, path)?,
+                            element: None,
+                        }
+                    };
+                    Ok(Some(order_metric))
                 }
             })
             .collect()
@@ -829,7 +871,9 @@ pub(super) fn project_inputs(rows: LogicalPlan, inputs: &PlanInputs) -> Result<L
 ///
 /// Every metric of the members is computed for every grouping set and read only at its own
 /// granularity: one aggregate reads the rows once, where one aggregate per granularity would
-/// read them once per granularity.
+/// read them once per granularity. The `percentiles` of the stage that read the same value share
+/// one digest ([`SharedDigest`]); a `percentile_ranks` is one `rank_counts` aggregate; every other
+/// statistic is one aggregate column of its metric.
 ///
 /// # Errors
 ///
@@ -840,16 +884,28 @@ pub(super) fn plan_stage(
     members: &[Granularity],
 ) -> Result<StagePlan, OpenSearchError> {
     let mut aggregates = vec![count(lit(1_i64)).alias(DOC_COUNT_COLUMN)];
+    let mut percentiles: Vec<(usize, &PercentilesSpec)> = Vec::new();
     for (metric, slot) in layout.metrics.iter().enumerate() {
-        if members.contains(&slot.granularity) {
+        if !members.contains(&slot.granularity) {
+            continue;
+        }
+        if let AggregationKind::Percentiles(spec) = slot.aggregation {
+            percentiles.push((metric, spec));
+        } else if let AggregationKind::PercentileRanks(spec) = slot.aggregation {
+            aggregates.push(
+                plan_rank_counts_aggregate(spec, col(name_value_column(metric)))
+                    .alias(name_statistic_column(metric, Statistic::RankCounts)),
+            );
+        } else {
+            let value = col(name_value_column(metric));
             for &statistic in slot.kind.list_statistics() {
-                aggregates.push(
-                    plan_statistic(statistic, col(name_value_column(metric)))?
-                        .alias(name_statistic_column(metric, statistic)),
-                );
+                aggregates
+                    .push(plan_statistic(statistic, value.clone())?.alias(name_statistic_column(metric, statistic)));
             }
         }
     }
+    let digests = group_shared_digests(percentiles)?;
+    aggregates.extend(digests.iter().map(SharedDigest::plan_digest));
     let grouped_levels: Vec<usize> = members
         .iter()
         .flat_map(|member| list_granularity_levels(layout, *member).iter().copied())
@@ -857,12 +913,9 @@ pub(super) fn plan_stage(
         .into_iter()
         .collect();
     if grouped_levels.is_empty() {
-        let plan = relation
-            .aggregate(Vec::<Expr>::new(), aggregates)
-            .and_then(LogicalPlanBuilder::build)
-            .map_err(convert_plan_error)?;
+        let aggregate = relation.aggregate(Vec::<Expr>::new(), aggregates).map_err(convert_plan_error)?;
         return Ok(StagePlan {
-            plan,
+            plan: build_with_member_quantiles(aggregate, &digests)?,
             members: members.iter().map(|member| (*member, 0)).collect(),
             has_grouping_sets: false,
         });
@@ -882,15 +935,45 @@ pub(super) fn plan_stage(
         .iter()
         .map(|member| compute_level_mask(&grouped_levels, list_granularity_levels(layout, *member)))
         .collect::<Result<Vec<_>, _>>()?;
-    let plan = relation
+    let aggregate = relation
         .aggregate(vec![grouping_set(sets)], aggregates)
-        .and_then(LogicalPlanBuilder::build)
         .map_err(convert_plan_error)?;
     Ok(StagePlan {
-        plan,
+        plan: build_with_member_quantiles(aggregate, &digests)?,
         members: members.iter().copied().zip(masks).collect(),
         has_grouping_sets: true,
     })
+}
+
+/// `aggregate`, followed by the per-member `quantiles` columns of every shared digest. Without
+/// a shared digest the aggregate is the plan, so no projection is paid for.
+///
+/// # Errors
+///
+/// `500` when the projection fails to type-check.
+fn build_with_member_quantiles(
+    aggregate: LogicalPlanBuilder,
+    digests: &[SharedDigest<'_>],
+) -> Result<LogicalPlan, OpenSearchError> {
+    let member_quantiles: Vec<Expr> = digests.iter().flat_map(SharedDigest::plan_member_quantiles).collect();
+    if member_quantiles.is_empty() {
+        return aggregate.build().map_err(convert_plan_error);
+    }
+    // Every aggregate column keeps its name, the level mask included, so the assembler reads
+    // the stage as before. The analyzer that resolves `grouping()` drops DataFusion's internal
+    // grouping-id column, so the projection must not name it; pinned by
+    // `bucket_tree_tests::percentiles_over_the_same_field_share_one_digest_and_read_their_own_percents`,
+    // which fails when the projection names it.
+    let aggregate_columns = aggregate
+        .schema()
+        .columns()
+        .into_iter()
+        .filter(|column| column.name != Aggregate::INTERNAL_GROUPING_ID)
+        .map(Expr::Column);
+    aggregate
+        .project(aggregate_columns.chain(member_quantiles))
+        .and_then(LogicalPlanBuilder::build)
+        .map_err(convert_plan_error)
 }
 
 /// The `grouping()` mask of the rows whose set is the key columns of `path`, when the aggregate
@@ -1092,9 +1175,10 @@ fn list_aggregations(tree: &AggregationTree) -> Vec<&NamedAggregation> {
 
 /// Refuse a field mapped to different types, or stored as different Arrow types, across the
 /// searched indices, and a field `aggregation` cannot read. A bucket or a numeric metric reads
-/// numbers (`histogram`, `range`; `avg`, `sum`, `min`, `max` and `stats` also booleans and
-/// dates), a `date_histogram` and a `date_range` dates, a `terms`, a `value_count` and a
-/// `cardinality` anything but text and objects; `filter` and `filters` read no field.
+/// numbers (`histogram`, `range`; `avg`, `sum`, `min`, `max`, `stats`, `percentiles` and
+/// `percentile_ranks` also booleans and dates), a `date_histogram` and a `date_range` dates, a
+/// `terms`, a `value_count` and a `cardinality` anything but text and objects; `filter` and
+/// `filters` read no field.
 fn check_field_for_aggregation(
     aggregation: &NamedAggregation,
     field_name: &str,
@@ -1146,6 +1230,8 @@ fn check_field_for_aggregation(
         AggregationKind::Min(_) if !is_metric_input => refuse("min"),
         AggregationKind::Max(_) if !is_metric_input => refuse("max"),
         AggregationKind::Stats(_) if !is_metric_input => refuse("stats"),
+        AggregationKind::Percentiles(_) if !is_metric_input => refuse("percentiles"),
+        AggregationKind::PercentileRanks(_) if !is_metric_input => refuse("percentile_ranks"),
         AggregationKind::ValueCount(_) if is_text_or_object => refuse("value_count"),
         AggregationKind::Cardinality(_) if is_text_or_object => refuse("cardinality"),
         AggregationKind::DateHistogram(_)
@@ -1158,6 +1244,8 @@ fn check_field_for_aggregation(
         | AggregationKind::ValueCount(_)
         | AggregationKind::Stats(_)
         | AggregationKind::Cardinality(_)
+        | AggregationKind::Percentiles(_)
+        | AggregationKind::PercentileRanks(_)
         | AggregationKind::Range(_)
         | AggregationKind::DateRange(_)
         | AggregationKind::Filters(_)
@@ -1211,7 +1299,9 @@ fn choose_row_data_type(aggregation: &NamedAggregation, resolved: &[Option<Resol
         | AggregationKind::Sum(_)
         | AggregationKind::Min(_)
         | AggregationKind::Max(_)
-        | AggregationKind::Stats(_) => DataType::Float64,
+        | AggregationKind::Stats(_)
+        | AggregationKind::Percentiles(_)
+        | AggregationKind::PercentileRanks(_) => DataType::Float64,
         AggregationKind::Filters(_) | AggregationKind::Filter(_) => return None,
     };
     Some(resolved.iter().flatten().find_map(map_field_data_type).unwrap_or(fallback))
@@ -4337,5 +4427,308 @@ mod bucket_tree_tests {
             ]
         );
         assert_eq!(aggregations["unmapped"], json!({"value": 0}));
+    }
+
+    #[tokio::test]
+    async fn percentiles_render_keyed_nn_n_keys_by_default_and_an_array_when_keyed_is_false() {
+        // Each service holds one distinct duration, so every percentile equals it. The two
+        // percentiles read the same field, so they share one digest under a grouping set.
+        let rows = [
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), Some(100), None),
+            build_test_row(AT_11_10, Some("api"), Some("INFO"), Some(100), None),
+            build_test_row(AT_10_40, Some("web"), Some("INFO"), Some(250), None),
+        ];
+        let aggregations = run_aggregations(
+            &rows,
+            json!({"services": {
+                "terms": {"field": "service_name", "order": {"_key": "asc"}},
+                "aggs": {
+                    "keyed": {"percentiles": {"field": "duration_micros", "percents": [50, 99]}},
+                    "listed": {"percentiles": {"field": "duration_micros", "percents": [50, 99], "keyed": false}}
+                }
+            }}),
+        )
+        .await
+        .expect("aggregate the rows");
+        let buckets = &aggregations["services"]["buckets"];
+        assert_eq!(buckets.as_array().map(Vec::len), Some(2));
+        assert_eq!(buckets[0]["key"], json!("api"));
+        assert_eq!(buckets[0]["keyed"], json!({"values": {"50.0": 100.0, "99.0": 100.0}}));
+        assert_eq!(
+            buckets[0]["listed"],
+            json!({"values": [{"key": 50.0, "value": 100.0}, {"key": 99.0, "value": 100.0}]})
+        );
+        assert_eq!(buckets[1]["key"], json!("web"));
+        assert_eq!(buckets[1]["keyed"], json!({"values": {"50.0": 250.0, "99.0": 250.0}}));
+        assert_eq!(
+            buckets[1]["listed"],
+            json!({"values": [{"key": 50.0, "value": 250.0}, {"key": 99.0, "value": 250.0}]})
+        );
+    }
+
+    #[tokio::test]
+    async fn percentiles_without_percents_answer_the_seven_default_keys() {
+        let rows = [
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), Some(400), None),
+            build_test_row(AT_10_40, Some("web"), Some("INFO"), Some(400), None),
+        ];
+        let aggregations = run_aggregations(&rows, json!({"1": {"percentiles": {"field": "duration_micros"}}}))
+            .await
+            .expect("aggregate the rows");
+        assert_eq!(
+            aggregations["1"],
+            json!({"values": {
+                "1.0": 400.0, "5.0": 400.0, "25.0": 400.0, "50.0": 400.0,
+                "75.0": 400.0, "95.0": 400.0, "99.0": 400.0
+            }})
+        );
+    }
+
+    #[tokio::test]
+    async fn string_percents_normalize_to_one_decimal_keys() {
+        let rows = [build_test_row(
+            AT_10_05_00_000999,
+            Some("api"),
+            Some("INFO"),
+            Some(300),
+            None,
+        )];
+        let aggregations = run_aggregations(
+            &rows,
+            json!({"1": {"percentiles": {"field": "duration_micros", "percents": ["25", "50.5", 99]}}}),
+        )
+        .await
+        .expect("aggregate the rows");
+        assert_eq!(
+            aggregations["1"],
+            json!({"values": {"25.0": 300.0, "50.5": 300.0, "99.0": 300.0}})
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_percents_render_one_keyed_entry_and_two_equal_listed_entries() {
+        // A percent listed twice is estimated once and read at both of its positions.
+        let rows = [
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), Some(300), None),
+            build_test_row(AT_10_40, Some("api"), Some("INFO"), Some(300), None),
+        ];
+        let aggregations = run_aggregations(
+            &rows,
+            json!({
+                "keyed": {"percentiles": {"field": "duration_micros", "percents": [50, 50]}},
+                "listed": {"percentiles": {"field": "score", "percents": [50, 50], "keyed": false}},
+                "listed_durations": {"percentiles": {"field": "duration_micros", "percents": [50, 50], "keyed": false}}
+            }),
+        )
+        .await
+        .expect("aggregate the rows");
+        assert_eq!(aggregations["keyed"], json!({"values": {"50.0": 300.0}}));
+        // No score is stored, so both entries of the listed form have no value.
+        assert_eq!(
+            aggregations["listed"],
+            json!({"values": [{"key": 50.0, "value": null}, {"key": 50.0, "value": null}]})
+        );
+        assert_eq!(
+            aggregations["listed_durations"],
+            json!({"values": [{"key": 50.0, "value": 300.0}, {"key": 50.0, "value": 300.0}]})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_percentiles_with_a_repeated_percent_reads_both_positions() {
+        // The only percentiles of its stage: its digest is not shared, yet its list repeats a
+        // percent, so each position reads the one estimate.
+        let rows = [build_test_row(
+            AT_10_05_00_000999,
+            Some("api"),
+            Some("INFO"),
+            Some(700),
+            None,
+        )];
+        let keyed_aggregations = run_aggregations(
+            &rows,
+            json!({"1": {"percentiles": {"field": "duration_micros", "percents": [50, 50]}}}),
+        )
+        .await
+        .expect("aggregate the rows");
+        assert_eq!(keyed_aggregations["1"], json!({"values": {"50.0": 700.0}}));
+        let listed_aggregations = run_aggregations(
+            &rows,
+            json!({"1": {"percentiles": {"field": "duration_micros", "percents": [50, 50], "keyed": false}}}),
+        )
+        .await
+        .expect("aggregate the rows");
+        assert_eq!(
+            listed_aggregations["1"],
+            json!({"values": [{"key": 50.0, "value": 700.0}, {"key": 50.0, "value": 700.0}]})
+        );
+    }
+
+    #[tokio::test]
+    async fn percentile_ranks_are_exact() {
+        // Four durations 100..400 and one row without a duration, which no rank counts.
+        let rows = [
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), Some(100), None),
+            build_test_row(AT_10_40, Some("api"), Some("INFO"), Some(200), None),
+            build_test_row(AT_11_10, Some("api"), Some("INFO"), Some(300), None),
+            build_test_row(AT_11_30, Some("api"), Some("INFO"), Some(400), None),
+            build_test_row(AT_11_30, Some("web"), Some("ERROR"), None, None),
+        ];
+        let aggregations = run_aggregations(
+            &rows,
+            json!({"1": {"percentile_ranks": {"field": "duration_micros", "values": [250, 400, 50], "keyed": false}}}),
+        )
+        .await
+        .expect("aggregate the rows");
+        assert_eq!(
+            aggregations["1"],
+            json!({"values": [
+                {"key": 250.0, "value": 50.0},
+                {"key": 400.0, "value": 100.0},
+                {"key": 50.0, "value": 0.0}
+            ]})
+        );
+    }
+
+    #[tokio::test]
+    async fn terms_ordered_by_a_percentile_path_under_a_date_histogram_rank_by_that_percentile() {
+        let rows = [
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), Some(100), None),
+            build_test_row(AT_10_40, Some("web"), Some("INFO"), Some(300), None),
+            build_test_row(AT_11_10, Some("api"), Some("INFO"), Some(500), None),
+            build_test_row(AT_11_30, Some("web"), Some("INFO"), Some(200), None),
+        ];
+        for path in ["1[50.0]", "1['50.0']", "1.50"] {
+            let aggregations = run_aggregations(
+                &rows,
+                json!({"hours": {
+                    "date_histogram": {"field": "timestamp", "fixed_interval": "1h"},
+                    "aggs": {"services": {
+                        "terms": {"field": "service_name", "size": 5, "order": {path: "desc"}},
+                        "aggs": {"1": {"percentiles": {"field": "duration_micros", "percents": [50]}}}
+                    }}
+                }}),
+            )
+            .await
+            .expect("aggregate the rows");
+            let hours = &aggregations["hours"]["buckets"];
+            assert_eq!(hours.as_array().map(Vec::len), Some(2), "{path}");
+            assert_eq!(hours[0]["key"], json!(HOUR_10_KEY), "{path}");
+            assert_eq!(
+                summarize_buckets(&hours[0]["services"], "1"),
+                vec![
+                    json!(["web", 1, {"values": {"50.0": 300.0}}]),
+                    json!(["api", 1, {"values": {"50.0": 100.0}}]),
+                ],
+                "{path}"
+            );
+            assert_eq!(hours[1]["key"], json!(HOUR_11_KEY), "{path}");
+            assert_eq!(
+                summarize_buckets(&hours[1]["services"], "1"),
+                vec![
+                    json!(["api", 1, {"values": {"50.0": 500.0}}]),
+                    json!(["web", 1, {"values": {"50.0": 200.0}}]),
+                ],
+                "{path}"
+            );
+        }
+        // A percent the percentiles aggregation does not compute cannot order.
+        let error = run_aggregations(
+            &rows,
+            json!({"services": {
+                "terms": {"field": "service_name", "order": {"1[75.0]": "desc"}},
+                "aggs": {"1": {"percentiles": {"field": "duration_micros", "percents": [50]}}}
+            }}),
+        )
+        .await
+        .expect_err("75 is not computed");
+        render_refusal(error, "aggregation_execution_exception").await;
+    }
+
+    #[tokio::test]
+    async fn a_terms_order_by_a_percentile_ranks_path_is_an_aggregation_execution_exception() {
+        for order in [json!({"2[50.0]": "asc"}), json!({"2": "asc"}), json!({"2.50": "asc"})] {
+            let error = run_aggregations(
+                &build_hourly_rows(),
+                json!({"services": {
+                    "terms": {"field": "service_name", "order": order.clone()},
+                    "aggs": {"2": {"percentile_ranks": {"field": "duration_micros", "values": [50]}}}
+                }}),
+            )
+            .await
+            .expect_err("a percentile_ranks cannot order buckets");
+            render_refusal(error, "aggregation_execution_exception").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_percent_order_path_on_a_metric_without_percents_is_an_aggregation_execution_exception() {
+        // Without the refusal the path would order by the average itself.
+        let error = run_aggregations(
+            &build_hourly_rows(),
+            json!({"services": {
+                "terms": {"field": "service_name", "order": {"1[50.0]": "desc"}},
+                "aggs": {"1": {"avg": {"field": "duration_micros"}}}
+            }}),
+        )
+        .await
+        .expect_err("an avg computes no percent");
+        render_refusal(error, "aggregation_execution_exception").await;
+    }
+
+    #[tokio::test]
+    async fn percentiles_over_the_same_field_share_one_digest_and_read_their_own_percents() {
+        // Durations 100, 300, 500 and scores 1.5, 2.5, 4.0. Percent 0 is the minimum and 100
+        // the maximum exactly, so each value is stated by hand.
+        let rows = [
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), Some(100), Some(1.5)),
+            build_test_row(AT_10_40, Some("api"), Some("INFO"), Some(300), Some(2.5)),
+            build_test_row(AT_11_10, Some("api"), Some("INFO"), Some(500), Some(4.0)),
+        ];
+        let aggregations = json!({"services": {
+            "terms": {"field": "service_name"},
+            "aggs": {
+                "a": {"percentiles": {"field": "duration_micros", "percents": [100, 0]}},
+                "b": {"percentiles": {"field": "duration_micros", "percents": [0]}},
+                "c": {"percentiles": {"field": "score", "percents": [100]}}
+            }
+        }});
+        let rendered_aggregations = run_aggregations(&rows, aggregations.clone()).await.expect("aggregate the rows");
+        let buckets = &rendered_aggregations["services"]["buckets"];
+        assert_eq!(buckets.as_array().map(Vec::len), Some(1));
+        let api = &buckets[0];
+        assert_eq!(api["key"], json!("api"));
+        assert_eq!(api["a"], json!({"values": {"100.0": 500.0, "0.0": 100.0}}));
+        assert_eq!(api["b"], json!({"values": {"0.0": 100.0}}));
+        assert_eq!(api["c"], json!({"values": {"100.0": 4.0}}));
+        // One digest per field: "a" and "b" share the duration digest.
+        let tree = parse_aggregations(&aggregations).expect("parse the request");
+        let layout = AggregationLayout::new(&tree, read_request_now()).expect("lay out the request");
+        let rows_plan = scan_test_rows(&rows);
+        let inputs = resolve_plan_inputs(&layout, rows_plan.schema()).expect("resolve the inputs");
+        let plans = plan_aggregations(rows_plan, &layout, &inputs).expect("plan the request");
+        let mut digest_count = 0_usize;
+        for stage in &plans.stages {
+            stage
+                .plan
+                .apply(|node| {
+                    if let LogicalPlan::Aggregate(aggregate) = node {
+                        digest_count += aggregate
+                            .aggr_expr
+                            .iter()
+                            .map(|expression| expression.clone().unalias())
+                            .filter(|expression| {
+                                matches!(
+                                    expression,
+                                    Expr::AggregateFunction(function) if function.func.name() == "multi_quantile"
+                                )
+                            })
+                            .count();
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .expect("walk the plan");
+        }
+        assert_eq!(digest_count, 2);
     }
 }

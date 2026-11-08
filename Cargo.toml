@@ -108,6 +108,9 @@ iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev 
 
 # DataFusion
 datafusion = "54.1"
+# DataFusion's t-digest, used directly by the OpenSearch `percentiles` aggregate;
+# `datafusion` does not re-export it. Keep it on the same minor as `datafusion`.
+datafusion-functions-aggregate-common = "54.1"
 datafusion-tracing = "54.0"
 # 0.4.15 builds against datafusion 52 / arrow-flight 57, which no longer unify
 # with the pins above (SQLOptions, SessionState and the FlightSqlService trait all

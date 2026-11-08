@@ -7,6 +7,7 @@ mod distinct;
 mod metrics;
 mod multi_bucket;
 mod parse;
+mod percentiles;
 mod plan;
 mod render;
 mod terms;

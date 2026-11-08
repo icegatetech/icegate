@@ -35,6 +35,7 @@ iceberg-datafusion = { workspace = true }
 
 # DataFusion
 datafusion = { workspace = true }
+datafusion-functions-aggregate-common = { workspace = true }
 datafusion-tracing = { workspace = true }
 datafusion-flight-sql-server = { workspace = true }
 

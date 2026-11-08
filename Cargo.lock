@@ -5356,6 +5356,7 @@ dependencies = [
  "criterion",
  "datafusion 54.1.0",
  "datafusion-flight-sql-server",
+ "datafusion-functions-aggregate-common 54.1.0",
  "datafusion-tracing",
  "futures",
  "hex",

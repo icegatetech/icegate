@@ -17,6 +17,9 @@ use super::metrics::MetricSpec;
 use super::multi_bucket::{
     DateMathRange, DateRangeBound, DateRangeBucketsSpec, FiltersBuckets, FiltersSpec, NumericRange, RangeBucketsSpec,
 };
+use super::percentiles::{
+    PercentileRanksSpec, PercentilesSpec, parse_percentile_ranks, parse_percentiles, split_percent_path,
+};
 use super::terms::{TermsSpec, parse_terms};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::{
@@ -45,9 +48,7 @@ const OUT_OF_SCOPE_KINDS: [&str; 6] = [
 const OUT_OF_SCOPE_PIPELINES: [&str; 1] = ["extended_stats_bucket"];
 
 /// Kinds of the aggregation surface that are not planned yet.
-const NOT_YET_PLANNED_KINDS: [&str; 14] = [
-    "percentiles",
-    "percentile_ranks",
+const NOT_YET_PLANNED_KINDS: [&str; 12] = [
     "extended_stats",
     "top_hits",
     "cumulative_sum",
@@ -103,6 +104,10 @@ pub(crate) enum AggregationKind {
     Stats(MetricSpec),
     /// The exact number of distinct values of the field in the bucket.
     Cardinality(MetricSpec),
+    /// Approximate quantiles of the bucket's values.
+    Percentiles(PercentilesSpec),
+    /// Exact shares, in percent, of the bucket's values at or below given values.
+    PercentileRanks(PercentileRanksSpec),
     /// Numeric `[from, to)` buckets; a row counts in every range it lies in.
     Range(RangeBucketsSpec),
     /// Date-math `[from, to)` buckets resolved against the request's `now`.
@@ -127,6 +132,8 @@ impl AggregationKind {
             | Self::ValueCount(spec)
             | Self::Stats(spec)
             | Self::Cardinality(spec) => Some(&spec.field),
+            Self::Percentiles(PercentilesSpec { metric, .. })
+            | Self::PercentileRanks(PercentileRanksSpec { metric, .. }) => Some(&metric.field),
             Self::Range(spec) => Some(&spec.field),
             Self::DateRange(spec) => Some(&spec.field),
             Self::Filters(_) | Self::Filter(_) => None,
@@ -182,6 +189,9 @@ pub(crate) struct MetricPath {
     /// The statistic of a multi-value metric (`max` in `score_stats.max`); `None` for a
     /// single-value metric.
     pub(crate) statistic: Option<String>,
+    /// The percent a `<id>[p]` or `<id>['p']` path selects, in key form (`"50.0"`); `None` for
+    /// every other form (an `<id>.p` path keeps `p` in `statistic`).
+    pub(crate) percent: Option<String>,
 }
 
 /// The width of a `date_histogram` bucket.
@@ -304,6 +314,8 @@ fn parse_kind(name: &str, kind_name: &str, value: &Value) -> Result<AggregationK
         "cardinality" => Ok(AggregationKind::Cardinality(parse_metric(
             name, kind_name, value, false,
         )?)),
+        "percentiles" => Ok(AggregationKind::Percentiles(parse_percentiles(name, value)?)),
+        "percentile_ranks" => Ok(AggregationKind::PercentileRanks(parse_percentile_ranks(name, value)?)),
         "range" => Ok(AggregationKind::Range(parse_range(name, value)?)),
         "date_range" => Ok(AggregationKind::DateRange(parse_date_range(name, value)?)),
         "filters" => Ok(AggregationKind::Filters(parse_filters(name, value)?)),
@@ -520,23 +532,27 @@ fn parse_extended_bounds<T: PartialOrd + Display>(
     }
 }
 
-/// Parse a `terms` order key that names a metric: `<id>`, `<id>.<stat>`, or `<id>-orderAgg` (an
-/// ordinary name). The statistic is what follows the first `.`.
+/// Parse a `terms` order key that names a metric: `<id>`, `<id>.<stat>`, `<id>[<percent>]`,
+/// `<id>['<percent>']`, or `<id>-orderAgg` (an ordinary name). The statistic is what follows the
+/// first `.`; a bracketed percent is kept in key form ([`split_percent_path`]).
 ///
 /// # Errors
 ///
 /// `400 parsing_exception` for an empty name or statistic, a `>` path into a deeper aggregation
-/// (a level orders only by a direct metric sub-aggregation), and a bracketed percentile selector.
+/// (a level orders only by a direct metric sub-aggregation), and a bracket that is unclosed or
+/// holds no finite number.
 pub(crate) fn parse_metric_path(text: &str) -> Result<MetricPath, OpenSearchError> {
     if text.contains('>') {
         return Err(OpenSearchError::parsing(format!(
             "order path [{text}] names a nested aggregation; order by a direct metric sub-aggregation"
         )));
     }
-    if text.contains('[') {
-        return Err(OpenSearchError::parsing(format!(
-            "order path [{text}] selects a percentile, which is not supported"
-        )));
+    if let Some((aggregation, percent)) = split_percent_path(text)? {
+        return Ok(MetricPath {
+            aggregation: aggregation.to_string(),
+            statistic: None,
+            percent: Some(percent),
+        });
     }
     let (aggregation, statistic) = text
         .split_once('.')
@@ -549,6 +565,7 @@ pub(crate) fn parse_metric_path(text: &str) -> Result<MetricPath, OpenSearchErro
     Ok(MetricPath {
         aggregation: aggregation.to_string(),
         statistic: statistic.map(str::to_string),
+        percent: None,
     })
 }
 
@@ -573,16 +590,11 @@ fn parse_metric(
             "field" => field = Some(expect_string(name, key, value)?.to_string()),
             "missing" if is_missing_accepted => missing = Some(read_lenient_number(name, key, value)?),
             ignored if IGNORED_EXECUTION_KEYS.contains(&ignored) => {}
-            unknown => {
-                return Err(OpenSearchError::unsupported_construct(
-                    unknown,
-                    format!("[{kind_name}] of [{name}] does not support [{unknown}]"),
-                ));
-            }
+            unknown => return Err(report_unsupported_key(kind_name, name, unknown)),
         }
     }
     Ok(MetricSpec {
-        field: field.ok_or_else(|| OpenSearchError::parsing(format!("[{kind_name}] of [{name}] requires [field]")))?,
+        field: field.ok_or_else(|| report_missing_key(kind_name, name, "field"))?,
         missing,
     })
 }
@@ -681,7 +693,7 @@ fn parse_range(name: &str, value: &Value) -> Result<RangeBucketsSpec, OpenSearch
             "ranges" => ranges = Some(read_ranges(name, value, parse_numeric_range)?),
             "keyed" => is_keyed = expect_flag(name, key, value)?,
             ignored if IGNORED_EXECUTION_KEYS.contains(&ignored) => {}
-            unknown => return Err(refuse_unknown_key("range", name, unknown)),
+            unknown => return Err(report_unsupported_key("range", name, unknown)),
         }
     }
     Ok(RangeBucketsSpec {
@@ -713,7 +725,7 @@ fn parse_date_range(name: &str, value: &Value) -> Result<DateRangeBucketsSpec, O
             "time_zone" => time_zone = Some(parse_time_zone(expect_string(name, key, value)?)?),
             "format" => format = Some(DateRenderFormat::parse(expect_string(name, key, value)?)?),
             ignored if IGNORED_EXECUTION_KEYS.contains(&ignored) => {}
-            unknown => return Err(refuse_unknown_key("date_range", name, unknown)),
+            unknown => return Err(report_unsupported_key("date_range", name, unknown)),
         }
     }
     Ok(DateRangeBucketsSpec {
@@ -761,7 +773,7 @@ fn parse_filters(name: &str, value: &Value) -> Result<FiltersSpec, OpenSearchErr
                 });
             }
             ignored if IGNORED_EXECUTION_KEYS.contains(&ignored) => {}
-            unknown => return Err(refuse_unknown_key("filters", name, unknown)),
+            unknown => return Err(report_unsupported_key("filters", name, unknown)),
         }
     }
     Ok(FiltersSpec {
@@ -831,16 +843,21 @@ fn read_range_entry<B>(
             "from" => from = Some(read_bound(name, "ranges.from", value)?),
             "to" => to = Some(read_bound(name, "ranges.to", value)?),
             "key" => key = Some(expect_string(name, "ranges.key", value)?.to_string()),
-            unknown => return Err(refuse_unknown_key("ranges", name, unknown)),
+            unknown => return Err(report_unsupported_key("ranges", name, unknown)),
         }
     }
     Ok((from, to, key))
 }
 
-/// The refusal of a key the `kind` object of aggregation `name` does not support: a `400
-/// parsing_exception` naming `unknown` under `construct`.
-fn refuse_unknown_key(kind: &str, name: &str, unknown: &str) -> OpenSearchError {
-    OpenSearchError::unsupported_construct(unknown, format!("[{kind}] of [{name}] does not support [{unknown}]"))
+/// The `400 parsing_exception` of a key the `kind_name` object of the aggregation `name` does not
+/// accept, naming `key` under `construct`.
+pub(super) fn report_unsupported_key(kind_name: &str, name: &str, key: &str) -> OpenSearchError {
+    OpenSearchError::unsupported_construct(key, format!("[{kind_name}] of [{name}] does not support [{key}]"))
+}
+
+/// The `400 parsing_exception` of a key the `kind_name` aggregation `name` requires and lacks.
+pub(super) fn report_missing_key(kind_name: &str, name: &str, key: &str) -> OpenSearchError {
+    OpenSearchError::parsing(format!("[{kind_name}] of [{name}] requires [{key}]"))
 }
 
 /// A date bound as written: a string (a date, date math or epoch milliseconds), or a JSON
@@ -868,7 +885,7 @@ fn read_date_bound(name: &str, key: &str, value: &Value) -> Result<DateRangeBoun
 /// # Errors
 ///
 /// `400 parsing_exception` naming `key` of `name` for any other value.
-fn expect_flag(name: &str, key: &str, value: &Value) -> Result<bool, OpenSearchError> {
+pub(super) fn expect_flag(name: &str, key: &str, value: &Value) -> Result<bool, OpenSearchError> {
     value
         .as_bool()
         .ok_or_else(|| OpenSearchError::parsing(format!("[{key}] of [{name}] must be a boolean")))
@@ -1500,6 +1517,7 @@ mod tests {
         let path = |aggregation: &str, statistic: Option<&str>| MetricPath {
             aggregation: aggregation.to_string(),
             statistic: statistic.map(str::to_string),
+            percent: None,
         };
         assert_eq!(parse_metric_path("1").expect("an id"), path("1", None));
         assert_eq!(
@@ -1514,12 +1532,20 @@ mod tests {
             parse_metric_path("1.95").expect("a dotted percent"),
             path("1", Some("95"))
         );
-        for refused in ["", ".max", "score_stats.", "outer>inner", "1[50.0]"] {
+        for refused in ["", ".max", "score_stats.", "outer>inner", "1[50.0"] {
             let error = parse_metric_path(refused).expect_err("the path must be refused");
             let (status, body) = render_envelope(error).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
             assert_eq!(body["error"]["type"], "parsing_exception", "{refused}");
         }
+        assert_eq!(
+            parse_metric_path("1['50.5']").expect("a quoted percent"),
+            MetricPath {
+                aggregation: "1".to_string(),
+                statistic: None,
+                percent: Some("50.5".to_string()),
+            }
+        );
 
         let Ok(AggregationKind::Terms(spec)) = parse_first_kind(&json!({"services": {"terms": {
             "field": "service_name", "order": {"1": "desc"}
