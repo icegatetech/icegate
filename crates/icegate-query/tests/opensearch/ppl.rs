@@ -19,8 +19,8 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::data::{
-    Cell, LogRow, OperationRow, Row, commit_log_rows, commit_operation_rows, commit_rows, create_exact_name_table,
-    required_string,
+    Cell, LogRow, OperationRow, PriceRow, Row, commit_log_rows, commit_operation_rows, commit_price_rows, commit_rows,
+    create_exact_name_table, required_string,
 };
 use super::harness::{ServerOptions, TestServer};
 use super::search::NearlyFullMemory;
@@ -919,5 +919,537 @@ async fn sort_puts_null_first_ascending_and_last_descending() {
     assert_eq!(read_rows(&ascending_answer), &json!([[null], ["api"], ["web"]]));
     let descending_answer = run_query(&server, "source=logs | sort - service_name | fields service_name").await;
     assert_eq!(read_rows(&descending_answer), &json!([["web"], ["api"], [null]]));
+    server.shutdown().await;
+}
+
+/// The one `acme` row of the function table: `api`, `ERROR`, `disk full`, at 12:00:00.
+const ERROR_ROW: &str = "source=logs | where severity_text = 'ERROR'";
+
+#[tokio::test]
+async fn each_supported_function_returns_the_stated_value() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    // Each expected value is derived by hand from the function's stated contract (README).
+    let cases = [
+        ("if(severity_text = 'ERROR', 1, 0)", json!(1)),
+        (
+            "case(severity_text = 'INFO', 'i', severity_text = 'ERROR', 'e' else 'x')",
+            json!("e"),
+        ),
+        ("case(severity_text = 'INFO', 'i')", json!(null)),
+        (
+            "coalesce(nullif(body, 'disk full'), service_name, 'none')",
+            json!("api"),
+        ),
+        ("ifnull(service_name, 'x')", json!("api")),
+        ("nullif(severity_text, 'ERROR')", json!(null)),
+        ("isnull(body)", json!(false)),
+        ("isnotnull(body)", json!(true)),
+        ("concat(severity_text, '-', service_name)", json!("ERROR-api")),
+        ("concat(severity_text, nullif(body, 'disk full'))", json!(null)),
+        ("lower(severity_text)", json!("error")),
+        ("upper('disk')", json!("DISK")),
+        ("trim('  x  ')", json!("x")),
+        ("ltrim('  x  ')", json!("x  ")),
+        ("rtrim('  x  ')", json!("  x")),
+        ("substring('abcdef', 2, 3)", json!("bcd")),
+        ("substring('abcdef', 3)", json!("cdef")),
+        ("substr('abcdef', 3)", json!("cdef")),
+        ("length('h\u{e9}llo')", json!(6)),
+        ("locate('full', body)", json!(6)),
+        ("like(body, 'DISK%')", json!(true)),
+        ("like(body, 'DISK%', true)", json!(false)),
+        ("like(body, 'disk_full', true)", json!(true)),
+        ("body like 'DISK%'", json!(true)),
+        ("md5('abc')", json!("900150983cd24fb0d6963f7d28e17f72")),
+        ("abs(-3)", json!(3)),
+        ("floor(2.7)", json!(2)),
+        ("ceil(2.1)", json!(3)),
+        ("ceiling(2.1)", json!(3)),
+        ("round(2.567, 2)", json!(2.57)),
+        ("round(2.5)", json!(3.0)),
+        ("mod(7, 3)", json!(1)),
+        ("7 % 3", json!(1)),
+        ("-7 % 3", json!(-1)),
+        // `*` binds tighter than `+`.
+        ("1 + 2 * 3", json!(7)),
+        ("severity_text in ('WARN', 'ERROR')", json!(true)),
+        ("severity_text not in ('ERROR')", json!(false)),
+        ("2 between 1 and 2", json!(true)),
+        ("5 not between 1 and 2", json!(true)),
+        ("service_name is null", json!(false)),
+        ("service_name is not null", json!(true)),
+        // `logs` stores the `service.name` resource attribute in its `service_name` column.
+        ("resource_attributes.service.name", json!("api")),
+        (
+            "timestamp('2026-10-08 12:00:00.123456')",
+            json!("2026-10-08 12:00:00.123456"),
+        ),
+        (
+            "date_format(timestamp, '%Y/%m/%d %H:%i:%s')",
+            json!("2026/10/08 12:00:00"),
+        ),
+        ("unix_timestamp(timestamp)", json!(1_791_460_800.0)),
+        ("from_unixtime(1791460800.5)", json!("2026-10-08 12:00:00.5")),
+        ("from_unixtime(1791460800, '%Y/%m/%d')", json!("2026/10/08")),
+        (
+            "from_unixtime(1791460800.5, '%Y-%m-%d %H:%i:%s.%f')",
+            json!("2026-10-08 12:00:00.500000"),
+        ),
+        // A string that is not a literal converts through a cast, not the literal parser.
+        (
+            "timestamp(concat('2026-10-08 ', '12:00:00'))",
+            json!("2026-10-08 12:00:00"),
+        ),
+        ("cast(timestamp as string)", json!("2026-10-08 12:00:00")),
+    ];
+    for (expression, expected) in cases {
+        let query = format!("{ERROR_ROW} | eval v = {expression} | fields v");
+        let answer = run_query(&server, &query).await;
+        assert_eq!(read_rows(&answer), &json!([[expected]]), "expression {expression}");
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn now_returns_the_request_time() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    let before_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs_f64();
+    let answer = run_query(
+        &server,
+        &format!("{ERROR_ROW} | eval a = unix_timestamp(), b = unix_timestamp(now()) | fields a, b"),
+    )
+    .await;
+    let after_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs_f64();
+    let row = &read_rows(&answer)[0];
+    let (request_seconds, now_seconds) = (row[0].as_f64().expect("a"), row[1].as_f64().expect("b"));
+    assert!(
+        (before_seconds - 1.0..=after_seconds + 1.0).contains(&request_seconds),
+        "now {request_seconds} outside [{before_seconds}, {after_seconds}]"
+    );
+    assert!(
+        (request_seconds - now_seconds).abs() < 1e-6,
+        "now() is taken once per request"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unknown_function_is_a_400_naming_it() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    let answer = run_query(&server, "source=logs | eval x = reverse(body)").await;
+    assert_ppl_error(
+        &answer,
+        StatusCode::BAD_REQUEST,
+        "UnsupportedOperationException",
+        "UNSUPPORTED_OPERATION",
+    );
+    assert_eq!(answer.body["error"]["context"]["function"], json!("reverse"));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_dotted_map_path_reads_one_key_and_is_null_when_absent() {
+    let (server, catalog) = TestServer::start().await;
+    let rows_written = [LogRow {
+        tenant_id: TENANT,
+        timestamp_micros: NOON_MICROS,
+        service_name: Some("api"),
+        severity_text: Some("INFO"),
+        body: Some("map"),
+        resource_attributes: &[("host.name", "node-a")],
+        log_attributes: &[("http", "x"), ("http.method", "GET"), ("a`b", "tick")],
+    }];
+    commit_log_rows(&catalog, &rows_written).await.expect("commit logs");
+    let answer = run_query(
+        &server,
+        "source=logs | fields log_attributes.http.method, log_attributes.`http.method`, log_attributes.http, \
+         log_attributes.`a``b`, log_attributes.missing, resource_attributes.`host.name`",
+    )
+    .await;
+    // The unquoted and the backtick-quoted spellings name the same field, which is listed once.
+    assert_eq!(
+        read_column_names(&answer),
+        vec![
+            "log_attributes.http.method",
+            "log_attributes.http",
+            "log_attributes.a`b",
+            "log_attributes.missing",
+            "resource_attributes.host.name"
+        ]
+    );
+    assert_eq!(read_rows(&answer), &json!([["GET", "x", "tick", null, "node-a"]]));
+    let filtered_answer = run_query(
+        &server,
+        "source=logs | where log_attributes.`http.method` = 'GET' | fields body",
+    )
+    .await;
+    assert_eq!(read_rows(&filtered_answer), &json!([["map"]]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn string_comparisons_and_sorts_use_byte_order() {
+    let (server, catalog) = TestServer::start().await;
+    let build_service_row = |timestamp_micros: i64, service_name: &'static str| LogRow {
+        tenant_id: TENANT,
+        timestamp_micros,
+        service_name: Some(service_name),
+        severity_text: Some("INFO"),
+        body: None,
+        resource_attributes: &[],
+        log_attributes: &[],
+    };
+    let rows_written = [
+        build_service_row(NOON_MICROS, "api"),
+        build_service_row(NOON_MICROS + 1, "Zeta"),
+        build_service_row(NOON_MICROS + 2, "\u{e9}clair"),
+        build_service_row(NOON_MICROS + 3, "zulu"),
+    ];
+    commit_log_rows(&catalog, &rows_written).await.expect("commit logs");
+    // UTF-8 bytes: 'Z' 0x5A < 'a' 0x61 < 'z' 0x7A < 'é' 0xC3 0xA9.
+    let sorted_answer = run_query(&server, "source=logs | sort service_name | fields service_name").await;
+    assert_eq!(
+        read_rows(&sorted_answer),
+        &json!([["Zeta"], ["api"], ["zulu"], ["\u{e9}clair"]])
+    );
+    let greater_answer = run_query(
+        &server,
+        "source=logs | where service_name > 'zulu' | fields service_name",
+    )
+    .await;
+    assert_eq!(read_rows(&greater_answer), &json!([["\u{e9}clair"]]));
+    let smallest_answer = run_query(&server, "source=logs | where service_name < 'a' | fields service_name").await;
+    assert_eq!(read_rows(&smallest_answer), &json!([["Zeta"]]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn integer_division_truncates_and_decimal_columns_read_as_double() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    // 3.25 USD per million input tokens, a Decimal(38, 10) holding 32_500_000_000. Written before
+    // the first query: the engine refreshes the snapshot of a table the WAL does not feed on an
+    // interval, not per request.
+    commit_price_rows(
+        &catalog,
+        &[PriceRow {
+            model: "gpt-test",
+            input_usd_per_1m: Some(32_500_000_000),
+        }],
+    )
+    .await
+    .expect("commit prices");
+    let division_answer = run_query(
+        &server,
+        &format!(
+            "{ERROR_ROW} | eval a = 7 / 2, b = -7 / 2, c = 7.0 / 2, d = 1 / 0, e = mod(7, 0) | fields a, b, c, d, e"
+        ),
+    )
+    .await;
+    assert_eq!(read_rows(&division_answer), &json!([[3, -3, 3.5, null, null]]));
+    let decimal_answer = run_query(&server, "source=prices | fields model, input_usd_per_1m").await;
+    assert_eq!(
+        decimal_answer.body["schema"],
+        json!([{"name": "model", "type": "string"}, {"name": "input_usd_per_1m", "type": "double"}])
+    );
+    assert_eq!(read_rows(&decimal_answer), &json!([["gpt-test", 3.25]]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn array_functions_return_null_on_a_null_list_and_a_value_on_an_empty_list() {
+    let (server, catalog) = TestServer::start().await;
+    let build_reasons_row = |timestamp_micros: i64, finish_reasons: Option<&'static [&'static str]>| OperationRow {
+        finish_reasons,
+        ..build_test_operation_row(TENANT, timestamp_micros, None)
+    };
+    let rows_written = [
+        build_reasons_row(NOON_MICROS, Some(&["stop", "length"])),
+        build_reasons_row(NOON_MICROS + 1, Some(&[])),
+        build_reasons_row(NOON_MICROS + 2, None),
+    ];
+    commit_operation_rows(&catalog, &rows_written).await.expect("commit operations");
+    let answer = run_query(
+        &server,
+        "source=operations | sort timestamp | eval e = exists(finish_reasons, x -> x = 'stop'), \
+         n = array_length(finish_reasons), j = mvjoin(finish_reasons, ','), i = mvindex(finish_reasons, 0), \
+         l = mvindex(finish_reasons, -1), s = mvindex(finish_reasons, 0, 1), f = forall(finish_reasons, x -> x = 'stop'), \
+         k = filter(finish_reasons, x -> x != 'stop'), u = transform(finish_reasons, x -> upper(x)) \
+         | fields e, n, j, i, l, s, f, k, u",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&answer),
+        &json!([
+            [
+                true,
+                2,
+                "stop,length",
+                "stop",
+                "length",
+                ["stop", "length"],
+                false,
+                ["length"],
+                ["STOP", "LENGTH"]
+            ],
+            [false, 0, "", null, null, [], true, [], []],
+            [null, null, null, null, null, null, null, null, null]
+        ])
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn locate_is_case_sensitive_and_md5_renders_lowercase_hex() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    let answer = run_query(
+        &server,
+        &format!(
+            "{ERROR_ROW} | eval a = locate('full', body), b = locate('FULL', body), c = md5(body) | fields a, b, c"
+        ),
+    )
+    .await;
+    // md5("disk full") computed outside IceGate (`printf 'disk full' | md5`).
+    assert_eq!(read_rows(&answer), &json!([[6, 0, "0ce552d660ffab58758aa955f2c9cd7d"]]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn timestampdiff_in_microseconds_returns_a_long() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    let answer = run_query(
+        &server,
+        "source=logs | sort timestamp | eval d = timestampdiff(MICROSECOND, timestamp('2026-10-08 12:00:00'), timestamp), \
+         s = timestampdiff(SECOND, timestamp('2026-10-08 12:00:00'), timestamp) | fields d, s",
+    )
+    .await;
+    assert_eq!(
+        answer.body["schema"],
+        json!([{"name": "d", "type": "bigint"}, {"name": "s", "type": "bigint"}])
+    );
+    assert_eq!(read_rows(&answer), &json!([[0, 0], [1_250_000, 1], [2_000_001, 2]]));
+    // The rows lie 0, 1.25 and 2.000001 seconds after noon: whole milliseconds truncate toward
+    // zero, and every coarser unit is 0.
+    let coarse_units_answer = run_query(
+        &server,
+        "source=logs | sort timestamp | eval ms = timestampdiff(MILLISECOND, timestamp('2026-10-08 12:00:00'), timestamp), \
+         mi = timestampdiff(MINUTE, timestamp('2026-10-08 12:00:00'), timestamp), \
+         h = timestampdiff(HOUR, timestamp('2026-10-08 12:00:00'), timestamp), \
+         d = timestampdiff(DAY, timestamp('2026-10-08 12:00:00'), timestamp), \
+         w = timestampdiff(WEEK, timestamp('2026-10-08 12:00:00'), timestamp) | fields ms, mi, h, d, w",
+    )
+    .await;
+    assert_eq!(
+        read_rows(&coarse_units_answer),
+        &json!([[0, 0, 0, 0, 0], [1250, 0, 0, 0, 0], [2000, 0, 0, 0, 0]])
+    );
+    let refused_answer = run_query(
+        &server,
+        "source=logs | eval d = timestampdiff(MONTH, timestamp, timestamp)",
+    )
+    .await;
+    assert_ppl_error(
+        &refused_answer,
+        StatusCode::BAD_REQUEST,
+        "SemanticCheckException",
+        "SEMANTIC_ERROR",
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cast_to_each_supported_type() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    let answer = run_query(
+        &server,
+        &format!(
+            "{ERROR_ROW} | eval a = cast('2.5' as double), b = cast(2.9 as long), c = cast('7' as int), \
+             d = cast(42 as string), e = cast('true' as boolean), f = cast('2026-10-08 12:00:00.5' as timestamp), \
+             g = cast('1.5' as float), h = cast('8' as integer) \
+             | fields a, b, c, d, e, f, g, h"
+        ),
+    )
+    .await;
+    assert_eq!(
+        answer.body["schema"],
+        json!([
+            {"name": "a", "type": "double"},
+            {"name": "b", "type": "bigint"},
+            {"name": "c", "type": "int"},
+            {"name": "d", "type": "string"},
+            {"name": "e", "type": "boolean"},
+            {"name": "f", "type": "timestamp"},
+            {"name": "g", "type": "double"},
+            {"name": "h", "type": "int"}
+        ])
+    );
+    assert_eq!(
+        read_rows(&answer),
+        &json!([[2.5, 2, 7, "42", true, "2026-10-08 12:00:00.5", 1.5, 8]])
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_string_column_that_is_not_a_timestamp_fails_the_query_at_execution() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    // A column's values are unknown at planning, so `disk full` is refused only when it is cast.
+    let answer = run_query(&server, &format!("{ERROR_ROW} | eval v = timestamp(body) | fields v")).await;
+    assert_ppl_error(
+        &answer,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "IllegalStateException",
+        "EXECUTION_ERROR",
+    );
+    let details = answer.body["error"]["details"].as_str().expect("details");
+    assert!(details.contains("disk full"), "details {details}");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn rename_and_eval_feed_later_commands() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    let answer = run_query(
+        &server,
+        "source=logs | rename severity_text as level | eval loud = upper(level), level = lower(level), n = 1, m = n + 1 \
+         | where loud = 'ERROR' | fields level, loud, m",
+    )
+    .await;
+    assert_eq!(read_rows(&answer), &json!([["error", "ERROR", 2]]));
+    // Renaming onto an existing field removes that field; renaming a field onto itself keeps it.
+    let replacing_answer = run_query(
+        &server,
+        &format!(
+            "{ERROR_ROW} | rename service_name as body, severity_text as severity_text | fields body, severity_text"
+        ),
+    )
+    .await;
+    assert_eq!(read_rows(&replacing_answer), &json!([["api", "ERROR"]]));
+    let missing_field_answer = run_query(&server, "source=logs | rename nope as x").await;
+    assert_ppl_error(
+        &missing_field_answer,
+        StatusCode::BAD_REQUEST,
+        "SemanticCheckException",
+        "FIELD_NOT_FOUND",
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn each_refused_expression_is_a_400_with_its_stated_reason() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    commit_operation_rows(&catalog, &[build_test_operation_row(TENANT, NOON_MICROS, None)])
+        .await
+        .expect("commit operations");
+    // Each reason is IceGate's own wording, asserted literally.
+    let semantic_cases = [
+        (
+            "source=logs | eval v = lower(body, body)",
+            "function [lower] takes 1 argument(s), not 2",
+        ),
+        (
+            "source=logs | eval v = timestamp(5)",
+            "timestamp() takes a string or a timestamp, not Int64; use from_unixtime for numbers",
+        ),
+        (
+            "source=logs | eval v = date_format(timestamp, '%U')",
+            "date_format does not support the specifier %U",
+        ),
+        (
+            "source=logs | eval v = date_format(timestamp, body)",
+            "date_format takes a string literal here",
+        ),
+        (
+            "source=logs | eval v = like(body, 'x', severity_text)",
+            "like takes true or false as its third argument",
+        ),
+        (
+            "source=logs | eval v = mvindex(body, service_name)",
+            "mvindex takes integer literals as indexes",
+        ),
+        (
+            "source=operations | eval v = forall(finish_reasons, (x, y) -> x = y)",
+            "the lambda of forall takes one parameter",
+        ),
+        (
+            "source=logs | rename service* as svc",
+            "rename takes field names, not the pattern [service*]",
+        ),
+        ("source=logs | rename * as svc", "rename takes field names, not *"),
+        (
+            "source=logs | eval v = coalesce(x -> x = 'a')",
+            "a lambda is only an argument of an array function",
+        ),
+        (
+            "source=operations | eval v = exists(finish_reasons, 'stop')",
+            "exists takes a lambda as its second argument",
+        ),
+        (
+            "source=logs | fields - service_name | where resource_attributes.service.name = 'api'",
+            "field [resource_attributes.service.name] reads the column [service_name], which an earlier command \
+             removed, renamed or replaced",
+        ),
+        (
+            "source=logs | rename service_name as svc, body as service_name | where resource_attributes.service.name = 'api'",
+            "field [resource_attributes.service.name] reads the column [service_name], which an earlier command \
+             removed, renamed or replaced",
+        ),
+        (
+            "source=logs | eval service_name = 'x' | where resource_attributes.service.name = 'api'",
+            "field [resource_attributes.service.name] reads the column [service_name], which an earlier command \
+             removed, renamed or replaced",
+        ),
+        // `logs` stores the attribute in a column, `spans` keeps it in its resource map.
+        (
+            "source=logs,spans | where resource_attributes.service.name = 'api'",
+            "field [resource_attributes.service.name] reads a column in some source indices and not in others",
+        ),
+    ];
+    for (query, expected_reason) in semantic_cases {
+        let answer = run_query(&server, query).await;
+        assert_ppl_error(
+            &answer,
+            StatusCode::BAD_REQUEST,
+            "SemanticCheckException",
+            "SEMANTIC_ERROR",
+        );
+        assert_eq!(answer.body["error"]["reason"], json!(expected_reason), "query {query}");
+    }
+    // The reason names the field's Arrow type after this prefix.
+    let not_a_list_answer = run_query(&server, "source=logs | eval v = forall(body, x -> x = 'a')").await;
+    assert_ppl_error(
+        &not_a_list_answer,
+        StatusCode::BAD_REQUEST,
+        "SemanticCheckException",
+        "SEMANTIC_ERROR",
+    );
+    let reason = not_a_list_answer.body["error"]["reason"].as_str().expect("reason");
+    assert!(
+        reason.starts_with("forall takes an array as its first argument, not "),
+        "reason {reason}"
+    );
+    let cast_answer = run_query(&server, "source=logs | eval v = cast(body as date)").await;
+    assert_ppl_error(
+        &cast_answer,
+        StatusCode::BAD_REQUEST,
+        "UnsupportedOperationException",
+        "UNSUPPORTED_OPERATION",
+    );
+    assert_eq!(cast_answer.body["error"]["context"]["function"], json!("cast as date"));
     server.shutdown().await;
 }

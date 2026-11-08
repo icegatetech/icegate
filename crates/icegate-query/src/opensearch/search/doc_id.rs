@@ -42,6 +42,8 @@ pub(crate) const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SECOND;
 pub(crate) const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MINUTE;
 /// Microseconds in a day, the unit step of a `Date32` value.
 pub(crate) const MICROS_PER_DAY: i64 = 86_400_000_000;
+/// Microseconds in a week, the longest calendar unit a `derivative.unit` or a PPL interval names.
+pub(crate) const MICROS_PER_WEEK: i64 = 7 * MICROS_PER_DAY;
 
 /// Characters of a hashed `_id`: 8 timestamp bytes and 8 hash bytes, as hex.
 const HASHED_DOCUMENT_ID_LENGTH: usize = 32;

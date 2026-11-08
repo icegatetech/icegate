@@ -15,11 +15,12 @@ use datafusion::arrow::record_batch::RecordBatch;
 use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
 use iceberg::{Catalog, NamespaceIdent, TableCreation};
 use icegate_common::schema::{
-    COL_BODY, COL_DURATION_MICROS, COL_END_TIMESTAMP, COL_INGESTED_TIMESTAMP, COL_LOG_ATTRIBUTES,
-    COL_OBSERVED_TIMESTAMP, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT,
-    COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID,
+    COL_BODY, COL_CURRENCY, COL_DURATION_MICROS, COL_END_TIMESTAMP, COL_INGESTED_TIMESTAMP, COL_INPUT_USD_PER_1M,
+    COL_LOG_ATTRIBUTES, COL_MIN_INPUT_TOKENS, COL_MODEL, COL_OBSERVED_TIMESTAMP, COL_PROVIDER, COL_REGION,
+    COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME, COL_SERVICE_TIER, COL_SEVERITY_TEXT, COL_SOURCE,
+    COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID, COL_VALID_FROM, COL_VALID_FROM_SOURCE,
 };
-use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE, OPERATIONS_TABLE};
+use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE, OPERATIONS_TABLE, PRICES_TABLE};
 
 pub use super::test_rows::{Cell, Row, RowWriteError, commit_rows, write_wal_segment};
 use super::test_rows::{FINISH_REASONS, TEMPERATURE, build_operation_row, commit_batch, read_arrow_schema};
@@ -265,4 +266,39 @@ fn convert_operation_row<'a>(row: &'a OperationRow<'a>) -> Row<'a> {
     cells.extend(row.temperature.map(|temperature| (TEMPERATURE, Cell::Double(temperature))));
     cells.extend(row.finish_reasons.map(|reasons| (FINISH_REASONS, Cell::TextList(reasons))));
     build_operation_row(row.tenant_id, row.operation_name, row.timestamp_micros, cells)
+}
+
+/// The `valid_from` of every test price, 2026-01-01T00:00:00Z.
+const TEST_PRICE_VALID_FROM_MICROS: i64 = 1_767_225_600_000_000;
+
+/// One `prices` row: the price of `model`. Every other key column holds a fixed test value (see
+/// `build_price_row`), and every other rate is null.
+pub struct PriceRow<'a> {
+    /// `model`.
+    pub model: &'a str,
+    /// The unscaled `input_usd_per_1m`, at the column's own scale; `None` is null.
+    pub input_usd_per_1m: Option<i128>,
+}
+
+/// Write `rows` into the global `prices` table as one append; see [`commit_rows`].
+pub async fn commit_price_rows(catalog: &Arc<dyn Catalog>, rows: &[PriceRow<'_>]) -> Result<(), RowWriteError> {
+    let generic_rows: Vec<Row<'_>> = rows.iter().map(build_price_row).collect();
+    commit_rows(catalog, PRICES_TABLE, &generic_rows).await
+}
+
+/// The generic row of one price. `prices` has no `tenant_id`, so the row's tenant is never read.
+fn build_price_row<'a>(row: &PriceRow<'a>) -> Row<'a> {
+    let mut cells = vec![
+        (COL_PROVIDER, Cell::Text("test")),
+        (COL_MODEL, Cell::Text(row.model)),
+        (COL_SERVICE_TIER, Cell::Text("standard")),
+        (COL_REGION, Cell::Text("global")),
+        (COL_MIN_INPUT_TOKENS, Cell::Long(0)),
+        (COL_VALID_FROM, Cell::Micros(TEST_PRICE_VALID_FROM_MICROS)),
+        (COL_VALID_FROM_SOURCE, Cell::Text("test")),
+        (COL_CURRENCY, Cell::Text("USD")),
+        (COL_SOURCE, Cell::Text("test")),
+    ];
+    cells.extend(row.input_usd_per_1m.map(|rate| (COL_INPUT_USD_PER_1M, Cell::Decimal(rate))));
+    Row { tenant: "", cells }
 }

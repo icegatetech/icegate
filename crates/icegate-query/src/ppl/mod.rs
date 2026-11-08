@@ -8,6 +8,7 @@
 mod ast;
 mod build;
 mod error;
+mod functions;
 mod plan;
 
 pub(crate) use build::parse_ppl;

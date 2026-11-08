@@ -9,26 +9,35 @@ use antlr4rust::rule_context::CustomRuleContext;
 use antlr4rust::token::Token;
 use antlr4rust::tree::{ParseTree, Tree};
 use icegate_query_grammar::ppl::{
-    BooleanLiteralContextAttrs, CommandsContextAll, CommandsContextAttrs, CompareExprContextAttrs,
-    ComparisonOperatorContextAll, ComparisonOperatorContextAttrs, DefaultSortFieldContextAttrs, ExpressionContextAll,
-    FieldExprContextAttrs, FieldExpressionContextAll, FieldExpressionContextAttrs, FieldsCommandBodyContextAll,
-    FieldsCommandBodyContextAttrs, FieldsCommandContextAttrs, FromClauseContextAll, FromClauseContextAttrs,
-    IdentContextAll, IdentContextAttrs, IdentsAsQualifiedNameContextAttrs, IdentsAsTableQualifiedNameContextAttrs,
-    IdentsAsWildcardQualifiedNameContextAttrs, IntegerLiteralContextAll, LiteralValueContextAll,
-    LiteralValueContextAttrs, LiteralValueExprContextAttrs, LogicalExprContextAttrs, LogicalExpressionContextAll,
-    LogicalNotContextAttrs, NestedValueExprContextAttrs, PplCommandsContextAll, PplCommandsContextAttrs,
-    PplStatementContextAttrs, PrefixSortFieldContextAttrs, QualifiedNameContextAll, QueryStatementContextAll,
-    QueryStatementContextAttrs, RootContextAttrs, SearchCommandContextAll, SearchFromContextAttrs,
+    BetweenContextAttrs, BooleanLiteralContextAttrs, CaseFunctionCallContextAll, CaseFunctionCallContextAttrs,
+    CommandsContextAll, CommandsContextAttrs, CompareExprContextAttrs, ComparisonOperatorContextAll,
+    ComparisonOperatorContextAttrs, DataTypeFunctionCallContextAttrs, DefaultSortFieldContextAttrs,
+    EvalClauseContextAll, EvalClauseContextAttrs, EvalCommandContextAttrs, EvalFunctionCallContextAttrs,
+    ExpressionContextAll, FieldExprContextAttrs, FieldExpressionContextAll, FieldExpressionContextAttrs,
+    FieldsCommandBodyContextAll, FieldsCommandBodyContextAttrs, FieldsCommandContextAttrs, FromClauseContextAll,
+    FromClauseContextAttrs, FunctionArgContextAll, FunctionArgContextAttrs, FunctionArgExpressionContextAttrs,
+    FunctionArgsContextAll, FunctionArgsContextAttrs, FunctionCallContextAll, FunctionCallContextAttrs,
+    FunctionCallExprContextAttrs, IdentContextAll, IdentContextAttrs, IdentsAsQualifiedNameContextAttrs,
+    IdentsAsTableQualifiedNameContextAttrs, IdentsAsWildcardQualifiedNameContextAttrs, InExprContextAttrs,
+    IntegerLiteralContextAll, IsNullPredicateContextAttrs, LambdaContextAll, LambdaContextAttrs,
+    LambdaExprContextAttrs, LiteralValueContextAll, LiteralValueContextAttrs, LiteralValueExprContextAttrs,
+    LogicalExprContextAttrs, LogicalExpressionContextAll, LogicalNotContextAttrs, NestedValueExprContextAttrs,
+    NullNotnullContextAttrs, PplCommandsContextAll, PplCommandsContextAttrs, PplStatementContextAttrs,
+    PrefixSortFieldContextAttrs, QualifiedNameContextAll, QueryStatementContextAll, QueryStatementContextAttrs,
+    RenameClauseContextAll, RenameCommandContextAttrs, RenameFieldExpressionContextAll,
+    RenameFieldExpressionContextAttrs, RootContextAttrs, SearchCommandContextAll, SearchFromContextAttrs,
     SelectFieldExpressionContextAll, SelectFieldExpressionContextAttrs, SortCommandContextAttrs, SortFieldContextAll,
     SortFieldExpressionContextAll, SortFieldExpressionContextAttrs, SortbyClauseContextAttrs, StringLiteralContextAll,
     SuffixSortFieldContextAttrs, TableCommandContextAttrs, TableIdentContextAll, TableIdentContextAttrs,
     TableOrSubqueryClauseContextAttrs, TableQualifiedNameContextAll, TableSourceClauseContextAttrs,
-    TableSourceContextAll, TableSourceContextAttrs, ValueExprContextAttrs, ValueExpressionContextAll,
-    WcFieldListContextAttrs, WcQualifiedNameContextAll, WhereCommandContextAttrs, WildcardContextAll,
-    WildcardContextAttrs, parse_ppl_root, ruleNames,
+    TableSourceContextAll, TableSourceContextAttrs, TimestampFunctionCallContextAttrs, ValueExprContextAttrs,
+    ValueExpressionContextAll, ValueListContextAttrs, WcFieldListContextAttrs, WcQualifiedNameContextAll,
+    WhereCommandContextAttrs, WildcardContextAll, WildcardContextAttrs, parse_ppl_root, ruleNames,
 };
 
-use super::ast::{CompareOperator, PplCommand, PplExpr, PplLiteral, PplQuery, PplSortKey, PplSource};
+use super::ast::{
+    ArithmeticOperator, CastTarget, CompareOperator, PplCommand, PplExpr, PplLiteral, PplQuery, PplSortKey, PplSource,
+};
 use super::error::PplError;
 
 /// How many rows `head` keeps when it names no number.
@@ -192,7 +201,57 @@ fn build_command(command: &CommandsContextAll<'_>) -> Result<PplCommand, PplErro
             .unwrap_or(0);
         return Ok(PplCommand::Head { count, offset });
     }
+    if let Some(eval) = command.evalCommand() {
+        let assignments = eval
+            .evalClause_all()
+            .iter()
+            .map(|clause| build_assignment(clause))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(PplCommand::Eval(assignments));
+    }
+    if let Some(rename) = command.renameCommand() {
+        let renames = rename
+            .renameClause_all()
+            .iter()
+            .map(|clause| build_rename(clause))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(PplCommand::Rename(renames));
+    }
     Err(build_unsupported_command_error(&name_first_child_rule(command)))
+}
+
+fn build_assignment(clause: &EvalClauseContextAll<'_>) -> Result<(String, PplExpr), PplError> {
+    let field = clause.fieldExpression().ok_or_else(|| build_missing_part_error("eval"))?;
+    let value = clause.logicalExpression().ok_or_else(|| build_missing_part_error("eval"))?;
+    Ok((name_field(&field)?, build_logical_expression(&value)?))
+}
+
+/// One `<field> as <name>` pair. Wildcard renames are refused: a pattern pair would rename an
+/// unbounded set of fields.
+fn build_rename(clause: &RenameClauseContextAll<'_>) -> Result<(String, String), PplError> {
+    let original_field = clause
+        .orignalField
+        .as_deref()
+        .ok_or_else(|| build_missing_part_error("rename"))?;
+    let new_field = clause
+        .renamedField
+        .as_deref()
+        .ok_or_else(|| build_missing_part_error("rename"))?;
+    Ok((name_rename_field(original_field)?, name_rename_field(new_field)?))
+}
+
+/// The field name of one side of a `rename` pair; `*` and a wildcard pattern are refused.
+fn name_rename_field(field: &RenameFieldExpressionContextAll<'_>) -> Result<String, PplError> {
+    let qualified_name = field.wcQualifiedName().ok_or_else(|| PplError::Semantic {
+        reason: "rename takes field names, not *".to_string(),
+    })?;
+    let name = name_wildcard_path(&qualified_name)?;
+    if name.contains('*') {
+        return Err(PplError::Semantic {
+            reason: format!("rename takes field names, not the pattern [{name}]"),
+        });
+    }
+    Ok(name)
 }
 
 fn build_fields(body: &FieldsCommandBodyContextAll<'_>) -> Result<PplCommand, PplError> {
@@ -354,19 +413,57 @@ fn build_expression(expression: &ExpressionContextAll<'_>) -> Result<PplExpr, Pp
             let operator = compare
                 .comparisonOperator()
                 .ok_or_else(|| build_missing_part_error("comparison"))?;
-            let operator = read_compare_operator(&operator)?;
             let left = compare.left.as_deref().ok_or_else(|| build_missing_part_error("comparison"))?;
             let right = compare.right.as_deref().ok_or_else(|| build_missing_part_error("comparison"))?;
+            let (left, right) = (build_expression(left)?, build_expression(right)?);
+            // `a LIKE b` is the two-argument `like(a, b)`, case-insensitive like the function.
+            if operator.LIKE().is_some() {
+                return Ok(PplExpr::FunctionCall {
+                    name: "like".to_string(),
+                    arguments: vec![left, right],
+                });
+            }
             Ok(PplExpr::Compare {
-                operator,
-                left: Box::new(build_expression(left)?),
-                right: Box::new(build_expression(right)?),
+                operator: read_compare_operator(&operator)?,
+                left: Box::new(left),
+                right: Box::new(right),
             })
         }
         ExpressionContextAll::RelevanceExprContext(relevance) => Err(refuse_function_call(relevance)),
-        ExpressionContextAll::InExprContext(_) => Err(build_unsupported_function_error("in")),
-        ExpressionContextAll::BetweenContext(_) => Err(build_unsupported_function_error("between")),
-        ExpressionContextAll::IsNullPredicateContext(_) => Err(build_unsupported_function_error("is null")),
+        ExpressionContextAll::InExprContext(membership) => {
+            let value = membership.expression().ok_or_else(|| build_missing_part_error("in"))?;
+            let value_list = membership.valueList().ok_or_else(|| build_missing_part_error("in"))?;
+            let list = value_list
+                .literalValue_all()
+                .iter()
+                .map(|literal| build_literal(literal).map(PplExpr::Literal))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(PplExpr::In {
+                value: Box::new(build_expression(&value)?),
+                list,
+                is_negated: membership.NOT().is_some(),
+            })
+        }
+        ExpressionContextAll::BetweenContext(between) => {
+            let operands = between.expression_all();
+            let [value, low, high] = operands.as_slice() else {
+                return Err(build_missing_part_error("between"));
+            };
+            Ok(PplExpr::Between {
+                value: Box::new(build_expression(value)?),
+                low: Box::new(build_expression(low)?),
+                high: Box::new(build_expression(high)?),
+                is_negated: between.NOT().is_some(),
+            })
+        }
+        ExpressionContextAll::IsNullPredicateContext(null_test) => {
+            let value = null_test.expression().ok_or_else(|| build_missing_part_error("is null"))?;
+            let null_keyword = null_test.nullNotnull().ok_or_else(|| build_missing_part_error("is null"))?;
+            Ok(PplExpr::IsNull {
+                value: Box::new(build_expression(&value)?),
+                is_negated: null_keyword.NOT().is_some(),
+            })
+        }
         ExpressionContextAll::Error(_) => Err(PplError::Internal {
             reason: "an unlabeled expression".to_string(),
         }),
@@ -413,14 +510,41 @@ fn build_value(value: &ValueExpressionContextAll<'_>) -> Result<PplExpr, PplErro
                 .ok_or_else(|| build_missing_part_error("parenthesis"))?;
             build_logical_expression(&nested_expression)
         }
-        ValueExpressionContextAll::BinaryArithmeticContext(arithmetic) => Err(build_unsupported_function_error(
-            &arithmetic
+        ValueExpressionContextAll::BinaryArithmeticContext(arithmetic) => {
+            let operator_token = arithmetic
                 .binaryOperator
                 .as_ref()
-                .map_or_else(String::new, |operator| operator.get_text().to_string()),
-        )),
-        ValueExpressionContextAll::FunctionCallExprContext(call) => Err(refuse_function_call(call)),
-        ValueExpressionContextAll::LambdaExprContext(_) => Err(build_unsupported_function_error("lambda")),
+                .ok_or_else(|| build_missing_part_error("arithmetic"))?;
+            let operator = match operator_token.get_text() {
+                "+" => ArithmeticOperator::Add,
+                "-" => ArithmeticOperator::Subtract,
+                "*" => ArithmeticOperator::Multiply,
+                "/" => ArithmeticOperator::Divide,
+                "%" => ArithmeticOperator::Modulo,
+                other => return Err(build_unsupported_function_error(other)),
+            };
+            let left = arithmetic
+                .left
+                .as_deref()
+                .ok_or_else(|| build_missing_part_error("arithmetic"))?;
+            let right = arithmetic
+                .right
+                .as_deref()
+                .ok_or_else(|| build_missing_part_error("arithmetic"))?;
+            Ok(PplExpr::Arithmetic {
+                operator,
+                left: Box::new(build_value(left)?),
+                right: Box::new(build_value(right)?),
+            })
+        }
+        ValueExpressionContextAll::FunctionCallExprContext(call) => {
+            let call = call.functionCall().ok_or_else(|| build_missing_part_error("function call"))?;
+            build_function_call(&call)
+        }
+        ValueExpressionContextAll::LambdaExprContext(lambda) => {
+            let lambda = lambda.lambda().ok_or_else(|| build_missing_part_error("lambda"))?;
+            build_lambda(&lambda)
+        }
         ValueExpressionContextAll::ForeachPlaceholderExprContext(_) => Err(build_unsupported_command_error("foreach")),
         ValueExpressionContextAll::ScalarSubqueryExprContext(_)
         | ValueExpressionContextAll::InSubqueryExprContext(_)
@@ -428,6 +552,130 @@ fn build_value(value: &ValueExpressionContextAll<'_>) -> Result<PplExpr, PplErro
         ValueExpressionContextAll::Error(_) => Err(PplError::Internal {
             reason: "an unlabeled value expression".to_string(),
         }),
+    }
+}
+
+fn build_function_call(call: &FunctionCallContextAll<'_>) -> Result<PplExpr, PplError> {
+    if let Some(eval) = call.evalFunctionCall() {
+        let name = eval
+            .evalFunctionName()
+            .ok_or_else(|| build_missing_part_error("function call"))?;
+        let arguments = match eval.functionArgs() {
+            Some(arguments) => build_arguments(&arguments)?,
+            None => Vec::new(),
+        };
+        return Ok(PplExpr::FunctionCall {
+            name: name.get_text().to_ascii_lowercase(),
+            arguments,
+        });
+    }
+    if let Some(cast) = call.dataTypeFunctionCall() {
+        let value = cast.logicalExpression().ok_or_else(|| build_missing_part_error("cast"))?;
+        let target = cast.convertedDataType().ok_or_else(|| build_missing_part_error("cast"))?;
+        return Ok(PplExpr::Cast {
+            value: Box::new(build_logical_expression(&value)?),
+            target: read_cast_target(&target.get_text())?,
+        });
+    }
+    if let Some(case) = call.caseFunctionCall() {
+        return build_case(&case);
+    }
+    if let Some(timestamp) = call.timestampFunctionCall() {
+        let name = timestamp
+            .timestampFunctionName()
+            .ok_or_else(|| build_missing_part_error("timestamp function"))?
+            .get_text()
+            .to_ascii_lowercase();
+        let unit = timestamp
+            .simpleDateTimePart()
+            .ok_or_else(|| build_missing_part_error("timestamp function"))?;
+        let first_argument = timestamp
+            .firstArg
+            .as_deref()
+            .ok_or_else(|| build_missing_part_error("timestamp function"))?;
+        let second_argument = timestamp
+            .secondArg
+            .as_deref()
+            .ok_or_else(|| build_missing_part_error("timestamp function"))?;
+        // The grammar spells the unit as a keyword; the library reads it as a string literal.
+        return Ok(PplExpr::FunctionCall {
+            name,
+            arguments: vec![
+                PplExpr::Literal(PplLiteral::String(unit.get_text().to_ascii_uppercase())),
+                build_argument(first_argument)?,
+                build_argument(second_argument)?,
+            ],
+        });
+    }
+    Err(refuse_function_call(call))
+}
+
+fn build_arguments(arguments: &FunctionArgsContextAll<'_>) -> Result<Vec<PplExpr>, PplError> {
+    arguments
+        .functionArg_all()
+        .iter()
+        .map(|argument| build_argument(argument))
+        .collect()
+}
+
+fn build_argument(argument: &FunctionArgContextAll<'_>) -> Result<PplExpr, PplError> {
+    let expression = argument
+        .functionArgExpression()
+        .ok_or_else(|| build_missing_part_error("argument"))?;
+    if let Some(lambda) = expression.lambda() {
+        return build_lambda(&lambda);
+    }
+    let value = expression
+        .logicalExpression()
+        .ok_or_else(|| build_missing_part_error("argument"))?;
+    build_logical_expression(&value)
+}
+
+fn build_lambda(lambda: &LambdaContextAll<'_>) -> Result<PplExpr, PplError> {
+    let body = lambda.logicalExpression().ok_or_else(|| build_missing_part_error("lambda"))?;
+    Ok(PplExpr::Lambda {
+        parameters: lambda.ident_all().iter().map(|ident| unquote_identifier(ident)).collect(),
+        body: Box::new(build_logical_expression(&body)?),
+    })
+}
+
+/// `case(c1, v1, c2, v2, … [else v])`: the grammar lists the conditions as logical
+/// expressions and the values (the `else` value last) as value expressions.
+fn build_case(case: &CaseFunctionCallContextAll<'_>) -> Result<PplExpr, PplError> {
+    let conditions = case.logicalExpression_all();
+    let values = case.valueExpression_all();
+    let has_else = case.ELSE().is_some();
+    if values.len() != conditions.len() + usize::from(has_else) {
+        return Err(build_missing_part_error("case"));
+    }
+    let branches = conditions
+        .iter()
+        .zip(&values)
+        .map(|(condition, value)| Ok((build_logical_expression(condition)?, build_value(value)?)))
+        .collect::<Result<Vec<_>, PplError>>()?;
+    let otherwise = if has_else {
+        let else_value = values.last().ok_or_else(|| build_missing_part_error("case"))?;
+        Some(Box::new(build_value(else_value)?))
+    } else {
+        None
+    };
+    Ok(PplExpr::Case { branches, otherwise })
+}
+
+/// The `cast` target named `type_name`; a type IceGate does not cast to is refused as the
+/// function `cast as <type>`.
+fn read_cast_target(type_name: &str) -> Result<CastTarget, PplError> {
+    match type_name.to_ascii_uppercase().as_str() {
+        "DOUBLE" | "FLOAT" => Ok(CastTarget::Double),
+        "LONG" => Ok(CastTarget::Long),
+        "INT" | "INTEGER" => Ok(CastTarget::Int),
+        "STRING" => Ok(CastTarget::String),
+        "BOOLEAN" => Ok(CastTarget::Boolean),
+        "TIMESTAMP" => Ok(CastTarget::Timestamp),
+        other => Err(build_unsupported_function_error(&format!(
+            "cast as {}",
+            other.to_ascii_lowercase()
+        ))),
     }
 }
 

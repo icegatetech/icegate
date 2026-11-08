@@ -60,7 +60,7 @@ use crate::opensearch::script::{
     recognize_moving_function,
 };
 use crate::opensearch::search::doc_id::{
-    MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MILLISECOND, MICROS_PER_MINUTE, MICROS_PER_SECOND,
+    MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MILLISECOND, MICROS_PER_MINUTE, MICROS_PER_SECOND, MICROS_PER_WEEK,
 };
 
 /// Keys of a `cumulative_sum` body; it takes no `gap_policy`.
@@ -94,8 +94,6 @@ const DEFAULT_ALPHA: f64 = 0.3;
 const DEFAULT_BETA: f64 = 0.1;
 /// Largest `window` and `lag`.
 const MAX_PIPELINE_SPAN: f64 = 65_535.0;
-/// Microseconds in a week, the longest calendar unit a `derivative.unit` may name.
-const MICROS_PER_WEEK: i64 = 7 * MICROS_PER_DAY;
 /// Longest `derivative.unit`, in milliseconds: one week.
 const MAX_UNIT_MILLIS: f64 = convert_micros_to_millis(MICROS_PER_WEEK);
 

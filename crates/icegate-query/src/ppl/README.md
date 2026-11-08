@@ -55,10 +55,82 @@ case-sensitive. A source on system indices is a 400.
 | `fields [+\|-] <field>, …` | `+` (or no sign) keeps the named fields in the order named; `-` drops them and keeps the rest in their order. `*` inside a name is a wildcard. |
 | `sort [+\|-]<field> [asc\|desc], …` | Sorts by each key in turn; `-` or `desc` sorts descending. NULL sorts first ascending and last descending. A key with both a sign and a direction is a 400. |
 | `head [N] [from M]` | Skips M rows, then keeps N (`DEFAULT_HEAD_COUNT` in `build.rs` when N is omitted). |
+| `eval <field> = <expression>, …` | Applies the assignments in order, each seeing the fields of the ones before it. An assignment to an existing field replaces it in place; a new field is appended. |
+| `rename <field> as <name>, …` | Applies the pairs in order; each field keeps its position under its new name, and a field already holding the new name is removed. A wildcard pattern or `*` is a 400. |
 
 The output columns of a source are the table's columns in table order. A field reference is
 resolved against the columns of the pipeline at that point, case-sensitively; a name that
-matches none is a 400 `FIELD_NOT_FOUND`.
+matches none is a 400 `FIELD_NOT_FOUND`, except for the promoted resource attributes below.
+
+## Fields and types
+
+A field reference resolves, in this order, to a lambda parameter in scope, the column of that
+exact name, a resource attribute the source's profile promotes to a column, or a key of a MAP
+column written `<column>.<key>` (the key may itself contain dots; an absent key is NULL).
+A promoted resource attribute whose column an earlier command removed, renamed, or replaced
+(a `rename` onto its name, an `eval` assigning it) is a 400 `SEMANTIC_ERROR`, and so is a
+promoted attribute that the source indices disagree on (a column in some, not in others).
+Several source indices are combined with UNION ALL over the union of their columns, in the order
+the columns first appear; a column an index lacks is NULL in its rows, and a column typed
+differently across the indices is a 400.
+
+- Decimal columns read as `double`, the one numeric type PPL reports for them.
+- Strings compare and sort byte-wise (code-point order), never by locale.
+- A fixed-size binary id renders as lowercase hex; comparing it with a value of another type is a
+  400, because the engine would compare bytes, not the hex the client sees.
+- Timestamps are microseconds in UTC. A timestamp literal is `yyyy-MM-dd`, or
+  `yyyy-MM-dd HH:mm:ss` (a `T` may separate date and time) with a fraction no finer than a
+  microsecond; any other form, and a finer fraction, is a 400.
+
+## Expressions
+
+| Form | Contract |
+|---|---|
+| `=`, `!=`, `<`, `<=`, `>`, `>=` | NULL on either side is unknown. |
+| `<value> like <pattern>` | The same as `like(value, pattern)`. |
+| `and`, `or`, `xor`, `not` | Three-valued; `xor` is true when exactly one side is true. |
+| `<value> [not] in (<literal>, …)` | Membership in the literal list. |
+| `<value> [not] between <low> and <high>` | Both bounds inclusive. |
+| `<value> is [not] null` | Never NULL. |
+| `+`, `-`, `*`, `/`, `%` | `*`, `/` and `%` bind tighter than `+` and `-`. Integer `/` truncates toward zero; `/` and `%` by zero are NULL. |
+| `case(<condition>, <value>, … [else <value>])` | The value of the first true condition, else the `else` value, else NULL. |
+| `cast(<value> as <type>)` | Types `double` (`float`), `long`, `int` (`integer`), `string`, `boolean`, `timestamp`. A timestamp cast to `string` renders as the output does. Another type is a 400 naming the function `cast as <type>`. |
+
+## Functions
+
+`functions.rs` holds the library; a function outside it is a 400 naming it. Unless a row says
+otherwise, a NULL argument gives NULL, and a wrong number of arguments is a 400.
+
+| Function | Contract |
+|---|---|
+| `if(c, a, b)` | `a` when `c` is true, else `b`. |
+| `coalesce(a, …)`, `ifnull(a, b)`, `nullif(a, b)` | The first non-NULL argument; `a` unless NULL then `b`; NULL when `a = b`, else `a`. |
+| `isnull(a)`, `isnotnull(a)` | Never NULL. |
+| `concat(a, …)` | NULL when any argument is NULL; other types are cast to strings. |
+| `lower`, `upper`, `trim`, `ltrim`, `rtrim` | Unicode case mapping; trimming removes spaces. |
+| `substring(s, start[, length])`, `substr` | 1-based. |
+| `length(s)` | Length in bytes of the UTF-8 encoding. |
+| `locate(sub, s)` | 1-based position of the first occurrence, 0 when absent; case-sensitive. The three-argument form is refused. |
+| `like(s, pattern[, case_sensitive])` | `%` matches any run, `_` one character, `\` escapes; without the third argument the match ignores case. The third argument is the literal `true` or `false`. |
+| `abs`, `mod(a, b)` | `mod` by zero is NULL. |
+| `floor`, `ceil` (`ceiling`) | A `bigint`. |
+| `round(x[, digits])` | A `double`. |
+| `md5(s)` | Lowercase hex. |
+| `timestamp(v)` | A string literal folds to a timestamp literal, so a comparison with a timestamp column can prune scans. Any other string is cast, and a value that is not a timestamp fails the query at execution with a 500 `EXECUTION_ERROR`. A number is a 400; use `from_unixtime`. |
+| `timestampdiff(unit, start, end)` | `end - start` in whole units, truncated toward zero, as a `bigint`. Units `MICROSECOND`, `MILLISECOND`, `SECOND`, `MINUTE`, `HOUR`, `DAY`, `WEEK`; calendar units are a 400. |
+| `date_format(v, format)` | `format` is a string literal of MySQL-style specifiers, rendered in UTC: `%Y %y %m %c %d %e %H %k %h %I %l %i %s %S %f %p %M %b %W %a %j %T %r %%`. Another specifier is a 400. |
+| `now()` | The request time, taken once per request. |
+| `unix_timestamp([v])` | Seconds since the epoch as a `double`; without an argument, of the request time. |
+| `from_unixtime(seconds[, format])` | The timestamp `seconds` after the epoch, rounded to the microsecond; with a format, rendered as `date_format` does. |
+| `array_length(list)` | 0 for an empty list. |
+| `mvjoin(list, separator)` | The elements joined; an empty list gives an empty string. |
+| `mvindex(list, index[, end])` | 0-based integer-literal indexes, negative ones counting from the end; with `end`, the elements from `index` to `end` inclusive. A single index outside the list is NULL; a range over the empty list is the empty list. |
+| `exists(list, x -> p)`, `forall(list, x -> p)` | Whether any / every element satisfies `p`; `false` / `true` for an empty list. |
+| `filter(list, x -> p)`, `transform(list, x -> e)` | The elements satisfying `p`; each element mapped by `e`. |
+
+Array functions return NULL for a NULL list. `exists`, `forall`, `filter` and `transform` take a
+list and a lambda of one parameter; another first or second argument, and a lambda anywhere
+else, is a 400.
 
 ## Limits
 
