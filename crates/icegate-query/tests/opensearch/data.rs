@@ -10,6 +10,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{
     ArrayRef, MapBuilder, MapFieldNames, StringArray, StringBuilder, TimestampMicrosecondArray, new_null_array,
 };
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
@@ -342,4 +343,34 @@ fn build_price_row<'a>(row: &PriceRow<'a>) -> Row<'a> {
     ];
     cells.extend(row.input_usd_per_1m.map(|rate| (COL_INPUT_USD_PER_1M, Cell::Decimal(rate))));
     Row { tenant: "", cells }
+}
+
+/// Write `row_count` rows into `table` as one batch over the table's current schema, committed
+/// through [`commit_batch`]: one append with the table's production writer settings, recording
+/// [`COMMITTED_WAL_OFFSET`]. Columns named in `columns` take the given arrays, each `row_count`
+/// long and cast to the column's Arrow type (so a list or timestamp array needs no field-id
+/// metadata); every other column is null, so the caller names every required column. A name in
+/// `columns` that is no column of `table` is an error, never a silently null column.
+pub async fn commit_table_columns(
+    catalog: &Arc<dyn Catalog>,
+    table: &str,
+    row_count: usize,
+    columns: &[(&str, ArrayRef)],
+) -> Result<(), RowWriteError> {
+    let arrow_schema = read_arrow_schema(catalog, table).await?;
+    if let Some((unknown_name, _)) = columns.iter().find(|(name, _)| arrow_schema.field_with_name(name).is_err()) {
+        return Err(format!("[{unknown_name}] is no column of [{table}]").into());
+    }
+    let arrays = arrow_schema
+        .fields()
+        .iter()
+        .map(
+            |field| match columns.iter().find(|(name, _)| field.name().as_str() == *name) {
+                Some((_, array)) => cast(array, field.data_type()),
+                None => Ok(new_null_array(field.data_type(), row_count)),
+            },
+        )
+        .collect::<Result<Vec<ArrayRef>, _>>()?;
+    let batch = RecordBatch::try_new(Arc::clone(&arrow_schema), arrays)?;
+    commit_batch(catalog, table, batch).await
 }

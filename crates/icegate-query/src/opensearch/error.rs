@@ -285,7 +285,24 @@ impl OpenSearchError {
     /// A response `format` the endpoint does not render (`400`, `illegal_argument_exception`),
     /// which `format` carries for a client.
     pub(crate) fn unsupported_response_format(format: &str) -> Self {
-        Self::illegal_argument(format!("response format [{format}] is not supported; use jdbc"))
+        Self::illegal_argument(format!(
+            "response format [{format}] is not supported; use jdbc, viz, csv or raw"
+        ))
+        .with_metadata("format", format)
+    }
+
+    /// A query parameter the requested response `format` cannot honour (`400`,
+    /// `illegal_argument_exception`); `parameter` and `format` carry both for a client.
+    pub(crate) fn unsupported_parameter_with_format(parameter: &str, format: &str) -> Self {
+        Self::illegal_argument(format!("{parameter} is not supported with format={format}"))
+            .with_metadata("parameter", parameter)
+            .with_metadata("format", format)
+    }
+
+    /// An explain `format` other than `json` (`400`, `illegal_argument_exception`), which
+    /// `format` carries for a client.
+    pub(crate) fn unsupported_explain_format(format: &str) -> Self {
+        Self::illegal_argument(format!("explain format [{format}] is not supported; use json"))
             .with_metadata("format", format)
     }
 

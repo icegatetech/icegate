@@ -208,7 +208,7 @@ fn remove_matched_paths(value: Value, patterns: &[&[Segment]]) -> Value {
 }
 
 /// Every `filter_path` value of `uri`, joined with `,`: repeating the parameter adds paths.
-fn read_filter_path(uri: &Uri) -> Option<String> {
+pub(crate) fn read_filter_path(uri: &Uri) -> Option<String> {
     let pairs: Vec<(String, String)> = serde_urlencoded::from_str(uri.query()?).ok()?;
     let values: Vec<String> = pairs
         .into_iter()

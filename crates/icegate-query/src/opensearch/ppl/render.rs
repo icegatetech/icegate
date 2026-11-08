@@ -1,15 +1,19 @@
-//! Rendering of PPL results.
+//! Rendering of PPL results: the jdbc response, which defines how every value renders, and the
+//! `viz`, `csv` and `raw` formats built from its rows.
 
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, NaiveDate};
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::arrow::datatypes::{
     DataType, Date32Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
     UInt32Type, UInt64Type,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Number, Value, json};
 
+use super::handlers::PplFormat;
 use crate::opensearch::search::read_timestamp_micros;
-use crate::ppl::{PplColumn, PplError};
+use crate::ppl::{PplColumn, PplError, PplType};
 
 /// Microseconds in one second.
 const MICROS_PER_SECOND: i64 = 1_000_000;
@@ -28,6 +32,33 @@ const MICROS_PER_SECOND: i64 = 1_000_000;
 /// Returns [`PplError::Internal`] when a batch does not match `columns` or holds a type the
 /// planner never returns.
 pub(crate) fn render_jdbc(columns: &[PplColumn], batches: &[RecordBatch]) -> Result<Value, PplError> {
+    let datarows = render_datarows(columns, batches)?;
+    let row_count = datarows.len();
+    let schema: Vec<Value> = columns
+        .iter()
+        .map(|column| json!({"name": column.name, "type": column.ppl_type.name()}))
+        .collect();
+    // The rows move into the body: `json!` would serialize them through a reference, copying
+    // every cell.
+    let mut body = Map::with_capacity(4);
+    body.insert("schema".to_owned(), Value::Array(schema));
+    body.insert(
+        "datarows".to_owned(),
+        Value::Array(datarows.into_iter().map(Value::Array).collect()),
+    );
+    body.insert("total".to_owned(), json!(row_count));
+    body.insert("size".to_owned(), json!(row_count));
+    Ok(Value::Object(body))
+}
+
+/// The rows of `batches`, each cell rendered by [`render_cell`]; every format reads its cells
+/// from here, so the formats cannot disagree on how a value renders.
+///
+/// # Errors
+///
+/// Returns [`PplError::Internal`] when a batch does not match `columns` or holds a type the
+/// planner never returns.
+fn render_datarows(columns: &[PplColumn], batches: &[RecordBatch]) -> Result<Vec<Vec<Value>>, PplError> {
     let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
     let mut datarows = Vec::with_capacity(row_count);
     for batch in batches {
@@ -46,14 +77,10 @@ pub(crate) fn render_jdbc(columns: &[PplColumn], batches: &[RecordBatch]) -> Res
                 .iter()
                 .map(|column| render_cell(column.as_ref(), row))
                 .collect::<Result<Vec<_>, _>>()?;
-            datarows.push(Value::Array(cells));
+            datarows.push(cells);
         }
     }
-    let schema: Vec<Value> = columns
-        .iter()
-        .map(|column| json!({"name": column.name, "type": column.ppl_type.name()}))
-        .collect();
-    Ok(json!({"schema": schema, "datarows": datarows, "total": row_count, "size": row_count}))
+    Ok(datarows)
 }
 
 /// The JSON value of row `row` of `array`.
@@ -171,13 +198,241 @@ fn render_list(values: &dyn Array) -> Result<Value, PplError> {
         .map(Value::Array)
 }
 
+/// The content type of every successful PPL answer, the text formats included.
+const PPL_JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
+
+/// Renders a planned query's batches in the requested format, answered with
+/// [`PPL_JSON_CONTENT_TYPE`] whatever the format, the `csv` and `raw` text included.
+///
+/// # Errors
+///
+/// Whatever [`render_datarows`] reports for a column it cannot render.
+pub(crate) fn render_ppl_response(
+    format: PplFormat,
+    columns: &[PplColumn],
+    batches: &[RecordBatch],
+) -> Result<Response, PplError> {
+    let body = match format {
+        PplFormat::Jdbc => render_jdbc(columns, batches)?.to_string(),
+        PplFormat::Viz => render_viz(columns, batches)?.to_string(),
+        PplFormat::Csv => render_csv(columns, batches)?,
+        PplFormat::Raw => render_raw(columns, batches)?,
+    };
+    Ok(([(header::CONTENT_TYPE, PPL_JSON_CONTENT_TYPE)], body).into_response())
+}
+
+/// Renders the `viz` format: `{data: {<col>: [...]}, metadata: {fields: [{name, type}]}, size,
+/// status: 200}`, one array per column keyed by column name, each cell rendered as the jdbc
+/// response renders it, and each field typed with its `viz` name (see [`name_viz_type`]).
+///
+/// # Errors
+///
+/// Whatever [`render_datarows`] reports.
+pub(crate) fn render_viz(columns: &[PplColumn], batches: &[RecordBatch]) -> Result<Value, PplError> {
+    let rows = render_datarows(columns, batches)?;
+    let row_count = rows.len();
+    let mut column_cells: Vec<Vec<Value>> = columns.iter().map(|_| Vec::with_capacity(row_count)).collect();
+    // `render_datarows` refuses a batch whose width differs from `columns`, so every row has one
+    // cell per column and the zip drops none.
+    for row in rows {
+        for (cells, cell) in column_cells.iter_mut().zip(row) {
+            cells.push(cell);
+        }
+    }
+    let column_values: Map<String, Value> = columns
+        .iter()
+        .zip(column_cells)
+        .map(|(column, cells)| (column.name.clone(), Value::Array(cells)))
+        .collect();
+    let fields: Vec<Value> = columns
+        .iter()
+        .map(|column| json!({ "name": column.name, "type": name_viz_type(column.ppl_type) }))
+        .collect();
+    // The columns move into the body: `json!` would serialize them through a reference, copying
+    // every cell.
+    let mut body = Map::with_capacity(4);
+    body.insert("data".to_owned(), Value::Object(column_values));
+    body.insert("metadata".to_owned(), json!({ "fields": fields }));
+    body.insert("size".to_owned(), json!(row_count));
+    body.insert("status".to_owned(), json!(200));
+    Ok(Value::Object(body))
+}
+
+/// Renders the `csv` format: comma-separated, a cell quoted only when it holds a separator, a
+/// quote or a line break; see [`render_flat`].
+///
+/// # Errors
+///
+/// Whatever [`render_datarows`] reports.
+pub(crate) fn render_csv(columns: &[PplColumn], batches: &[RecordBatch]) -> Result<String, PplError> {
+    render_flat(columns, batches, FlatLayout::Csv)
+}
+
+/// Renders the `raw` format: pipe-separated and never quoted; see [`render_flat`].
+///
+/// # Errors
+///
+/// Whatever [`render_datarows`] reports.
+pub(crate) fn render_raw(columns: &[PplColumn], batches: &[RecordBatch]) -> Result<String, PplError> {
+    render_flat(columns, batches, FlatLayout::Raw)
+}
+
+/// The `viz` type name of a PPL type: the jdbc name, except that `string` is `keyword`, `int`
+/// `integer`, `bigint` `long`, `struct` `object` and `array` `nested`. IceGate has one string
+/// type, so a full-text column is `keyword` too.
+const fn name_viz_type(ppl_type: PplType) -> &'static str {
+    match ppl_type {
+        PplType::String => "keyword",
+        PplType::Int => "integer",
+        PplType::Bigint => "long",
+        PplType::Double => "double",
+        PplType::Boolean => "boolean",
+        PplType::Timestamp => "timestamp",
+        PplType::Date => "date",
+        PplType::Struct => "object",
+        PplType::Array => "nested",
+    }
+}
+
+/// The two text layouts of a PPL result.
+#[derive(Debug, Clone, Copy)]
+enum FlatLayout {
+    /// `,`-separated, quoted where needed.
+    Csv,
+    /// `|`-separated, never quoted.
+    Raw,
+}
+
+impl FlatLayout {
+    /// The cell separator.
+    const fn separator(self) -> char {
+        match self {
+            Self::Csv => ',',
+            Self::Raw => '|',
+        }
+    }
+
+    /// Appends one cell to `text`. `csv` double-quotes a cell holding `,`, `"`, `\r` or `\n` and
+    /// doubles its embedded quotes; `raw` never quotes.
+    fn write_cell(self, text: &mut String, cell: &str) {
+        let needs_quotes = matches!(self, Self::Csv) && cell.contains([',', '"', '\r', '\n']);
+        if needs_quotes {
+            text.push('"');
+            for (index, unquoted_part) in cell.split('"').enumerate() {
+                if index > 0 {
+                    text.push_str("\"\"");
+                }
+                text.push_str(unquoted_part);
+            }
+            text.push('"');
+        } else {
+            text.push_str(cell);
+        }
+    }
+}
+
+/// Renders the header line of column names, then one line per row, joined by `\n` with no
+/// trailing line break. A top-level NULL cell is empty, a NULL list column included; `null`
+/// appears only inside a list, a MAP or a struct (see [`write_flat_cell`]).
+fn render_flat(columns: &[PplColumn], batches: &[RecordBatch], layout: FlatLayout) -> Result<String, PplError> {
+    let rows = render_datarows(columns, batches)?;
+    let mut text = String::new();
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            text.push(layout.separator());
+        }
+        layout.write_cell(&mut text, &column.name);
+    }
+    // One buffer for every cell: a cell is written out before `layout` decides on its quoting.
+    let mut cell_text = String::new();
+    for row in &rows {
+        text.push('\n');
+        for (index, cell) in row.iter().enumerate() {
+            if index > 0 {
+                text.push(layout.separator());
+            }
+            cell_text.clear();
+            write_flat_cell(&mut cell_text, cell);
+            layout.write_cell(&mut text, &cell_text);
+        }
+    }
+    Ok(text)
+}
+
+/// Appends the text of one top-level cell to `text`: nothing for NULL (a NULL list or MAP column
+/// included), otherwise the value as [`write_flat_value`] writes it. A `null` is written only for
+/// a NULL inside a list, a MAP or a struct.
+fn write_flat_cell(text: &mut String, cell: &Value) {
+    if !cell.is_null() {
+        write_flat_value(text, cell);
+    }
+}
+
+/// Appends a jdbc value to `text` as flat text: strings verbatim, lists `[a, b]`, objects
+/// `{k=v, k2=v2}` in key byte order with each key whole (a dotted MAP key is never split), and a
+/// nested NULL as `null`.
+fn write_flat_value(text: &mut String, value: &Value) {
+    match value {
+        Value::Null => text.push_str("null"),
+        Value::Bool(is_true) => text.push_str(if *is_true { "true" } else { "false" }),
+        Value::Number(number) => write_plain_number(text, number),
+        Value::String(string_value) => text.push_str(string_value),
+        Value::Array(items) => {
+            text.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    text.push_str(", ");
+                }
+                write_flat_value(text, item);
+            }
+            text.push(']');
+        }
+        Value::Object(entries) => {
+            let mut sorted_entries: Vec<(&String, &Value)> = entries.iter().collect();
+            sorted_entries.sort_unstable_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+            text.push('{');
+            for (index, (key, item)) in sorted_entries.into_iter().enumerate() {
+                if index > 0 {
+                    text.push_str(", ");
+                }
+                text.push_str(key);
+                text.push('=');
+                write_flat_value(text, item);
+            }
+            text.push('}');
+        }
+    }
+}
+
+/// Appends a number in plain decimal: integers as they are, doubles with at least one fraction
+/// digit and never an exponent.
+///
+/// Rust's `Display` for `f64` never uses an exponent and prints the shortest text that reads back
+/// as the same double, which is the plain decimal form the flat formats promise. A number rendered
+/// from an `f64` answers `None` to `as_i64` and `as_u64`, so a double `3.0` keeps its `.0`.
+fn write_plain_number(text: &mut String, number: &Number) {
+    if let Some(integer) = number.as_i64() {
+        text.push_str(itoa::Buffer::new().format(integer));
+    } else if let Some(unsigned_integer) = number.as_u64() {
+        text.push_str(itoa::Buffer::new().format(unsigned_integer));
+    } else if let Some(double) = number.as_f64() {
+        let double_text = double.to_string();
+        let is_integral = !double_text.contains('.');
+        text.push_str(&double_text);
+        if is_integral {
+            text.push_str(".0");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, TimeZone, Utc};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+    use serde_json::json;
 
-    use super::format_timestamp;
+    use super::{FlatLayout, PplType, format_timestamp, name_viz_type, write_flat_cell};
 
     #[test]
     fn rendered_timestamps_drop_the_trailing_zeros_of_a_six_digit_utc_fraction() {
@@ -217,6 +472,70 @@ mod tests {
                 !rendered_timestamp.contains('T') && !rendered_timestamp.contains('Z'),
                 "rendered {rendered_timestamp}"
             );
+        }
+    }
+
+    #[test]
+    fn flat_cells_render_nested_values_lists_and_plain_decimals() {
+        for (value, expected) in [
+            (json!(null), ""),
+            (json!("plain"), "plain"),
+            (json!(true), "true"),
+            (json!(42), "42"),
+            (json!(-7), "-7"),
+            (json!(3.0), "3.0"),
+            (json!(0.5), "0.5"),
+            (json!(1e21), "1000000000000000000000.0"),
+            (json!("NaN"), "NaN"),
+            (json!([]), "[]"),
+            (json!(["a", null, 2]), "[a, null, 2]"),
+            (json!({}), "{}"),
+            (
+                json!({"http.method": "GET", "Zone": "eu"}),
+                "{Zone=eu, http.method=GET}",
+            ),
+            (json!({"outer": {"b": null, "a": [1.5]}}), "{outer={a=[1.5], b=null}}"),
+            (json!({"at": "2026-10-08 12:00:00.5"}), "{at=2026-10-08 12:00:00.5}"),
+        ] {
+            let mut cell_text = String::new();
+            write_flat_cell(&mut cell_text, &value);
+            assert_eq!(cell_text, expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn csv_cells_are_quoted_only_when_they_hold_a_separator_quote_or_line_break() {
+        for (cell, expected) in [
+            ("plain", "plain"),
+            ("a,b", "\"a,b\""),
+            ("say \"hi\"", "\"say \"\"hi\"\"\""),
+            ("line1\nline2", "\"line1\nline2\""),
+            ("carriage\rreturn", "\"carriage\rreturn\""),
+            ("x|y", "x|y"),
+        ] {
+            let mut csv_text = String::new();
+            FlatLayout::Csv.write_cell(&mut csv_text, cell);
+            assert_eq!(csv_text, expected, "{cell:?}");
+            let mut raw_text = String::new();
+            FlatLayout::Raw.write_cell(&mut raw_text, cell);
+            assert_eq!(raw_text, cell, "raw never quotes {cell:?}");
+        }
+    }
+
+    #[test]
+    fn viz_type_names_differ_from_jdbc_for_string_int_bigint_struct_and_array() {
+        for (ppl_type, expected) in [
+            (PplType::String, "keyword"),
+            (PplType::Int, "integer"),
+            (PplType::Bigint, "long"),
+            (PplType::Double, "double"),
+            (PplType::Boolean, "boolean"),
+            (PplType::Timestamp, "timestamp"),
+            (PplType::Date, "date"),
+            (PplType::Struct, "object"),
+            (PplType::Array, "nested"),
+        ] {
+            assert_eq!(name_viz_type(ppl_type), expected, "{ppl_type:?}");
         }
     }
 }

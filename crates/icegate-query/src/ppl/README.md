@@ -19,25 +19,48 @@ source=logs-* | where severity_text = 'ERROR' | fields timestamp, service_name, 
    tenant's `TenantSession`: the tenant scope, index expressions, name resolution and the
    per-query memory limit are those of every other front end of the listener. The analyzer runs
    while planning, so a type error is the query's 400, not a failure during execution.
-4. `opensearch/ppl/` executes the plan and renders the jdbc response, or the error envelope.
+4. `opensearch/ppl/` executes the plan and renders the requested format, or the error envelope.
+   `POST /_plugins/_ppl/_explain` stops after planning and answers the DataFusion logical and
+   physical plan text instead.
 
 ## Request
 
 The body is a JSON object with a string `query` and an optional integer `fetch_size`. Every other
 key is accepted and ignored; the query text alone decides the result. `fetch_size` 0 bounds
 nothing; N ≥ 1 keeps the first N rows of the final output, as a trailing `| head N` does. The
-`format` query parameter accepts `jdbc` (the default) only; every other value is a 400. A
-request that cannot be read is refused in the listener's 400 `illegal_argument_exception`
-envelope, which names the offending `key` (and its `value`, when the body gave one) or `format`.
+`format` query parameter accepts `jdbc` (the default), `viz`, `csv` or `raw`, in any case; every
+other value is a 400. `csv` and `raw` refuse a `filter_path` parameter with a 400 that carries
+`parameter` and `format`, because their body is not JSON. A request that cannot be read is
+refused in the listener's 400 `illegal_argument_exception` envelope, which names the offending
+`key` (and its `value`, when the body gave one) or `format`.
+
+`POST /_plugins/_ppl/_explain` takes the same body and answers
+`{"calcite": {"logical": "<text>", "physical": "<text>"}}`, the DataFusion logical and physical
+plans of the query; its `format` parameter accepts only `json`, and another value is a 400 that
+carries `format`. The query is planned, never executed. Parse, planning and source errors answer
+in the PPL error envelope, as on `/_plugins/_ppl`.
 
 ## Response
 
-`{schema: [{name, type}], datarows, total, size}`, where `total` and `size` both count the rows
-returned. `schema` lists the output columns in order with their PPL types (`string`, `int`,
+Every format answers `application/json; charset=UTF-8`, the `csv` and `raw` text included.
+
+`jdbc` is `{schema: [{name, type}], datarows, total, size}`, where `total` and `size` both count
+the rows returned. `schema` lists the output columns in order with their PPL types (`string`, `int`,
 `bigint`, `double`, `boolean`, `timestamp`, `date`, `struct`, `array`). `render.rs` states how
 each cell renders: timestamps in UTC as `yyyy-MM-dd HH:mm:ss[.f]` with trailing zeros dropped,
 fixed-size binary ids as lowercase hex, a MAP column as one object keyed by its stored keys (a
 dotted key is never split), `NaN` and the infinities as strings.
+
+`viz` is `{data: {<column>: [...]}, metadata: {fields: [{name, type}]}, size, status: 200}`: one
+array per column, keyed by column name, with each cell rendered as `jdbc` renders it. Its type
+names differ from `jdbc`'s: `string` is `keyword`, `int` `integer`, `bigint` `long`, `struct`
+`object` and `array` `nested`; the others keep their name.
+
+`csv` and `raw` are flat text: a line of column names, then one line per row. `csv` is
+comma-separated and quotes a cell only when it holds a separator, a quote or a line break; `raw`
+is pipe-separated and never quoted. A NULL cell is empty; every other cell is its `jdbc` value as
+text, with numbers in plain decimal and MAPs as `{k=v, …}` with each key whole. `render.rs`
+states the exact rules.
 
 ## Sources
 

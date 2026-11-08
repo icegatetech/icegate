@@ -125,6 +125,7 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
             "/_plugins/_ppl",
             post(ppl::execute_ppl_query).layer(Extension(config.ppl.clone())),
         )
+        .route("/_plugins/_ppl/_explain", post(ppl::explain_ppl_query))
         .route("/{index}/_msearch", post(search::run_multi_search_on_index))
         .route(
             "/_search/scroll",

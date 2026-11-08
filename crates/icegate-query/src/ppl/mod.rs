@@ -13,4 +13,4 @@ mod plan;
 
 pub(crate) use build::parse_ppl;
 pub(crate) use error::PplError;
-pub(crate) use plan::{PplColumn, plan_ppl};
+pub(crate) use plan::{PplColumn, PplType, plan_ppl};
