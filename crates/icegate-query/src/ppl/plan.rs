@@ -18,14 +18,18 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::functions::core::expr_fn::get_field;
 use datafusion::functions::expr_fn::{coalesce, date_part, floor, make_date, regexp_replace, to_char};
+use datafusion::functions_aggregate::average::avg_udaf;
+use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::functions_aggregate::expr_fn::{array_agg, avg, count, max, min, sum};
+use datafusion::functions_aggregate::min_max::{max_udaf, min_udaf};
+use datafusion::functions_aggregate::sum::sum_udaf;
 use datafusion::functions_nested::expr_fn::array_element;
 use datafusion::functions_window::expr_fn::row_number;
-use datafusion::logical_expr::expr::{Case, Lambda, LambdaVariable};
+use datafusion::logical_expr::expr::{Case, Lambda, LambdaVariable, WindowFunction};
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{
     Between, EmptyRelation, Expr, ExprFunctionExt, ExprSchemable, JoinType, LogicalPlan, LogicalPlanBuilder, Operator,
-    SortExpr, binary_expr, cast, col, ident, in_subquery, lit, not, when,
+    SortExpr, WindowFrame, WindowFunctionDefinition, binary_expr, cast, col, ident, in_subquery, lit, not, when,
 };
 use datafusion::optimizer::Analyzer;
 use futures::future::BoxFuture;
@@ -35,7 +39,7 @@ use regex::Regex;
 use super::ast::{
     BinCommand, BinSpan, CompareOperator, DedupCommand, FillnullCommand, FillnullReplacements, JoinCommand, JoinKind,
     ParseCommand, PplCommand, PplExpr, PplGroupKey, PplLiteral, PplQuery, PplSortKey, PplSource, RankCommand, SpanUnit,
-    StatsCommand, TimechartCommand,
+    StatsCommand, StreamStatsCommand, TimechartCommand,
 };
 use super::error::PplError;
 use super::functions::{
@@ -144,10 +148,11 @@ struct Pipeline<'session> {
     /// The source indices while the pipeline still carries their columns; a command that
     /// replaces the columns (an aggregation) ends it.
     source: Option<SourceBinding<'session>>,
-    /// The keys of the last `sort`, over the current columns; empty when no `sort` came since the
-    /// source or the last aggregation, where the order is the source's: the scan's for an index
-    /// source, no promised order for a subsearch source. `dedup` keeps the first
-    /// rows in this order. A `rename` of a sorted column moves its key to the new name; before a
+    /// The keys of the row order, over the current columns: the keys of the last `sort`, or after a
+    /// window command the key on its row ordinal ([`order_by_row_ordinal`]). Empty when neither came
+    /// since the source or the last aggregation, where the order is the source's: the scan's for an
+    /// index source, no promised order for a subsearch source. `dedup` keeps the first rows in this
+    /// order. A `rename` of a sorted column moves its key to the new name; before a
     /// command removes or replaces a sorted column, the key's values are copied into a hidden
     /// order column (see [`hide_touched_sort_keys`]), so the order outlives the column.
     sort_keys: Vec<SortExpr>,
@@ -516,12 +521,32 @@ async fn apply_command<'session>(
             }
             (builder, sort_keys)
         }
+        PplCommand::EventStats(command) => {
+            let planned = plan_event_stats(builder, command, &build_scope(), &sort_keys)?;
+            record_window_outputs(source.as_mut(), &command.aggregations);
+            planned
+        }
+        PplCommand::StreamStats(command) => {
+            let planned = plan_stream_stats(builder, command, &build_scope(), &sort_keys)?;
+            record_window_outputs(source.as_mut(), &command.aggregations);
+            planned
+        }
     };
     Ok(Pipeline {
         builder,
         source,
         sort_keys,
     })
+}
+
+/// Records the output names of a window command in `source`'s replaced columns: a name that was an input
+/// column now holds an aggregate, so a promoted attribute must not read it.
+fn record_window_outputs(source: Option<&mut SourceBinding<'_>>, aggregations: &[(String, PplExpr)]) {
+    if let Some(source) = source {
+        source
+            .replaced_columns
+            .extend(aggregations.iter().map(|(name, _)| name.clone()));
+    }
 }
 
 /// `builder` and `sort_keys` after a command that writes columns in place, and the names of the
@@ -563,15 +588,70 @@ const fn build_aggregated_pipeline<'session>(builder: LogicalPlanBuilder) -> Pip
 /// a name with one of them.
 pub(super) const RESERVED_NAME_PREFIX: &str = "__ppl_";
 
-/// The prefix of the hidden order columns, within [`RESERVED_NAME_PREFIX`]. They hold the values
-/// of sort keys whose columns a later command removed or replaced, travel with the rows through
-/// every command up to an aggregation, and are never part of the output.
+/// The prefix of the hidden columns, within [`RESERVED_NAME_PREFIX`]. They carry the row order:
+/// the values of sort keys whose columns a later command removed or replaced, and the row ordinal
+/// of a window command ([`ROW_ORDINAL_COLUMN`]). They travel with the rows through every command
+/// up to an aggregation, a `join` or a window command, which replaces them with its own ordinal,
+/// and are never part of the output.
 const ORDER_COLUMN_PREFIX: &str = "__ppl_order_";
 
-/// Whether `name` is a hidden order column. The name alone tells, because no field of a query
-/// starts with [`RESERVED_NAME_PREFIX`].
-fn is_order_column(name: &str) -> bool {
+/// The hidden column that carries each row's position in the incoming order after a command that
+/// numbered its rows (a window command). No PPL name produces it: names that begin with
+/// [`RESERVED_NAME_PREFIX`] are reserved, and the order columns of [`hide_touched_sort_keys`] end in
+/// a number. It stays in the plan through every command that keeps rows, so a later command still
+/// reads the order; a later window command, a `join` or [`finish_plan`] drops it.
+const ROW_ORDINAL_COLUMN: &str = "__ppl_order_row";
+
+/// The window column [`number_incoming_rows`] numbers the rows into before it is renamed to
+/// [`ROW_ORDINAL_COLUMN`]: the window's input may still hold an earlier ordinal under that name.
+const ROW_NUMBER_COLUMN: &str = "__ppl_row_number";
+
+/// Whether `name` is a hidden column, which no client ever sees: a sort-key order column or the row
+/// ordinal. The name alone tells, because no field of a query starts with [`RESERVED_NAME_PREFIX`].
+fn is_hidden_column(name: &str) -> bool {
     name.starts_with(ORDER_COLUMN_PREFIX)
+}
+
+/// `builder` without its hidden columns; unchanged when it has none.
+fn drop_hidden_columns(builder: LogicalPlanBuilder) -> Result<LogicalPlanBuilder, PplError> {
+    if !builder.schema().fields().iter().any(|field| is_hidden_column(field.name())) {
+        return Ok(builder);
+    }
+    let projection = list_visible_columns(builder.schema());
+    Ok(builder.project(projection)?)
+}
+
+/// Every column of `schema` but the hidden ones, each keeping its qualifier.
+fn list_visible_columns(schema: &DFSchema) -> Vec<Expr> {
+    list_columns(schema)
+        .into_iter()
+        .filter(|column| !matches!(column, Expr::Column(column) if is_hidden_column(&column.name)))
+        .collect()
+}
+
+/// Numbers the rows of `builder` into [`ROW_ORDINAL_COLUMN`] in their incoming `ordering` and drops every
+/// hidden column of `builder` (the order columns and an earlier ordinal) once the window has read them, so
+/// the output carries exactly one ordinal and no other hidden column.
+///
+/// The ordering is written into the numbering window as its `ORDER BY`, so the numbers follow it however
+/// the rows below the window are partitioned or re-sorted; nothing relies on a sort beneath the window
+/// surviving. With an empty ordering the numbers follow the order in which the rows arrive. A window
+/// without partition keys also stops filter pushdown: no predicate written after the command can move
+/// below it.
+fn number_incoming_rows(builder: LogicalPlanBuilder, ordering: &[SortExpr]) -> Result<LogicalPlanBuilder, PplError> {
+    let ordinal = row_number()
+        .order_by(ordering.to_vec())
+        .window_frame(WindowFrame::new(Some(true)))
+        .build()?
+        .alias(ROW_NUMBER_COLUMN);
+    let mut projection = list_visible_columns(builder.schema());
+    projection.push(ident(ROW_NUMBER_COLUMN).alias(ROW_ORDINAL_COLUMN));
+    Ok(builder.window(vec![ordinal])?.project(projection)?)
+}
+
+/// The order [`number_incoming_rows`] recorded, as the sort keys of the pipeline after the command.
+fn order_by_row_ordinal() -> Vec<SortExpr> {
+    vec![ident(ROW_ORDINAL_COLUMN).sort(true, false)]
 }
 
 /// Whether `sort` reads a column `is_touched` names.
@@ -698,6 +778,11 @@ fn name_key_column(index: usize) -> String {
 /// The internal column of the aggregation at `index`.
 fn name_aggregate_column(index: usize) -> String {
     format!("__ppl_aggregate_{index}")
+}
+
+/// The window column of the distinct window aggregate at `index` of a window command.
+fn name_window_column(index: usize) -> String {
+    format!("__ppl_window_{index}")
 }
 
 /// The relation of the branch of the aggregation at `index`.
@@ -1246,6 +1331,227 @@ fn deduplicate_rows(
     Ok(deduplicated_rows.project(columns)?)
 }
 
+/// The window form of one aggregation over `partition_by`: the whole partition, or for a running total
+/// the rows of the partition up to the current one in the incoming order.
+///
+/// # Errors
+///
+/// `Semantic` for a function other than `count`, `sum`, `avg`, `min` and `max` or a wrong argument count.
+fn build_window_aggregate(
+    aggregation: &PplExpr,
+    partition_by: &[Expr],
+    is_running: bool,
+    scope: &ExpressionScope<'_>,
+) -> Result<Expr, PplError> {
+    let PplExpr::FunctionCall { name, arguments } = aggregation else {
+        return Err(PplError::Internal {
+            reason: format!("a window aggregation is not a function call: {aggregation:?}"),
+        });
+    };
+    let lowered_arguments = arguments
+        .iter()
+        .map(|argument| lower_expression(argument, scope))
+        .collect::<Result<Vec<_>, PplError>>()?;
+    let (function, arguments) = match (name.as_str(), lowered_arguments.len()) {
+        // `count()` counts rows: the constant argument is never NULL.
+        ("count", 0) => (count_udaf(), vec![lit(1_i64)]),
+        ("count", 1) => (count_udaf(), lowered_arguments),
+        ("sum", 1) => (sum_udaf(), lowered_arguments),
+        ("avg", 1) => (avg_udaf(), lowered_arguments),
+        ("min", 1) => (min_udaf(), lowered_arguments),
+        ("max", 1) => (max_udaf(), lowered_arguments),
+        (other, count) => {
+            return Err(PplError::Semantic {
+                reason: format!(
+                    "`{other}` with {count} argument(s) is not supported in eventstats or streamstats; \
+                     use count, sum, avg, min or max"
+                ),
+            });
+        }
+    };
+    let (order_by, frame) = if is_running {
+        // ROWS UNBOUNDED PRECEDING to CURRENT ROW: the ordinal is unique, so the order is strict.
+        (order_by_row_ordinal(), WindowFrame::new(Some(true)))
+    } else {
+        (Vec::new(), WindowFrame::new(None))
+    };
+    Ok(Expr::from(WindowFunction::new(
+        WindowFunctionDefinition::AggregateUDF(function),
+        arguments,
+    ))
+    .partition_by(partition_by.to_vec())
+    .order_by(order_by)
+    .window_frame(frame)
+    .build()?)
+}
+
+/// One window command, normalized: `eventstats` and `streamstats` differ only in the frame and in whether a
+/// NULL group key keeps its aggregates.
+struct WindowCommand<'c> {
+    /// The command as the query names it (`eventstats` or `streamstats`), for refusals.
+    command_name: &'static str,
+    /// Output name and aggregation call, in the order written.
+    aggregations: &'c [(String, PplExpr)],
+    /// The `by` fields.
+    partition_fields: Vec<&'c str>,
+    /// A running total (`streamstats`) instead of the whole group (`eventstats`).
+    is_running: bool,
+    /// Whether a row with a NULL key gets its group's aggregates or NULL.
+    is_bucket_nullable: bool,
+}
+
+/// Plans a window command so that rows keep their incoming order: number the rows in `ordering`, compute
+/// every aggregate (a `by` repartitions the rows and a running total orders them by that number), and sort
+/// back by the number. The number stays as a hidden column and is the order the plan answers with. The
+/// fields and the aggregations resolve in `scope`, the command's input; the numbering keeps every visible
+/// input column under its name, so they resolve the same over the numbered rows.
+///
+/// Each distinct aggregate is computed once, in a window column named by [`name_window_column`]: the
+/// window names its output after the expression with every column qualified, so only an alias names it
+/// reliably.
+///
+/// # Errors
+///
+/// `Semantic` for an output name given twice and for unsupported aggregations; lowering errors.
+fn plan_window_command(
+    builder: LogicalPlanBuilder,
+    command: &WindowCommand<'_>,
+    scope: &ExpressionScope<'_>,
+    ordering: &[SortExpr],
+) -> Result<(LogicalPlanBuilder, Vec<SortExpr>), PplError> {
+    let input = number_incoming_rows(builder, ordering)?;
+    let input_schema = Arc::clone(input.schema());
+    let partition_by = command
+        .partition_fields
+        .iter()
+        .map(|field| resolve_field(field, scope))
+        .collect::<Result<Vec<_>, PplError>>()?;
+
+    // Each distinct window is listed once, with the name it was compared by; two output names of one
+    // aggregate read the same window column.
+    let mut windows: Vec<(String, Expr)> = Vec::with_capacity(command.aggregations.len());
+    let mut outputs: Vec<(&str, String)> = Vec::with_capacity(command.aggregations.len());
+    for (name, aggregation) in command.aggregations {
+        if outputs.iter().any(|(listed, _)| listed == name) {
+            return Err(PplError::Semantic {
+                reason: format!("{} names the column `{name}` twice", command.command_name),
+            });
+        }
+        let window = build_window_aggregate(aggregation, &partition_by, command.is_running, scope)?;
+        let window_name = window.schema_name().to_string();
+        let position = windows
+            .iter()
+            .position(|(listed_name, _)| *listed_name == window_name)
+            .unwrap_or_else(|| {
+                windows.push((window_name, window));
+                windows.len() - 1
+            });
+        outputs.push((name.as_str(), name_window_column(position)));
+    }
+    let window_exprs: Vec<Expr> = windows
+        .into_iter()
+        .enumerate()
+        .map(|(position, (_, window))| window.alias(name_window_column(position)))
+        .collect();
+    let windowed_plan = input.window(window_exprs)?;
+    let windowed_schema = Arc::clone(windowed_plan.schema());
+    let keys_present = if command.is_bucket_nullable {
+        None
+    } else {
+        conjunction(partition_by.iter().map(|key| key.clone().is_not_null()))
+    };
+    let build_aggregate = |name: &str, window_column: &str| -> Result<Expr, PplError> {
+        let column = ident(window_column);
+        let value = match &keys_present {
+            Some(keys_present) => {
+                let data_type = column.get_type(windowed_schema.as_ref())?;
+                let null = ScalarValue::try_from(&data_type)?;
+                when(keys_present.clone(), column).otherwise(lit(null))?
+            }
+            None => column,
+        };
+        Ok(value.alias(name))
+    };
+
+    // An aggregate named like an input column takes that column's place, the others follow the input
+    // columns; the hidden ordinal is an input column too, so it stays.
+    let mut projection = Vec::with_capacity(input_schema.fields().len() + outputs.len());
+    for (qualifier, field) in input_schema.iter() {
+        projection.push(match outputs.iter().find(|(name, _)| *name == field.name().as_str()) {
+            Some((name, window_column)) => build_aggregate(name, window_column)?,
+            None => Expr::Column(Column::from((qualifier, field))),
+        });
+    }
+    for (name, window_column) in &outputs {
+        if !input_schema.has_column_with_unqualified_name(name) {
+            projection.push(build_aggregate(name, window_column)?);
+        }
+    }
+    let ordinal_order = order_by_row_ordinal();
+    let ordered_plan = windowed_plan.project(projection)?.sort(ordinal_order.clone())?;
+    Ok((ordered_plan, ordinal_order))
+}
+
+/// Plans `eventstats`: the aggregates of each row's group, over the whole group.
+///
+/// # Errors
+///
+/// `Internal` for a `by span(…)` key, which the builder refuses; the errors of [`plan_window_command`].
+fn plan_event_stats(
+    builder: LogicalPlanBuilder,
+    command: &StatsCommand,
+    scope: &ExpressionScope<'_>,
+    ordering: &[SortExpr],
+) -> Result<(LogicalPlanBuilder, Vec<SortExpr>), PplError> {
+    let partition_fields = command
+        .by
+        .iter()
+        .map(|key| match key {
+            PplGroupKey::Field(field) => Ok(field.as_str()),
+            PplGroupKey::Span { .. } => Err(PplError::Internal {
+                reason: "an eventstats span key; the builder refuses `by span(…)`".to_string(),
+            }),
+        })
+        .collect::<Result<Vec<_>, PplError>>()?;
+    plan_window_command(
+        builder,
+        &WindowCommand {
+            command_name: "eventstats",
+            aggregations: &command.aggregations,
+            partition_fields,
+            is_running: false,
+            is_bucket_nullable: command.is_bucket_nullable,
+        },
+        scope,
+        ordering,
+    )
+}
+
+/// Plans `streamstats`: running aggregates of each row's group in the incoming order; a NULL key is a group.
+///
+/// # Errors
+///
+/// The errors of [`plan_window_command`].
+fn plan_stream_stats(
+    builder: LogicalPlanBuilder,
+    command: &StreamStatsCommand,
+    scope: &ExpressionScope<'_>,
+    ordering: &[SortExpr],
+) -> Result<(LogicalPlanBuilder, Vec<SortExpr>), PplError> {
+    plan_window_command(
+        builder,
+        &WindowCommand {
+            command_name: "streamstats",
+            aggregations: &command.aggregations,
+            partition_fields: command.by.iter().map(String::as_str).collect(),
+            is_running: true,
+            is_bucket_nullable: true,
+        },
+        scope,
+        ordering,
+    )
+}
+
 /// `timechart`: the aggregation per time bucket and series, as the columns `<time field>,
 /// [<by field>], <aggregation>`, ordered by time then series, NULL last; empty buckets are not
 /// filled.
@@ -1581,8 +1887,8 @@ fn floor_to_calendar_multiple(index: Expr, length: i64) -> Result<Expr, PplError
 /// Keep the listed fields in the order listed, or with `is_exclusion` drop them and keep the
 /// rest in their order. A name listed twice is kept once. A listed field that is not a column
 /// (a MAP key path such as ``log_attributes.`http.method` ``, or a promoted resource attribute)
-/// is kept as a column named by its path. Patterns never match the hidden order columns, which
-/// are always kept after the selected ones.
+/// is kept as a column named by its path. Patterns never match the hidden columns, which are
+/// always kept after the selected ones, so the row order they carry survives `fields`.
 fn select_fields(
     builder: LogicalPlanBuilder,
     is_exclusion: bool,
@@ -1594,7 +1900,7 @@ fn select_fields(
         .fields()
         .iter()
         .map(|field| field.name().clone())
-        .partition(|name| is_order_column(name));
+        .partition(|name| is_hidden_column(name));
     if is_exclusion {
         let mut dropped_names: HashSet<&str> = HashSet::with_capacity(patterns.len());
         for pattern in patterns {
@@ -1730,7 +2036,7 @@ fn map_renamed_columns(schema: &DFSchema, renames: &[(String, String)]) -> Resul
 }
 
 /// `builder`'s columns as `renamed_columns` ([`map_renamed_columns`]) lists them, then every
-/// hidden order column added since that mapping was taken.
+/// hidden column added since that mapping was taken.
 fn rename_fields(
     builder: LogicalPlanBuilder,
     renamed_columns: &[(String, String)],
@@ -1746,7 +2052,7 @@ fn rename_fields(
             .iter()
             .map(|field| field.name())
             .filter(|name| {
-                is_order_column(name) && renamed_columns.iter().all(|(source_column, _)| source_column != *name)
+                is_hidden_column(name) && renamed_columns.iter().all(|(source_column, _)| source_column != *name)
             })
             .map(ident),
     );
@@ -2106,22 +2412,10 @@ fn fold_string_operand(operand: Expr, other: &Expr, schema: &DFSchema) -> Result
     )))
 }
 
-/// Build `builder` without its hidden order columns, run the analyzer so a type error is reported
-/// as the query's error rather than at execution, and describe the output columns.
+/// Build `builder` without its hidden columns ([`drop_hidden_columns`]), run the analyzer so a type
+/// error is reported as the query's error rather than at execution, and describe the output columns.
 fn finish_plan(builder: LogicalPlanBuilder) -> Result<PplPlan, PplError> {
-    let has_order_columns = builder.schema().fields().iter().any(|field| is_order_column(field.name()));
-    let builder = if has_order_columns {
-        let output_columns: Vec<Expr> = builder
-            .schema()
-            .columns()
-            .into_iter()
-            .filter(|column| !is_order_column(&column.name))
-            .map(Expr::Column)
-            .collect();
-        builder.project(output_columns)?
-    } else {
-        builder
-    };
+    let builder = drop_hidden_columns(builder)?;
     let plan = Analyzer::new().execute_and_check(builder.build()?, &ConfigOptions::default(), |_, _| {})?;
     let columns = plan
         .schema()
@@ -2414,8 +2708,8 @@ fn extract_named_group(source: &Expr, extraction_pattern: &str, group: &str) -> 
 }
 
 /// Plans `fillnull`: each selected column becomes `coalesce(column, replacement)` under its own
-/// name. Answers the plan and the names of the filled columns. Hidden order columns are never
-/// output columns, so a `fillnull` without a field list leaves them alone.
+/// name. Answers the plan and the names of the filled columns. Hidden columns are never output
+/// columns, so a `fillnull` without a field list leaves them alone.
 ///
 /// # Errors
 ///
@@ -2433,7 +2727,7 @@ fn plan_fillnull(
             schema
                 .fields()
                 .iter()
-                .filter(|field| !is_order_column(field.name()))
+                .filter(|field| !is_hidden_column(field.name()))
                 .map(|field| (field.name().clone(), value.clone()))
                 .collect()
         }
@@ -2707,6 +3001,9 @@ async fn plan_join(
             ),
         });
     }
+    // A join keeps no row order, so its output never carries the left side's hidden columns; the right
+    // side is planned by `plan_ppl`, which drops its own.
+    let builder = drop_hidden_columns(builder)?;
     let right_side_plan = plan_subquery(&join.right, planning).await?;
     let left_side = qualify_plan(builder, join.left_alias.as_deref())?;
     let right_side = qualify_plan(
@@ -2782,9 +3079,9 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     use super::{
-        ExpressionScope, PplColumn, PplType, aggregate_rows, bin_time, bucket_time, build_describe_plan,
-        coerce_timestamp_operands, lower_expression, plan_fillnull, plan_ppl, project_source_columns, select_fields,
-        union_branches,
+        ExpressionScope, PplColumn, PplType, ROW_ORDINAL_COLUMN, aggregate_rows, bin_time, bucket_time,
+        build_describe_plan, coerce_timestamp_operands, drop_hidden_columns, hide_touched_sort_keys, lower_expression,
+        plan_fillnull, plan_ppl, project_source_columns, select_fields, union_branches,
     };
     use crate::opensearch::catalog::FieldType;
     use crate::opensearch::context::RequestContext;
@@ -3579,5 +3876,57 @@ mod tests {
                 "{fillnull_text} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn fields_keep_the_hidden_row_ordinal_and_match_only_visible_columns() {
+        use datafusion::logical_expr::table_scan;
+
+        // The ordinal comes first, so a `*` that matched it would list it before `body`.
+        let schema = Schema::new(vec![
+            Field::new(ROW_ORDINAL_COLUMN, DataType::UInt64, false),
+            Field::new("body", DataType::Utf8, true),
+            Field::new("severity_text", DataType::Utf8, true),
+        ]);
+        let scan = table_scan(Some("logs"), &schema, None).expect("scan");
+        let read_names = |builder: &LogicalPlanBuilder| -> Vec<String> {
+            builder.schema().fields().iter().map(|field| field.name().clone()).collect()
+        };
+        let select_names = |builder: &LogicalPlanBuilder, is_exclusion: bool, patterns: &[&str]| -> Vec<String> {
+            let builder_schema = Arc::clone(builder.schema());
+            let scope = ExpressionScope::new(&builder_schema, None, DateTime::UNIX_EPOCH);
+            let patterns: Vec<String> = patterns.iter().map(|pattern| (*pattern).to_string()).collect();
+            read_names(&select_fields(builder.clone(), is_exclusion, &patterns, &scope).expect("fields plans"))
+        };
+        for (is_exclusion, patterns, expected) in [
+            (false, ["*"], vec!["body", "severity_text", ROW_ORDINAL_COLUMN]),
+            (false, ["severity_text"], vec!["severity_text", ROW_ORDINAL_COLUMN]),
+            (true, ["body"], vec!["severity_text", ROW_ORDINAL_COLUMN]),
+        ] {
+            assert_eq!(select_names(&scan, is_exclusion, &patterns), expected, "{patterns:?}");
+        }
+        assert_eq!(
+            read_names(&drop_hidden_columns(scan.clone()).expect("the drop plans")),
+            vec!["body", "severity_text"]
+        );
+
+        // A sort key on `body` hidden before `fields - body` removes it: the order column it lands in is kept
+        // beside the ordinal, `*` still lists only the visible columns, and the drop removes both.
+        let (hidden_rows, hidden_keys) =
+            hide_touched_sort_keys(scan, vec![ident("body").sort(true, true)], |column| column == "body")
+                .expect("the hidden key plans");
+        assert_eq!(hidden_keys, vec![ident("__ppl_order_0").sort(true, true)]);
+        assert_eq!(
+            select_names(&hidden_rows, true, &["body"]),
+            vec!["severity_text", ROW_ORDINAL_COLUMN, "__ppl_order_0"]
+        );
+        assert_eq!(
+            select_names(&hidden_rows, false, &["*"]),
+            vec!["body", "severity_text", ROW_ORDINAL_COLUMN, "__ppl_order_0"]
+        );
+        assert_eq!(
+            read_names(&drop_hidden_columns(hidden_rows).expect("the drop plans")),
+            vec!["body", "severity_text"]
+        );
     }
 }

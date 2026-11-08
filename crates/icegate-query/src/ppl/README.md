@@ -90,6 +90,7 @@ see [`describe`](#describe). `source=[ <subsearch> ] [as t]` reads a subsearch's
 | `parse <field> '<pattern>'` | See [`parse`](#parse). |
 | `fillnull with <v> [in <fields>]`, `fillnull using <f> = <v>, …`, `fillnull value=<v> [<fields>]` | See [`fillnull`](#fillnull). |
 | `[inner \| left] join [left=<l>] [right=<r>] on <criteria> <right side>` | See [Joins](#joins). |
+| `eventstats …`, `streamstats …` | See [Window commands](#window-commands). |
 
 The output columns of a source are the table's columns in table order. A field reference is
 resolved against the columns of the pipeline at that point, case-sensitively; a name that
@@ -275,8 +276,9 @@ The order of a `sort` holds until the next `sort` or aggregation, whatever comes
 `rename` of a sorted column carries the order to the new name, and a `fields`, `eval`, `bin` or
 `rename`, `parse` or `fillnull` that removes or replaces a sorted column keeps the sorted values in
 a hidden column
-that `dedup` orders by and the output never shows. `stats`, `top`, `rare` and `timechart` define
-their own output order, so a `sort` before them does not carry past them.
+that `dedup` orders by and the output never shows. `eventstats` and `streamstats` keep the
+incoming order and record it in a hidden column that later commands read. `stats`, `top`, `rare`
+and `timechart` define their own output order, so a `sort` before them does not carry past them.
 
 ## `describe`
 
@@ -365,6 +367,26 @@ subsearch (`[ source=spans | … ] as s`). Without a type the join is inner; a t
   qualifies its columns for a later `join` (`t.service_name`); other commands use the bare names. An alias on an
   index source (`source=logs as l`) is a 400; a join names its sides with `left=` / `right=`.
 - **System indices:** a subsearch over a system index is a 400 naming it, like a system-index source.
+
+## Window commands
+
+- **`eventstats [bucket_nullable=<bool>] <aggregation> [as <name>], … [by <field>, …]`** adds the aggregates of
+  each row's group to that row (the whole input without `by`).
+- **`streamstats <aggregation> [as <name>], … [by <field>, …]`** adds running aggregates: each row's value covers
+  its group from the first row of the incoming order up to and including itself (`sort … | streamstats count() as
+  rn by k | where rn = 1` keeps the first row per `k`).
+- **Aggregations:** `count()`, `count(<expr>)`, `sum`, `avg`, `min`, `max`; any other is a 400 naming it. A column
+  is named by `as`, else by the call as written (`count()`). A name equal to an input column replaces it in place;
+  a name given twice is a 400.
+- **NULL keys:** `bucket_nullable=true` (the default) makes NULL keys one group; `false` gives rows with a NULL
+  key NULL aggregates. `streamstats` always groups NULL keys and refuses every argument (`current`, `window`,
+  `global`, `reset_before`, `reset_after`, `bucket_nullable`): its running window always reaches from the first
+  row of the group to the current row. Both commands group by fields only: `by span(…)` is a 400.
+- **Order:** both commands keep the incoming order of the rows (see
+  [Row order after aggregation](#row-order-after-aggregation)); without one (no `sort`, or after `stats` or
+  `join`) the rows have no order to keep. A `where` written after them filters their output; it never moves
+  below them.
+- **Never capped:** both read every row of their input.
 
 ## Timestamp literals
 

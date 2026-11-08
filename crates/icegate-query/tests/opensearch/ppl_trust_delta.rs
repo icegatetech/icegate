@@ -93,6 +93,34 @@ async fn create_system_index(server: &TestServer, tenant: &str) -> Result<(), re
     Ok(())
 }
 
+/// Rows on each side (Iceberg, WAL) of the order tests: more than the engine's batch size, so each side
+/// arrives in more than one record batch.
+const ROWS_PER_SIDE: usize = 9_000;
+
+/// The bodies `00000`, `00001`, … of `count` numbered rows: row `k`'s body is `k` in five digits.
+fn build_numbered_bodies(count: usize) -> Vec<String> {
+    (0..count).map(|offset| format!("{offset:05}")).collect()
+}
+
+/// Tenant-A log rows at `NOON + k` µs with body `bodies[k]`, for every `k` of the given parity: parity 0 for the
+/// even rows, 1 for the odd ones. Split by parity across Iceberg and the WAL, the two sides interleave in time,
+/// so only an explicit order can put them in sequence.
+fn build_numbered_rows(bodies: &[String], parity: usize) -> Vec<Row<'_>> {
+    bodies
+        .iter()
+        .zip(0_i64..)
+        .skip(parity)
+        .step_by(2)
+        .map(|(body, offset)| {
+            build_log_row(
+                TENANT_A,
+                NOON + offset,
+                vec![(icegate_common::schema::COL_BODY, Cell::Text(body))],
+            )
+        })
+        .collect()
+}
+
 /// A log row of `tenant` at `micros` with `cells`.
 fn build_log_row<'a>(tenant: &'a str, micros: i64, mut cells: Vec<(&'a str, Cell<'a>)>) -> Row<'a> {
     cells.push((COL_TIMESTAMP, Cell::Micros(micros)));
@@ -1144,6 +1172,442 @@ mod subsearch {
             let system_reply = refuse_ppl(&server, TENANT_A, &query).await;
             assert_semantic_refusal(&system_reply, SYSTEM_INDEX);
         }
+        server.shutdown().await;
+    }
+}
+
+/// `eventstats` and `streamstats`: aggregates per group added to every row, in the incoming order.
+mod window {
+    use icegate_common::schema::{COL_BODY, COL_SEVERITY_TEXT};
+    use icegate_query::engine::QueryEngineConfig;
+
+    use super::*;
+
+    fn build_logged_row<'a>(
+        tenant: &'a str,
+        second: i64,
+        body: &'a str,
+        service: Option<&'a str>,
+        severity: &'a str,
+    ) -> Row<'a> {
+        let mut cells = vec![(COL_BODY, Cell::Text(body)), (COL_SEVERITY_TEXT, Cell::Text(severity))];
+        if let Some(service) = service {
+            cells.push((COL_SERVICE_NAME, Cell::Text(service)));
+        }
+        build_log_row(tenant, NOON + second * SECOND, cells)
+    }
+
+    /// A server over the tenant-A logs `a`–`e`, logged 1–5 seconds after noon: `a` and `c` in `checkout`,
+    /// `b` in `cart`, `d` and `e` without a service, and only `c` at `ERROR`; plus a tenant-B `checkout` row
+    /// `z` in the same WAL file as `d` and `e`, which no tenant-A query may count.
+    ///
+    /// # Errors
+    ///
+    /// The write error when a row cannot be committed or the WAL segment cannot be written.
+    async fn start_grouped_logs_server() -> Result<TestServer, RowWriteError> {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_logged_row(TENANT_A, 1, "a", Some("checkout"), "INFO"),
+                build_logged_row(TENANT_A, 2, "b", Some("cart"), "INFO"),
+                build_logged_row(TENANT_A, 3, "c", Some("checkout"), "ERROR"),
+            ],
+        )
+        .await?;
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            LOGS_TABLE,
+            1,
+            &[
+                build_logged_row(TENANT_A, 4, "d", None, "INFO"),
+                build_logged_row(TENANT_A, 5, "e", None, "INFO"),
+                build_logged_row(TENANT_B, 6, "z", Some("checkout"), "INFO"),
+            ],
+        )
+        .await?;
+        Ok(server)
+    }
+
+    #[tokio::test]
+    async fn eventstats_adds_group_aggregates_to_every_row_with_bucket_nullable() {
+        let server = start_grouped_logs_server().await.expect("start the grouped logs server");
+
+        let format_grouped_query = |options: &str| {
+            format!(
+                "source=logs | sort body | eventstats {options} count() as n, max(timestamp) as newest by service_name \
+                 | fields body, service_name, n, newest"
+            )
+        };
+        let nullable_answer = run_ppl(&server, TENANT_A, &format_grouped_query("")).await;
+        assert_eq!(
+            nullable_answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("service_name", "string"),
+                build_schema_column("n", "bigint"),
+                build_schema_column("newest", "timestamp")
+            ])
+        );
+        assert_eq!(
+            nullable_answer["datarows"],
+            json!([
+                ["a", "checkout", 2, "2026-10-08 12:00:03"],
+                ["b", "cart", 1, "2026-10-08 12:00:02"],
+                ["c", "checkout", 2, "2026-10-08 12:00:03"],
+                ["d", null, 2, "2026-10-08 12:00:05"],
+                ["e", null, 2, "2026-10-08 12:00:05"]
+            ])
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &format_grouped_query("bucket_nullable=true")).await["datarows"],
+            nullable_answer["datarows"]
+        );
+
+        let non_nullable_answer = run_ppl(&server, TENANT_A, &format_grouped_query("bucket_nullable=false")).await;
+        assert_eq!(
+            non_nullable_answer["datarows"],
+            json!([
+                ["a", "checkout", 2, "2026-10-08 12:00:03"],
+                ["b", "cart", 1, "2026-10-08 12:00:02"],
+                ["c", "checkout", 2, "2026-10-08 12:00:03"],
+                ["d", null, null, null],
+                ["e", null, null, null]
+            ])
+        );
+
+        let whole_query = "source=logs | sort - body | eventstats count() as total | fields body, total";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, whole_query).await["datarows"],
+            json!([["e", 5], ["d", 5], ["c", 5], ["b", 5], ["a", 5]])
+        );
+
+        // An aggregate named like an input column replaces it in place: `service_name` stays second, now a
+        // count. INFO holds a, b, d and e.
+        let replacing_query = "source=logs | fields body, service_name, severity_text | sort body \
+             | eventstats count() as service_name by severity_text | head 1";
+        let replacing_answer = run_ppl(&server, TENANT_A, replacing_query).await;
+        assert_eq!(
+            replacing_answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("service_name", "bigint"),
+                build_schema_column("severity_text", "string")
+            ])
+        );
+        assert_eq!(replacing_answer["datarows"], json!([["a", 4, "INFO"]]));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_ordinal_eventstats_records_survives_fields_and_fillnull_for_a_later_streamstats() {
+        let server = start_grouped_logs_server().await.expect("start the grouped logs server");
+
+        // `fields` keeps the hidden ordinal `eventstats` recorded for the later `streamstats`; `fillnull`'s
+        // all-fields form skips it and fills the visible string columns only.
+        let filled_query = "source=logs | sort body | eventstats count() as n by service_name \
+             | fields body, service_name | fillnull with 'none' | streamstats count() as rn \
+             | fields body, service_name, rn";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, filled_query).await["datarows"],
+            json!([
+                ["a", "checkout", 1],
+                ["b", "cart", 2],
+                ["c", "checkout", 3],
+                ["d", "none", 4],
+                ["e", "none", 5]
+            ])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn window_commands_refuse_duplicate_names_unsupported_functions_and_replaced_promoted_columns() {
+        let server = start_grouped_logs_server().await.expect("start the grouped logs server");
+
+        for command in ["eventstats", "streamstats"] {
+            let twice_reply = refuse_ppl(
+                &server,
+                TENANT_A,
+                &format!("source=logs | {command} count() as n, max(timestamp) as n"),
+            )
+            .await;
+            assert_semantic_refusal(&twice_reply, &format!("{command} names the column `n` twice"));
+
+            let distinct_reply =
+                refuse_ppl(&server, TENANT_A, &format!("source=logs | {command} dc(service_name)")).await;
+            assert_semantic_refusal(&distinct_reply, "`dc`");
+
+            // An aggregate that replaces the column a promoted attribute reads leaves that attribute unreadable.
+            let replaced_reply = refuse_ppl(
+                &server,
+                TENANT_A,
+                &format!(
+                    "source=logs | {command} count() as service_name | where resource_attributes.service.name = 'api'"
+                ),
+            )
+            .await;
+            assert_semantic_refusal(
+                &replaced_reply,
+                "field [resource_attributes.service.name] reads the column [service_name], which an earlier command \
+                 removed, renamed or replaced",
+            );
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn eventstats_computes_every_supported_aggregate_and_refuses_span_keys() {
+        let server = start_grouped_logs_server().await.expect("start the grouped logs server");
+
+        // `elapsed` is a row's second after noon (a=1 … e=5). `count(service_name)` counts non-NULL values, so
+        // the NULL group of d and e counts 0; `a` and `b` name one aggregate twice and share its window column.
+        let aggregates_query = "source=logs | sort body \
+             | eval elapsed = timestampdiff(SECOND, timestamp('2026-10-08 12:00:00'), timestamp) \
+             | eventstats count(service_name) as services, sum(elapsed) as elapsed_sum, \
+               avg(elapsed) as elapsed_avg, min(elapsed) as elapsed_min, count() as a, count() as b by service_name \
+             | fields body, services, elapsed_sum, elapsed_avg, elapsed_min, a, b";
+        let aggregates_answer = run_ppl(&server, TENANT_A, aggregates_query).await;
+        assert_eq!(
+            aggregates_answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("services", "bigint"),
+                build_schema_column("elapsed_sum", "bigint"),
+                build_schema_column("elapsed_avg", "double"),
+                build_schema_column("elapsed_min", "bigint"),
+                build_schema_column("a", "bigint"),
+                build_schema_column("b", "bigint")
+            ])
+        );
+        assert_eq!(
+            aggregates_answer["datarows"],
+            json!([
+                ["a", 2, 4, 2.0, 1, 2, 2],
+                ["b", 1, 2, 2.0, 2, 1, 1],
+                ["c", 2, 4, 2.0, 1, 2, 2],
+                ["d", 0, 9, 4.5, 4, 2, 2],
+                ["e", 0, 9, 4.5, 4, 2, 2]
+            ])
+        );
+
+        let span_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | eventstats count() by span(timestamp, 1h)",
+        )
+        .await;
+        assert_semantic_refusal(
+            &span_reply,
+            "eventstats groups by fields; `by span(…)` is not supported",
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn streamstats_count_by_numbers_rows_in_their_sorted_order() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_logged_row(TENANT_A, 1, "a", Some("checkout"), "INFO"),
+                build_logged_row(TENANT_A, 3, "c", Some("checkout"), "INFO"),
+                build_logged_row(TENANT_A, 5, "e", Some("cart"), "INFO"),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            LOGS_TABLE,
+            1,
+            &[
+                build_logged_row(TENANT_A, 2, "b", Some("cart"), "INFO"),
+                build_logged_row(TENANT_A, 4, "d", Some("checkout"), "INFO"),
+                build_logged_row(TENANT_B, 3, "z", Some("checkout"), "INFO"),
+            ],
+        )
+        .await
+        .expect("write logs segment");
+
+        let ascending_query =
+            "source=logs | sort timestamp | streamstats count() as rn by service_name | fields body, service_name, rn";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, ascending_query).await["datarows"],
+            json!([
+                ["a", "checkout", 1],
+                ["b", "cart", 1],
+                ["c", "checkout", 2],
+                ["d", "checkout", 3],
+                ["e", "cart", 2]
+            ])
+        );
+        let descending_query = "source=logs | sort - timestamp | streamstats count() as rn by service_name | fields body, service_name, rn";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, descending_query).await["datarows"],
+            json!([
+                ["e", "cart", 1],
+                ["d", "checkout", 1],
+                ["c", "checkout", 2],
+                ["b", "cart", 2],
+                ["a", "checkout", 3]
+            ])
+        );
+        let first_per_group_query =
+            "source=logs | sort timestamp | streamstats count() as rn by service_name | where rn = 1 | fields body";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, first_per_group_query).await["datarows"],
+            json!([["a"], ["b"]])
+        );
+        let running_query = "source=logs | sort timestamp | streamstats count() as seen | fields body, seen";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, running_query).await["datarows"],
+            json!([["a", 1], ["b", 2], ["c", 3], ["d", 4], ["e", 5]])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_where_after_eventstats_or_streamstats_never_moves_below_them() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_logged_row(TENANT_A, 1, "a", Some("checkout"), "INFO"),
+                build_logged_row(TENANT_A, 2, "b", Some("cart"), "ERROR"),
+                build_logged_row(TENANT_A, 3, "c", Some("checkout"), "ERROR"),
+                // Read by tenant A, `z` would be a third `checkout` row and a third answer row.
+                build_logged_row(TENANT_B, 4, "z", Some("checkout"), "ERROR"),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        // A filter moved below either command would make `c` the first and only `checkout` row: 1, not 2.
+        let event_query = "source=logs | sort body | eventstats count() as n by service_name \
+             | where severity_text = 'ERROR' | fields body, n";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, event_query).await["datarows"],
+            json!([["b", 1], ["c", 2]])
+        );
+        let stream_query = "source=logs | sort body | streamstats count() as rn by service_name \
+             | where severity_text = 'ERROR' | fields body, rn";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, stream_query).await["datarows"],
+            json!([["b", 1], ["c", 2]])
+        );
+
+        for query in [event_query, stream_query] {
+            let (logical_plan, _physical_plan) = explain_ppl(&server, TENANT_A, query).await;
+            let lines: Vec<&str> = logical_plan.lines().collect();
+            let filter_line = lines
+                .iter()
+                .position(|line| line.contains("Filter:") && line.contains("severity_text"))
+                .unwrap_or_else(|| panic!("no severity filter:\n{logical_plan}"));
+            let window_line = lines
+                .iter()
+                .position(|line| line.contains("WindowAggr"))
+                .unwrap_or_else(|| panic!("no window:\n{logical_plan}"));
+            assert!(
+                filter_line < window_line,
+                "the filter stays above the window:\n{logical_plan}"
+            );
+            assert!(
+                find_plan_lines(&logical_plan, "TableScan")
+                    .iter()
+                    .all(|line| !line.contains("ERROR")),
+                "the filter never reaches the scan:\n{logical_plan}"
+            );
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn eventstats_over_more_than_ten_thousand_rows_is_never_capped() {
+        let (server, catalog) = TestServer::start().await;
+        let mut rows: Vec<Row<'_>> = (0..10_050)
+            .map(|offset| {
+                build_log_row(
+                    TENANT_A,
+                    NOON + offset,
+                    vec![(COL_SERVICE_NAME, Cell::Text("checkout"))],
+                )
+            })
+            .collect();
+        rows.extend((0..3).map(|offset| {
+            build_log_row(
+                TENANT_B,
+                NOON + offset,
+                vec![(COL_SERVICE_NAME, Cell::Text("checkout"))],
+            )
+        }));
+        commit_rows(&catalog, LOGS_TABLE, &rows).await.expect("commit logs");
+
+        let query =
+            "source=logs | eventstats count() as n by service_name | stats count() as rows, max(n) as group_size";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, query).await["datarows"],
+            json!([[10_050, 10_050]])
+        );
+        server.shutdown().await;
+    }
+
+    /// The even rows are one Iceberg commit and the odd rows one WAL segment, each more rows than the engine's
+    /// batch size, so the scans deliver them in batches of either side; only the order written into the
+    /// numbering window puts them in time order. Row `k` is at `NOON + k` µs with body `k`, so its rank is
+    /// `k + 1`. A tenant-B row one microsecond before row 0 in the Iceberg commit would take rank 1 and make the
+    /// total 18001 if tenant A read it.
+    #[tokio::test]
+    async fn streamstats_follows_the_sorted_order_across_iceberg_and_wal_beyond_one_batch() {
+        assert!(
+            ROWS_PER_SIDE > QueryEngineConfig::default().batch_size,
+            "each side must span more than one record batch"
+        );
+        let (server, catalog) = TestServer::start().await;
+        let bodies = build_numbered_bodies(2 * ROWS_PER_SIDE);
+        let mut iceberg_rows = build_numbered_rows(&bodies, 0);
+        iceberg_rows.push(build_log_row(
+            TENANT_B,
+            NOON - 1,
+            vec![(COL_BODY, Cell::Text("tenant-b"))],
+        ));
+        commit_rows(&catalog, LOGS_TABLE, &iceberg_rows)
+            .await
+            .expect("commit the even rows and the tenant-B row");
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            LOGS_TABLE,
+            1,
+            &build_numbered_rows(&bodies, 1),
+        )
+        .await
+        .expect("write the odd rows");
+
+        let ascending_query = "source=logs | sort timestamp | streamstats count() as rn \
+             | where rn = 1 or rn = 2 or rn = 9001 or rn = 18000 | fields body, rn";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, ascending_query).await["datarows"],
+            json!([["00000", 1], ["00001", 2], ["09000", 9001], ["17999", 18000]])
+        );
+
+        // `fields` keeps the hidden ordinal `eventstats` left behind, so `streamstats` still numbers the rows in
+        // descending order.
+        let chained_query = "source=logs | sort - timestamp | eventstats count() as total | fields body, total \
+             | streamstats count() as rn | where rn = 1 or rn = 2 or rn = 9001 or rn = 18000 | fields body, rn, total";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, chained_query).await["datarows"],
+            json!([
+                ["17999", 1, 18000],
+                ["17998", 2, 18000],
+                ["08999", 9001, 18000],
+                ["00000", 18000, 18000]
+            ])
+        );
         server.shutdown().await;
     }
 }

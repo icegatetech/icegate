@@ -84,6 +84,10 @@ pub(crate) enum PplCommand {
     Fillnull(FillnullCommand),
     /// `join` with criteria; the pipeline so far is the left side.
     Join(JoinCommand),
+    /// `eventstats`: every row gains the aggregates of its group, rows keep their order.
+    EventStats(StatsCommand),
+    /// `streamstats`: every row gains running aggregates of its group, rows keep their order.
+    StreamStats(StreamStatsCommand),
 }
 
 /// A `join` with `on` criteria: the pipeline so far is the left side.
@@ -143,7 +147,8 @@ pub(crate) enum FillnullReplacements {
     Fields(Vec<(String, PplExpr)>),
 }
 
-/// A `stats` command.
+/// A `stats` command, or an `eventstats` command, which takes the same aggregations, keys and
+/// `bucket_nullable` but keeps every row.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StatsCommand {
     /// The aggregations in order, each with its output name: the alias, or the text of the call
@@ -153,6 +158,18 @@ pub(crate) struct StatsCommand {
     pub(crate) by: Vec<PplGroupKey>,
     /// Whether rows whose key is NULL form a group (`bucket_nullable`, true by default).
     pub(crate) is_bucket_nullable: bool,
+}
+
+/// `streamstats <aggregation> [as <name>], … [by <field>, …]`.
+///
+/// Each row's value covers the rows of its group from the first row of the incoming order up to and
+/// including itself; a NULL key is a group of its own.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StreamStatsCommand {
+    /// Output column name and aggregation call, in the order written.
+    pub(crate) aggregations: Vec<(String, PplExpr)>,
+    /// The fields that partition the running aggregates.
+    pub(crate) by: Vec<String>,
 }
 
 /// A group key of `stats`.

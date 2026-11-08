@@ -19,7 +19,8 @@ use icegate_query_grammar::ppl::{
     CountEvalFunctionCallContextAttrs, DataTypeFunctionCallContextAttrs, DedupCommandContextAll,
     DedupCommandContextAttrs, DefaultSortFieldContextAttrs, DescribeCommandContextAttrs,
     DistinctCountFunctionCallContextAttrs, EvalClauseContextAll, EvalClauseContextAttrs, EvalCommandContextAttrs,
-    EvalExpressionContextAttrs, EvalFunctionCallContextAttrs, ExpressionContextAll, FieldExprContextAttrs,
+    EvalExpressionContextAttrs, EvalFunctionCallContextAttrs, EventstatsAggTermContextAttrs,
+    EventstatsCommandContextAll, EventstatsCommandContextAttrs, ExpressionContextAll, FieldExprContextAttrs,
     FieldExpressionContextAll, FieldExpressionContextAttrs, FieldListContextAll, FieldListContextAttrs,
     FieldsCommandBodyContextAll, FieldsCommandBodyContextAttrs, FieldsCommandContextAttrs,
     FillNullUsingClauseContextAttrs, FillNullUsingContextAttrs, FillNullValueAllFieldsContextAttrs,
@@ -44,21 +45,23 @@ use icegate_query_grammar::ppl::{
     SortbyClauseContextAttrs, SpanClauseContextAttrs, SpanLiteralContextAll, SpanLiteralContextAttrs,
     StatsAggTermContextAll, StatsAggTermContextAttrs, StatsArgsContextAttrs, StatsByClauseContextAll,
     StatsByClauseContextAttrs, StatsCommandContextAll, StatsCommandContextAttrs, StatsFunctionCallContextAttrs,
-    StatsFunctionContextAll, StringLiteralContextAll, SubSearchContextAll, SubSearchContextAttrs,
+    StatsFunctionContextAll, StreamstatsAggTermContextAttrs, StreamstatsCommandContextAll,
+    StreamstatsCommandContextAttrs, StringLiteralContextAll, SubSearchContextAll, SubSearchContextAttrs,
     SuffixSortFieldContextAttrs, TableCommandContextAttrs, TableIdentContextAll, TableIdentContextAttrs,
     TableOrSubqueryClauseContextAll, TableOrSubqueryClauseContextAttrs, TableQualifiedNameContextAll,
     TableSourceClauseContextAll, TableSourceClauseContextAttrs, TableSourceContextAll, TableSourceContextAttrs,
     TimechartCommandContextAll, TimechartCommandContextAttrs, TimechartParameterContextAttrs,
     TimestampFunctionCallContextAttrs, TypeOptionContextAttrs, ValueExprContextAttrs, ValueExpressionContextAll,
     ValueListContextAttrs, ValuesAggFunctionCallContextAttrs, ValuesAggFunctionContextAttrs,
-    WcFieldExpressionContextAttrs, WcFieldListContextAttrs, WcQualifiedNameContextAll, WhereCommandContextAttrs,
-    WildcardContextAll, WildcardContextAttrs, parse_ppl_root, ruleNames,
+    WcFieldExpressionContextAll, WcFieldExpressionContextAttrs, WcFieldListContextAttrs, WcQualifiedNameContextAll,
+    WhereCommandContextAttrs, WildcardContextAll, WildcardContextAttrs, WindowFunctionContextAll,
+    WindowFunctionContextAttrs, parse_ppl_root, ruleNames,
 };
 
 use super::ast::{
     ArithmeticOperator, BinCommand, BinSpan, CastTarget, CompareOperator, DedupCommand, FillnullCommand,
     FillnullReplacements, JoinCommand, JoinKind, ParseCommand, PplCommand, PplExpr, PplGroupKey, PplLiteral, PplQuery,
-    PplSortKey, PplSource, RankCommand, SpanUnit, StatsCommand, TimechartCommand,
+    PplSortKey, PplSource, RankCommand, SpanUnit, StatsCommand, StreamStatsCommand, TimechartCommand,
 };
 use super::error::PplError;
 use super::plan::RESERVED_NAME_PREFIX;
@@ -340,6 +343,12 @@ fn build_command(command: &CommandsContextAll<'_>) -> Result<PplCommand, PplErro
     }
     if let Some(join) = command.joinCommand() {
         return build_join_command(&join);
+    }
+    if let Some(eventstats) = command.eventstatsCommand() {
+        return build_eventstats_command(&eventstats);
+    }
+    if let Some(streamstats) = command.streamstatsCommand() {
+        return build_streamstats_command(&streamstats);
     }
     Err(build_unsupported_command_error(&name_first_child_rule(command)))
 }
@@ -729,6 +738,110 @@ fn build_group_keys(clause: &StatsByClauseContextAll<'_>) -> Result<Vec<PplGroup
         }
     }
     Ok(keys)
+}
+
+/// Builds one `eventstats` / `streamstats` aggregation: a call named by its `as` alias, else by the call
+/// as written (`count()`, `avg(duration_micros)`). An alias is named like a `stats` alias, so a reserved
+/// name is refused ([`check_field_name`]).
+fn build_window_aggregation(
+    function: Option<Rc<WindowFunctionContextAll<'_>>>,
+    alias: Option<&WcFieldExpressionContextAll<'_>>,
+) -> Result<(String, PplExpr), PplError> {
+    let function = function.ok_or_else(|| build_missing_part_error("window command"))?;
+    let name = function
+        .windowFunctionName()
+        .ok_or_else(|| build_missing_part_error("window command"))?
+        .get_text()
+        .to_ascii_lowercase();
+    let arguments = match function.functionArgs() {
+        Some(arguments) => build_arguments(&arguments)?,
+        None => Vec::new(),
+    };
+    let column = match alias {
+        Some(alias) => {
+            let alias_name = alias.wcQualifiedName().ok_or_else(|| build_missing_part_error("alias"))?;
+            name_wildcard_path(&alias_name)?
+        }
+        None => function.get_text(),
+    };
+    Ok((column, PplExpr::FunctionCall { name, arguments }))
+}
+
+/// The `by` fields of the window command `command_name`, each wrapped by `wrap_field` as its command keeps
+/// it; without a `by` clause, none. A `by span(…)` is refused before any field is named, so a span the
+/// command could not use is never built.
+///
+/// # Errors
+///
+/// `Semantic` for a `by span(…)`: a window command groups by fields only.
+fn build_window_group_fields<T>(
+    command_name: &str,
+    clause: Option<Rc<StatsByClauseContextAll<'_>>>,
+    wrap_field: impl Fn(String) -> T,
+) -> Result<Vec<T>, PplError> {
+    let Some(clause) = clause else {
+        return Ok(Vec::new());
+    };
+    if clause.bySpanClause().is_some() {
+        return Err(PplError::Semantic {
+            reason: format!("{command_name} groups by fields; `by span(…)` is not supported"),
+        });
+    }
+    clause.fieldList().map_or_else(
+        || Ok(Vec::new()),
+        |fields| {
+            fields
+                .fieldExpression_all()
+                .iter()
+                .map(|field| name_field(field).map(&wrap_field))
+                .collect()
+        },
+    )
+}
+
+/// Builds `eventstats [bucket_nullable=<bool>] <aggregation>, … [by <field>, …]`.
+///
+/// # Errors
+///
+/// `Semantic` for a `by span(…)` ([`build_window_group_fields`]).
+fn build_eventstats_command(eventstats: &EventstatsCommandContextAll<'_>) -> Result<PplCommand, PplError> {
+    let is_bucket_nullable = match eventstats.bucketNullableArg() {
+        Some(argument) => read_bucket_nullable(&argument)?,
+        None => DEFAULT_BUCKET_NULLABLE,
+    };
+    let aggregations = eventstats
+        .eventstatsAggTerm_all()
+        .iter()
+        .map(|term| build_window_aggregation(term.windowFunction(), term.alias.as_deref()))
+        .collect::<Result<Vec<_>, PplError>>()?;
+    let by = build_window_group_fields("eventstats", eventstats.statsByClause(), PplGroupKey::Field)?;
+    Ok(PplCommand::EventStats(StatsCommand {
+        aggregations,
+        by,
+        is_bucket_nullable,
+    }))
+}
+
+/// Builds `streamstats <aggregation>, … [by <field>, …]`.
+///
+/// # Errors
+///
+/// `Semantic` naming every written `streamstats` argument (IceGate's running window always reaches from the
+/// first row of the group to the current row), and for a `by span(…)` ([`build_window_group_fields`]).
+fn build_streamstats_command(streamstats: &StreamstatsCommandContextAll<'_>) -> Result<PplCommand, PplError> {
+    if let Some(arguments) = streamstats.streamstatsArgs() {
+        let written_arguments = spell_tokens(&*arguments);
+        if !written_arguments.is_empty() {
+            return Err(build_unsupported_option_error("streamstats", &written_arguments));
+        }
+    }
+    let aggregations = streamstats
+        .streamstatsAggTerm_all()
+        .iter()
+        .map(|term| build_window_aggregation(term.windowFunction(), term.alias.as_deref()))
+        .collect::<Result<Vec<_>, PplError>>()?;
+    let by = build_window_group_fields("streamstats", streamstats.statsByClause(), std::convert::identity)?;
+    Ok(PplCommand::StreamStats(StreamStatsCommand { aggregations, by }))
 }
 
 /// The `span(…) [as <alias>]` key; a clause without a field buckets the implicit time field.
@@ -2167,6 +2280,8 @@ mod tests {
             ("source=logs | join left=__ppl_x on x = y spans", "__ppl_x"),
             ("source=logs | join right=__ppl_x on x = y spans", "__ppl_x"),
             ("source=logs | join on x = y spans as __ppl_x", "__ppl_x"),
+            ("source=logs | eventstats count() as __ppl_x", "__ppl_x"),
+            ("source=logs | streamstats count() as __ppl_x", "__ppl_x"),
         ];
         for (query, name) in cases {
             assert_eq!(
@@ -2416,6 +2531,95 @@ mod tests {
             (
                 "source=logs | where (trace_id, span_id) in [ source=spans | fields trace_id, span_id ]",
                 "(a, b)",
+            ),
+        ] {
+            let result = parse_ppl(text);
+            assert!(
+                matches!(&result, Err(PplError::Semantic { reason }) if reason.contains(expected_name)),
+                "{text}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn eventstats_and_streamstats_build_their_ast_nodes() {
+        let parsed_query =
+            parse_ppl("source=logs | eventstats bucket_nullable=false count() as n, max(timestamp) by service_name")
+                .expect("eventstats parses");
+        let [
+            PplCommand::EventStats(StatsCommand {
+                aggregations,
+                by,
+                is_bucket_nullable,
+            }),
+        ] = parsed_query.commands.as_slice()
+        else {
+            panic!("not one eventstats: {:?}", parsed_query.commands);
+        };
+        assert!(!is_bucket_nullable);
+        let names: Vec<&str> = aggregations.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["n", "max(timestamp)"]);
+        assert!(
+            matches!(&aggregations[0].1, PplExpr::FunctionCall { name, arguments } if name == "count" && arguments.is_empty()),
+            "{:?}",
+            aggregations[0].1
+        );
+        assert!(
+            matches!(&aggregations[1].1, PplExpr::FunctionCall { name, arguments } if name == "max" && arguments.len() == 1),
+            "{:?}",
+            aggregations[1].1
+        );
+        assert!(
+            matches!(by.as_slice(), [PplGroupKey::Field(field)] if field == "service_name"),
+            "{by:?}"
+        );
+
+        let defaulted_query = parse_ppl("source=logs | eventstats count()").expect("eventstats parses");
+        let [PplCommand::EventStats(command)] = defaulted_query.commands.as_slice() else {
+            panic!("not one eventstats: {:?}", defaulted_query.commands);
+        };
+        assert!(command.is_bucket_nullable);
+        assert!(command.by.is_empty());
+        assert_eq!(command.aggregations[0].0, "count()");
+
+        let running_query =
+            parse_ppl("source=logs | streamstats count() as rn by service_name").expect("streamstats parses");
+        let [PplCommand::StreamStats(command)] = running_query.commands.as_slice() else {
+            panic!("not one streamstats: {:?}", running_query.commands);
+        };
+        assert_eq!(command.aggregations[0].0, "rn");
+        assert_eq!(command.by, ["service_name"]);
+    }
+
+    #[test]
+    fn window_command_arguments_and_spans_are_400s_naming_them() {
+        for (text, expected_name) in [
+            ("source=logs | streamstats window=2 count() by service_name", "window=2"),
+            ("source=logs | streamstats current=false count()", "current=false"),
+            (
+                "source=logs | streamstats bucket_nullable=false count() by service_name",
+                "bucket_nullable=false",
+            ),
+            (
+                "source=logs | streamstats window=2 current=false count()",
+                "[window=2 current=false]",
+            ),
+            (
+                "source=logs | streamstats count() by span(timestamp, 1h)",
+                "streamstats groups by fields; `by span(…)`",
+            ),
+            (
+                "source=logs | eventstats count() by service_name, span(timestamp, 1h)",
+                "eventstats groups by fields; `by span(…)`",
+            ),
+            // The span is refused before it is built, so its unit is never read: `us` names no span unit.
+            (
+                "source=logs | eventstats count() by span(timestamp, 1us)",
+                "eventstats groups by fields; `by span(…)`",
+            ),
+            (
+                "source=logs | streamstats count() by span(timestamp, 1us)",
+                "streamstats groups by fields; `by span(…)`",
             ),
         ] {
             let result = parse_ppl(text);
