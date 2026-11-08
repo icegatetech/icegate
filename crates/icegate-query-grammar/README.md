@@ -8,6 +8,7 @@ caller that walks it. `icegate-query` depends on it: the visitor in its
 | Module | Start rule | Entry point |
 |---|---|---|
 | `lucene` | `topLevelQuery` | `parse_lucene_query` |
+| `ppl` | `root` | `parse_ppl_root` |
 
 Each entry point stops at the first syntax error and returns it as `SyntaxError`; the doc
 comments of the entry point and of `SyntaxError` state where the error is reported and what
@@ -92,3 +93,43 @@ files of `src/lucene/`.
 
 Regeneration is byte-identical: after `make -C crates/icegate-query-grammar/src/lucene gen`,
 `git status --short crates/icegate-query-grammar` lists no change unless a grammar changed.
+
+## PPL
+
+`src/ppl/` holds the PPL grammar of the OpenSearch SQL plugin, vendored unchanged, and the parser
+generated from it. The grammar contract: every query the pinned grammar accepts parses.
+
+| Pin | Value |
+|---|---|
+| Repository | `opensearch-project/sql` |
+| Tag | `3.9.0.0` |
+| Commit | the commit of that tag, held by `UPSTREAM_COMMIT` in `src/ppl/Makefile` |
+| Grammar files | `ppl/src/main/antlr/OpenSearchPPLLexer.g4`, `ppl/src/main/antlr/OpenSearchPPLParser.g4` |
+| Licence | Apache-2.0; `LICENSE.txt` and `NOTICE` from the repository root are kept beside the grammar |
+
+`src/ppl/Makefile` (`vendor`) downloads from the commit its `UPSTREAM_COMMIT` names. The pin
+follows the emulated OpenSearch version: a change of the default `opensearch.version`
+(`crates/icegate-query/src/opensearch/config.rs`) re-vendors the grammar from the matching tag
+in the same change.
+
+### Regenerating
+
+The generator and the runtime are those of "Regenerating a parser" above. From the repository
+root:
+
+```sh
+make -C crates/icegate-query-grammar/src/ppl vendor
+make -C crates/icegate-query-grammar/src/ppl gen
+```
+
+`vendor` downloads the grammar and licence files. `gen`, in `src/ppl/Makefile`, owns the exact
+commands: the generator run, the context rename, the lint allowance on every generated `.rs`
+file and the single trailing newline on every generated file. The generator prints one warning
+(154) about `unionCommand`, which the pinned grammar carries.
+
+`src/ppl/mod.rs` is hand-written: it declares the generated modules under
+`#![allow(missing_docs)]`, keeps `#[allow(dead_code)]` on the base listener and the base
+visitor, which nothing uses, and holds the entry point. `rustfmt.toml` ignores the generated
+files of `src/ppl/`.
+
+Regeneration is byte-identical: running `gen` twice produces the same files.

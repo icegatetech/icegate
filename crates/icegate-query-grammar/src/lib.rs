@@ -9,6 +9,7 @@
 //! crate README.
 
 pub mod lucene;
+pub mod ppl;
 
 /// The first error that stopped a parse.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -18,8 +19,8 @@ pub struct SyntaxError {
     pub line: isize,
     /// Column of the offending input, counted in characters from 0.
     pub column: isize,
-    /// The offending character or token; `None` when the text ended too early or the
-    /// reported position names no character of the text.
+    /// The offending character or token as written; `None` when the error names none. What an
+    /// entry point reports at the end of the text is stated in that entry point's doc.
     pub offending_text: Option<String>,
     /// What went wrong, in this crate's wording.
     pub message: String,
