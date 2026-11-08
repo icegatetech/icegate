@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{
     ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, ListArray,
-    MapBuilder, MapFieldNames, StringArray, StringBuilder, TimestampMicrosecondArray, new_empty_array, new_null_array,
+    ListBuilder, MapBuilder, MapFieldNames, StringArray, StringBuilder, TimestampMicrosecondArray, new_empty_array,
+    new_null_array,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
@@ -156,6 +157,8 @@ pub enum Cell<'a> {
     /// A decimal, as its unscaled value at the column's own scale (`1.5` at scale 10 is
     /// `15_000_000_000`).
     Decimal(i128),
+    /// The elements of a `LIST<string>` column, in stored order; `&[]` is the empty list.
+    TextList(&'a [&'a str]),
 }
 
 /// One table row with explicit values: its tenant and the cells it sets. Every other column is
@@ -170,7 +173,7 @@ pub struct Row<'a> {
 
 /// The `operations` label column, which has no `COL_*` constant. [`build_rows_batch`] panics on
 /// a cell naming a column the table lacks, so a renamed column fails the test that names it; the
-/// same holds for the three columns below.
+/// same holds for every column constant below.
 pub const OPERATION_NAME: &str = "operation_name";
 /// The `operations` double column `temperature`, which has no `COL_*` constant.
 pub const TEMPERATURE: &str = "temperature";
@@ -178,6 +181,8 @@ pub const TEMPERATURE: &str = "temperature";
 pub const STREAM: &str = "stream";
 /// The `operations` long column `top_k`, which has no `COL_*` constant.
 pub const TOP_K: &str = "top_k";
+/// The `operations` string-list column `finish_reasons`, which has no `COL_*` constant.
+pub const FINISH_REASONS: &str = "finish_reasons";
 
 /// An `operations` row of `tenant` at `micros`, labelled `label` in [`OPERATION_NAME`], with
 /// `cells`.
@@ -325,6 +330,24 @@ fn build_rows_column(field: &Field, rows: &[Row<'_>]) -> Result<ArrayRef, RowWri
                     }
                     None => builder.append(is_required)?,
                     Some(_) => panic!("`{name}` takes Map"),
+                }
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::List(item) if item.data_type() == &DataType::Utf8 => {
+            // The element field is the table's own, so the Iceberg field id `RecordBatch::try_new`
+            // compares matches.
+            let mut builder = ListBuilder::new(StringBuilder::new()).with_field(Arc::clone(item));
+            for row in rows {
+                match find_row_cell(row, name) {
+                    Some(Cell::TextList(values)) => {
+                        for value in *values {
+                            builder.values().append_value(value);
+                        }
+                        builder.append(true);
+                    }
+                    None => builder.append(is_required),
+                    Some(_) => panic!("`{name}` takes TextList"),
                 }
             }
             Arc::new(builder.finish())

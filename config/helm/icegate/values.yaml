@@ -302,6 +302,10 @@ query:
       maxResultWindow: 10000
       # -- Most buckets one search's aggregations may answer, every level counted; a search over it is refused with a 400, never truncated.
       maxBuckets: 65535
+    ## Limits of the PPL endpoint (/_plugins/_ppl).
+    ppl:
+      # -- (int) Most rows a PPL query may return, counted after the request's fetch_size. A longer output is a 400 naming the limit, never truncated. null sets no row limit; the query deadline, the per-query memory limit and load shedding still bound every query.
+      maxResultRows: null
 
   ## Prometheus metrics endpoint
   metrics:

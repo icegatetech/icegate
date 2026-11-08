@@ -521,7 +521,7 @@ async fn seq_no_primary_term_on_a_data_index_is_a_400() {
 }
 
 /// A [`UsageReader`] above the default high watermark, so the shedding layer refuses.
-struct NearlyFullMemory;
+pub(super) struct NearlyFullMemory;
 
 impl UsageReader for NearlyFullMemory {
     fn limit_bytes(&self) -> u64 {

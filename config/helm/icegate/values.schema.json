@@ -156,6 +156,14 @@
                 "maxResultWindow": { "type": "integer", "minimum": 1, "description": "Largest from + size a _search accepts, on data and system indices alike." },
                 "maxBuckets": { "type": "integer", "minimum": 1, "description": "Most buckets one search's aggregations may answer." }
               }
+            },
+            "ppl": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "description": "Limits of the PPL endpoint on the OpenSearch listener.",
+              "properties": {
+                "maxResultRows": { "type": ["integer", "null"], "minimum": 1, "description": "Most rows a PPL query may return; null sets no row limit." }
+              }
             }
           }
         },

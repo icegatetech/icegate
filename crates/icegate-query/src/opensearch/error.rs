@@ -25,9 +25,71 @@ use crate::error::QueryError;
 /// Content type of every envelope.
 const CONTENT_TYPE_JSON: &str = "application/json; charset=UTF-8";
 
+/// What kind of error an [`OpenSearchError`] is, so a caller maps errors by kind and never by
+/// their reason text. Each variant is one class of error. A decorating constructor, one that
+/// returns another constructor's error with its own reason or extra keys, keeps that base kind
+/// (for example `unsupported_construct`, `answer_too_large` and `invalid_request_key`) unless a
+/// caller must tell it apart. `memory_limit_exceeded` and `no_handler` are such exceptions: both
+/// decorate `illegal_argument` and carry their own kinds. A search-phase failure that wraps
+/// another error as its root cause (`query_shard`, `result_window_too_large`,
+/// `too_many_buckets`) carries its own kind, whatever the cause's kind is. A new class of error
+/// adds its variant, and every exhaustive match over the kinds (the PPL mapping) stops compiling
+/// until it maps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenSearchErrorKind {
+    /// [`OpenSearchError::illegal_argument`].
+    IllegalArgument,
+    /// [`OpenSearchError::parsing`].
+    Parsing,
+    /// [`OpenSearchError::memory_pressure`].
+    MemoryPressure,
+    /// [`OpenSearchError::deadline_exceeded`].
+    DeadlineExceeded,
+    /// [`OpenSearchError::internal`].
+    Internal,
+    /// [`OpenSearchError::no_handler`].
+    NoHandler,
+    /// [`OpenSearchError::index_not_found`].
+    IndexNotFound {
+        /// The index or expression the request named.
+        index: String,
+    },
+    /// [`OpenSearchError::payload_too_large`].
+    PayloadTooLarge,
+    /// [`OpenSearchError::resource_already_exists`].
+    ResourceAlreadyExists,
+    /// [`OpenSearchError::cluster_block`].
+    ClusterBlock,
+    /// [`OpenSearchError::write_contention`].
+    WriteContention,
+    /// [`OpenSearchError::snapshot_too_large`].
+    SnapshotTooLarge,
+    /// [`OpenSearchError::version_conflict`].
+    VersionConflict,
+    /// [`OpenSearchError::document_missing`].
+    DocumentMissing,
+    /// [`OpenSearchError::query_shard`].
+    QueryShard,
+    /// [`OpenSearchError::search_context_missing`].
+    SearchContextMissing,
+    /// [`OpenSearchError::result_window_too_large`].
+    ResultWindowTooLarge,
+    /// [`OpenSearchError::too_many_buckets`].
+    TooManyBuckets,
+    /// [`OpenSearchError::aggregation_execution`].
+    AggregationExecution,
+    /// [`OpenSearchError::memory_limit_exceeded`].
+    MemoryLimitExceeded {
+        /// The per-query memory limit in bytes.
+        limit_bytes: usize,
+    },
+}
+
 /// An error answered in the `OpenSearch` envelope.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OpenSearchError {
+    /// What kind of error this is; see [`OpenSearchErrorKind`].
+    kind: OpenSearchErrorKind,
     /// HTTP status of the answer, repeated as the envelope's `status`.
     status: StatusCode,
     /// The envelope's `type`, on the error and, unless `root_cause` replaces it, on its root cause.
@@ -46,9 +108,10 @@ pub(crate) struct OpenSearchError {
 }
 
 impl OpenSearchError {
-    /// An error of `error_type` answered with `status`.
-    fn new(status: StatusCode, error_type: &'static str, reason: impl Into<String>) -> Self {
+    /// An error of `kind` and `error_type` answered with `status`.
+    fn new(kind: OpenSearchErrorKind, status: StatusCode, error_type: &'static str, reason: impl Into<String>) -> Self {
         Self {
+            kind,
             status,
             error_type,
             reason: reason.into(),
@@ -60,7 +123,12 @@ impl OpenSearchError {
     /// A well-formed request that asks for something invalid, names no usable tenant or carries
     /// an unknown parameter: `400`, `illegal_argument_exception`.
     pub(crate) fn illegal_argument(reason: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "illegal_argument_exception", reason)
+        Self::new(
+            OpenSearchErrorKind::IllegalArgument,
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            reason,
+        )
     }
 
     /// The 400 a query gets when the listener's per-query memory pool cannot grant a
@@ -68,10 +136,13 @@ impl OpenSearchError {
     /// and the configuration key that sets it, with `limit` carrying the limit in bytes
     /// for a client.
     pub(crate) fn memory_limit_exceeded(limit_bytes: usize) -> Self {
-        Self::illegal_argument(format!(
-            "the query needs more memory than the per-query limit of [{limit_bytes}] bytes \
-             (opensearch.max_query_memory_bytes)"
-        ))
+        Self {
+            kind: OpenSearchErrorKind::MemoryLimitExceeded { limit_bytes },
+            ..Self::illegal_argument(format!(
+                "the query needs more memory than the per-query limit of [{limit_bytes}] bytes \
+                 (opensearch.max_query_memory_bytes)"
+            ))
+        }
         .with_metadata("limit", limit_bytes)
     }
 
@@ -79,6 +150,7 @@ impl OpenSearchError {
     /// retryable.
     pub(crate) fn memory_pressure() -> Self {
         Self::new(
+            OpenSearchErrorKind::MemoryPressure,
             StatusCode::SERVICE_UNAVAILABLE,
             "memory_pressure_exception",
             "service under memory pressure, retry later",
@@ -89,6 +161,7 @@ impl OpenSearchError {
     /// `query_deadline_exceeded_exception`, retryable.
     pub(crate) fn deadline_exceeded() -> Self {
         Self::new(
+            OpenSearchErrorKind::DeadlineExceeded,
             StatusCode::SERVICE_UNAVAILABLE,
             "query_deadline_exceeded_exception",
             "query exceeded engine.max_query_duration_secs",
@@ -97,13 +170,23 @@ impl OpenSearchError {
 
     /// A failure inside IceGate that the request could not have avoided: `500`, `exception`.
     pub(crate) fn internal(reason: impl Into<String>) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "exception", reason)
+        Self::new(
+            OpenSearchErrorKind::Internal,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "exception",
+            reason,
+        )
     }
 
     /// A request body or query the parser refuses, an unsupported construct or an unknown body
     /// key included (`400`).
     pub(crate) fn parsing(reason: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "parsing_exception", reason)
+        Self::new(
+            OpenSearchErrorKind::Parsing,
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            reason,
+        )
     }
 
     /// A query construct IceGate does not evaluate (`400`, `parsing_exception`), which `construct`
@@ -188,9 +271,28 @@ impl OpenSearchError {
         Self::parsing(reason).with_metadata("limit", limit)
     }
 
+    /// A request key `key` that is missing or holds a value of the wrong form (`400`,
+    /// `illegal_argument_exception`): `key` carries it for a client, and `value` the value the
+    /// request gave, when it gave one.
+    pub(crate) fn invalid_request_key(key: &str, value: Option<&Value>, reason: impl Into<String>) -> Self {
+        let error = Self::illegal_argument(reason).with_metadata("key", key);
+        match value {
+            Some(value) => error.with_metadata("value", value.clone()),
+            None => error,
+        }
+    }
+
+    /// A response `format` the endpoint does not render (`400`, `illegal_argument_exception`),
+    /// which `format` carries for a client.
+    pub(crate) fn unsupported_response_format(format: &str) -> Self {
+        Self::illegal_argument(format!("response format [{format}] is not supported; use jdbc"))
+            .with_metadata("format", format)
+    }
+
     /// The request body exceeds `opensearch.max_request_body_bytes` (`413`).
     pub(crate) fn payload_too_large() -> Self {
         Self::new(
+            OpenSearchErrorKind::PayloadTooLarge,
             StatusCode::PAYLOAD_TOO_LARGE,
             "illegal_argument_exception",
             "request body exceeds opensearch.max_request_body_bytes",
@@ -222,14 +324,22 @@ impl OpenSearchError {
     }
 
     /// The envelope's `reason`, which a refusal that wraps this error quotes as its cause.
-    pub(crate) fn reason(&self) -> &str {
-        &self.reason
+    pub(crate) const fn reason(&self) -> &str {
+        self.reason.as_str()
+    }
+
+    /// What kind of error this is; see [`OpenSearchErrorKind`].
+    pub(crate) const fn kind(&self) -> &OpenSearchErrorKind {
+        &self.kind
     }
 
     /// `index` does not exist (`404`). `index` is the concrete name that is missing, or the whole
     /// expression when it matched nothing and the endpoint disallows an empty match.
     pub(crate) fn index_not_found(index: &str) -> Self {
         Self::new(
+            OpenSearchErrorKind::IndexNotFound {
+                index: index.to_string(),
+            },
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
             format!("no such index [{index}]"),
@@ -243,7 +353,7 @@ impl OpenSearchError {
     /// A search-phase failure (`400`, phase `query`, grouped) of one shard whose cause is
     /// `root_cause`. The cause renders as the failed shard's `reason` and as `root_cause[0]`; the
     /// failed shard names `index` when one is given.
-    fn search_phase_failure(index: Option<&str>, root_cause: &Self) -> Self {
+    fn search_phase_failure(kind: OpenSearchErrorKind, index: Option<&str>, root_cause: &Self) -> Self {
         let shard_cause = root_cause.render_cause();
         let mut failed_shard = Map::new();
         failed_shard.insert("shard".to_string(), json!(0));
@@ -252,6 +362,7 @@ impl OpenSearchError {
         }
         failed_shard.insert("reason".to_string(), Value::Object(shard_cause.clone()));
         let mut error = Self::new(
+            kind,
             StatusCode::BAD_REQUEST,
             "search_phase_execution_exception",
             "all shards failed",
@@ -269,10 +380,15 @@ impl OpenSearchError {
     /// grouped, one failed shard) whose root cause is the `query_shard_exception`; the entry of
     /// `failed_shards` carries `shard`, `index` and `reason`.
     pub(crate) fn query_shard(index: &str, reason: &str) -> Self {
-        let shard_cause = Self::new(StatusCode::BAD_REQUEST, "query_shard_exception", reason)
-            .with_metadata("index", index)
-            .with_metadata("index_uuid", "_na_");
-        Self::search_phase_failure(Some(index), &shard_cause)
+        let shard_cause = Self::new(
+            OpenSearchErrorKind::QueryShard,
+            StatusCode::BAD_REQUEST,
+            "query_shard_exception",
+            reason,
+        )
+        .with_metadata("index", index)
+        .with_metadata("index_uuid", "_na_");
+        Self::search_phase_failure(OpenSearchErrorKind::QueryShard, Some(index), &shard_cause)
     }
 
     /// `from + size` exceeds `search.max_result_window` (`400`, a search-phase failure whose root
@@ -283,7 +399,7 @@ impl OpenSearchError {
             "result window is too large: from + size must be less than or equal to [{max}] but was [{}]",
             from.saturating_add(size)
         ));
-        Self::search_phase_failure(None, &cause)
+        Self::search_phase_failure(OpenSearchErrorKind::ResultWindowTooLarge, None, &cause)
     }
 
     /// One search's aggregations would answer more than `max` buckets (`400`).
@@ -293,8 +409,10 @@ impl OpenSearchError {
     /// rather than `503` because retrying cannot shrink the answer.
     pub(crate) fn too_many_buckets(max: usize, actual: usize) -> Self {
         Self::search_phase_failure(
+            OpenSearchErrorKind::TooManyBuckets,
             None,
             &Self::new(
+                OpenSearchErrorKind::TooManyBuckets,
                 StatusCode::BAD_REQUEST,
                 "too_many_buckets_exception",
                 format!(
@@ -311,7 +429,12 @@ impl OpenSearchError {
     /// typed differently across them (`400`). Buckets of keys of different types would otherwise
     /// share one list.
     pub(crate) fn aggregation_execution(reason: &str) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "aggregation_execution_exception", reason)
+        Self::new(
+            OpenSearchErrorKind::AggregationExecution,
+            StatusCode::BAD_REQUEST,
+            "aggregation_execution_exception",
+            reason,
+        )
     }
 
     /// An aggregation over `field`, which the searched indices give more than one type, mapped or
@@ -412,6 +535,7 @@ impl OpenSearchError {
     /// The scroll `scroll_id` expired, or the snapshot object it reads is gone (`404`).
     pub(crate) fn search_context_missing(scroll_id: &str) -> Self {
         Self::new(
+            OpenSearchErrorKind::SearchContextMissing,
             StatusCode::NOT_FOUND,
             "search_context_missing_exception",
             format!("No search context found for id [{scroll_id}]"),
@@ -421,6 +545,7 @@ impl OpenSearchError {
     /// The system index `index` already exists (`400`).
     pub(crate) fn resource_already_exists(index: &str) -> Self {
         Self::new(
+            OpenSearchErrorKind::ResourceAlreadyExists,
             StatusCode::BAD_REQUEST,
             "resource_already_exists_exception",
             format!("index [{index}/_na_] already exists"),
@@ -435,6 +560,7 @@ impl OpenSearchError {
     /// [`document_missing`](Self::document_missing) instead, with or without a condition.
     pub(crate) fn version_conflict(index: &str, id: &str) -> Self {
         Self::new(
+            OpenSearchErrorKind::VersionConflict,
             StatusCode::CONFLICT,
             "version_conflict_engine_exception",
             format!("[{id}]: version conflict"),
@@ -448,6 +574,7 @@ impl OpenSearchError {
     /// carries is checked.
     pub(crate) fn document_missing(index: &str, id: &str) -> Self {
         Self::new(
+            OpenSearchErrorKind::DocumentMissing,
             StatusCode::NOT_FOUND,
             "document_missing_exception",
             format!("[{id}]: document missing"),
@@ -461,6 +588,7 @@ impl OpenSearchError {
     /// an index outside the system indices (`403`).
     pub(crate) fn cluster_block(index: &str) -> Self {
         Self::new(
+            OpenSearchErrorKind::ClusterBlock,
             StatusCode::FORBIDDEN,
             "cluster_block_exception",
             format!("index [{index}] blocked by: [FORBIDDEN/8/index write (api)];"),
@@ -473,6 +601,7 @@ impl OpenSearchError {
     /// landed.
     pub(crate) fn write_contention() -> Self {
         Self::new(
+            OpenSearchErrorKind::WriteContention,
             StatusCode::SERVICE_UNAVAILABLE,
             "write_contention_exception",
             "the system-index write could not be confirmed; its outcome is unknown, retry later",
@@ -483,6 +612,7 @@ impl OpenSearchError {
     /// (`413`); nothing was written.
     pub(crate) fn snapshot_too_large(max_snapshot_bytes: usize) -> Self {
         Self::new(
+            OpenSearchErrorKind::SnapshotTooLarge,
             StatusCode::PAYLOAD_TOO_LARGE,
             "illegal_argument_exception",
             format!(
@@ -503,7 +633,10 @@ impl OpenSearchError {
     /// No route serves `method` on `path`: a `400` `illegal_argument_exception` in the envelope,
     /// never a `404` or `405`.
     pub(crate) fn no_handler(method: &Method, path: &str) -> Self {
-        Self::illegal_argument(format!("no handler found for uri [{path}] and method [{method}]"))
+        Self {
+            kind: OpenSearchErrorKind::NoHandler,
+            ..Self::illegal_argument(format!("no handler found for uri [{path}] and method [{method}]"))
+        }
     }
 }
 
@@ -903,5 +1036,124 @@ mod tests {
         assert_eq!(body["error"]["root_cause"][0]["type"], "illegal_argument_exception");
         assert_eq!(body["error"]["limit"], 1_048_576);
         assert_eq!(body["error"]["root_cause"][0]["limit"], 1_048_576);
+    }
+
+    /// The position of `kind` in the declaration order. The match has no catch-all, so a kind
+    /// added later stops this test from compiling until it is listed in the cases below.
+    const fn find_kind_position(kind: &OpenSearchErrorKind) -> usize {
+        match kind {
+            OpenSearchErrorKind::IllegalArgument => 0,
+            OpenSearchErrorKind::Parsing => 1,
+            OpenSearchErrorKind::MemoryPressure => 2,
+            OpenSearchErrorKind::DeadlineExceeded => 3,
+            OpenSearchErrorKind::Internal => 4,
+            OpenSearchErrorKind::NoHandler => 5,
+            OpenSearchErrorKind::IndexNotFound { .. } => 6,
+            OpenSearchErrorKind::PayloadTooLarge => 7,
+            OpenSearchErrorKind::ResourceAlreadyExists => 8,
+            OpenSearchErrorKind::ClusterBlock => 9,
+            OpenSearchErrorKind::WriteContention => 10,
+            OpenSearchErrorKind::SnapshotTooLarge => 11,
+            OpenSearchErrorKind::VersionConflict => 12,
+            OpenSearchErrorKind::DocumentMissing => 13,
+            OpenSearchErrorKind::QueryShard => 14,
+            OpenSearchErrorKind::SearchContextMissing => 15,
+            OpenSearchErrorKind::ResultWindowTooLarge => 16,
+            OpenSearchErrorKind::TooManyBuckets => 17,
+            OpenSearchErrorKind::AggregationExecution => 18,
+            OpenSearchErrorKind::MemoryLimitExceeded { .. } => 19,
+        }
+    }
+
+    #[test]
+    fn every_constructor_records_its_kind() {
+        let unit_cases = [
+            (
+                OpenSearchError::illegal_argument("x"),
+                OpenSearchErrorKind::IllegalArgument,
+            ),
+            (OpenSearchError::parsing("x"), OpenSearchErrorKind::Parsing),
+            (OpenSearchError::memory_pressure(), OpenSearchErrorKind::MemoryPressure),
+            (
+                OpenSearchError::deadline_exceeded(),
+                OpenSearchErrorKind::DeadlineExceeded,
+            ),
+            (OpenSearchError::internal("x"), OpenSearchErrorKind::Internal),
+            (
+                OpenSearchError::no_handler(&Method::GET, "/nope"),
+                OpenSearchErrorKind::NoHandler,
+            ),
+            (
+                OpenSearchError::payload_too_large(),
+                OpenSearchErrorKind::PayloadTooLarge,
+            ),
+            (
+                OpenSearchError::resource_already_exists(".kibana_1"),
+                OpenSearchErrorKind::ResourceAlreadyExists,
+            ),
+            (
+                OpenSearchError::cluster_block("logs"),
+                OpenSearchErrorKind::ClusterBlock,
+            ),
+            (
+                OpenSearchError::write_contention(),
+                OpenSearchErrorKind::WriteContention,
+            ),
+            (
+                OpenSearchError::snapshot_too_large(1024),
+                OpenSearchErrorKind::SnapshotTooLarge,
+            ),
+            (
+                OpenSearchError::version_conflict(".kibana_1", "doc-1"),
+                OpenSearchErrorKind::VersionConflict,
+            ),
+            (
+                OpenSearchError::document_missing(".kibana_1", "doc-1"),
+                OpenSearchErrorKind::DocumentMissing,
+            ),
+            (
+                OpenSearchError::query_shard("logs", "x"),
+                OpenSearchErrorKind::QueryShard,
+            ),
+            (
+                OpenSearchError::search_context_missing("scroll-1"),
+                OpenSearchErrorKind::SearchContextMissing,
+            ),
+            (
+                OpenSearchError::result_window_too_large(9_000, 2_000, 10_000),
+                OpenSearchErrorKind::ResultWindowTooLarge,
+            ),
+            (
+                OpenSearchError::too_many_buckets(10, 11),
+                OpenSearchErrorKind::TooManyBuckets,
+            ),
+            (
+                OpenSearchError::aggregation_execution("x"),
+                OpenSearchErrorKind::AggregationExecution,
+            ),
+        ];
+        let mut positions: Vec<usize> = Vec::with_capacity(20);
+        for (error, kind) in &unit_cases {
+            assert_eq!(error.kind(), kind, "error {error:?}");
+            positions.push(find_kind_position(kind));
+        }
+        // The payload of a kind is read by destructuring: derived `PartialEq` does not count as a
+        // read for the `dead_code` lint.
+        let index_not_found = OpenSearchError::index_not_found("logs-x");
+        let OpenSearchErrorKind::IndexNotFound { index } = index_not_found.kind().clone() else {
+            panic!("index_not_found records IndexNotFound");
+        };
+        assert_eq!(index, "logs-x");
+        positions.push(find_kind_position(index_not_found.kind()));
+        let memory_limit = OpenSearchError::memory_limit_exceeded(4096);
+        let OpenSearchErrorKind::MemoryLimitExceeded { limit_bytes } = memory_limit.kind().clone() else {
+            panic!("memory_limit_exceeded records MemoryLimitExceeded");
+        };
+        assert_eq!(limit_bytes, 4096);
+        positions.push(find_kind_position(memory_limit.kind()));
+        // Every kind is covered exactly once.
+        positions.sort_unstable();
+        assert_eq!(positions, (0..20).collect::<Vec<_>>());
+        assert_eq!(OpenSearchError::illegal_argument("bad index").reason(), "bad index");
     }
 }

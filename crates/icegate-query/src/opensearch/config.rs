@@ -74,6 +74,8 @@ pub struct OpenSearchConfig {
     pub system_indices: SystemIndicesConfig,
     /// Search limits (`search.max_result_window`, `search.max_buckets`).
     pub search: SearchLimitsConfig,
+    /// Limits of the PPL endpoint.
+    pub ppl: PplLimitsConfig,
 }
 
 impl OpenSearchConfig {
@@ -85,7 +87,8 @@ impl OpenSearchConfig {
     /// Returns [`QueryError::Config`] for a blank host or cluster name, a zero
     /// `max_request_body_bytes`, `max_query_memory_bytes` or `field_discovery_window_secs`, or
     /// a [`version`](Self::version) outside its documented form, and every error of
-    /// [`SearchLimitsConfig::validate`] and [`SystemIndicesConfig::validate`].
+    /// [`SearchLimitsConfig::validate`], [`PplLimitsConfig::validate`] and
+    /// [`SystemIndicesConfig::validate`].
     pub fn validate(&self) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -113,6 +116,7 @@ impl OpenSearchConfig {
         }
         EmulatedVersion::parse(&self.version)?;
         self.search.validate()?;
+        self.ppl.validate()?;
         self.system_indices.validate()
     }
 }
@@ -130,6 +134,7 @@ impl Default for OpenSearchConfig {
             field_discovery_window_secs: DEFAULT_FIELD_DISCOVERY_WINDOW_SECS,
             system_indices: SystemIndicesConfig::default(),
             search: SearchLimitsConfig::default(),
+            ppl: PplLimitsConfig::default(),
         }
     }
 }
@@ -189,6 +194,33 @@ impl SearchLimitsConfig {
         if self.max_buckets == 0 {
             return Err(QueryError::Config(
                 "opensearch.search.max_buckets must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Limits of `/_plugins/_ppl` (`opensearch.ppl`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PplLimitsConfig {
+    /// The most rows a PPL query may return, counted after the request's `fetch_size`. A query
+    /// whose output has more rows is refused with a 400 naming this limit; it is never
+    /// truncated. `None` (the default) sets no row limit: the query deadline, the per-query
+    /// memory limit and load shedding still bound every query.
+    pub max_result_rows: Option<usize>,
+}
+
+impl PplLimitsConfig {
+    /// Validate the limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryError::Config`] for a row limit of 0, which would refuse every query.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_result_rows == Some(0) {
+            return Err(QueryError::Config(
+                "opensearch.ppl.max_result_rows must be at least 1 when set".to_string(),
             ));
         }
         Ok(())
@@ -493,6 +525,9 @@ mod tests {
                 "max_result_window": 7,
                 "max_buckets": 9,
             },
+            "ppl": {
+                "max_result_rows": 11,
+            },
         }))
         .expect("a section naming every key deserializes");
 
@@ -514,6 +549,7 @@ mod tests {
         assert_eq!(config.system_indices.max_answer_bytes, 268_435_458);
         assert_eq!(config.search.max_result_window, 7);
         assert_eq!(config.search.max_buckets, 9);
+        assert_eq!(config.ppl.max_result_rows, Some(11));
     }
 
     #[test]
@@ -732,5 +768,33 @@ mod tests {
             ..OpenSearchConfig::default()
         };
         disabled.validate().expect("a disabled listener validates nothing");
+    }
+
+    #[test]
+    fn ppl_limits_default_to_no_row_limit_and_refuse_a_zero_limit() {
+        let config = OpenSearchConfig::default();
+        assert_eq!(config.ppl, PplLimitsConfig { max_result_rows: None });
+        assert!(config.ppl.validate().is_ok());
+        assert!(
+            PplLimitsConfig {
+                max_result_rows: Some(1)
+            }
+            .validate()
+            .is_ok()
+        );
+        let zero_limit_config = OpenSearchConfig {
+            enabled: true,
+            ppl: PplLimitsConfig {
+                max_result_rows: Some(0),
+            },
+            ..OpenSearchConfig::default()
+        };
+        assert!(matches!(zero_limit_config.validate(), Err(QueryError::Config(_))));
+        let limited_config: OpenSearchConfig =
+            serde_json::from_value(json!({"ppl": {"max_result_rows": 5000}})).expect("ppl section");
+        assert_eq!(limited_config.ppl.max_result_rows, Some(5000));
+        let null_limit_config: OpenSearchConfig =
+            serde_json::from_value(json!({"ppl": {"max_result_rows": null}})).expect("null limit");
+        assert_eq!(null_limit_config.ppl.max_result_rows, None);
     }
 }

@@ -39,6 +39,10 @@ pub mod traceql;
 /// evaluator.
 pub(crate) mod query_dsl;
 
+/// PPL, the piped processing language of `/_plugins/_ppl`: its AST, the builder from the parse
+/// tree and the planner.
+pub(crate) mod ppl;
+
 /// Doubles and bootstrap shared by the crate's inline tests.
 #[cfg(test)]
 mod test_support;

@@ -15,13 +15,14 @@ use datafusion::arrow::record_batch::RecordBatch;
 use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
 use iceberg::{Catalog, NamespaceIdent, TableCreation};
 use icegate_common::schema::{
-    COL_BODY, COL_INGESTED_TIMESTAMP, COL_LOG_ATTRIBUTES, COL_OBSERVED_TIMESTAMP, COL_RESOURCE_ATTRIBUTES,
-    COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_TENANT_ID, COL_TIMESTAMP,
+    COL_BODY, COL_DURATION_MICROS, COL_END_TIMESTAMP, COL_INGESTED_TIMESTAMP, COL_LOG_ATTRIBUTES,
+    COL_OBSERVED_TIMESTAMP, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT,
+    COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID,
 };
-use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
+use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE, OPERATIONS_TABLE};
 
 pub use super::test_rows::{Cell, Row, RowWriteError, commit_rows, write_wal_segment};
-use super::test_rows::{commit_batch, read_arrow_schema};
+use super::test_rows::{FINISH_REASONS, TEMPERATURE, build_operation_row, commit_batch, read_arrow_schema};
 
 /// 2026-10-08T10:00:00Z in microseconds, the instant [`compute_micros_at_minute`] counts from.
 const TEN_O_CLOCK_MICROS: i64 = 1_791_453_600_000_000;
@@ -209,4 +210,59 @@ pub async fn create_exact_name_table(
 /// A required string column, for test-created exact-name tables.
 pub fn required_string(id: i32, name: &str) -> NestedField {
     NestedField::required(id, name, Type::Primitive(PrimitiveType::String))
+}
+
+/// One `operations` row. The operation runs from `timestamp_micros` to `end_timestamp_micros`
+/// (`duration_micros` is their difference) and was ingested at `timestamp_micros`; every column
+/// not named here is null, or its type's zero value when required.
+pub struct OperationRow<'a> {
+    /// The tenant the row belongs to.
+    pub tenant_id: &'a str,
+    /// `trace_id`.
+    pub trace_id: [u8; 16],
+    /// `span_id`.
+    pub span_id: [u8; 8],
+    /// Start time, microseconds since the epoch.
+    pub timestamp_micros: i64,
+    /// End time, microseconds since the epoch.
+    pub end_timestamp_micros: i64,
+    /// `operation_name`.
+    pub operation_name: &'a str,
+    /// `request_model`.
+    pub request_model: Option<&'a str>,
+    /// `input_tokens`.
+    pub input_tokens: Option<i64>,
+    /// `temperature`.
+    pub temperature: Option<f64>,
+    /// `finish_reasons`; `Some(&[])` is the empty list, `None` the null list.
+    pub finish_reasons: Option<&'a [&'a str]>,
+}
+
+/// Write `rows` into `operations` as one append; see [`commit_rows`].
+pub async fn commit_operation_rows(catalog: &Arc<dyn Catalog>, rows: &[OperationRow<'_>]) -> Result<(), RowWriteError> {
+    let generic_rows: Vec<Row<'_>> = rows.iter().map(convert_operation_row).collect();
+    commit_rows(catalog, OPERATIONS_TABLE, &generic_rows).await
+}
+
+/// The generic row of one operation, through the shared `build_operation_row`, which sets the
+/// timestamp and the operation name.
+fn convert_operation_row<'a>(row: &'a OperationRow<'a>) -> Row<'a> {
+    let mut cells = vec![
+        (COL_TRACE_ID, Cell::Bytes(&row.trace_id)),
+        (COL_SPAN_ID, Cell::Bytes(&row.span_id)),
+        (COL_END_TIMESTAMP, Cell::Micros(row.end_timestamp_micros)),
+        (
+            COL_DURATION_MICROS,
+            Cell::Long(row.end_timestamp_micros - row.timestamp_micros),
+        ),
+        (COL_INGESTED_TIMESTAMP, Cell::Micros(row.timestamp_micros)),
+    ];
+    // `request_model` and `input_tokens` have no constant: no test of the crate's own layer
+    // writes them, so a shared one would have no reader there. A renamed column still fails
+    // the row builder, which refuses a cell naming a column the table lacks.
+    cells.extend(row.request_model.map(|model| ("request_model", Cell::Text(model))));
+    cells.extend(row.input_tokens.map(|tokens| ("input_tokens", Cell::Long(tokens))));
+    cells.extend(row.temperature.map(|temperature| (TEMPERATURE, Cell::Double(temperature))));
+    cells.extend(row.finish_reasons.map(|reasons| (FINISH_REASONS, Cell::TextList(reasons))));
+    build_operation_row(row.tenant_id, row.operation_name, row.timestamp_micros, cells)
 }

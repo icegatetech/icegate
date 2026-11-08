@@ -12,13 +12,14 @@
 pub(crate) mod catalog;
 mod cluster;
 mod config;
-mod context;
+pub(crate) mod context;
 pub(crate) mod error;
-mod extract;
+pub(crate) mod extract;
 mod fields;
 mod filter_path;
-mod glob;
+pub(crate) mod glob;
 mod node;
+mod ppl;
 mod routes;
 mod script;
 pub(crate) mod search;
@@ -26,7 +27,7 @@ mod server;
 mod state;
 pub(crate) mod system_index;
 
-pub use config::{OpenSearchConfig, SearchLimitsConfig, SystemIndicesConfig};
+pub use config::{OpenSearchConfig, PplLimitsConfig, SearchLimitsConfig, SystemIndicesConfig};
 pub use server::{run, run_with_port_tx};
 pub use system_index::{SystemObjectStore, build_system_object_store};
 pub(crate) use system_index::{refuse_overlapping_locations, resolve_system_indices_location};

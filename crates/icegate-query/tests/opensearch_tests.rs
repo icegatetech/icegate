@@ -16,6 +16,7 @@
 //! - `indices`: `_resolve/index` and `<index>/_settings`
 //! - `listener`: the listener's start-up
 //! - `msearch`: `_msearch` over HTTP: items, their order, statuses and per-item errors
+//! - `ppl`: `/_plugins/_ppl`: commands, functions, the jdbc response, the PPL error envelope
 //! - `requests`: JSON and NDJSON request helpers shared by the system-index and data-index modules
 //! - `rustfs_conditional`: the object-store guarantees the system-index store builds on
 //! - `saved_objects`: system-index document endpoints

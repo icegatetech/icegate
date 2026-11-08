@@ -12,6 +12,7 @@ mod harness;
 mod indices;
 mod listener;
 mod msearch;
+mod ppl;
 mod requests;
 mod rustfs_conditional;
 mod saved_objects;

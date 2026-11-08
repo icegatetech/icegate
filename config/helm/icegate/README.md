@@ -449,6 +449,7 @@ an image pinned by digest (`icegate-ingest@sha256:...`) verifies the same way.
 | query.opensearch.maxQueryMemoryBytes | int | `1073741824` | Bytes of memory one OpenSearch query may hold. The listener's sessions draw from a pool of this size, spilling to temporary files stays enabled, and a query needing more answers 400 naming the limit. Other protocols are unbounded. |
 | query.opensearch.maxRequestBodyBytes | int | `33554432` | Largest request body the listener accepts, in bytes. It also bounds how much of a refused request's body is drained. |
 | query.opensearch.port | int | `9200` | Listener port. |
+| query.opensearch.ppl.maxResultRows | int | `nil` | Most rows a PPL query may return, counted after the request's fetch_size. A longer output is a 400 naming the limit, never truncated. null sets no row limit; the query deadline, the per-query memory limit and load shedding still bound every query. |
 | query.opensearch.search.maxBuckets | int | `65535` | Most buckets one search's aggregations may answer, every level counted; a search over it is refused with a 400, never truncated. |
 | query.opensearch.search.maxResultWindow | int | `10000` | Largest from + size a _search accepts, on data and system indices alike, and the largest page a system-index scroll opens with. A larger window is answered 400, never truncated. |
 | query.opensearch.systemIndices.cacheMaxBytes | int | `268435456` | Bound of the decoded-snapshot cache, in bytes; at least maxSnapshotBytes. |

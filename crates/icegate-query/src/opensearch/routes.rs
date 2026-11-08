@@ -9,12 +9,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
 use axum::http::{Method, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
+use axum::{Extension, Router};
 use icegate_common::{ShedPolicy, shed_when_pressured};
 
 use super::cluster::{cat, datasources, health, info, resolve, settings};
@@ -22,6 +22,7 @@ use super::config::OpenSearchConfig;
 use super::error::OpenSearchError;
 use super::fields;
 use super::filter_path::apply_filter_path;
+use super::ppl;
 use super::search;
 use super::state::OpenSearchState;
 use super::system_index;
@@ -120,6 +121,10 @@ pub(super) fn build_router(state: OpenSearchState, runtime: &QueryRuntime, confi
             get(search::search_indices).post(search::search_indices),
         )
         .route("/_msearch", post(search::run_multi_search))
+        .route(
+            "/_plugins/_ppl",
+            post(ppl::execute_ppl_query).layer(Extension(config.ppl.clone())),
+        )
         .route("/{index}/_msearch", post(search::run_multi_search_on_index))
         .route(
             "/_search/scroll",

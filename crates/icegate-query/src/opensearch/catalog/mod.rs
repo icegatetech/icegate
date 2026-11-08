@@ -41,8 +41,8 @@ pub(crate) use self::field::{FieldType, FieldValue, IndexField, ResolvedField, S
 use self::map_key_cache::{MapKeyCache, MapKeys, MapKeysVersion};
 pub(crate) use self::native::native_column_type;
 use self::native::{list_native_fields, resolve_native_field};
-pub(crate) use self::registry::{IndexEntry, IndexOptions, IndexSet, IndexTarget, read_index_options};
-use self::registry::{Profile, choose_index_target, find_telemetry_table, select_system_names};
+pub(crate) use self::registry::{IndexEntry, IndexOptions, IndexSet, IndexTarget, Profile, read_index_options};
+use self::registry::{choose_index_target, find_telemetry_table, select_system_names};
 use super::error::OpenSearchError;
 use super::system_index::{CurrentSnapshot, SystemIndexStore, SystemSnapshot};
 use crate::engine::QueryEngine;

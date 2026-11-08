@@ -384,6 +384,7 @@ OPENSEARCH_VALUES = {
         "maxAnswerBytes": 268435458,
     },
     "search": {"maxResultWindow": 10001, "maxBuckets": 65536},
+    "ppl": {"maxResultRows": 5001},
 }
 OPENSEARCH_SECTION = {
     "enabled": True,
@@ -402,6 +403,7 @@ OPENSEARCH_SECTION = {
         "max_answer_bytes": 268435458,
     },
     "search": {"max_result_window": 10001, "max_buckets": 65536},
+    "ppl": {"max_result_rows": 5001},
 }
 
 # The system_indices section an enabled release renders on the chart defaults: the
