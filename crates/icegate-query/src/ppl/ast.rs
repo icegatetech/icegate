@@ -88,6 +88,8 @@ pub(crate) enum PplCommand {
     EventStats(StatsCommand),
     /// `streamstats`: every row gains running aggregates of its group, rows keep their order.
     StreamStats(StreamStatsCommand),
+    /// `append [<branch>]`: the branch's rows after the pipeline's, on the union of their columns.
+    Append(Box<PplQuery>),
 }
 
 /// A `join` with `on` criteria: the pipeline so far is the left side.

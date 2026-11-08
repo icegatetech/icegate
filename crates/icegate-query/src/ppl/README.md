@@ -91,6 +91,7 @@ see [`describe`](#describe). `source=[ <subsearch> ] [as t]` reads a subsearch's
 | `fillnull with <v> [in <fields>]`, `fillnull using <f> = <v>, …`, `fillnull value=<v> [<fields>]` | See [`fillnull`](#fillnull). |
 | `[inner \| left] join [left=<l>] [right=<r>] on <criteria> <right side>` | See [Joins](#joins). |
 | `eventstats …`, `streamstats …` | See [Window commands](#window-commands). |
+| `append [ <search> \| <commands> ]` | See [`append`](#append). |
 
 The output columns of a source are the table's columns in table order. A field reference is
 resolved against the columns of the pipeline at that point, case-sensitively; a name that
@@ -110,7 +111,8 @@ A promoted resource attribute whose column an earlier command removed, renamed, 
 promoted attribute that the source indices disagree on (a column in some, not in others).
 Several source indices are combined with UNION ALL over the union of their columns, in the order
 the columns first appear; a column an index lacks is NULL in its rows, and a column typed
-differently across the indices is a 400.
+differently across the indices is a 400 naming it, both indices and both PPL types (the Arrow
+types when the two share one PPL name).
 
 - Decimal columns read as `double`, the one numeric type PPL reports for them.
 - Strings compare and sort byte-wise (code-point order), never by locale.
@@ -388,6 +390,18 @@ subsearch (`[ source=spans | … ] as s`). Without a type the join is inner; a t
   below them.
 - **Never capped:** both read every row of their input.
 
+## `append`
+
+`append [ <search> | <commands> ]` adds the branch's rows after the pipeline's rows. The pipeline's rows come
+first in their incoming order, the branch's rows follow in the branch's own output order, and chained `append`s
+concatenate in the order written. The columns are the pipeline's, then the branch's new ones; a column missing on
+one side is NULL there, and a column both sides have with different types is a 400 naming it and both PPL
+types, or the Arrow types when the two share one PPL name (no coercion). A type that differs only in the names or metadata of nested fields is the same type (each table
+numbers the Iceberg field ids of its `MAP` columns on its own), and the column takes the pipeline's type. The
+branch runs through the same tenant scope and is never capped; a branch over a system index is a 400 naming it,
+and a branch without a search is a 400. The commands after `append` (`streamstats`, another `append`) see the
+rows in this order.
+
 ## Timestamp literals
 
 A string literal compared with a timestamp field (`=`, `!=`, `<`, `<=`, `>`, `>=`, `between`, `in`),
@@ -433,6 +447,6 @@ contract for every route.
 
 Every source resolves through the requesting tenant's session, whose scan carries the tenant
 filter, so a PPL query never reads another tenant's rows. `tests/opensearch/ppl.rs` pins this
-with two tenants written in the same batch. Every join side and every subsearch resolves through
-that same session; `tests/opensearch/ppl_trust_delta.rs` pins it with both tenants' rows in one WAL
-segment.
+with two tenants written in the same batch. Every join side, every subsearch and every `append`
+branch resolves through that same session; `tests/opensearch/ppl_trust_delta.rs` pins it with
+both tenants' rows in one WAL segment.

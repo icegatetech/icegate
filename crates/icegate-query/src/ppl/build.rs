@@ -12,14 +12,14 @@ use antlr4rust::rule_context::CustomRuleContext;
 use antlr4rust::token::Token;
 use antlr4rust::tree::{ParseTree, Tree};
 use icegate_query_grammar::ppl::{
-    BetweenContextAttrs, BinCommandContextAll, BinCommandContextAttrs, BinSpanValueContextAll,
-    BooleanLiteralContextAttrs, BucketNullableArgContextAll, ByClauseContextAttrs, BySpanClauseContextAll,
-    BySpanClauseContextAttrs, CaseFunctionCallContextAll, CaseFunctionCallContextAttrs, CommandsContextAll,
-    CommandsContextAttrs, CompareExprContextAttrs, ComparisonOperatorContextAll, ComparisonOperatorContextAttrs,
-    CountEvalFunctionCallContextAttrs, DataTypeFunctionCallContextAttrs, DedupCommandContextAll,
-    DedupCommandContextAttrs, DefaultSortFieldContextAttrs, DescribeCommandContextAttrs,
-    DistinctCountFunctionCallContextAttrs, EvalClauseContextAll, EvalClauseContextAttrs, EvalCommandContextAttrs,
-    EvalExpressionContextAttrs, EvalFunctionCallContextAttrs, EventstatsAggTermContextAttrs,
+    AppendCommandContextAll, AppendCommandContextAttrs, BetweenContextAttrs, BinCommandContextAll,
+    BinCommandContextAttrs, BinSpanValueContextAll, BooleanLiteralContextAttrs, BucketNullableArgContextAll,
+    ByClauseContextAttrs, BySpanClauseContextAll, BySpanClauseContextAttrs, CaseFunctionCallContextAll,
+    CaseFunctionCallContextAttrs, CommandsContextAll, CommandsContextAttrs, CompareExprContextAttrs,
+    ComparisonOperatorContextAll, ComparisonOperatorContextAttrs, CountEvalFunctionCallContextAttrs,
+    DataTypeFunctionCallContextAttrs, DedupCommandContextAll, DedupCommandContextAttrs, DefaultSortFieldContextAttrs,
+    DescribeCommandContextAttrs, DistinctCountFunctionCallContextAttrs, EvalClauseContextAll, EvalClauseContextAttrs,
+    EvalCommandContextAttrs, EvalExpressionContextAttrs, EvalFunctionCallContextAttrs, EventstatsAggTermContextAttrs,
     EventstatsCommandContextAll, EventstatsCommandContextAttrs, ExpressionContextAll, FieldExprContextAttrs,
     FieldExpressionContextAll, FieldExpressionContextAttrs, FieldListContextAll, FieldListContextAttrs,
     FieldsCommandBodyContextAll, FieldsCommandBodyContextAttrs, FieldsCommandContextAttrs,
@@ -350,7 +350,30 @@ fn build_command(command: &CommandsContextAll<'_>) -> Result<PplCommand, PplErro
     if let Some(streamstats) = command.streamstatsCommand() {
         return build_streamstats_command(&streamstats);
     }
+    if let Some(append) = command.appendCommand() {
+        return build_append_command(&append);
+    }
     Err(build_unsupported_command_error(&name_first_child_rule(command)))
+}
+
+/// Builds `append [ <search> | <commands> ]`.
+///
+/// # Errors
+///
+/// `Semantic` for a branch without a search; the errors of the branch's source and commands.
+fn build_append_command(append: &AppendCommandContextAll<'_>) -> Result<PplCommand, PplError> {
+    let search = append.searchCommand().ok_or_else(|| PplError::Semantic {
+        reason: "append needs a search: write `append [ source=<index> | … ]`".to_string(),
+    })?;
+    let commands = append
+        .commands_all()
+        .iter()
+        .map(|command| build_command(command))
+        .collect::<Result<Vec<_>, PplError>>()?;
+    Ok(PplCommand::Append(Box::new(PplQuery {
+        source: build_search_source(&search)?,
+        commands,
+    })))
 }
 
 /// The join type IceGate plans for a written join type; no type at all means inner.
@@ -2628,5 +2651,26 @@ mod tests {
                 "{text}: {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn append_builds_its_branch_and_needs_a_search() {
+        let parsed_query = parse_ppl("source=logs | fields body | append [ source=spans | sort name | head 2 ]")
+            .expect("append parses");
+        let [PplCommand::Fields { .. }, PplCommand::Append(branch)] = parsed_query.commands.as_slice() else {
+            panic!("not fields then append: {:?}", parsed_query.commands);
+        };
+        assert!(
+            matches!(&branch.source, PplSource::Index { expression } if expression == "spans"),
+            "{:?}",
+            branch.source
+        );
+        assert_eq!(branch.commands.len(), 2, "{:?}", branch.commands);
+
+        let result = parse_ppl("source=logs | append [ | fields body ]");
+        assert!(
+            matches!(&result, Err(PplError::Semantic { reason }) if reason.contains("append needs a search")),
+            "{result:?}"
+        );
     }
 }

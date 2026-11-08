@@ -1,10 +1,15 @@
-//! The PPL commands trust needs beyond the core: `join` and subsearches, over real HTTP. Every row is
-//! written here with explicit values, and every expected row is stated by hand from the rules in
-//! `ppl/README.md`.
+//! The PPL commands trust needs beyond the core: `join`, subsearches, window commands and `append`, over
+//! real HTTP. Every row is written here with explicit values, and every expected row is stated by hand from
+//! the rules in `ppl/README.md`.
 #![allow(clippy::expect_used)]
 
+use std::sync::Arc;
+
+use iceberg::Catalog;
 use icegate_common::schema::{COL_NAME, COL_SERVICE_NAME, COL_TIMESTAMP};
 use icegate_common::{LOGS_TABLE, SPANS_TABLE};
+use icegate_query::engine::QueryEngineConfig;
+use icegate_query::opensearch::{OpenSearchConfig, PplLimitsConfig};
 use serde_json::{Value, json};
 
 use super::data::{Cell, Row, RowWriteError, commit_rows, write_wal_segment};
@@ -58,13 +63,17 @@ fn assert_semantic_error(error: &Value) {
 
 /// Asserts that `reply` is the semantic refusal and that its reason mentions `expected_text`.
 fn assert_semantic_refusal(reply: &PplReply, expected_text: &str) {
+    assert_semantic_refusal_naming(reply, &[expected_text]);
+}
+
+/// Asserts that `reply` is the semantic refusal and that its reason mentions every one of `names`.
+fn assert_semantic_refusal_naming(reply: &PplReply, names: &[&str]) {
     let error = &reply.parse_json_body()["error"];
     assert_semantic_error(error);
-    assert!(
-        error["reason"].as_str().is_some_and(|reason| reason.contains(expected_text)),
-        "{}",
-        reply.text
-    );
+    let reason = error["reason"].as_str().unwrap_or_default();
+    for name in names {
+        assert!(reason.contains(name), "no `{name}` in {}", reply.text);
+    }
 }
 
 /// The lines of `plan` that mention `operator`.
@@ -119,6 +128,42 @@ fn build_numbered_rows(bodies: &[String], parity: usize) -> Vec<Row<'_>> {
             )
         })
         .collect()
+}
+
+/// Writes the logs of the order tests: `2 * ROWS_PER_SIDE` tenant-A rows from [`build_numbered_rows`], the even
+/// rows as one Iceberg commit and the odd rows as one WAL segment, plus a tenant-B row one microsecond before row
+/// 0 in the Iceberg commit, which would come first in time order if tenant A read it.
+///
+/// Asserts first that `ROWS_PER_SIDE` exceeds the engine's batch size, so each side arrives in more than one
+/// record batch.
+///
+/// # Errors
+///
+/// The write error of the Iceberg commit or of the WAL segment.
+async fn write_numbered_logs_across_iceberg_and_wal(
+    server: &TestServer,
+    catalog: &Arc<dyn Catalog>,
+) -> Result<(), RowWriteError> {
+    assert!(
+        ROWS_PER_SIDE > QueryEngineConfig::default().batch_size,
+        "each side must span more than one record batch"
+    );
+    let bodies = build_numbered_bodies(2 * ROWS_PER_SIDE);
+    let mut iceberg_rows = build_numbered_rows(&bodies, 0);
+    iceberg_rows.push(build_log_row(
+        TENANT_B,
+        NOON - 1,
+        vec![(icegate_common::schema::COL_BODY, Cell::Text("tenant-b"))],
+    ));
+    commit_rows(catalog, LOGS_TABLE, &iceberg_rows).await?;
+    write_wal_segment(
+        &server.wal_store,
+        catalog,
+        LOGS_TABLE,
+        1,
+        &build_numbered_rows(&bodies, 1),
+    )
+    .await
 }
 
 /// A log row of `tenant` at `micros` with `cells`.
@@ -1179,7 +1224,6 @@ mod subsearch {
 /// `eventstats` and `streamstats`: aggregates per group added to every row, in the incoming order.
 mod window {
     use icegate_common::schema::{COL_BODY, COL_SEVERITY_TEXT};
-    use icegate_query::engine::QueryEngineConfig;
 
     use super::*;
 
@@ -1556,37 +1600,15 @@ mod window {
         server.shutdown().await;
     }
 
-    /// The even rows are one Iceberg commit and the odd rows one WAL segment, each more rows than the engine's
-    /// batch size, so the scans deliver them in batches of either side; only the order written into the
-    /// numbering window puts them in time order. Row `k` is at `NOON + k` µs with body `k`, so its rank is
-    /// `k + 1`. A tenant-B row one microsecond before row 0 in the Iceberg commit would take rank 1 and make the
-    /// total 18001 if tenant A read it.
+    /// Over [`write_numbered_logs_across_iceberg_and_wal`], ascending time order ranks the row with body `k` at
+    /// `k + 1`, and descending time order after `eventstats` ranks it at `18000 - k` with a total of 18000. The
+    /// helper's tenant-B row would take rank 1 ascending and make the total 18001 if tenant A read it.
     #[tokio::test]
     async fn streamstats_follows_the_sorted_order_across_iceberg_and_wal_beyond_one_batch() {
-        assert!(
-            ROWS_PER_SIDE > QueryEngineConfig::default().batch_size,
-            "each side must span more than one record batch"
-        );
         let (server, catalog) = TestServer::start().await;
-        let bodies = build_numbered_bodies(2 * ROWS_PER_SIDE);
-        let mut iceberg_rows = build_numbered_rows(&bodies, 0);
-        iceberg_rows.push(build_log_row(
-            TENANT_B,
-            NOON - 1,
-            vec![(COL_BODY, Cell::Text("tenant-b"))],
-        ));
-        commit_rows(&catalog, LOGS_TABLE, &iceberg_rows)
+        write_numbered_logs_across_iceberg_and_wal(&server, &catalog)
             .await
-            .expect("commit the even rows and the tenant-B row");
-        write_wal_segment(
-            &server.wal_store,
-            &catalog,
-            LOGS_TABLE,
-            1,
-            &build_numbered_rows(&bodies, 1),
-        )
-        .await
-        .expect("write the odd rows");
+            .expect("write the numbered logs");
 
         let ascending_query = "source=logs | sort timestamp | streamstats count() as rn \
              | where rn = 1 or rn = 2 or rn = 9001 or rn = 18000 | fields body, rn";
@@ -1606,6 +1628,398 @@ mod window {
                 ["17998", 2, 18000],
                 ["08999", 9001, 18000],
                 ["00000", 18000, 18000]
+            ])
+        );
+        server.shutdown().await;
+    }
+}
+
+/// `append`: branches concatenated in order onto the union of their columns, tenant-scoped, uncapped.
+mod append {
+    use icegate_common::schema::{COL_BODY, COL_DURATION_MICROS, COL_RESOURCE_ATTRIBUTES};
+
+    use super::*;
+
+    fn build_body_row<'a>(tenant: &'a str, micros: i64, body: &'a str, service: &'a str) -> Row<'a> {
+        build_log_row(
+            tenant,
+            micros,
+            vec![(COL_BODY, Cell::Text(body)), (COL_SERVICE_NAME, Cell::Text(service))],
+        )
+    }
+
+    #[tokio::test]
+    async fn append_concatenates_branches_in_order() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_body_row(TENANT_A, NOON, "c1", "checkout"),
+                build_body_row(TENANT_A, NOON, "c2", "checkout"),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        // Tenant B's `c4` shares the WAL file with `c3`; read by tenant A it would lead the pipeline's rows.
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            LOGS_TABLE,
+            1,
+            &[
+                build_body_row(TENANT_A, NOON, "c3", "checkout"),
+                build_body_row(TENANT_B, NOON, "c4", "checkout"),
+            ],
+        )
+        .await
+        .expect("write logs segment");
+        // Tenant B's `a0` shares the Iceberg commit with the spans; read by tenant A it would lead the branch.
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[
+                build_span_row(TENANT_A, NOON, "checkout", "s2"),
+                build_span_row(TENANT_A, NOON, "cart", "s1"),
+                build_span_row(TENANT_B, NOON, "checkout", "a0"),
+            ],
+        )
+        .await
+        .expect("commit spans");
+
+        let query = "source=logs | where service_name = 'checkout' | sort - body | fields body, service_name \
+             | append [ source=spans | sort name | fields name, service_name ]";
+        let answer = run_ppl(&server, TENANT_A, query).await;
+        assert_eq!(
+            answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("service_name", "string"),
+                build_schema_column("name", "string")
+            ])
+        );
+        assert_eq!(
+            answer["datarows"],
+            json!([
+                ["c3", "checkout", null],
+                ["c2", "checkout", null],
+                ["c1", "checkout", null],
+                [null, "cart", "s1"],
+                [null, "checkout", "s2"]
+            ])
+        );
+
+        let chained_query = "source=logs | where body = 'c1' | fields body \
+             | append [ source=logs | where body = 'c3' | fields body ] \
+             | append [ source=logs | where body = 'c2' | fields body ]";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, chained_query).await["datarows"],
+            json!([["c1"], ["c3"], ["c2"]])
+        );
+        // The first `append` leaves an order no scan gives (descending, then ascending), so the second `append`
+        // keeps it only by reading the order the first one leaves.
+        let reordered_chain_query = "source=logs | sort - body | fields body \
+             | append [ source=logs | sort body | fields body ] \
+             | append [ source=logs | where body = 'c1' | fields body ]";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, reordered_chain_query).await["datarows"],
+            json!([["c3"], ["c2"], ["c1"], ["c1"], ["c2"], ["c3"], ["c1"]])
+        );
+
+        let conflict_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | fields body | append [ source=spans | eval body = 1 | fields body ]",
+        )
+        .await;
+        // The contract names the column and both types; the wording around them is not part of it.
+        assert_semantic_refusal_naming(&conflict_reply, &["body", "string", "bigint"]);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_logs_context_style_anchor_with_two_appended_neighbour_branches_answers_the_stated_rows() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_body_row(TENANT_A, NOON - 3 * SECOND, "o3", "checkout"),
+                build_body_row(TENANT_A, NOON - 2 * SECOND, "o2", "checkout"),
+                build_body_row(TENANT_A, NOON, "anchor", "checkout"),
+                build_body_row(TENANT_A, NOON + 2 * SECOND, "n2", "checkout"),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        // The nearest neighbours and tenant B's rows at the same instants share one WAL segment file.
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            LOGS_TABLE,
+            1,
+            &[
+                build_body_row(TENANT_A, NOON - SECOND, "o1", "checkout"),
+                build_body_row(TENANT_A, NOON + SECOND, "n1", "checkout"),
+                build_body_row(TENANT_A, NOON + 3 * SECOND, "n3", "checkout"),
+                build_body_row(TENANT_B, NOON - SECOND, "b-older", "checkout"),
+                build_body_row(TENANT_B, NOON + SECOND, "b-newer", "checkout"),
+            ],
+        )
+        .await
+        .expect("write logs segment");
+
+        let context_query = "source=logs | where timestamp = '2026-10-08 12:00:00' and body = 'anchor' | head 1 \
+             | eval context_row_kind = 'anchor' | fields timestamp, body, context_row_kind \
+             | append [ source=logs | where timestamp < '2026-10-08 12:00:00' | sort - timestamp | head 2 \
+                 | eval context_row_kind = 'older' | fields timestamp, body, context_row_kind ] \
+             | append [ source=logs | where timestamp > '2026-10-08 12:00:00' | sort timestamp | head 2 \
+                 | eval context_row_kind = 'newer' | fields timestamp, body, context_row_kind ]";
+        let answer = run_ppl(&server, TENANT_A, context_query).await;
+        assert_eq!(
+            answer["schema"],
+            json!([
+                build_schema_column("timestamp", "timestamp"),
+                build_schema_column("body", "string"),
+                build_schema_column("context_row_kind", "string")
+            ])
+        );
+        assert_eq!(
+            answer["datarows"],
+            json!([
+                ["2026-10-08 12:00:00", "anchor", "anchor"],
+                ["2026-10-08 11:59:59", "o1", "older"],
+                ["2026-10-08 11:59:58", "o2", "older"],
+                ["2026-10-08 12:00:01", "n1", "newer"],
+                ["2026-10-08 12:00:02", "n2", "newer"]
+            ])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_appended_branch_never_reads_another_tenants_rows() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[build_body_row(TENANT_A, NOON, "a-log", "checkout")],
+        )
+        .await
+        .expect("commit logs");
+        // One WAL segment file holds both tenants' spans.
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            SPANS_TABLE,
+            0,
+            &[
+                build_span_row(TENANT_A, NOON, "checkout", "a-span"),
+                build_span_row(TENANT_B, NOON, "checkout", "b-span"),
+            ],
+        )
+        .await
+        .expect("write spans segment");
+
+        let query = "source=logs | fields body | append [ source=spans | fields name ]";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, query).await["datarows"],
+            json!([["a-log", null], [null, "a-span"]])
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_B, query).await["datarows"],
+            json!([[null, "b-span"]])
+        );
+
+        // A branch over a system index is refused like a system-index source, naming the index.
+        create_system_index(&server, TENANT_A).await.expect("create the system index");
+        let system_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            &format!("source=logs | append [ source={SYSTEM_INDEX} ]"),
+        )
+        .await;
+        assert_semantic_refusal(&system_reply, SYSTEM_INDEX);
+        server.shutdown().await;
+    }
+
+    /// The listener's row limit bounds only the query's output: the branch alone is refused for exceeding
+    /// it, while the same branch under `append` and `stats` is read in full and answers one row. The
+    /// branch also holds more rows than the default `search.max_result_window`, so that window applied to
+    /// it would change the count as well.
+    #[tokio::test]
+    async fn an_appended_branch_beyond_the_row_limit_is_never_capped() {
+        const BRANCH_ROWS: i64 = 10_050;
+        let config = OpenSearchConfig {
+            ppl: PplLimitsConfig {
+                max_result_rows: Some(100),
+            },
+            ..OpenSearchConfig::default()
+        };
+        assert!(
+            i64::try_from(config.search.max_result_window).expect("the window fits an i64") < BRANCH_ROWS,
+            "the branch must exceed the default result window"
+        );
+        let (server, catalog) = TestServer::start_with_config(config).await;
+        let mut spans: Vec<Row<'_>> = (0..BRANCH_ROWS)
+            .map(|offset| build_span_row(TENANT_A, NOON + offset, "checkout", "a-span"))
+            .collect();
+        spans.extend((0..3).map(|offset| build_span_row(TENANT_B, NOON + offset, "checkout", "b-span")));
+        commit_rows(&catalog, SPANS_TABLE, &spans).await.expect("commit spans");
+
+        let branch_reply = refuse_ppl(&server, TENANT_A, "source=spans | fields name").await;
+        let branch_error = &branch_reply.parse_json_body()["error"];
+        assert_eq!(branch_error["code"], "RESOURCE_LIMIT_EXCEEDED", "{branch_error}");
+        assert_eq!(branch_error["context"]["limit"], 100, "{branch_error}");
+
+        let query = "source=logs | fields body | append [ source=spans | fields name ] | stats count() as n";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, query).await["datarows"],
+            json!([[BRANCH_ROWS]])
+        );
+        server.shutdown().await;
+    }
+
+    /// Both sides read [`write_numbered_logs_across_iceberg_and_wal`]; the pipeline is sorted ascending and the
+    /// branch descending, and both drop their sort key. `streamstats` reads the order `append` leaves: the
+    /// pipeline's row of rank `r` has body `r - 1` and the branch's row of rank `18000 + r` has body `18000 - r`.
+    /// The helper's tenant-B row would take rank 1 if tenant A read it.
+    #[tokio::test]
+    async fn append_keeps_both_sides_in_order_across_iceberg_and_wal_beyond_one_batch() {
+        let (server, catalog) = TestServer::start().await;
+        write_numbered_logs_across_iceberg_and_wal(&server, &catalog)
+            .await
+            .expect("write the numbered logs");
+
+        let query = "source=logs | sort timestamp | fields body \
+             | append [ source=logs | sort - timestamp | fields body ] | streamstats count() as rn \
+             | where rn = 1 or rn = 9001 or rn = 18000 or rn = 18001 or rn = 18002 or rn = 36000 | fields body, rn";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, query).await["datarows"],
+            json!([
+                ["00000", 1],
+                ["09000", 9001],
+                ["17999", 18000],
+                ["17999", 18001],
+                ["17998", 18002],
+                ["00000", 36000]
+            ])
+        );
+        server.shutdown().await;
+    }
+
+    /// Each side sorts on a column its `fields` drops, so each carries its sort key as a hidden column: a
+    /// timestamp in the pipeline, an integer in the branch. Hidden columns are no part of the column union, so
+    /// the two types never meet.
+    #[tokio::test]
+    async fn append_drops_the_hidden_sort_keys_of_both_sides() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_body_row(TENANT_A, NOON + SECOND, "l2", "checkout"),
+                build_body_row(TENANT_A, NOON, "l1", "checkout"),
+                // Read by tenant A, `b-log` would lead the pipeline's rows.
+                build_body_row(TENANT_B, NOON - SECOND, "b-log", "checkout"),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        let build_timed_span_row = |tenant, name, duration| {
+            let mut row = build_span_row(tenant, NOON, "checkout", name);
+            row.cells.push((COL_DURATION_MICROS, Cell::Long(duration)));
+            row
+        };
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[
+                build_timed_span_row(TENANT_A, "slow", 30),
+                build_timed_span_row(TENANT_A, "fast", 10),
+                build_timed_span_row(TENANT_A, "mid", 20),
+                // Read by tenant A, `b-fastest` would lead the branch's rows.
+                build_timed_span_row(TENANT_B, "b-fastest", 5),
+            ],
+        )
+        .await
+        .expect("commit spans");
+
+        let query = "source=logs | sort timestamp | fields body \
+             | append [ source=spans | sort duration_micros | fields name ]";
+        let answer = run_ppl(&server, TENANT_A, query).await;
+        assert_eq!(
+            answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("name", "string")
+            ])
+        );
+        assert_eq!(
+            answer["datarows"],
+            json!([
+                ["l1", null],
+                ["l2", null],
+                [null, "fast"],
+                [null, "mid"],
+                [null, "slow"]
+            ])
+        );
+        server.shutdown().await;
+    }
+
+    /// `resource_attributes` is a map in both tables, whose nested Iceberg field ids each table numbers on its
+    /// own: the column is one PPL type on both sides, so `append` unions it rather than refusing it.
+    #[tokio::test]
+    async fn append_unions_a_map_column_logs_and_spans_share() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[build_log_row(
+                TENANT_A,
+                NOON,
+                vec![
+                    (COL_BODY, Cell::Text("l1")),
+                    (COL_RESOURCE_ATTRIBUTES, Cell::Map(&[("host.name", "node-a")])),
+                ],
+            )],
+        )
+        .await
+        .expect("commit logs");
+        let build_hosted_span_row = |tenant, name, resource_attributes| {
+            let mut row = build_span_row(tenant, NOON, "checkout", name);
+            row.cells.push((COL_RESOURCE_ATTRIBUTES, Cell::Map(resource_attributes)));
+            row
+        };
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[
+                build_hosted_span_row(TENANT_A, "s1", &[("host.name", "node-b")]),
+                // Read by tenant A, `b-span` would lead the branch's rows.
+                build_hosted_span_row(TENANT_B, "b-span", &[("host.name", "node-z")]),
+            ],
+        )
+        .await
+        .expect("commit spans");
+
+        let query = "source=logs | fields body, resource_attributes \
+             | append [ source=spans | sort name | fields name, resource_attributes ]";
+        let answer = run_ppl(&server, TENANT_A, query).await;
+        assert_eq!(
+            answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("resource_attributes", "struct"),
+                build_schema_column("name", "string")
+            ])
+        );
+        assert_eq!(
+            answer["datarows"],
+            json!([
+                ["l1", { "host.name": "node-a" }, null],
+                [null, { "host.name": "node-b" }, "s1"]
             ])
         );
         server.shutdown().await;

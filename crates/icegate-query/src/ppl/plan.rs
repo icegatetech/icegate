@@ -148,9 +148,10 @@ struct Pipeline<'session> {
     /// The source indices while the pipeline still carries their columns; a command that
     /// replaces the columns (an aggregation) ends it.
     source: Option<SourceBinding<'session>>,
-    /// The keys of the row order, over the current columns: the keys of the last `sort`, or after a
-    /// window command the key on its row ordinal ([`order_by_row_ordinal`]). Empty when neither came
-    /// since the source or the last aggregation, where the order is the source's: the scan's for an
+    /// The keys of the row order, over the current columns: the keys of the last `sort`, after a
+    /// window command the key on its row ordinal ([`order_by_row_ordinal`]), or after `append` the key
+    /// on its branch column followed by the key on the row ordinal ([`plan_append`]). Empty when none
+    /// came since the source or the last aggregation, where the order is the source's: the scan's for an
     /// index source, no promised order for a subsearch source. `dedup` keeps the first rows in this
     /// order. A `rename` of a sorted column moves its key to the new name; before a
     /// command removes or replaces a sorted column, the key's values are copied into a hidden
@@ -222,19 +223,40 @@ struct Planning<'a> {
 /// [`PplError::FieldNotFound`] for a reference to no column, [`PplError::UnsupportedFunction`]
 /// for a function outside the library, and [`PplError::Semantic`] for a source on system
 /// indices, a field typed differently across the source indices, an expression whose types do
-/// not fit, a subsearch of `in` returning other than one column, or an `in [ … ]` outside a
-/// top-level `and` conjunct of `where`.
+/// not fit, a subsearch of `in` returning other than one column, an `in [ … ]` outside a
+/// top-level `and` conjunct of `where`, or a column both sides of an `append` have with different
+/// types.
 pub(crate) async fn plan_ppl(
     query: &PplQuery,
     session: &TenantSession,
     context: &RequestContext,
     cluster_name: &str,
 ) -> Result<PplPlan, PplError> {
-    let planning = Planning {
+    let pipeline = plan_pipeline(
+        query,
+        Planning {
+            session,
+            context,
+            cluster_name,
+        },
+    )
+    .await?;
+    finish_plan(pipeline.builder)
+}
+
+/// Plans the source and the commands of `query` into one pipeline that still carries its hidden columns and
+/// its sort keys: [`plan_ppl`] drops the hidden columns before the answer, and an `append` branch keeps them,
+/// so its rows are numbered in the branch's own order.
+///
+/// # Errors
+///
+/// The errors of the source and of every command, as [`plan_ppl`] documents them.
+async fn plan_pipeline<'a>(query: &'a PplQuery, planning: Planning<'a>) -> Result<Pipeline<'a>, PplError> {
+    let Planning {
         session,
         context,
         cluster_name,
-    };
+    } = planning;
     let mut pipeline = match &query.source {
         PplSource::Index { expression } => plan_index_source(expression, session).await?,
         PplSource::Describe { index } => plan_describe(index, session, context.now, cluster_name).await?,
@@ -254,7 +276,7 @@ pub(crate) async fn plan_ppl(
     for command in &query.commands {
         pipeline = apply_command(pipeline, command, planning).await?;
     }
-    finish_plan(pipeline.builder)
+    Ok(pipeline)
 }
 
 /// The rows of the data indices `expression` names.
@@ -353,35 +375,34 @@ fn union_branches(branches: Vec<(&str, LogicalPlanBuilder)>) -> Result<LogicalPl
             reason: "a PPL source without an index".to_string(),
         });
     }
-    let mut columns: Vec<(String, DataType, &str)> = Vec::new();
+    let mut columns: Vec<(String, DataType)> = Vec::new();
     for (index, builder) in &branches {
-        for field in builder.schema().fields() {
-            match columns.iter().find(|(name, ..)| name == field.name()) {
-                Some((name, data_type, first_index)) if !data_type.equals_datatype(field.data_type()) => {
-                    return Err(PplError::Semantic {
+        merge_column_types(&mut columns, builder.schema().fields()).map_err(|conflict| {
+            // Only a refusal names the index that set the column's type, so it is looked up here
+            // rather than tracked for every column.
+            let first_branch = branches
+                .iter()
+                .find(|(_, earlier)| earlier.schema().has_column_with_unqualified_name(&conflict.name));
+            match first_branch {
+                Some((first_index, _)) => {
+                    let (union_type_name, field_type_name) = conflict.name_types();
+                    PplError::Semantic {
                         reason: format!(
-                            "field [{name}] has type {data_type} in [{first_index}] and {} in [{index}]",
-                            field.data_type()
+                            "field [{}] has type {union_type_name} in [{first_index}] and \
+                             {field_type_name} in [{index}]",
+                            conflict.name
                         ),
-                    });
+                    }
                 }
-                Some(_) => {}
-                None => columns.push((field.name().clone(), field.data_type().clone(), index)),
+                None => PplError::Internal {
+                    reason: format!("the column union holds [{}] from no index", conflict.name),
+                },
             }
-        }
+        })?;
     }
     let mut union: Option<LogicalPlanBuilder> = None;
     for (_, builder) in branches {
-        let projection = columns
-            .iter()
-            .map(
-                |(name, data_type, _)| match builder.schema().field_with_unqualified_name(name) {
-                    Ok(field) if field.data_type() == data_type => Ok(ident(name)),
-                    Ok(_) => Ok(cast(ident(name), data_type.clone()).alias(name)),
-                    Err(_) => Ok(lit(ScalarValue::try_from(data_type)?).alias(name)),
-                },
-            )
-            .collect::<Result<Vec<_>, PplError>>()?;
+        let projection = build_union_projection(builder.schema(), &columns)?;
         let branch = builder.project(projection)?.build()?;
         union = Some(match union {
             None => LogicalPlanBuilder::from(branch),
@@ -391,6 +412,87 @@ fn union_branches(branches: Vec<(&str, LogicalPlanBuilder)>) -> Result<LogicalPl
     union.ok_or_else(|| PplError::Internal {
         reason: "a PPL source without an index".to_string(),
     })
+}
+
+/// A field whose type is a different PPL type than the type a column union already holds for its
+/// name: the two differ in more than nested field names or metadata.
+#[derive(Debug)]
+struct ColumnTypeConflict {
+    /// The column's name.
+    name: String,
+    /// The type the union holds for the column.
+    union_type: DataType,
+    /// The type of the field that conflicts with it.
+    field_type: DataType,
+}
+
+impl ColumnTypeConflict {
+    /// The names a refusal gives the union's type and the field's type, in that order: their PPL type
+    /// names, which the jdbc schema reports. When both are the same PPL type (two integer widths, two
+    /// string encodings) the PPL names would not tell them apart, so both are named by their Arrow types.
+    fn name_types(&self) -> (String, String) {
+        let union_type_name = name_ppl_type(&self.name, &self.union_type);
+        let field_type_name = name_ppl_type(&self.name, &self.field_type);
+        if union_type_name == field_type_name {
+            return (self.union_type.to_string(), self.field_type.to_string());
+        }
+        (union_type_name, field_type_name)
+    }
+}
+
+/// Adds every field of `fields` that `columns` does not name yet, with its type, in field order. A
+/// field whose type is the same PPL type as its column's ([`DataType::equals_datatype`]: nested field
+/// names and metadata aside) leaves the column's type as it is.
+///
+/// # Errors
+///
+/// The first field whose type is a different PPL type than its column's; `columns` then holds the
+/// fields before it.
+fn merge_column_types<'f>(
+    columns: &mut Vec<(String, DataType)>,
+    fields: impl IntoIterator<Item = &'f FieldRef>,
+) -> Result<(), ColumnTypeConflict> {
+    for field in fields {
+        match columns.iter().find(|(name, _)| name == field.name()) {
+            Some((name, union_type)) if !union_type.equals_datatype(field.data_type()) => {
+                return Err(ColumnTypeConflict {
+                    name: name.clone(),
+                    union_type: union_type.clone(),
+                    field_type: field.data_type().clone(),
+                });
+            }
+            Some(_) => {}
+            None => columns.push((field.name().clone(), field.data_type().clone())),
+        }
+    }
+    Ok(())
+}
+
+/// The projection of `schema` onto `columns`, one expression per column in their order, each producing
+/// exactly the column's type under its name: the column itself when its type is equal, cast to the
+/// column's type when it differs (only in nested field names or metadata, as [`merge_column_types`]
+/// allows), and a NULL of that type when `schema` lacks it.
+///
+/// # Errors
+///
+/// `Semantic` when a column's type has no NULL value DataFusion can build.
+fn build_union_projection(schema: &DFSchema, columns: &[(String, DataType)]) -> Result<Vec<Expr>, PplError> {
+    columns
+        .iter()
+        .map(|(name, data_type)| {
+            Ok(match schema.iter().find(|(_, field)| field.name() == name) {
+                Some((qualifier, field)) => {
+                    let column = Expr::Column(Column::new(qualifier.cloned(), field.name()));
+                    if field.data_type() == data_type {
+                        column
+                    } else {
+                        cast(column, data_type.clone()).alias(name)
+                    }
+                }
+                None => lit(ScalarValue::try_from(data_type)?).alias(name),
+            })
+        })
+        .collect()
 }
 
 /// `pipeline` after `command`. A command that plans a nested query (the right side of a `join`)
@@ -531,6 +633,15 @@ async fn apply_command<'session>(
             record_window_outputs(source.as_mut(), &command.aggregations);
             planned
         }
+        PplCommand::Append(branch) => {
+            let (builder, sort_keys) = plan_append(builder, &sort_keys, branch, planning).await?;
+            // The branch's rows come from other indices: the source binding no longer describes the rows.
+            return Ok(Pipeline {
+                builder,
+                source: None,
+                sort_keys,
+            });
+        }
     };
     Ok(Pipeline {
         builder,
@@ -589,25 +700,34 @@ const fn build_aggregated_pipeline<'session>(builder: LogicalPlanBuilder) -> Pip
 pub(super) const RESERVED_NAME_PREFIX: &str = "__ppl_";
 
 /// The prefix of the hidden columns, within [`RESERVED_NAME_PREFIX`]. They carry the row order:
-/// the values of sort keys whose columns a later command removed or replaced, and the row ordinal
-/// of a window command ([`ROW_ORDINAL_COLUMN`]). They travel with the rows through every command
-/// up to an aggregation, a `join` or a window command, which replaces them with its own ordinal,
-/// and are never part of the output.
+/// the values of sort keys whose columns a later command removed or replaced, the row ordinal of a
+/// window command or an `append` ([`ROW_ORDINAL_COLUMN`]), and the side of an `append`
+/// ([`APPEND_BRANCH_COLUMN`]). They travel with the rows through every command up to an
+/// aggregation or a `join`, which drops them, or a window command or an `append`, which replaces
+/// them with its own ordinal (and, for `append`, the branch column); they are never part of the
+/// output.
 const ORDER_COLUMN_PREFIX: &str = "__ppl_order_";
 
 /// The hidden column that carries each row's position in the incoming order after a command that
-/// numbered its rows (a window command). No PPL name produces it: names that begin with
-/// [`RESERVED_NAME_PREFIX`] are reserved, and the order columns of [`hide_touched_sort_keys`] end in
-/// a number. It stays in the plan through every command that keeps rows, so a later command still
-/// reads the order; a later window command, a `join` or [`finish_plan`] drops it.
+/// numbered its rows (a window command, or each side of an `append`). No PPL name produces it: names
+/// that begin with [`RESERVED_NAME_PREFIX`] are reserved, and the order columns of
+/// [`hide_touched_sort_keys`] end in a number. It stays in the plan through every command that keeps
+/// rows, so a later command still reads the order; a later aggregation, window command, `append`, `join`
+/// or [`finish_plan`] drops it.
 const ROW_ORDINAL_COLUMN: &str = "__ppl_order_row";
+
+/// The hidden column that tells the pipeline's rows (0) from the branch's (1) after `append`; no PPL
+/// name produces it, for the reasons [`ROW_ORDINAL_COLUMN`] states. With the row ordinal it is the
+/// order the commands after `append` read.
+const APPEND_BRANCH_COLUMN: &str = "__ppl_order_branch";
 
 /// The window column [`number_incoming_rows`] numbers the rows into before it is renamed to
 /// [`ROW_ORDINAL_COLUMN`]: the window's input may still hold an earlier ordinal under that name.
 const ROW_NUMBER_COLUMN: &str = "__ppl_row_number";
 
-/// Whether `name` is a hidden column, which no client ever sees: a sort-key order column or the row
-/// ordinal. The name alone tells, because no field of a query starts with [`RESERVED_NAME_PREFIX`].
+/// Whether `name` is a hidden column, which no client ever sees: a sort-key order column, the row
+/// ordinal or the side of an `append`. The name alone tells, because no field of a query
+/// starts with [`RESERVED_NAME_PREFIX`].
 fn is_hidden_column(name: &str) -> bool {
     name.starts_with(ORDER_COLUMN_PREFIX)
 }
@@ -629,18 +749,18 @@ fn list_visible_columns(schema: &DFSchema) -> Vec<Expr> {
         .collect()
 }
 
-/// Numbers the rows of `builder` into [`ROW_ORDINAL_COLUMN`] in their incoming `ordering` and drops every
+/// Numbers the rows of `builder` into [`ROW_ORDINAL_COLUMN`] in their incoming `sort_keys` and drops every
 /// hidden column of `builder` (the order columns and an earlier ordinal) once the window has read them, so
 /// the output carries exactly one ordinal and no other hidden column.
 ///
-/// The ordering is written into the numbering window as its `ORDER BY`, so the numbers follow it however
+/// The sort keys are written into the numbering window as its `ORDER BY`, so the numbers follow them however
 /// the rows below the window are partitioned or re-sorted; nothing relies on a sort beneath the window
-/// surviving. With an empty ordering the numbers follow the order in which the rows arrive. A window
+/// surviving. With no sort keys the numbers follow the order in which the rows arrive. A window
 /// without partition keys also stops filter pushdown: no predicate written after the command can move
 /// below it.
-fn number_incoming_rows(builder: LogicalPlanBuilder, ordering: &[SortExpr]) -> Result<LogicalPlanBuilder, PplError> {
+fn number_incoming_rows(builder: LogicalPlanBuilder, sort_keys: &[SortExpr]) -> Result<LogicalPlanBuilder, PplError> {
     let ordinal = row_number()
-        .order_by(ordering.to_vec())
+        .order_by(sort_keys.to_vec())
         .window_frame(WindowFrame::new(Some(true)))
         .build()?
         .alias(ROW_NUMBER_COLUMN);
@@ -1400,7 +1520,7 @@ struct WindowCommand<'c> {
     is_bucket_nullable: bool,
 }
 
-/// Plans a window command so that rows keep their incoming order: number the rows in `ordering`, compute
+/// Plans a window command so that rows keep their incoming order: number the rows in `sort_keys`, compute
 /// every aggregate (a `by` repartitions the rows and a running total orders them by that number), and sort
 /// back by the number. The number stays as a hidden column and is the order the plan answers with. The
 /// fields and the aggregations resolve in `scope`, the command's input; the numbering keeps every visible
@@ -1417,9 +1537,9 @@ fn plan_window_command(
     builder: LogicalPlanBuilder,
     command: &WindowCommand<'_>,
     scope: &ExpressionScope<'_>,
-    ordering: &[SortExpr],
+    sort_keys: &[SortExpr],
 ) -> Result<(LogicalPlanBuilder, Vec<SortExpr>), PplError> {
-    let input = number_incoming_rows(builder, ordering)?;
+    let input = number_incoming_rows(builder, sort_keys)?;
     let input_schema = Arc::clone(input.schema());
     let partition_by = command
         .partition_fields
@@ -1501,7 +1621,7 @@ fn plan_event_stats(
     builder: LogicalPlanBuilder,
     command: &StatsCommand,
     scope: &ExpressionScope<'_>,
-    ordering: &[SortExpr],
+    sort_keys: &[SortExpr],
 ) -> Result<(LogicalPlanBuilder, Vec<SortExpr>), PplError> {
     let partition_fields = command
         .by
@@ -1523,7 +1643,7 @@ fn plan_event_stats(
             is_bucket_nullable: command.is_bucket_nullable,
         },
         scope,
-        ordering,
+        sort_keys,
     )
 }
 
@@ -1536,7 +1656,7 @@ fn plan_stream_stats(
     builder: LogicalPlanBuilder,
     command: &StreamStatsCommand,
     scope: &ExpressionScope<'_>,
-    ordering: &[SortExpr],
+    sort_keys: &[SortExpr],
 ) -> Result<(LogicalPlanBuilder, Vec<SortExpr>), PplError> {
     plan_window_command(
         builder,
@@ -1548,7 +1668,7 @@ fn plan_stream_stats(
             is_bucket_nullable: true,
         },
         scope,
-        ordering,
+        sort_keys,
     )
 }
 
@@ -2871,6 +2991,90 @@ fn plan_subquery<'a>(query: &'a PplQuery, planning: Planning<'a>) -> BoxFuture<'
     ))
 }
 
+/// Plans an `append` branch with the parent's session, request and cluster name, keeping its hidden columns
+/// and its sort keys, so its rows can be numbered in that order.
+///
+/// Boxed like [`plan_subquery`], for the same recursion through [`plan_pipeline`].
+fn plan_branch_pipeline<'a>(
+    query: &'a PplQuery,
+    planning: Planning<'a>,
+) -> BoxFuture<'a, Result<Pipeline<'a>, PplError>> {
+    Box::pin(plan_pipeline(query, planning))
+}
+
+/// Projects one side of an `append` onto `columns` ([`build_union_projection`]), numbered in its
+/// incoming `sort_keys` and marked with `branch_number`; the side's own hidden columns are dropped by the
+/// numbering.
+fn align_append_branch(
+    side: LogicalPlanBuilder,
+    sort_keys: &[SortExpr],
+    columns: &[(String, DataType)],
+    branch_number: u8,
+) -> Result<LogicalPlanBuilder, PplError> {
+    let numbered_input = number_incoming_rows(side, sort_keys)?;
+    let mut projection = build_union_projection(numbered_input.schema(), columns)?;
+    projection.extend([
+        lit(branch_number).alias(APPEND_BRANCH_COLUMN),
+        ident(ROW_ORDINAL_COLUMN),
+    ]);
+    Ok(numbered_input.project(projection)?)
+}
+
+/// The fields of `schema` but the hidden ones, in schema order.
+fn iterate_visible_fields(schema: &DFSchema) -> impl Iterator<Item = &FieldRef> {
+    schema.fields().iter().filter(|field| !is_hidden_column(field.name()))
+}
+
+/// The visible columns of `schema` with their types, in schema order.
+fn list_visible_column_types(schema: &DFSchema) -> Vec<(String, DataType)> {
+    iterate_visible_fields(schema)
+        .map(|field| (field.name().clone(), field.data_type().clone()))
+        .collect()
+}
+
+/// Plans `append`: the pipeline's rows in their incoming `sort_keys` order, then the branch's rows in the
+/// branch's own order. Answers the plan and the sort keys the commands after `append` read.
+///
+/// A union has no row order of its own, so each side carries its branch number and its row number and the
+/// union is sorted by both. The two columns stay, hidden, so the commands after `append` keep that order;
+/// [`plan_ppl`] drops them. The output columns are the pipeline's visible ones, then the branch's new ones;
+/// both sides are projected onto them explicitly. A column both sides have takes the pipeline's type when
+/// the two types differ only in nested field names or metadata (each table numbers its Iceberg field ids
+/// on its own), which is the same PPL type; any other difference is refused, so no value is ever coerced.
+/// The branch is planned through the same tenant session and nothing caps it.
+///
+/// # Errors
+///
+/// `Semantic` for a column both sides have with different types; the branch's errors.
+async fn plan_append(
+    builder: LogicalPlanBuilder,
+    sort_keys: &[SortExpr],
+    branch: &PplQuery,
+    planning: Planning<'_>,
+) -> Result<(LogicalPlanBuilder, Vec<SortExpr>), PplError> {
+    let appended_branch = plan_branch_pipeline(branch, planning).await?;
+    let mut columns = list_visible_column_types(builder.schema());
+    merge_column_types(&mut columns, iterate_visible_fields(appended_branch.builder.schema())).map_err(|conflict| {
+        let (pipeline_type_name, branch_type_name) = conflict.name_types();
+        PplError::Semantic {
+            reason: format!(
+                "append: column `{}` is {pipeline_type_name} in the pipeline and {branch_type_name} in the appended \
+                 branch",
+                conflict.name
+            ),
+        }
+    })?;
+    let pipeline = align_append_branch(builder, sort_keys, &columns, 0)?;
+    let aligned_branch =
+        align_append_branch(appended_branch.builder, &appended_branch.sort_keys, &columns, 1)?.build()?;
+    let append_order = vec![
+        ident(APPEND_BRANCH_COLUMN).sort(true, false),
+        ident(ROW_ORDINAL_COLUMN).sort(true, false),
+    ];
+    let appended_rows = pipeline.union(aligned_branch)?.sort(append_order.clone())?;
+    Ok((appended_rows, append_order))
+}
+
 /// `plan` with every column qualified by `alias`, or unchanged without one.
 fn qualify_plan(plan: LogicalPlanBuilder, alias: Option<&str>) -> Result<LogicalPlanBuilder, PplError> {
     if let Some(alias) = alias {
@@ -3263,6 +3467,52 @@ mod tests {
             })
             .collect();
         assert_eq!(branch_columns, vec![expected_columns.clone(), expected_columns]);
+    }
+
+    /// A column whose type is a different PPL type in two indices is refused naming the column, both
+    /// indices and both PPL types, so a MAP column reads as `struct`, never as its nested Arrow type.
+    /// Two types that are the same PPL type are named by their Arrow types, which tell them apart.
+    #[test]
+    fn union_branches_name_the_ppl_types_of_a_conflicting_column() {
+        let refusals = [
+            (
+                Field::new("count", DataType::Int64, false),
+                Field::new("count", DataType::Utf8, true),
+                "field [count] has type bigint in [first] and string in [second]",
+            ),
+            (
+                build_labels_field("14", "15"),
+                Field::new("labels", DataType::Utf8, true),
+                "field [labels] has type struct in [first] and string in [second]",
+            ),
+            (
+                Field::new("message", DataType::Utf8, true),
+                Field::new("message", DataType::LargeUtf8, true),
+                "field [message] has type Utf8 in [first] and LargeUtf8 in [second]",
+            ),
+        ];
+        for (first_field, second_field, expected_reason) in refusals {
+            let first_scan = LogicalPlanBuilder::scan(
+                "first",
+                Arc::new(LogicalTableSource::new(Arc::new(Schema::new(vec![first_field])))),
+                None,
+            )
+            .expect("first scan");
+            let second_scan = LogicalPlanBuilder::scan(
+                "second",
+                Arc::new(LogicalTableSource::new(Arc::new(Schema::new(vec![second_field])))),
+                None,
+            )
+            .expect("second scan");
+
+            assert_eq!(
+                union_branches(vec![("first", first_scan), ("second", second_scan)]).err(),
+                Some(PplError::Semantic {
+                    reason: expected_reason.to_string()
+                }),
+                "{expected_reason}"
+            );
+        }
     }
 
     /// A `MAP<string, string>` field named `labels` whose key and value fields carry the Iceberg
