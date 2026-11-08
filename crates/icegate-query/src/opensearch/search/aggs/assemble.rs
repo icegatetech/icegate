@@ -6,7 +6,10 @@
 //! that `size` or `min_doc_count` cut is never answered. A `terms` level ranks each parent's
 //! candidates by its order, then by key ascending, and keeps `size` of them. A `date_histogram`
 //! and a `histogram` level answer their buckets in key order and, with `min_doc_count: 0`, the
-//! empty buckets between the first and the last key, widened to `extended_bounds`. Every
+//! empty buckets between the first and the last key, widened to `extended_bounds`. A `range`,
+//! `date_range`, `filters` or `filter` level is keyed by bucket ordinal and answers every bucket
+//! the request lists, in request order, an empty one with no rows. A level's candidates may come
+//! from another stage aggregate than its parent's: they are matched by the parent's keys. Every
 //! answered bucket, empty ones included, counts against `search.max_buckets` before it is
 //! materialized.
 
@@ -450,6 +453,13 @@ pub(super) fn read_level_key(
         (LevelKind::Terms { .. }, ScalarValue::Boolean(Some(value))) => BucketKey::Boolean(value),
         (LevelKind::Terms { .. }, ScalarValue::FixedSizeBinary(_, Some(bytes))) => BucketKey::HexId(bytes),
         (LevelKind::Terms { .. }, ScalarValue::TimestampMicrosecond(Some(value), _)) => BucketKey::Date(value),
+        (
+            LevelKind::Range { .. }
+            | LevelKind::DateRange { .. }
+            | LevelKind::Filters { .. }
+            | LevelKind::Filter { .. },
+            ScalarValue::Int32(Some(ordinal)),
+        ) => BucketKey::Long(i64::from(ordinal)),
         (_, other) => {
             return Err(OpenSearchError::internal(format!(
                 "bucket key of [{}] has the unexpected value [{other}]",
@@ -477,7 +487,54 @@ fn select_level(
             select_date_histogram(level.name, spec, rounding, candidates, budget)
         }
         LevelKind::Histogram { spec } => select_histogram(level.name, spec, candidates, budget),
+        LevelKind::Range { spec } => select_fixed_buckets(level.name, spec.ranges.len(), candidates, budget),
+        LevelKind::DateRange { spec, .. } => select_fixed_buckets(level.name, spec.ranges.len(), candidates, budget),
+        LevelKind::Filters { filter_count, .. } => select_fixed_buckets(level.name, *filter_count, candidates, budget),
+        LevelKind::Filter { .. } => select_fixed_buckets(level.name, 1, candidates, budget),
     }
+}
+
+/// Every bucket of a multi-membership level under one parent, by ordinal: the observed ones with
+/// their rows, the others empty.
+///
+/// # Errors
+///
+/// `400 too_many_buckets_exception` past the budget, counted before any bucket is built; `500`
+/// for a key that is not an ordinal of the level's buckets.
+fn select_fixed_buckets(
+    name: &str,
+    bucket_count: usize,
+    candidates: Vec<Candidate>,
+    budget: &mut BucketBudget,
+) -> Result<LevelInstance, OpenSearchError> {
+    budget.consume(bucket_count)?;
+    let mut candidates_by_ordinal: Vec<Option<Candidate>> =
+        std::iter::repeat_with(|| None).take(bucket_count).collect();
+    for candidate in candidates {
+        let &BucketKey::Long(ordinal) = &candidate.key else {
+            return Err(OpenSearchError::internal(format!(
+                "a key of [{name}] is not a bucket ordinal"
+            )));
+        };
+        let slot = usize::try_from(ordinal)
+            .ok()
+            .and_then(|ordinal| candidates_by_ordinal.get_mut(ordinal))
+            .ok_or_else(|| {
+                OpenSearchError::internal(format!("bucket ordinal [{ordinal}] of [{name}] is out of range"))
+            })?;
+        *slot = Some(candidate);
+    }
+    let buckets = candidates_by_ordinal
+        .into_iter()
+        .zip(0_i64..)
+        .map(|(candidate, ordinal)| {
+            candidate.map_or_else(|| create_empty_bucket(BucketKey::Long(ordinal)), select_candidate)
+        })
+        .collect();
+    Ok(LevelInstance {
+        buckets,
+        sum_other_doc_count: 0,
+    })
 }
 
 /// Rank a parent's `terms` candidates and keep `size` of them. Only keys present in the matching

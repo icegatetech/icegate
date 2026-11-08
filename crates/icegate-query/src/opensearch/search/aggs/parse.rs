@@ -14,14 +14,19 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 
 use super::metrics::MetricSpec;
+use super::multi_bucket::{
+    DateMathRange, DateRangeBound, DateRangeBucketsSpec, FiltersBuckets, FiltersSpec, NumericRange, RangeBucketsSpec,
+};
 use super::terms::{TermsSpec, parse_terms};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::{
     MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MILLISECOND, MICROS_PER_MINUTE, MICROS_PER_SECOND,
 };
 use crate::opensearch::search::hits::DateRenderFormat;
+use crate::query_dsl::ast::Query;
 use crate::query_dsl::date_math::{TimeZoneSpec, parse_time_zone};
 use crate::query_dsl::literal::parse_java_double;
+use crate::query_dsl::parse::parse_query;
 
 /// Keys every kind accepts and ignores: they tune per-shard execution.
 pub(super) const IGNORED_EXECUTION_KEYS: [&str; 3] = ["execution_hint", "shard_size", "collect_mode"];
@@ -40,11 +45,7 @@ const OUT_OF_SCOPE_KINDS: [&str; 6] = [
 const OUT_OF_SCOPE_PIPELINES: [&str; 1] = ["extended_stats_bucket"];
 
 /// Kinds of the aggregation surface that are not planned yet.
-const NOT_YET_PLANNED_KINDS: [&str; 19] = [
-    "range",
-    "date_range",
-    "filters",
-    "filter",
+const NOT_YET_PLANNED_KINDS: [&str; 15] = [
     "cardinality",
     "percentiles",
     "percentile_ranks",
@@ -101,21 +102,32 @@ pub(crate) enum AggregationKind {
     ValueCount(MetricSpec),
     /// `count`, `min`, `max`, `avg` and `sum` together.
     Stats(MetricSpec),
+    /// Numeric `[from, to)` buckets; a row counts in every range it lies in.
+    Range(RangeBucketsSpec),
+    /// Date-math `[from, to)` buckets resolved against the request's `now`.
+    DateRange(DateRangeBucketsSpec),
+    /// One bucket per query; a row counts in every bucket it matches.
+    Filters(FiltersSpec),
+    /// The single bucket of the rows the query matches.
+    Filter(Box<Query>),
 }
 
 impl AggregationKind {
-    /// The field the aggregation reads.
-    pub(crate) fn field(&self) -> &str {
+    /// The field the aggregation reads; `None` for `filter` and `filters`, which read queries.
+    pub(crate) fn field(&self) -> Option<&str> {
         match self {
-            Self::DateHistogram(spec) => &spec.field,
-            Self::Terms(spec) => &spec.field,
-            Self::Histogram(spec) => &spec.field,
+            Self::DateHistogram(spec) => Some(&spec.field),
+            Self::Terms(spec) => Some(&spec.field),
+            Self::Histogram(spec) => Some(&spec.field),
             Self::Avg(spec)
             | Self::Sum(spec)
             | Self::Min(spec)
             | Self::Max(spec)
             | Self::ValueCount(spec)
-            | Self::Stats(spec) => &spec.field,
+            | Self::Stats(spec) => Some(&spec.field),
+            Self::Range(spec) => Some(&spec.field),
+            Self::DateRange(spec) => Some(&spec.field),
+            Self::Filters(_) | Self::Filter(_) => None,
         }
     }
 }
@@ -287,6 +299,10 @@ fn parse_kind(name: &str, kind_name: &str, value: &Value) -> Result<AggregationK
             name, kind_name, value, false,
         )?)),
         "stats" => Ok(AggregationKind::Stats(parse_metric(name, kind_name, value, false)?)),
+        "range" => Ok(AggregationKind::Range(parse_range(name, value)?)),
+        "date_range" => Ok(AggregationKind::DateRange(parse_date_range(name, value)?)),
+        "filters" => Ok(AggregationKind::Filters(parse_filters(name, value)?)),
+        "filter" => Ok(AggregationKind::Filter(Box::new(parse_query(value)?))),
         _ if OUT_OF_SCOPE_KINDS.contains(&kind_name)
             || OUT_OF_SCOPE_PIPELINES.contains(&kind_name)
             || kind_name.starts_with("geo_") =>
@@ -641,6 +657,218 @@ pub(super) fn read_strict_number(name: &str, key: &str, value: &Value) -> Result
         .ok_or_else(|| OpenSearchError::parsing(format!("[{key}] of [{name}] must be a number, got [{value}]")))
 }
 
+/// A `range`: `field`, a non-empty `ranges` array of `{from?, to?, key?}` with numeric bounds,
+/// and `keyed` (absent means `false`).
+///
+/// # Errors
+///
+/// `400 parsing_exception` for a malformed body, a missing `field` or `ranges`, an empty
+/// `ranges`, a value of the wrong JSON type (a numeric string bound included), and an unknown
+/// key (named under `construct`).
+fn parse_range(name: &str, value: &Value) -> Result<RangeBucketsSpec, OpenSearchError> {
+    let body = expect_object(name, "range", value)?;
+    let mut field = None;
+    let mut ranges = None;
+    let mut is_keyed = false;
+    for (key, value) in body {
+        match key.as_str() {
+            "field" => field = Some(expect_string(name, key, value)?.to_string()),
+            "ranges" => ranges = Some(read_ranges(name, value, parse_numeric_range)?),
+            "keyed" => is_keyed = expect_flag(name, key, value)?,
+            ignored if IGNORED_EXECUTION_KEYS.contains(&ignored) => {}
+            unknown => return Err(refuse_unknown_key("range", name, unknown)),
+        }
+    }
+    Ok(RangeBucketsSpec {
+        field: field.ok_or_else(|| OpenSearchError::parsing(format!("[range] of [{name}] requires [field]")))?,
+        ranges: ranges.ok_or_else(|| OpenSearchError::parsing(format!("[range] of [{name}] requires [ranges]")))?,
+        is_keyed,
+    })
+}
+
+/// A `date_range`: `field`, a non-empty `ranges` array of `{from?, to?, key?}` whose bounds are
+/// date strings or epoch-millisecond integers, `time_zone` and `format`.
+///
+/// # Errors
+///
+/// `400 parsing_exception` for a malformed body, a missing `field` or `ranges`, an empty
+/// `ranges`, a bound that is neither a string nor an integer of the `i64` range, a value of the
+/// wrong JSON type, an unknown time zone, and an unknown key (named under `construct`); `400
+/// illegal_argument_exception` for an unknown `format`.
+fn parse_date_range(name: &str, value: &Value) -> Result<DateRangeBucketsSpec, OpenSearchError> {
+    let body = expect_object(name, "date_range", value)?;
+    let mut field = None;
+    let mut ranges = None;
+    let mut time_zone = None;
+    let mut format = None;
+    for (key, value) in body {
+        match key.as_str() {
+            "field" => field = Some(expect_string(name, key, value)?.to_string()),
+            "ranges" => ranges = Some(read_ranges(name, value, parse_date_math_range)?),
+            "time_zone" => time_zone = Some(parse_time_zone(expect_string(name, key, value)?)?),
+            "format" => format = Some(DateRenderFormat::parse(expect_string(name, key, value)?)?),
+            ignored if IGNORED_EXECUTION_KEYS.contains(&ignored) => {}
+            unknown => return Err(refuse_unknown_key("date_range", name, unknown)),
+        }
+    }
+    Ok(DateRangeBucketsSpec {
+        field: field.ok_or_else(|| OpenSearchError::parsing(format!("[date_range] of [{name}] requires [field]")))?,
+        ranges: ranges
+            .ok_or_else(|| OpenSearchError::parsing(format!("[date_range] of [{name}] requires [ranges]")))?,
+        time_zone,
+        format,
+    })
+}
+
+/// A `filters`: `filters` as a non-empty object of named queries (kept in request order) or a
+/// non-empty array of anonymous ones.
+///
+/// # Errors
+///
+/// `400 parsing_exception` for a malformed body, a missing or empty `filters`, a query
+/// [`parse_query`] refuses, and an unknown key (named under `construct`).
+fn parse_filters(name: &str, value: &Value) -> Result<FiltersSpec, OpenSearchError> {
+    let body = expect_object(name, "filters", value)?;
+    let mut filters = None;
+    for (key, value) in body {
+        match key.as_str() {
+            "filters" => {
+                filters = Some(match value {
+                    Value::Object(named) if !named.is_empty() => FiltersBuckets::Named(
+                        named
+                            .iter()
+                            .map(|(bucket, query)| Ok((bucket.clone(), parse_query(query)?)))
+                            .collect::<Result<Vec<_>, OpenSearchError>>()?,
+                    ),
+                    Value::Array(anonymous) if !anonymous.is_empty() => {
+                        FiltersBuckets::Anonymous(anonymous.iter().map(parse_query).collect::<Result<Vec<_>, _>>()?)
+                    }
+                    Value::Null
+                    | Value::Bool(_)
+                    | Value::Number(_)
+                    | Value::String(_)
+                    | Value::Array(_)
+                    | Value::Object(_) => {
+                        return Err(OpenSearchError::parsing(format!(
+                            "[filters] of [{name}] must be a non-empty object or array"
+                        )));
+                    }
+                });
+            }
+            ignored if IGNORED_EXECUTION_KEYS.contains(&ignored) => {}
+            unknown => return Err(refuse_unknown_key("filters", name, unknown)),
+        }
+    }
+    Ok(FiltersSpec {
+        filters: filters
+            .ok_or_else(|| OpenSearchError::parsing(format!("[filters] of [{name}] requires [filters]")))?,
+    })
+}
+
+/// A non-empty `ranges` array, each entry an object parsed by `parse_entry`.
+///
+/// # Errors
+///
+/// `400 parsing_exception` for a value that is not a non-empty array of objects, and the errors
+/// of `parse_entry`.
+fn read_ranges<T>(
+    name: &str,
+    value: &Value,
+    parse_entry: fn(&str, &Map<String, Value>) -> Result<T, OpenSearchError>,
+) -> Result<Vec<T>, OpenSearchError> {
+    let entries = value
+        .as_array()
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| OpenSearchError::parsing(format!("[ranges] of [{name}] must be a non-empty array")))?;
+    entries
+        .iter()
+        .map(|entry| parse_entry(name, expect_object(name, "ranges", entry)?))
+        .collect()
+}
+
+/// One entry of a `range`'s `ranges`: numeric `from` and `to`, a string `key`.
+///
+/// # Errors
+///
+/// The errors of [`read_range_entry`].
+fn parse_numeric_range(name: &str, entry: &Map<String, Value>) -> Result<NumericRange, OpenSearchError> {
+    let (from, to, key) = read_range_entry(name, entry, read_strict_number)?;
+    Ok(NumericRange { from, to, key })
+}
+
+/// One entry of a `date_range`'s `ranges`: `from` and `to` as [`read_date_bound`] reads them, a
+/// string `key`.
+///
+/// # Errors
+///
+/// The errors of [`read_range_entry`].
+fn parse_date_math_range(name: &str, entry: &Map<String, Value>) -> Result<DateMathRange, OpenSearchError> {
+    let (from, to, key) = read_range_entry(name, entry, read_date_bound)?;
+    Ok(DateMathRange { from, to, key })
+}
+
+/// The `from`, `to` and `key` of one `ranges` entry, each bound read by `read_bound`.
+///
+/// # Errors
+///
+/// The errors of `read_bound`; `400 parsing_exception` for a `key` that is not a string and an
+/// unknown key (named under `construct`).
+fn read_range_entry<B>(
+    name: &str,
+    entry: &Map<String, Value>,
+    read_bound: fn(&str, &str, &Value) -> Result<B, OpenSearchError>,
+) -> Result<(Option<B>, Option<B>, Option<String>), OpenSearchError> {
+    let mut from = None;
+    let mut to = None;
+    let mut key = None;
+    for (entry_key, value) in entry {
+        match entry_key.as_str() {
+            "from" => from = Some(read_bound(name, "ranges.from", value)?),
+            "to" => to = Some(read_bound(name, "ranges.to", value)?),
+            "key" => key = Some(expect_string(name, "ranges.key", value)?.to_string()),
+            unknown => return Err(refuse_unknown_key("ranges", name, unknown)),
+        }
+    }
+    Ok((from, to, key))
+}
+
+/// The refusal of a key the `kind` object of aggregation `name` does not support: a `400
+/// parsing_exception` naming `unknown` under `construct`.
+fn refuse_unknown_key(kind: &str, name: &str, unknown: &str) -> OpenSearchError {
+    OpenSearchError::unsupported_construct(unknown, format!("[{kind}] of [{name}] does not support [{unknown}]"))
+}
+
+/// A date bound as written: a string (a date, date math or epoch milliseconds), or a JSON
+/// integer of epoch milliseconds.
+///
+/// # Errors
+///
+/// `400 parsing_exception` naming `key` for a fractional number, an integer outside the `i64`
+/// range, and any other JSON type.
+fn read_date_bound(name: &str, key: &str, value: &Value) -> Result<DateRangeBound, OpenSearchError> {
+    let refuse_bound = || {
+        OpenSearchError::parsing(format!(
+            "[{key}] of [{name}] must be a date string or an integer of epoch milliseconds, got [{value}]"
+        ))
+    };
+    match value {
+        Value::String(text) => Ok(DateRangeBound::Expression(text.clone())),
+        Value::Number(number) => number.as_i64().map(DateRangeBound::EpochMillis).ok_or_else(refuse_bound),
+        Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => Err(refuse_bound()),
+    }
+}
+
+/// `value` as a boolean.
+///
+/// # Errors
+///
+/// `400 parsing_exception` naming `key` of `name` for any other value.
+fn expect_flag(name: &str, key: &str, value: &Value) -> Result<bool, OpenSearchError> {
+    value
+        .as_bool()
+        .ok_or_else(|| OpenSearchError::parsing(format!("[{key}] of [{name}] must be a boolean")))
+}
+
 /// Epoch milliseconds written as a JSON integer or a string of ASCII digits.
 ///
 /// # Errors
@@ -704,6 +932,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::super::metrics::MetricSpec;
+    use super::super::multi_bucket::{DateRangeBound, FiltersBuckets};
     use super::super::terms::{TermsFilter, TermsOrder, TermsSpec};
     use super::{
         AggregationKind, AggregationTree, CalendarUnit, DateHistogramSpec, HistogramInterval, HistogramSpec,
@@ -1296,5 +1525,118 @@ mod tests {
             spec.order.as_slice(),
             [TermsOrder::Metric { path: ordering, order: SortOrder::Desc }] if *ordering == path("1", None)
         ));
+    }
+
+    #[tokio::test]
+    async fn range_date_range_and_filters_parse_their_keys_and_refuse_other_types() {
+        let Ok(AggregationKind::Range(range)) = parse_first_kind(&json!({"r": {"range": {
+            "field": "duration_micros", "keyed": true,
+            "ranges": [{"to": 100}, {"from": 100, "to": 300.5, "key": "middle"}]
+        }}})) else {
+            panic!("a range parses to Range");
+        };
+        assert_eq!(range.field, "duration_micros");
+        assert!(range.is_keyed);
+        assert_eq!(range.ranges.len(), 2);
+        assert_eq!(
+            (range.ranges[0].from, range.ranges[0].to, range.ranges[0].key.as_deref()),
+            (None, Some(100.0), None)
+        );
+        assert_eq!(
+            (range.ranges[1].from, range.ranges[1].to, range.ranges[1].key.as_deref()),
+            (Some(100.0), Some(300.5), Some("middle"))
+        );
+
+        let Ok(AggregationKind::DateRange(date_range)) = parse_first_kind(&json!({"d": {"date_range": {
+            "field": "timestamp", "time_zone": "Asia/Dubai",
+            "ranges": [{"from": "now-3d/d", "to": 1_791_462_896_789_i64}]
+        }}})) else {
+            panic!("a date_range parses to DateRange");
+        };
+        assert_eq!(
+            date_range.ranges[0].from,
+            Some(DateRangeBound::Expression("now-3d/d".into()))
+        );
+        assert_eq!(
+            date_range.ranges[0].to,
+            Some(DateRangeBound::EpochMillis(1_791_462_896_789))
+        );
+        assert!(date_range.time_zone.is_some());
+
+        let Ok(AggregationKind::Filters(named_filters)) = parse_first_kind(&json!({"f": {"filters": {"filters": {
+            "errors": {"term": {"severity_text": "ERROR"}}, "all": {"match_all": {}}
+        }}}})) else {
+            panic!("named filters parse to Filters");
+        };
+        let FiltersBuckets::Named(buckets) = &named_filters.filters else {
+            panic!("an object of filters is named");
+        };
+        let names: Vec<&str> = buckets.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["errors", "all"]);
+        let Ok(AggregationKind::Filters(anonymous_filters)) =
+            parse_first_kind(&json!({"f": {"filters": {"filters": [{"match_all": {}}]}}}))
+        else {
+            panic!("anonymous filters parse to Filters");
+        };
+        assert!(matches!(&anonymous_filters.filters, FiltersBuckets::Anonymous(queries) if queries.len() == 1));
+        assert!(matches!(
+            parse_first_kind(&json!({"one": {"filter": {"match_all": {}}}})),
+            Ok(AggregationKind::Filter(_))
+        ));
+
+        for refused_body in [
+            json!({"r": {"range": {"field": "duration_micros", "ranges": [{"from": "100"}]}}}),
+            json!({"r": {"range": {"field": "duration_micros", "ranges": []}}}),
+            json!({"r": {"range": {"field": "duration_micros", "ranges": [5]}}}),
+            json!({"r": {"range": {"field": "duration_micros", "ranges": [{"to": 1, "key": 5}]}}}),
+            json!({"r": {"range": {"field": "duration_micros", "keyed": "true", "ranges": [{"to": 1}]}}}),
+            json!({"r": {"range": {"ranges": [{"to": 1}]}}}),
+            json!({"r": {"range": {"field": "duration_micros"}}}),
+            json!({"d": {"date_range": {"field": "timestamp", "ranges": [{"from": true}]}}}),
+            // A fraction and an integer past i64 are no epoch milliseconds.
+            json!({"d": {"date_range": {"field": "timestamp", "ranges": [{"from": 1.5}]}}}),
+            json!({"d": {"date_range": {"field": "timestamp", "ranges": [{"from": 18_446_744_073_709_551_615_u64}]}}}),
+            json!({"d": {"date_range": {"ranges": [{"to": "now"}]}}}),
+            json!({"d": {"date_range": {"field": "timestamp"}}}),
+            json!({"d": {"date_range": {"field": "timestamp", "time_zone": "Mars/Base", "ranges": [{"to": "now"}]}}}),
+            json!({"f": {"filters": {"filters": {}}}}),
+            json!({"f": {"filters": {"filters": []}}}),
+            json!({"f": {"filters": {}}}),
+            json!({"f": {"filters": {"filters": {"a": {"no_such_query": {}}}}}}),
+            json!({"one": {"filter": {"no_such_query": {}}}}),
+        ] {
+            assert_refusal(refused_body, "parsing_exception").await;
+        }
+        assert_refusal(
+            json!({"d": {"date_range": {"field": "timestamp", "format": "basic_date", "ranges": [{"to": "now"}]}}}),
+            "illegal_argument_exception",
+        )
+        .await;
+        // An unknown key is a parsing_exception naming it under `construct`.
+        for (refused_body, construct) in [
+            (
+                json!({"r": {"range": {"field": "duration_micros", "ranges": [{"to": 1, "step": 2}]}}}),
+                "step",
+            ),
+            (
+                json!({"r": {"range": {"field": "duration_micros", "ranges": [{"to": 1}], "script": "x"}}}),
+                "script",
+            ),
+            (
+                json!({"d": {"date_range": {"field": "timestamp", "ranges": [{"to": "now", "step": 2}]}}}),
+                "step",
+            ),
+            (
+                json!({"d": {"date_range": {"field": "timestamp", "ranges": [{"to": "now"}], "keyed": true}}}),
+                "keyed",
+            ),
+            (
+                json!({"f": {"filters": {"filters": {"a": {"match_all": {}}}, "other_bucket": true}}}),
+                "other_bucket",
+            ),
+        ] {
+            let error = assert_refusal(refused_body, "parsing_exception").await;
+            assert_eq!(error["construct"], construct);
+        }
     }
 }

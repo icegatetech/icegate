@@ -5,14 +5,19 @@
 //! UTC epoch milliseconds of the bucket's local start. A `terms` answers
 //! `{doc_count_error_upper_bound: 0, sum_other_doc_count, buckets: [{key, doc_count, ..}]}`: the
 //! counts are exact, so the error bound is always `0`. A `histogram` key is the bucket's lower
-//! bound, `index × interval`, as a double. A sub-aggregation answers inside each bucket under its
-//! own name; a metric answers as `render_metric` writes it.
+//! bound, `index × interval`, as a double. A `range`, `date_range`, `filters` and `filter` answer
+//! every listed bucket in request order: a `range` with its key and echoed bounds (an object keyed
+//! by key when `keyed`), a `date_range` with its key and its bounds as epoch milliseconds and
+//! strings, named `filters` as an object keyed by name and anonymous ones as an array of bucket
+//! bodies, a `filter` as its single bucket's body. A sub-aggregation answers inside each bucket
+//! under its own name; a metric answers as `render_metric` writes it.
 
 use serde_json::{Map, Number, Value, json};
 
 use super::assemble::{AggregateReader, AssembledAggregations, BucketKey, LevelInstance, RowRef, SelectedBucket};
 use super::date_histogram::render_key_as_string;
 use super::metrics::render_metric;
+use super::multi_bucket::{FiltersBuckets, render_date_range_bounds, render_range_bounds};
 use super::plan::{AggregationLayout, BucketLevel, LayoutNode, LevelKind, PlanInputs};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::MICROS_PER_MILLISECOND;
@@ -96,6 +101,69 @@ impl Renderer<'_, '_> {
             LevelKind::DateHistogram { .. } | LevelKind::Histogram { .. } => Ok(json!({
                 "buckets": self.render_keyed_buckets(level, parent_path, instance)?
             })),
+            LevelKind::Range { spec } => {
+                let mut keyed_buckets = Map::new();
+                let mut listed_buckets = Vec::with_capacity(instance.buckets.len());
+                for (bucket, range) in instance.buckets.iter().zip(&spec.ranges) {
+                    let (key, mut object) = render_range_bounds(range);
+                    object.extend(self.render_bucket_body(level, parent_path, bucket)?);
+                    if spec.is_keyed {
+                        keyed_buckets.insert(key, Value::Object(object));
+                    } else {
+                        let mut entry = Map::new();
+                        entry.insert("key".to_string(), Value::String(key));
+                        entry.extend(object);
+                        listed_buckets.push(Value::Object(entry));
+                    }
+                }
+                let buckets = if spec.is_keyed {
+                    Value::Object(keyed_buckets)
+                } else {
+                    Value::Array(listed_buckets)
+                };
+                Ok(json!({ "buckets": buckets }))
+            }
+            LevelKind::DateRange { spec, bounds } => {
+                let mut listed_buckets = Vec::with_capacity(instance.buckets.len());
+                for ((bucket, range), resolved_range) in instance.buckets.iter().zip(&spec.ranges).zip(bounds) {
+                    let (key, object) = render_date_range_bounds(range, *resolved_range, spec.format)?;
+                    let mut entry = Map::new();
+                    entry.insert("key".to_string(), Value::String(key));
+                    entry.extend(object);
+                    entry.extend(self.render_bucket_body(level, parent_path, bucket)?);
+                    listed_buckets.push(Value::Object(entry));
+                }
+                Ok(json!({ "buckets": listed_buckets }))
+            }
+            LevelKind::Filters { spec, .. } => {
+                let buckets = match &spec.filters {
+                    FiltersBuckets::Named(filters) => {
+                        let mut keyed_buckets = Map::new();
+                        for (bucket, (name, _)) in instance.buckets.iter().zip(filters) {
+                            keyed_buckets.insert(
+                                name.clone(),
+                                Value::Object(self.render_bucket_body(level, parent_path, bucket)?),
+                            );
+                        }
+                        Value::Object(keyed_buckets)
+                    }
+                    FiltersBuckets::Anonymous(_) => Value::Array(
+                        instance
+                            .buckets
+                            .iter()
+                            .map(|bucket| self.render_bucket_body(level, parent_path, bucket).map(Value::Object))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    ),
+                };
+                Ok(json!({ "buckets": buckets }))
+            }
+            LevelKind::Filter { .. } => {
+                let bucket = instance
+                    .buckets
+                    .first()
+                    .ok_or_else(|| OpenSearchError::internal("a filter level answers no bucket"))?;
+                Ok(Value::Object(self.render_bucket_body(level, parent_path, bucket)?))
+            }
         }
     }
 
@@ -180,6 +248,16 @@ fn insert_bucket_key(
         (LevelKind::Terms { .. }, key) => insert_terms_key(object, key),
         (LevelKind::DateHistogram { .. } | LevelKind::Histogram { .. }, _) => Err(OpenSearchError::internal(format!(
             "a key of [{}] does not fit its level",
+            level.name
+        ))),
+        (
+            LevelKind::Range { .. }
+            | LevelKind::DateRange { .. }
+            | LevelKind::Filters { .. }
+            | LevelKind::Filter { .. },
+            _,
+        ) => Err(OpenSearchError::internal(format!(
+            "a bucket of [{}] renders its key with its bounds or its name",
             level.name
         ))),
     }

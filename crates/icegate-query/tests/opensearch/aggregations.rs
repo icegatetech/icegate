@@ -4,14 +4,16 @@
 
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 use icegate_common::LOGS_TABLE;
-use icegate_common::schema::{COL_DURATION_MICROS, COL_SEVERITY_TEXT, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID};
+use icegate_common::schema::{
+    COL_DURATION_MICROS, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID,
+};
 use icegate_query::opensearch::OpenSearchConfig;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::data::{
-    build_log_row_at_minute, build_service_log_row_at_minute, build_wal_log_row_at_minute, commit_log_rows,
-    create_exact_name_table, required_string, write_wal_segment,
+    Cell, Row, build_log_row_at_minute, build_service_log_row_at_minute, build_wal_log_row_at_minute, commit_log_rows,
+    commit_rows, compute_micros_at_minute, create_exact_name_table, required_string, write_wal_segment,
 };
 use super::harness::TestServer;
 use super::requests::send_request;
@@ -376,5 +378,100 @@ async fn a_metric_or_histogram_over_a_field_typed_differently_across_indices_is_
             "{aggregation}"
         );
     }
+    server.shutdown().await;
+}
+
+/// A row of the exact-name table `audit_events`: `service_name` at `minute` past 10:00Z.
+fn build_audit_row<'a>(tenant: &'a str, minute: i64, service_name: &'a str) -> Row<'a> {
+    Row {
+        tenant,
+        cells: vec![
+            (COL_TIMESTAMP, Cell::Micros(compute_micros_at_minute(minute))),
+            (COL_SERVICE_NAME, Cell::Text(service_name)),
+        ],
+    }
+}
+
+/// `logs` maps `service_name` and `severity_text`; `audit_events` maps `service_name` only, so a
+/// bucket query on `severity_text` matches none of its rows. The table is created before the
+/// listener's first session, so the first catalog listing holds it.
+#[tokio::test]
+async fn filter_and_filters_buckets_lower_their_queries_per_index() {
+    let (server, catalog) = TestServer::start().await;
+    create_exact_name_table(
+        &catalog,
+        "audit_events",
+        vec![
+            required_string(1, COL_TENANT_ID),
+            NestedField::required(2, COL_TIMESTAMP, Type::Primitive(PrimitiveType::Timestamp)),
+            NestedField::optional(3, COL_SERVICE_NAME, Type::Primitive(PrimitiveType::String)),
+        ],
+    )
+    .await
+    .expect("create audit_events");
+    // Tenant B's rows would raise `errors` to 3 and `checkout_only` to 6 if they leaked.
+    commit_log_rows(
+        &catalog,
+        &[
+            build_service_log_row_at_minute(TENANT_A, 5, "checkout", "ERROR", "an aggregation row"),
+            build_service_log_row_at_minute(TENANT_B, 7, "checkout", "ERROR", "a tenant-b row"),
+            build_service_log_row_at_minute(TENANT_A, 10, "cart", "ERROR", "an aggregation row"),
+            build_service_log_row_at_minute(TENANT_A, 20, "checkout", "INFO", "an aggregation row"),
+            build_service_log_row_at_minute(TENANT_A, 30, "checkout", "WARN", "an aggregation row"),
+        ],
+    )
+    .await
+    .expect("commit logs");
+    commit_rows(
+        &catalog,
+        "audit_events",
+        &[
+            build_audit_row(TENANT_A, 15, "checkout"),
+            build_audit_row(TENANT_B, 16, "checkout"),
+            build_audit_row(TENANT_A, 25, "cart"),
+        ],
+    )
+    .await
+    .expect("commit audit_events");
+
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/logs,audit_events/_search",
+        Some(&json!({
+            "size": 0,
+            "aggs": {
+                "levels": {"filters": {"filters": {
+                    "errors": {"term": {"severity_text": "ERROR"}},
+                    "infos": {"term": {"severity_text": "INFO"}}
+                }}},
+                "checkout_only": {
+                    "filter": {"term": {"service_name": "checkout"}},
+                    "aggs": {"severities": {"terms": {"field": "severity_text"}}}
+                }
+            }
+        })),
+    )
+    .await
+    .expect("search request");
+
+    // errors: the two ERROR logs; infos: the INFO log. checkout_only: three logs and one
+    // audit_events row, whose missing severity forms no severities bucket.
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        answer["aggregations"],
+        json!({
+            "levels": {"buckets": {"errors": {"doc_count": 2}, "infos": {"doc_count": 1}}},
+            "checkout_only": {
+                "doc_count": 4,
+                "severities": {"doc_count_error_upper_bound": 0, "sum_other_doc_count": 0, "buckets": [
+                    {"key": "ERROR", "doc_count": 1},
+                    {"key": "INFO", "doc_count": 1},
+                    {"key": "WARN", "doc_count": 1}
+                ]}
+            }
+        })
+    );
     server.shutdown().await;
 }

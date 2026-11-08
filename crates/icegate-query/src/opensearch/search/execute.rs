@@ -114,6 +114,7 @@ pub(crate) async fn search_data_indices(
     let scope = AggregationScope {
         session,
         max_buckets: limits.max_buckets,
+        now: context.now,
     };
     let aggregations = execute_aggregations(rows, &tree, &scope).await?;
     let Value::Object(body) = &mut response else {

@@ -2,13 +2,20 @@
 //!
 //! The aggregation tree is laid out in preorder ([`AggregationLayout`]): every bucket
 //! aggregation is a level whose key is computed from the matching rows, and every metric is
-//! read at the level that declares it, or over every matching row at the top. One `Aggregate`
-//! over GROUPING SETS computes every level and every metric of the request: one set per level,
-//! the key columns of its path from the top, plus the empty set when there are top-level
-//! metrics. `grouping()` tags each grouped row with the set it belongs to, so a level's buckets
-//! are told apart from its ancestors' even when a key is NULL, and a parent-level metric is
-//! computed at the parent's own granularity, never rebuilt from its children. The aggregate is
-//! executed once and its rows are collected, so the matching rows are read once.
+//! read at the level that declares it, or over every matching row at the top. A stage is one
+//! `Aggregate` over GROUPING SETS: one set per level it computes, the key columns of the level's
+//! path from the top, plus the empty set when it computes the top-level metrics. `grouping()`
+//! tags each grouped row with the set it belongs to, so a level's buckets are told apart from
+//! its ancestors' even when a key is NULL, and a parent-level metric is computed at the parent's
+//! own granularity, never rebuilt from its children.
+//!
+//! A `range`, `date_range` or `filters` level whose buckets can overlap keys each row by the
+//! list of the buckets it belongs to (`multi_bucket`). The levels whose paths cross the same
+//! such levels share one stage, which reads the matching rows with those lists unnested, so a
+//! row repeats only for the buckets it belongs to at those levels and below them. Every other
+//! level and the top-level metrics share the stage without an unnest. A request without
+//! overlapping buckets therefore has one stage, and each stage executes once, so it reads the
+//! matching rows once.
 //!
 //! Selection reads the collected rows in Rust (`assemble`): a level's buckets are read only
 //! under the surviving buckets of its parent, which is the semi-join to the surviving ancestors,
@@ -34,6 +41,10 @@ use super::assemble::{HISTOGRAM_INDEX_LIMIT, HISTOGRAM_INDEX_OUT_OF_RANGE, Stage
 use super::date_histogram::BucketRounding;
 use super::metrics::{
     MetricInput, MetricKind, MetricSpec, Statistic, plan_metric_input, plan_statistic, resolve_order_statistic,
+};
+use super::multi_bucket::{
+    DateRangeBucketsSpec, FiltersSpec, RangeBucketsSpec, ResolvedDateRange, are_disjoint, plan_ordinals,
+    plan_range_conditions, resolve_date_ranges,
 };
 use super::parse::{
     AggregationKind, AggregationTree, DateHistogramSpec, HistogramSpec, NamedAggregation, read_epoch_millis,
@@ -74,12 +85,21 @@ pub(super) fn name_statistic_column(metric: usize, statistic: Statistic) -> Stri
     format!("__metric_{metric}_{}", statistic.read_column_suffix())
 }
 
+/// The rows-plan column holding whether a row matches the `filter` / `filters` bucket query at
+/// `ordinal` of [`AggregationLayout::bucket_queries`].
+pub(super) fn name_bucket_filter_column(ordinal: usize) -> String {
+    format!("__bucket_filter_{ordinal}")
+}
+
 /// What executing aggregations needs from the request.
 pub(crate) struct AggregationScope<'a> {
     /// The tenant session the plans execute in.
     pub(crate) session: &'a TenantSession,
     /// The most buckets the request may answer, every level of every aggregation counted.
     pub(crate) max_buckets: usize,
+    /// The request's `now`, taken once per request, which `date_range` bounds resolve
+    /// against.
+    pub(crate) now: DateTime<Utc>,
 }
 
 /// Where an aggregation of the request sits in the layout.
@@ -128,6 +148,33 @@ pub(super) enum LevelKind<'a> {
         /// The request.
         spec: &'a HistogramSpec,
     },
+    /// `range` buckets.
+    Range {
+        /// The request.
+        spec: &'a RangeBucketsSpec,
+    },
+    /// `date_range` buckets.
+    DateRange {
+        /// The request.
+        spec: &'a DateRangeBucketsSpec,
+        /// Its ranges, resolved against the request's `now`.
+        bounds: Vec<ResolvedDateRange>,
+    },
+    /// `filters` buckets: one per bucket query, the queries at `first_filter_ordinal ..
+    /// first_filter_ordinal + filter_count` of the layout's `bucket_queries`.
+    Filters {
+        /// The request.
+        spec: &'a FiltersSpec,
+        /// The ordinal of the level's first bucket query.
+        first_filter_ordinal: usize,
+        /// How many bucket queries the level holds.
+        filter_count: usize,
+    },
+    /// The `filter` bucket: the layout's bucket query at `filter_ordinal`.
+    Filter {
+        /// The ordinal of the level's bucket query.
+        filter_ordinal: usize,
+    },
 }
 
 /// A bucket aggregation of the request.
@@ -172,10 +219,16 @@ pub(super) struct AggregationLayout<'a> {
     pub(super) levels: Vec<BucketLevel<'a>>,
     /// Every metric aggregation, by metric index.
     pub(super) metrics: Vec<MetricSlot<'a>>,
+    /// The query of every `filter` and `filters` bucket, in preorder; the position of a query is
+    /// the ordinal of its column in the rows plan ([`name_bucket_filter_column`]).
+    pub(super) bucket_queries: Vec<&'a Query>,
+    /// The request's `now`, which `date_range` bounds resolve against.
+    now: DateTime<Utc>,
 }
 
 impl<'a> AggregationLayout<'a> {
-    /// Lay out `tree` and resolve every `terms` order path to its metric.
+    /// Lay out `tree`, resolve every `terms` order path to its metric and every `date_range`
+    /// bound against `now`, and number the bucket queries.
     ///
     /// # Errors
     ///
@@ -183,13 +236,16 @@ impl<'a> AggregationLayout<'a> {
     /// aggregation_execution_exception` for an order path naming no metric sub-aggregation of
     /// its level, or no statistic of that metric; `400 illegal_argument_exception` for more than
     /// `MAX_BUCKET_LEVELS` bucket aggregations in the request (naming the top-level aggregation
-    /// that passes the limit under `aggregation`, the limit under `limit`), or a `date_histogram`
-    /// interval or offset out of range.
-    pub(super) fn new(tree: &'a AggregationTree) -> Result<Self, OpenSearchError> {
+    /// that passes the limit under `aggregation`, the limit under `limit`), a `date_histogram`
+    /// interval or offset out of range, and a `date_range` bound that is malformed or outside
+    /// the representable time range ([`resolve_date_ranges`]).
+    pub(super) fn new(tree: &'a AggregationTree, now: DateTime<Utc>) -> Result<Self, OpenSearchError> {
         let mut layout = Self {
             top: Vec::with_capacity(tree.aggregations.len()),
             levels: Vec::new(),
             metrics: Vec::new(),
+            bucket_queries: Vec::new(),
+            now,
         };
         for aggregation in &tree.aggregations {
             let node = layout.add_node(aggregation, &[])?;
@@ -221,6 +277,28 @@ impl<'a> AggregationLayout<'a> {
             }
             AggregationKind::Terms(spec) => self.add_level(aggregation, LevelKind::Terms { spec }, ancestors),
             AggregationKind::Histogram(spec) => self.add_level(aggregation, LevelKind::Histogram { spec }, ancestors),
+            AggregationKind::Range(spec) => self.add_level(aggregation, LevelKind::Range { spec }, ancestors),
+            AggregationKind::DateRange(spec) => {
+                let bounds = resolve_date_ranges(&aggregation.name, spec, self.now)?;
+                self.add_level(aggregation, LevelKind::DateRange { spec, bounds }, ancestors)
+            }
+            AggregationKind::Filters(spec) => {
+                let queries = spec.list_queries();
+                let first_filter_ordinal = self.bucket_queries.len();
+                let filter_count = queries.len();
+                self.bucket_queries.extend(queries);
+                let kind = LevelKind::Filters {
+                    spec,
+                    first_filter_ordinal,
+                    filter_count,
+                };
+                self.add_level(aggregation, kind, ancestors)
+            }
+            AggregationKind::Filter(query) => {
+                let filter_ordinal = self.bucket_queries.len();
+                self.bucket_queries.push(query);
+                self.add_level(aggregation, LevelKind::Filter { filter_ordinal }, ancestors)
+            }
             AggregationKind::Avg(spec) => self.add_metric(aggregation, MetricKind::Avg, spec, ancestors),
             AggregationKind::Sum(spec) => self.add_metric(aggregation, MetricKind::Sum, spec, ancestors),
             AggregationKind::Min(spec) => self.add_metric(aggregation, MetricKind::Min, spec, ancestors),
@@ -248,7 +326,12 @@ impl<'a> AggregationLayout<'a> {
         path.push(level);
         let ranking_spec = match &kind {
             LevelKind::Terms { spec } => Some(*spec),
-            LevelKind::DateHistogram { .. } | LevelKind::Histogram { .. } => None,
+            LevelKind::DateHistogram { .. }
+            | LevelKind::Histogram { .. }
+            | LevelKind::Range { .. }
+            | LevelKind::DateRange { .. }
+            | LevelKind::Filters { .. }
+            | LevelKind::Filter { .. } => None,
         };
         self.levels.push(BucketLevel {
             name: &aggregation.name,
@@ -365,11 +448,21 @@ pub(super) fn read_row_field(rows: &DFSchema, field: &str, aggregation: &str) ->
     })
 }
 
+/// The key a bucket level groups the rows by.
+pub(super) struct LevelKey {
+    /// Each row's key, or, when `is_membership_list`, the list of the ordinals of every bucket
+    /// the row belongs to. A NULL key (or a NULL entry) puts the row in no bucket of the level
+    /// or below it; the row still counts in its parent bucket.
+    pub(super) expr: Expr,
+    /// Whether `expr` is a membership list, which the planner unnests in a stage aggregate of
+    /// the level's own.
+    pub(super) is_membership_list: bool,
+}
+
 /// What the planner evaluates over the matching rows, by layout position.
 pub(super) struct PlanInputs {
-    /// The key of every level, by level index: NULL puts a row in no bucket of the level or
-    /// below it, and the row still counts in its parent bucket.
-    pub(super) level_keys: Vec<Expr>,
+    /// The key of every level, by level index.
+    pub(super) level_keys: Vec<LevelKey>,
     /// The input of every metric, by metric index.
     pub(super) metric_inputs: Vec<MetricInput>,
 }
@@ -380,8 +473,8 @@ pub(super) struct PlanInputs {
 /// # Errors
 ///
 /// `400 illegal_argument_exception` for a `missing` or an `include` / `exclude` value that does
-/// not fit the field's type, and for a pattern on a key that is not a string keyword; `500` for
-/// a column the rows plan lacks.
+/// not fit the field's type, for a pattern on a key that is not a string keyword, and for more
+/// buckets in one level than an `Int32` ordinal numbers; `500` for a column the rows plan lacks.
 pub(super) fn resolve_plan_inputs(
     layout: &AggregationLayout<'_>,
     rows: &DFSchema,
@@ -409,10 +502,18 @@ pub(super) fn resolve_plan_inputs(
 /// [`read_level_key`](super::assemble::read_level_key) refuses with a
 /// `400 illegal_argument_exception` naming the aggregation.
 ///
+/// A `range`, `date_range`, `filters` or `filter` level is keyed by bucket ordinal
+/// ([`plan_ordinals`]): a scalar when no row can meet two of its conditions, a membership list
+/// otherwise.
+///
 /// # Errors
 ///
 /// The errors of [`resolve_plan_inputs`] for one level.
-fn plan_level_key(level: &BucketLevel<'_>, rows: &DFSchema) -> Result<Expr, OpenSearchError> {
+fn plan_level_key(level: &BucketLevel<'_>, rows: &DFSchema) -> Result<LevelKey, OpenSearchError> {
+    let build_scalar_key = |expr: Expr| LevelKey {
+        expr,
+        is_membership_list: false,
+    };
     match &level.kind {
         LevelKind::DateHistogram { spec, rounding } => {
             let field = read_row_field(rows, &spec.field, level.name)?.expr;
@@ -433,7 +534,7 @@ fn plan_level_key(level: &BucketLevel<'_>, rows: &DFSchema) -> Result<Expr, Open
                 }
                 None => field,
             };
-            rounding.key_expression(value)
+            rounding.key_expression(value).map(build_scalar_key)
         }
         LevelKind::Terms { spec } => {
             let field = read_row_field(rows, &spec.field, level.name)?;
@@ -447,8 +548,8 @@ fn plan_level_key(level: &BucketLevel<'_>, rows: &DFSchema) -> Result<Expr, Open
             // `include` / `exclude` apply before ranking: a refused key becomes NULL, so its rows
             // form no group (and hold no aggregate state) and still count in the parent.
             match build_filter_predicate(level.name, spec, &key, &field.data_type)? {
-                Some(admitted) => when(admitted, key).end().map_err(convert_plan_error),
-                None => Ok(key),
+                Some(admitted) => when(admitted, key).end().map(build_scalar_key).map_err(convert_plan_error),
+                None => Ok(build_scalar_key(key)),
             }
         }
         LevelKind::Histogram { spec } => {
@@ -466,7 +567,33 @@ fn plan_level_key(level: &BucketLevel<'_>, rows: &DFSchema) -> Result<Expr, Open
             when(is_in_range, cast(index.clone(), DataType::Int64))
                 .when(index.is_not_null(), lit(HISTOGRAM_INDEX_OUT_OF_RANGE))
                 .end()
+                .map(build_scalar_key)
                 .map_err(convert_plan_error)
+        }
+        LevelKind::Range { spec } => {
+            let value = cast(read_row_field(rows, &spec.field, level.name)?.expr, DataType::Float64);
+            let bounds: Vec<(Option<f64>, Option<f64>)> =
+                spec.ranges.iter().map(|range| (range.from, range.to)).collect();
+            plan_ordinals(plan_range_conditions(&value, &bounds), are_disjoint(&bounds))
+        }
+        LevelKind::DateRange { spec, bounds } => {
+            let micros = cast(read_row_field(rows, &spec.field, level.name)?.expr, DataType::Int64);
+            let bounds: Vec<(Option<i64>, Option<i64>)> =
+                bounds.iter().map(|range| (range.from_micros, range.to_micros)).collect();
+            plan_ordinals(plan_range_conditions(&micros, &bounds), are_disjoint(&bounds))
+        }
+        LevelKind::Filters {
+            first_filter_ordinal,
+            filter_count,
+            ..
+        } => {
+            let conditions = (*first_filter_ordinal..first_filter_ordinal + filter_count)
+                .map(|ordinal| col(name_bucket_filter_column(ordinal)))
+                .collect();
+            plan_ordinals(conditions, *filter_count == 1)
+        }
+        LevelKind::Filter { filter_ordinal } => {
+            plan_ordinals(vec![col(name_bucket_filter_column(*filter_ordinal))], true)
         }
     }
 }
@@ -493,6 +620,11 @@ pub(super) fn list_granularity_levels<'l>(layout: &'l AggregationLayout<'_>, gra
 /// The aggregates computing every bucket and metric of `layout` over `rows`; an empty layout
 /// plans nothing.
 ///
+/// Granularities whose paths cross the same membership-list levels share one stage aggregate
+/// over the rows with those lists unnested. A row therefore repeats for the buckets it belongs to
+/// at those levels and below them, never for an ancestor or a sibling. Each stage reads the
+/// matching rows once; a request without membership-list levels has one stage.
+///
 /// # Errors
 ///
 /// `500` when a plan fails to type-check.
@@ -501,14 +633,72 @@ pub(super) fn plan_aggregations(
     layout: &AggregationLayout<'_>,
     inputs: &PlanInputs,
 ) -> Result<Vec<StagePlan>, OpenSearchError> {
-    let mut members: Vec<Granularity> = (0..layout.levels.len()).map(Granularity::Level).collect();
-    if layout.metrics.iter().any(|slot| slot.granularity == Granularity::Top) {
-        members.push(Granularity::Top);
+    let mut stages: Vec<(Vec<usize>, Vec<Granularity>)> = Vec::new();
+    for level in 0..layout.levels.len() {
+        let granularity = Granularity::Level(level);
+        add_stage_member(
+            &mut stages,
+            list_membership_chain(layout, inputs, granularity),
+            granularity,
+        );
     }
-    if members.is_empty() {
+    if layout.metrics.iter().any(|slot| slot.granularity == Granularity::Top) {
+        add_stage_member(&mut stages, Vec::new(), Granularity::Top);
+    }
+    if stages.is_empty() {
         return Ok(Vec::new());
     }
-    Ok(vec![plan_stage(project_inputs(rows, inputs)?, layout, &members)?])
+    let projected_rows = project_inputs(rows, inputs)?.build().map_err(convert_plan_error)?;
+    stages
+        .into_iter()
+        .map(|(chain, members)| plan_stage(unnest_memberships(&projected_rows, &chain)?, layout, &members))
+        .collect()
+}
+
+/// The membership-list levels on `granularity`'s path, top first: the unnests its rows need.
+pub(super) fn list_membership_chain(
+    layout: &AggregationLayout<'_>,
+    inputs: &PlanInputs,
+    granularity: Granularity,
+) -> Vec<usize> {
+    list_granularity_levels(layout, granularity)
+        .iter()
+        .copied()
+        .filter(|level| inputs.level_keys[*level].is_membership_list)
+        .collect()
+}
+
+/// Add `member` to the stage of `chain`, opening that stage when it is the first member.
+pub(super) fn add_stage_member(
+    stages: &mut Vec<(Vec<usize>, Vec<Granularity>)>,
+    chain: Vec<usize>,
+    member: Granularity,
+) {
+    if let Some((_, members)) = stages.iter_mut().find(|(stage_chain, _)| *stage_chain == chain) {
+        members.push(member);
+        return;
+    }
+    stages.push((chain, vec![member]));
+}
+
+/// The projected rows with the membership list of every level of `chain` unnested and its NULL
+/// entries (conditions the row fails) dropped.
+///
+/// # Errors
+///
+/// `500` when the unnest or the filter fails to type-check.
+pub(super) fn unnest_memberships(
+    projected_rows: &LogicalPlan,
+    chain: &[usize],
+) -> Result<LogicalPlanBuilder, OpenSearchError> {
+    chain
+        .iter()
+        .try_fold(LogicalPlanBuilder::from(projected_rows.clone()), |relation, level| {
+            relation
+                .unnest_column(Column::from_name(name_key_column(*level)))
+                .and_then(|unnested_rows| unnested_rows.filter(col(name_key_column(*level)).is_not_null()))
+                .map_err(convert_plan_error)
+        })
 }
 
 /// The rows projected onto the level keys and metric values the aggregates read.
@@ -521,7 +711,7 @@ pub(super) fn project_inputs(rows: LogicalPlan, inputs: &PlanInputs) -> Result<L
         .level_keys
         .iter()
         .enumerate()
-        .map(|(level, key)| key.clone().alias(name_key_column(level)));
+        .map(|(level, key)| key.expr.clone().alias(name_key_column(level)));
     let values = inputs
         .metric_inputs
         .iter()
@@ -629,10 +819,11 @@ pub(super) fn compute_level_mask(grouped_levels: &[usize], path: &[usize]) -> Re
 /// Answer the aggregations of `tree` over `rows`.
 ///
 /// `rows` holds one column per field the tree names, named by the field name and holding the
-/// field's single type across the searched indices; a row lacking the field holds NULL
-/// ([`plan_aggregation_rows`] builds it). The answer maps each top-level aggregation's request
-/// name to its rendered result. Every aggregation of the request is computed by one aggregate,
-/// so the matching rows are read once, and every plan runs in `scope.session`, so the plans
+/// field's single type across the searched indices (a row lacking the field holds NULL), and one
+/// `Boolean` column per `filter` / `filters` bucket query ([`plan_aggregation_rows`] builds it).
+/// The answer maps each top-level aggregation's request name to its rendered result. The
+/// aggregations are computed by one stage aggregate, plus one per distinct chain of levels whose
+/// buckets overlap ([`plan_aggregations`]), and every plan runs in `scope.session`, so the plans
 /// share its memory pool and its limit.
 ///
 /// # Errors
@@ -647,7 +838,7 @@ pub(crate) async fn execute_aggregations(
     tree: &AggregationTree,
     scope: &AggregationScope<'_>,
 ) -> Result<Map<String, Value>, OpenSearchError> {
-    let layout = AggregationLayout::new(tree)?;
+    let layout = AggregationLayout::new(tree, scope.now)?;
     let inputs = resolve_plan_inputs(&layout, rows.schema())?;
     let stages = plan_aggregations(rows, &layout, &inputs)?;
     let session = scope.session;
@@ -680,21 +871,24 @@ struct AggregationField {
     values: Vec<Option<FieldValue>>,
 }
 
-/// The matching rows of a search, projected onto the fields `tree` reads.
+/// The matching rows of a search, projected onto what `tree` reads.
 ///
 /// One branch per index: its scan, filtered by the query lowered for that index, projected onto
 /// one column per field (NULL where the index lacks the field), every column cast to the field's
-/// single type. The branches are concatenated with `UNION ALL`; because every branch already
-/// has the same column types, no union coercion takes place. With no index the plan is empty.
+/// single type, and onto one `Boolean` column per `filter` / `filters` bucket query
+/// ([`name_bucket_filter_column`]): the bucket query lowered for that index, `false` where it
+/// does not match, so a field the index does not map matches nothing there. The branches are
+/// concatenated with `UNION ALL`; because every branch already has the same column types, no
+/// union coercion takes place. With no index the plan is empty.
 ///
 /// # Errors
 ///
-/// `400 aggregation_execution_exception` for a field an aggregation reads that the searched
-/// indices map to different types, or store as different Arrow types, with `field` and
-/// `indices_by_type` naming the indices of each type; `400 illegal_argument_exception` for a
-/// field an aggregation cannot read (as [`check_field_for_aggregation`] lists them), with the
-/// `field`, its `field_type`, the `index`, the `aggregation` and its `aggregation_type`; the
-/// lowering's errors; `500` when planning fails.
+/// The layout's errors ([`AggregationLayout::new`]); `400 aggregation_execution_exception` for a
+/// field an aggregation reads that the searched indices map to different types, or store as
+/// different Arrow types, with `field` and `indices_by_type` naming the indices of each type; `400
+/// illegal_argument_exception` for a field an aggregation cannot read (as
+/// [`check_field_for_aggregation`] lists them), with the `field`, its `field_type`, the `index`,
+/// the `aggregation` and its `aggregation_type`; the lowering's errors; `500` when planning fails.
 pub(crate) fn plan_aggregation_rows(
     session: &TenantSession,
     entries: &[&IndexEntry],
@@ -702,15 +896,20 @@ pub(crate) fn plan_aggregation_rows(
     now: DateTime<Utc>,
     tree: &AggregationTree,
 ) -> Result<LogicalPlan, OpenSearchError> {
+    let layout = AggregationLayout::new(tree, now)?;
     let fields = resolve_aggregation_fields(session, entries, tree)?;
     let mut branches = Vec::with_capacity(entries.len());
     for (position, &entry) in entries.iter().enumerate() {
         let scope = LoweringScope { session, entry, now };
         let predicate = lower_query(query, &scope)?;
-        let projection = fields
+        let mut projection = fields
             .iter()
             .map(|field| build_branch_column(field, position))
             .collect::<Result<Vec<_>, _>>()?;
+        for (ordinal, bucket_query) in layout.bucket_queries.iter().enumerate() {
+            let bucket_match = lower_query(bucket_query, &scope)?;
+            projection.push(coalesce(vec![bucket_match, lit(false)]).alias(name_bucket_filter_column(ordinal)));
+        }
         let branch = session
             .scan_index(entry)?
             .filter(predicate)
@@ -720,24 +919,27 @@ pub(crate) fn plan_aggregation_rows(
         branches.push(branch);
     }
     let mut branches = branches.into_iter();
-    let Some(first) = branches.next() else {
-        let nulls = fields
+    let Some(first_branch) = branches.next() else {
+        let mut nulls = fields
             .iter()
             .map(|field| build_typed_null(&field.data_type).map(|null| null.alias(field.name.as_str())))
             .collect::<Result<Vec<_>, _>>()?;
+        nulls.extend(
+            (0..layout.bucket_queries.len()).map(|ordinal| lit(false).alias(name_bucket_filter_column(ordinal))),
+        );
         return LogicalPlanBuilder::empty(false)
             .project(nulls)
             .and_then(LogicalPlanBuilder::build)
             .map_err(convert_plan_error);
     };
     branches
-        .try_fold(LogicalPlanBuilder::from(first), LogicalPlanBuilder::union)
+        .try_fold(LogicalPlanBuilder::from(first_branch), LogicalPlanBuilder::union)
         .and_then(LogicalPlanBuilder::build)
         .map_err(convert_plan_error)
 }
 
 /// The distinct fields the aggregations of `tree` read, each checked against every aggregation
-/// that reads it.
+/// that reads it; `filter` and `filters` read none.
 fn resolve_aggregation_fields(
     session: &TenantSession,
     entries: &[&IndexEntry],
@@ -745,14 +947,18 @@ fn resolve_aggregation_fields(
 ) -> Result<Vec<AggregationField>, OpenSearchError> {
     let mut fields: Vec<AggregationField> = Vec::new();
     for aggregation in list_aggregations(tree) {
-        let name = aggregation.kind.field();
+        let Some(name) = aggregation.kind.field() else {
+            continue;
+        };
         let resolved: Vec<Option<ResolvedField>> =
             entries.iter().map(|entry| session.resolve_field(entry, name)).collect();
-        check_field_for_aggregation(aggregation, entries, &resolved)?;
-        if fields.iter().all(|field| field.name != name) {
+        check_field_for_aggregation(aggregation, name, entries, &resolved)?;
+        if fields.iter().all(|field| field.name != name)
+            && let Some(data_type) = choose_row_data_type(aggregation, &resolved)
+        {
             fields.push(AggregationField {
                 name: name.to_string(),
-                data_type: choose_row_data_type(aggregation, &resolved),
+                data_type,
                 values: resolved.into_iter().map(|field| field.map(|field| field.value)).collect(),
             });
         }
@@ -772,15 +978,16 @@ fn list_aggregations(tree: &AggregationTree) -> Vec<&NamedAggregation> {
 }
 
 /// Refuse a field mapped to different types, or stored as different Arrow types, across the
-/// searched indices, and a field `aggregation` cannot read. A `histogram` reads numbers; `avg`,
-/// `sum`, `min`, `max` and `stats` read numbers, booleans and dates; a `date_histogram` reads
-/// dates; a `terms` and a `value_count` read anything but text and objects.
+/// searched indices, and a field `aggregation` cannot read. A bucket or a numeric metric reads
+/// numbers (`histogram`, `range`; `avg`, `sum`, `min`, `max` and `stats` also booleans and
+/// dates), a `date_histogram` and a `date_range` dates, a `terms` and a `value_count` anything
+/// but text and objects; `filter` and `filters` read no field.
 fn check_field_for_aggregation(
     aggregation: &NamedAggregation,
+    field_name: &str,
     entries: &[&IndexEntry],
     resolved: &[Option<ResolvedField>],
 ) -> Result<(), OpenSearchError> {
-    let field_name = aggregation.kind.field();
     let mapped_fields: Vec<(&str, &ResolvedField)> = entries
         .iter()
         .zip(resolved)
@@ -819,6 +1026,8 @@ fn check_field_for_aggregation(
         AggregationKind::DateHistogram(_) if !matches!(field_type, FieldType::Date) => refuse("date_histogram"),
         AggregationKind::Terms(_) if is_text_or_object => refuse("terms"),
         AggregationKind::Histogram(_) if !is_number => refuse("histogram"),
+        AggregationKind::Range(_) if !is_number => refuse("range"),
+        AggregationKind::DateRange(_) if !matches!(field_type, FieldType::Date) => refuse("date_range"),
         AggregationKind::Avg(_) if !is_metric_input => refuse("avg"),
         AggregationKind::Sum(_) if !is_metric_input => refuse("sum"),
         AggregationKind::Min(_) if !is_metric_input => refuse("min"),
@@ -833,7 +1042,11 @@ fn check_field_for_aggregation(
         | AggregationKind::Min(_)
         | AggregationKind::Max(_)
         | AggregationKind::ValueCount(_)
-        | AggregationKind::Stats(_) => Ok(()),
+        | AggregationKind::Stats(_)
+        | AggregationKind::Range(_)
+        | AggregationKind::DateRange(_)
+        | AggregationKind::Filters(_)
+        | AggregationKind::Filter(_) => Ok(()),
     }
 }
 
@@ -869,22 +1082,24 @@ fn check_single_kind<K: Ord + Display>(
 }
 
 /// The type a field holds in the rows plan: the type of its first mapping, or the kind's own
-/// type when no searched index maps it.
-fn choose_row_data_type(aggregation: &NamedAggregation, resolved: &[Option<ResolvedField>]) -> DataType {
-    resolved
-        .iter()
-        .flatten()
-        .find_map(map_field_data_type)
-        .unwrap_or(match &aggregation.kind {
-            AggregationKind::DateHistogram(_) => DataType::Timestamp(TimeUnit::Microsecond, None),
-            AggregationKind::Terms(_) | AggregationKind::ValueCount(_) => DataType::Utf8,
-            AggregationKind::Histogram(_)
-            | AggregationKind::Avg(_)
-            | AggregationKind::Sum(_)
-            | AggregationKind::Min(_)
-            | AggregationKind::Max(_)
-            | AggregationKind::Stats(_) => DataType::Float64,
-        })
+/// type when no searched index maps it (the column is then NULL in every row); `None` for the
+/// kinds that read no field.
+fn choose_row_data_type(aggregation: &NamedAggregation, resolved: &[Option<ResolvedField>]) -> Option<DataType> {
+    let fallback = match &aggregation.kind {
+        AggregationKind::DateHistogram(_) | AggregationKind::DateRange(_) => {
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        }
+        AggregationKind::Terms(_) | AggregationKind::ValueCount(_) => DataType::Utf8,
+        AggregationKind::Histogram(_)
+        | AggregationKind::Range(_)
+        | AggregationKind::Avg(_)
+        | AggregationKind::Sum(_)
+        | AggregationKind::Min(_)
+        | AggregationKind::Max(_)
+        | AggregationKind::Stats(_) => DataType::Float64,
+        AggregationKind::Filters(_) | AggregationKind::Filter(_) => return None,
+    };
+    Some(resolved.iter().flatten().find_map(map_field_data_type).unwrap_or(fallback))
 }
 
 /// The Arrow type a field of `field`'s type holds in the rows plan; `None` for a type no
@@ -949,6 +1164,12 @@ mod tests {
         SearchLimitsConfig::default().max_buckets
     }
 
+    /// The request instant every planner test that does not state its own runs at; a test that
+    /// depends on it asserts it.
+    pub(super) const fn read_request_now() -> DateTime<Utc> {
+        DateTime::from_timestamp_micros(1_791_462_896_789_000).expect("a valid instant")
+    }
+
     /// Rows of one nullable `Timestamp(µs, None)` column named `field`.
     fn build_date_rows(field: &str, instants: &[Option<&str>]) -> RecordBatch {
         let values: TimestampMicrosecondArray = instants.iter().map(|text| text.map(parse_instant_micros)).collect();
@@ -976,6 +1197,7 @@ mod tests {
         let scope = AggregationScope {
             session: &session,
             max_buckets,
+            now: read_request_now(),
         };
         execute_aggregations(rows, &tree, &scope).await.map(Value::Object)
     }
@@ -1083,6 +1305,7 @@ mod tests {
         let scope = AggregationScope {
             session: &session,
             max_buckets: read_default_max_buckets(),
+            now,
         };
         let answer = execute_aggregations(rows, &tree, &scope)
             .await
@@ -1988,6 +2211,59 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn ranges_and_date_ranges_refuse_a_field_they_cannot_read_naming_it() {
+        let fixture = SearchFixture::new().await;
+        let session = fixture.open_session("tenant-a").await;
+        let entry = find_index_entry(&session, LOGS_TABLE);
+        let query = parse_query(&json!({"match_all": {}})).expect("match_all");
+        // Each body with the field it reads, that field's type in `logs`, and the refused kind.
+        for (aggregation, field, field_type, aggregation_type) in [
+            (
+                json!({"range": {"field": COL_SEVERITY_TEXT, "ranges": [{"to": 10}]}}),
+                COL_SEVERITY_TEXT,
+                "keyword",
+                "range",
+            ),
+            (
+                json!({"range": {"field": COL_TIMESTAMP, "ranges": [{"to": 10}]}}),
+                COL_TIMESTAMP,
+                "date",
+                "range",
+            ),
+            (
+                json!({"date_range": {"field": COL_SEVERITY_TEXT, "ranges": [{"to": "now"}]}}),
+                COL_SEVERITY_TEXT,
+                "keyword",
+                "date_range",
+            ),
+        ] {
+            let tree = parse_aggregations(&json!({"refused": aggregation.clone()})).expect("an aggregation");
+
+            let error = plan_aggregation_rows(&session, &[entry], &query, read_request_now(), &tree)
+                .expect_err("the field cannot be read by the aggregation");
+
+            let (status, envelope) = render_envelope(error).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{aggregation}");
+            assert_eq!(envelope["error"]["type"], "illegal_argument_exception", "{aggregation}");
+            assert_eq!(envelope["error"]["field"], field, "{aggregation}");
+            assert_eq!(envelope["error"]["field_type"], field_type, "{aggregation}");
+            assert_eq!(envelope["error"]["aggregation"], "refused", "{aggregation}");
+            assert_eq!(envelope["error"]["aggregation_type"], aggregation_type, "{aggregation}");
+        }
+        // A `date_range` reads a date, and `filter` / `filters` read no field.
+        for aggregation in [
+            json!({"date_range": {"field": COL_TIMESTAMP, "ranges": [{"to": "now"}]}}),
+            json!({"filter": {"term": {"severity_text": "ERROR"}}}),
+            json!({"filters": {"filters": [{"match_all": {}}]}}),
+        ] {
+            let tree = parse_aggregations(&json!({"accepted": aggregation.clone()})).expect("an aggregation");
+
+            plan_aggregation_rows(&session, &[entry], &query, read_request_now(), &tree)
+                .expect("the aggregation plans");
+        }
+    }
+
     /// The keys one round of the ranking property draws from, each listed in ascending key
     /// order, so the position of a key is its rank in the stated order.
     enum KeyDomain {
@@ -2063,6 +2339,7 @@ mod tests {
         let scope = AggregationScope {
             session: &session,
             max_buckets: read_default_max_buckets(),
+            now: read_request_now(),
         };
         let mut random = StdRng::seed_from_u64(20_261_011);
         let mut tied_rounds = 0;
@@ -2314,14 +2591,18 @@ mod bucket_tree_tests {
         TimestampMicrosecondArray,
     };
     use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
-    use datafusion::logical_expr::LogicalPlan;
+    use datafusion::common::Column;
+    use datafusion::functions::expr_fn::coalesce;
+    use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, col, lit};
     use datafusion::prelude::SessionContext;
     use serde_json::{Value, json};
 
-    use super::tests::{aggregate_plan, assert_too_many_buckets, read_default_max_buckets, scan_rows};
+    use super::tests::{
+        aggregate_plan, assert_too_many_buckets, read_default_max_buckets, read_request_now, scan_rows,
+    };
     use super::{
-        AggregationLayout, Granularity, LEVEL_MASK_COLUMN, compute_level_mask, name_key_column, plan_aggregations,
-        resolve_plan_inputs,
+        AggregationLayout, Granularity, LEVEL_MASK_COLUMN, compute_level_mask, name_bucket_filter_column,
+        name_key_column, plan_aggregations, resolve_plan_inputs,
     };
     use crate::opensearch::error::{OpenSearchError, render_envelope};
     use crate::opensearch::search::aggs::parse::parse_aggregations;
@@ -2414,6 +2695,43 @@ mod bucket_tree_tests {
         aggregate_plan(scan_test_rows(rows), &aggregations, read_default_max_buckets()).await
     }
 
+    /// The test rows with one Boolean column per `filter` / `filters` bucket query of the
+    /// request, as `plan_aggregation_rows` projects them. `predicates[ordinal]` stands for the
+    /// query at `ordinal` (request order, preorder) lowered over the rows; the real lowering is
+    /// per index and is pinned by the integration test
+    /// `filter_and_filters_buckets_lower_their_queries_per_index`.
+    fn scan_with_bucket_filters(rows: &[SourceRow], predicates: Vec<Expr>) -> LogicalPlan {
+        let scan = scan_test_rows(rows);
+        let mut projection: Vec<Expr> = scan
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| Expr::Column(Column::from_name(field.name())))
+            .collect();
+        projection.extend(predicates.into_iter().enumerate().map(|(ordinal, predicate)| {
+            coalesce(vec![predicate, lit(false)]).alias(name_bucket_filter_column(ordinal))
+        }));
+        LogicalPlanBuilder::from(scan)
+            .project(projection)
+            .and_then(LogicalPlanBuilder::build)
+            .expect("project the bucket filters")
+    }
+
+    /// Answer `aggregations` over `rows` with the bucket queries standing as `predicates`
+    /// ([`scan_with_bucket_filters`]).
+    async fn run_filtered_aggregations(
+        rows: &[SourceRow],
+        predicates: Vec<Expr>,
+        aggregations: Value,
+    ) -> Result<Value, OpenSearchError> {
+        aggregate_plan(
+            scan_with_bucket_filters(rows, predicates),
+            &aggregations,
+            read_default_max_buckets(),
+        )
+        .await
+    }
+
     /// `[key, doc_count, <child>]` of every bucket of `aggregation`; the other key renderings are
     /// left to the tests of the kind that renders them.
     fn summarize_buckets(aggregation: &Value, child: &str) -> Vec<Value> {
@@ -2469,7 +2787,7 @@ mod bucket_tree_tests {
             "hours": {"date_histogram": {"field": "timestamp", "fixed_interval": "1h"}}
         }))
         .expect("parse the aggregations");
-        let layout = AggregationLayout::new(&tree).expect("lay out the aggregations");
+        let layout = AggregationLayout::new(&tree, read_request_now()).expect("lay out the aggregations");
         let rows = scan_test_rows(&build_hourly_rows());
         let inputs = resolve_plan_inputs(&layout, rows.schema()).expect("resolve the inputs");
         let mut stages = plan_aggregations(rows, &layout, &inputs).expect("plan the aggregate");
@@ -3080,6 +3398,408 @@ mod bucket_tree_tests {
                 "amount_max_with_missing": {"value": 7.5},
                 "amount_count": {"value": 2}
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_filters_count_a_row_in_every_bucket_it_matches() {
+        let aggregations = run_filtered_aggregations(
+            &build_hourly_rows(),
+            // `*` is `match_all`; `level:error` is `term severity_text: ERROR`.
+            vec![lit(true), col("severity_text").eq(lit("ERROR"))],
+            json!({
+                "by_filter": {
+                    "filters": {"filters": {
+                        "*": {"match_all": {}},
+                        "level:error": {"term": {"severity_text": "ERROR"}}
+                    }},
+                    "aggs": {"max_duration": {"max": {"field": "duration_micros"}}}
+                },
+                "rows_with_a_service": {"value_count": {"field": "service_name"}}
+            }),
+        )
+        .await
+        .expect("aggregate the rows");
+
+        // Both ERROR rows count in "*" and in "level:error".
+        assert_eq!(
+            aggregations["by_filter"],
+            json!({"buckets": {
+                "*": {"doc_count": 6, "max_duration": {"value": 500.0}},
+                "level:error": {"doc_count": 2, "max_duration": {"value": 300.0}}
+            }})
+        );
+        // The sibling metric reads the rows of its own aggregate, before the unnest: each once.
+        assert_eq!(aggregations["rows_with_a_service"], json!({"value": 6}));
+    }
+
+    #[tokio::test]
+    async fn overlapping_ranges_count_a_row_in_every_range_with_a_sub_metric() {
+        let aggregations = run_aggregations(
+            &build_hourly_rows(),
+            json!({
+                "durations": {
+                    "range": {"field": "duration_micros", "ranges": [
+                        {"to": 250}, {"from": 100, "to": 400}, {"from": 300}
+                    ]},
+                    "aggs": {"max_duration": {"max": {"field": "duration_micros"}}}
+                },
+                "durations_seen": {"value_count": {"field": "duration_micros"}}
+            }),
+        )
+        .await
+        .expect("aggregate the rows");
+
+        // Durations 100, 300, 200, 500 and 50: 50 is in the first range, 100 and 200 in the
+        // first two, 300 in the last two, 500 in the last.
+        assert_eq!(
+            aggregations["durations"],
+            json!({"buckets": [
+                {"key": "*-250.0", "to": 250.0, "doc_count": 3, "max_duration": {"value": 200.0}},
+                {"key": "100.0-400.0", "from": 100.0, "to": 400.0, "doc_count": 3, "max_duration": {"value": 300.0}},
+                {"key": "300.0-*", "from": 300.0, "doc_count": 2, "max_duration": {"value": 500.0}}
+            ]})
+        );
+        assert_eq!(aggregations["durations_seen"], json!({"value": 5}));
+    }
+
+    #[tokio::test]
+    async fn keyed_ranges_echo_from_and_to_and_omit_open_ends() {
+        // Disjoint ranges: the scalar key, no unnest.
+        let aggregations = run_aggregations(
+            &build_hourly_rows(),
+            json!({"durations": {"range": {"field": "duration_micros", "keyed": true, "ranges": [
+                {"to": 100}, {"from": 100, "to": 300}, {"from": 300, "to": 1000}, {"from": 1000, "key": "slow"}
+            ]}}}),
+        )
+        .await
+        .expect("aggregate the rows");
+
+        assert_eq!(
+            aggregations["durations"],
+            json!({"buckets": {
+                "*-100.0": {"to": 100.0, "doc_count": 1},
+                "100.0-300.0": {"from": 100.0, "to": 300.0, "doc_count": 2},
+                "300.0-1000.0": {"from": 300.0, "to": 1000.0, "doc_count": 2},
+                "slow": {"from": 1000.0, "doc_count": 0}
+            }})
+        );
+        let keys: Vec<&String> = aggregations["durations"]["buckets"]
+            .as_object()
+            .expect("keyed buckets")
+            .keys()
+            .collect();
+        assert_eq!(keys, vec!["*-100.0", "100.0-300.0", "300.0-1000.0", "slow"]);
+    }
+
+    #[tokio::test]
+    async fn date_range_keys_resolve_now_relative_bounds_in_asia_dubai() {
+        // now is 2026-10-08T12:34:56.789Z, 16:34:56.789 in Dubai (UTC+4). now-3d is
+        // 2026-10-05T16:34:56.789+04:00, rounded down to the Dubai day:
+        // 2026-10-05T00:00:00+04:00, that is 2026-10-04T20:00:00Z.
+        assert_eq!(read_request_now().timestamp_micros(), 1_791_462_896_789_000);
+        let rows = vec![
+            // 2026-10-04T19:59:59.999Z, one millisecond before the lower bound.
+            build_test_row(1_791_143_999_999_000, Some("api"), Some("INFO"), None, None),
+            // 2026-10-04T20:00:00.000Z, the lower bound.
+            build_test_row(1_791_144_000_000_000, Some("api"), Some("INFO"), None, None),
+            // 2026-10-08T12:34:56.788Z, one millisecond before now.
+            build_test_row(1_791_462_896_788_000, Some("api"), Some("INFO"), None, None),
+            // 2026-10-08T12:34:56.789Z, now: the exclusive upper bound.
+            build_test_row(1_791_462_896_789_000, Some("api"), Some("INFO"), None, None),
+        ];
+        let aggregations = run_aggregations(
+            &rows,
+            json!({"recent": {"date_range": {
+                "field": "timestamp",
+                "time_zone": "Asia/Dubai",
+                "ranges": [{"from": "now-3d/d", "to": "now"}]
+            }}}),
+        )
+        .await
+        .expect("aggregate the rows");
+
+        assert_eq!(
+            aggregations["recent"],
+            json!({"buckets": [{
+                "key": "2026-10-04T20:00:00.000Z-2026-10-08T12:34:56.789Z",
+                "from": 1_791_144_000_000.0,
+                "from_as_string": "2026-10-04T20:00:00.000Z",
+                "to": 1_791_462_896_789.0,
+                "to_as_string": "2026-10-08T12:34:56.789Z",
+                "doc_count": 2
+            }]})
+        );
+    }
+
+    #[tokio::test]
+    async fn named_filters_render_a_keyed_object_and_anonymous_filters_an_array() {
+        let build_severity_predicate = |severity: &str| col("severity_text").eq(lit(severity.to_string()));
+        let named_filters = run_filtered_aggregations(
+            &build_hourly_rows(),
+            vec![
+                build_severity_predicate("ERROR"),
+                build_severity_predicate("INFO"),
+                build_severity_predicate("FATAL"),
+            ],
+            json!({"severities": {"filters": {"filters": {
+                "errors": {"term": {"severity_text": "ERROR"}},
+                "infos": {"term": {"severity_text": "INFO"}},
+                "fatal": {"term": {"severity_text": "FATAL"}}
+            }}}}),
+        )
+        .await
+        .expect("aggregate the rows");
+        assert_eq!(
+            named_filters["severities"],
+            json!({"buckets": {
+                "errors": {"doc_count": 2},
+                "infos": {"doc_count": 4},
+                "fatal": {"doc_count": 0}
+            }})
+        );
+        let names: Vec<&String> = named_filters["severities"]["buckets"]
+            .as_object()
+            .expect("keyed buckets")
+            .keys()
+            .collect();
+        assert_eq!(names, vec!["errors", "infos", "fatal"]);
+
+        let anonymous_filters = run_filtered_aggregations(
+            &build_hourly_rows(),
+            vec![build_severity_predicate("ERROR"), build_severity_predicate("INFO")],
+            json!({"severities": {"filters": {"filters": [
+                {"term": {"severity_text": "ERROR"}},
+                {"term": {"severity_text": "INFO"}}
+            ]}}}),
+        )
+        .await
+        .expect("aggregate the rows");
+        assert_eq!(
+            anonymous_filters["severities"],
+            json!({"buckets": [{"doc_count": 2}, {"doc_count": 4}]})
+        );
+    }
+
+    #[tokio::test]
+    async fn an_other_bucket_style_filters_request_counts_rows_outside_the_listed_terms() {
+        let mut rows = build_hourly_rows();
+        // 2026-10-08T11:50:00Z, a row without a service: outside every bucket.
+        rows.push(build_test_row(
+            1_791_460_200_000_000,
+            None,
+            Some("INFO"),
+            Some(10),
+            None,
+        ));
+        // The bucket query: an existing service other than api and web.
+        let other_service = col("service_name")
+            .is_not_null()
+            .and(!coalesce(vec![col("service_name").eq(lit("api")), lit(false)]))
+            .and(!coalesce(vec![col("service_name").eq(lit("web")), lit(false)]));
+        let aggregations = run_filtered_aggregations(
+            &rows,
+            vec![other_service],
+            json!({"other-filter": {
+                "filters": {"filters": {"-api-web": {"bool": {
+                    "must": [],
+                    "filter": [{"exists": {"field": "service_name"}}],
+                    "should": [],
+                    "must_not": [
+                        {"term": {"service_name": "api"}},
+                        {"term": {"service_name": "web"}}
+                    ]
+                }}}},
+                "aggs": {"1": {"max": {"field": "duration_micros"}}}
+            }}),
+        )
+        .await
+        .expect("aggregate the rows");
+
+        // Only db's row has a service other than api and web.
+        assert_eq!(
+            aggregations["other-filter"],
+            json!({"buckets": {"-api-web": {"doc_count": 1, "1": {"value": 50.0}}}})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_filter_bucket_restricts_its_sub_aggregations() {
+        let aggregations = run_filtered_aggregations(
+            &build_hourly_rows(),
+            vec![
+                col("severity_text").eq(lit("ERROR")),
+                col("severity_text").eq(lit("FATAL")),
+            ],
+            json!({
+                "errors": {
+                    "filter": {"term": {"severity_text": "ERROR"}},
+                    "aggs": {"services": {"terms": {"field": "service_name", "order": {"_key": "asc"}}}}
+                },
+                "fatal": {
+                    "filter": {"term": {"severity_text": "FATAL"}},
+                    "aggs": {"services": {"terms": {"field": "service_name"}}}
+                }
+            }),
+        )
+        .await
+        .expect("aggregate the rows");
+
+        assert_eq!(aggregations["errors"]["doc_count"], json!(2));
+        assert_eq!(
+            summarize_buckets(&aggregations["errors"]["services"], "no_sub_aggregation"),
+            vec![json!(["api", 1, null]), json!(["web", 1, null])]
+        );
+        // A filter no row matches still answers, with empty sub-aggregations.
+        assert_eq!(
+            aggregations["fatal"],
+            json!({"doc_count": 0, "services": {
+                "doc_count_error_upper_bound": 0,
+                "sum_other_doc_count": 0,
+                "buckets": []
+            }})
+        );
+    }
+
+    #[tokio::test]
+    async fn filters_under_a_terms_level_and_under_overlapping_ranges_count_rows_per_parent_bucket() {
+        // Bucket queries in preorder: 0 and 1 under `services`, 2 and 3 under `durations`.
+        let build_error_predicate = || col("severity_text").eq(lit("ERROR"));
+        let aggregations = run_filtered_aggregations(
+            &build_hourly_rows(),
+            vec![build_error_predicate(), lit(true), build_error_predicate(), lit(true)],
+            json!({
+                "services": {
+                    "terms": {"field": "service_name", "order": {"_key": "asc"}},
+                    "aggs": {"levels": {
+                        "filters": {"filters": {
+                            "errors": {"term": {"severity_text": "ERROR"}},
+                            "all": {"match_all": {}}
+                        }},
+                        "aggs": {"max_duration": {"max": {"field": "duration_micros"}}}
+                    }}
+                },
+                "durations": {
+                    "range": {"field": "duration_micros", "ranges": [{"to": 250}, {"from": 100}]},
+                    "aggs": {"levels": {"filters": {"filters": {
+                        "errors": {"term": {"severity_text": "ERROR"}},
+                        "all": {"match_all": {}}
+                    }}}}
+                }
+            }),
+        )
+        .await
+        .expect("aggregate the rows");
+
+        // api holds INFO 100, ERROR 300 and INFO 500; db INFO 50; web INFO 200 and an ERROR
+        // without a duration.
+        let build_levels = |errors: Value, all: Value| json!({"buckets": {"errors": errors, "all": all}});
+        assert_eq!(
+            aggregations["services"],
+            json!({"doc_count_error_upper_bound": 0, "sum_other_doc_count": 0, "buckets": [
+                {"key": "api", "doc_count": 3, "levels": build_levels(
+                    json!({"doc_count": 1, "max_duration": {"value": 300.0}}),
+                    json!({"doc_count": 3, "max_duration": {"value": 500.0}})
+                )},
+                {"key": "db", "doc_count": 1, "levels": build_levels(
+                    json!({"doc_count": 0, "max_duration": {"value": null}}),
+                    json!({"doc_count": 1, "max_duration": {"value": 50.0}})
+                )},
+                {"key": "web", "doc_count": 2, "levels": build_levels(
+                    json!({"doc_count": 1, "max_duration": {"value": null}}),
+                    json!({"doc_count": 2, "max_duration": {"value": 200.0}})
+                )}
+            ]})
+        );
+        // Below 250: 100, 200 and 50, all INFO. From 100: 100, 300, 200 and 500, the 300 an
+        // ERROR. The row of 100 and the row of 200 lie in both ranges and count under each.
+        assert_eq!(
+            aggregations["durations"],
+            json!({"buckets": [
+                {"key": "*-250.0", "to": 250.0, "doc_count": 3, "levels": build_levels(
+                    json!({"doc_count": 0}), json!({"doc_count": 3})
+                )},
+                {"key": "100.0-*", "from": 100.0, "doc_count": 4, "levels": build_levels(
+                    json!({"doc_count": 1}), json!({"doc_count": 4})
+                )}
+            ]})
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_buckets_at_max_buckets_are_answered_and_one_more_is_a_400() {
+        // Every listed range is answered, the empty `from: 1000` one included, and counts.
+        let build_ranges =
+            |ranges: Value| json!({"durations": {"range": {"field": "duration_micros", "ranges": ranges}}});
+        let request_below_limit = build_ranges(json!([{"to": 100}, {"from": 100}]));
+        let request_at_limit = build_ranges(json!([{"to": 100}, {"from": 100, "to": 1000}, {"from": 1000}]));
+        let request_above_limit = build_ranges(json!([
+            {"to": 100},
+            {"from": 100, "to": 1000},
+            {"from": 1000},
+            {"from": 5000}
+        ]));
+        let rows = || scan_test_rows(&build_hourly_rows());
+
+        let answer_below_limit = aggregate_plan(rows(), &request_below_limit, 3)
+            .await
+            .expect("two buckets fit three");
+        let answer_at_limit = aggregate_plan(rows(), &request_at_limit, 3)
+            .await
+            .expect("three buckets fit three");
+        let error_above_limit = aggregate_plan(rows(), &request_above_limit, 3)
+            .await
+            .expect_err("four buckets exceed three");
+
+        assert_eq!(
+            summarize_buckets(&answer_below_limit["durations"], "no_sub_aggregation"),
+            vec![json!(["*-100.0", 1, null]), json!(["100.0-*", 4, null])]
+        );
+        assert_eq!(
+            summarize_buckets(&answer_at_limit["durations"], "no_sub_aggregation"),
+            vec![
+                json!(["*-100.0", 1, null]),
+                json!(["100.0-1000.0", 4, null]),
+                json!(["1000.0-*", 0, null])
+            ]
+        );
+        assert_too_many_buckets(error_above_limit, 3).await;
+    }
+
+    #[tokio::test]
+    async fn a_date_range_renders_a_named_key_an_open_end_and_its_format() {
+        // `to` is a date string, `from` an integer of epoch milliseconds: both 11:00Z.
+        let aggregations = run_aggregations(
+            &build_hourly_rows(),
+            json!({"hours": {"date_range": {
+                "field": "timestamp",
+                "format": "epoch_millis",
+                "ranges": [
+                    {"to": "2026-10-08T11:00:00Z", "key": "before_eleven"},
+                    {"from": 1_791_457_200_000_i64}
+                ]
+            }}}),
+        )
+        .await
+        .expect("aggregate the rows");
+
+        // 10:05, 10:15 and 10:40 lie before 11:00; 11:10, 11:30 and 11:45 from it.
+        assert_eq!(
+            aggregations["hours"],
+            json!({"buckets": [
+                {
+                    "key": "before_eleven",
+                    "to": 1_791_457_200_000.0,
+                    "to_as_string": "1791457200000",
+                    "doc_count": 3
+                },
+                {
+                    "key": "1791457200000-*",
+                    "from": 1_791_457_200_000.0,
+                    "from_as_string": "1791457200000",
+                    "doc_count": 3
+                }
+            ]})
         );
     }
 }

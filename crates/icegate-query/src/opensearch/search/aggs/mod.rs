@@ -4,6 +4,7 @@
 mod assemble;
 mod date_histogram;
 mod metrics;
+mod multi_bucket;
 mod parse;
 mod plan;
 mod render;
