@@ -17,6 +17,8 @@
 //! - `listener`: the listener's start-up
 //! - `msearch`: `_msearch` over HTTP: items, their order, statuses and per-item errors
 //! - `ppl`: `/_plugins/_ppl`: commands, functions, the jdbc response, the PPL error envelope
+//! - `ppl_clients`: client-shaped PPL requests and PPL tenant isolation
+//! - `ppl_endpoints`: cluster settings, `SHOW TABLES`, the PPL grammar bundle and the plugin stubs
 //! - `ppl_formats`: the `viz`, `csv` and `raw` formats, `_explain`, and the scan pushdowns it shows
 //! - `requests`: JSON and NDJSON request helpers shared by the system-index and data-index modules
 //! - `rustfs_conditional`: the object-store guarantees the system-index store builds on

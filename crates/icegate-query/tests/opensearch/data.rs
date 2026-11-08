@@ -56,9 +56,28 @@ pub const fn build_service_log_row_at_minute<'a>(
     severity_text: &'a str,
     body: &'a str,
 ) -> LogRow<'a> {
+    build_service_log_row_at_micros(
+        tenant_id,
+        compute_micros_at_minute(minute),
+        service_name,
+        severity_text,
+        body,
+    )
+}
+
+/// A log of `tenant_id` and `service_name` at `timestamp_micros`, with `service_name`,
+/// `severity_text` and `body` set and both attribute maps empty; every other column follows the
+/// [`LogRow`] defaults.
+pub const fn build_service_log_row_at_micros<'a>(
+    tenant_id: &'a str,
+    timestamp_micros: i64,
+    service_name: &'a str,
+    severity_text: &'a str,
+    body: &'a str,
+) -> LogRow<'a> {
     LogRow {
         tenant_id,
-        timestamp_micros: compute_micros_at_minute(minute),
+        timestamp_micros,
         service_name: Some(service_name),
         severity_text: Some(severity_text),
         body: Some(body),
