@@ -88,6 +88,7 @@ see [`describe`](#describe).
 | `bin <field> span=<length>[<unit>]` | See [Bin](#bin). |
 | `parse <field> '<pattern>'` | See [`parse`](#parse). |
 | `fillnull with <v> [in <fields>]`, `fillnull using <f> = <v>, …`, `fillnull value=<v> [<fields>]` | See [`fillnull`](#fillnull). |
+| `[inner \| left] join [left=<l>] [right=<r>] on <criteria> <right side>` | See [Joins](#joins). |
 
 The output columns of a source are the table's columns in table order. A field reference is
 resolved against the columns of the pipeline at that point, case-sensitively; a name that
@@ -326,6 +327,30 @@ runs; a computed replacement is itself evaluated as any expression is.
 An incompatible type is a 400 naming the field and the PPL types of both; a field listed twice is a
 400; an unknown field is `FIELD_NOT_FOUND`.
 
+## Joins
+
+`[inner | left [outer] | outer] join [type=inner|left|outer] [max=0] [left=<l>] [right=<r>] on <criteria> <right side>`,
+with `where` accepted for `on`. The right side is an index expression (`spans`, `spans as s`) or a bracketed
+subsearch (`[ source=spans | … ] as s`). Without a type the join is inner; a type written both before `join` and as
+`type=` must agree. Each of `type=` and `max=` may be written once.
+
+- **Planning.** The criteria are one predicate of one join. Every equality between a left-only and a right-only
+  expression becomes a hash key; the rest (`or`, ranges, `isnull`) is the join's own filter, evaluated while
+  matching. A left join therefore keeps a left row whose candidates all fail the residual, with NULL right columns.
+  Pinned by `the_join_plan_hashes_on_the_equality_conjuncts_with_a_residual_filter` in
+  `tests/opensearch/ppl_trust_delta.rs`.
+- **Names in the criteria.** Each side offers the bare name of each column and, for a qualified column,
+  `<qualifier>.<name>`: the `left=` / `right=` alias when given, else the table (`logs.service_name`) or a
+  subsearch's `as` alias. A name offered twice is not visible and answers `FIELD_NOT_FOUND`; qualify it.
+- **Output.** The left columns, then the right columns. A right column whose name a left column has is renamed
+  `<right qualifier>.<name>` (`s.service_name`); with nothing to rename it by, or when the renamed name is taken
+  too (a chained join reusing `right=s`), the query is a 400 naming the column.
+- **Never capped.** The right side runs through the same tenant scope and has no row limit; `max=0` (also when
+  absent) joins every matching row. A right side over a system index is a 400 naming it.
+- **Refused (400):** `right`, `full`, `cross`, `semi` and `anti` joins, the field-list form without criteria,
+  join hints, `max` other than 0, and a repeated `type=` or `max=`. `overwrite=` is accepted and changes
+  nothing in the criteria form.
+
 ## Timestamp literals
 
 A string literal compared with a timestamp field (`=`, `!=`, `<`, `<=`, `>`, `>=`, `between`, `in`),
@@ -371,4 +396,5 @@ contract for every route.
 
 Every source resolves through the requesting tenant's session, whose scan carries the tenant
 filter, so a PPL query never reads another tenant's rows. `tests/opensearch/ppl.rs` pins this
-with two tenants written in the same batch.
+with two tenants written in the same batch. Every join side resolves through that same session;
+`tests/opensearch/ppl_trust_delta.rs` pins it with both tenants' rows in one WAL segment.

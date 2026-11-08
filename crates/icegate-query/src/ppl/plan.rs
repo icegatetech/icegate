@@ -6,14 +6,14 @@
 //! command then transforms the plan of the commands before it; a field reference resolves
 //! against the columns of the plan at that point.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use datafusion::arrow::datatypes::{DECIMAL128_MAX_PRECISION, DataType, Field, FieldRef, Schema, TimeUnit};
 use datafusion::common::format::DEFAULT_CAST_OPTIONS;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, DFSchema, DFSchemaRef, NullEquality, ScalarValue};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, NullEquality, ScalarValue, TableReference};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::functions::core::expr_fn::get_field;
@@ -27,13 +27,14 @@ use datafusion::logical_expr::{
     SortExpr, binary_expr, cast, col, ident, lit, not, when,
 };
 use datafusion::optimizer::Analyzer;
+use futures::future::BoxFuture;
 use icegate_common::schema::COL_TENANT_ID;
 use regex::Regex;
 
 use super::ast::{
-    BinCommand, BinSpan, CompareOperator, DedupCommand, FillnullCommand, FillnullReplacements, ParseCommand,
-    PplCommand, PplExpr, PplGroupKey, PplLiteral, PplQuery, PplSortKey, PplSource, RankCommand, SpanUnit, StatsCommand,
-    TimechartCommand,
+    BinCommand, BinSpan, CompareOperator, DedupCommand, FillnullCommand, FillnullReplacements, JoinCommand, JoinKind,
+    ParseCommand, PplCommand, PplExpr, PplGroupKey, PplLiteral, PplQuery, PplSortKey, PplSource, RankCommand, SpanUnit,
+    StatsCommand, TimechartCommand,
 };
 use super::error::PplError;
 use super::functions::{
@@ -190,6 +191,15 @@ impl<'a> ExpressionScope<'a> {
     }
 }
 
+/// What planning a nested query needs from its parent: the tenant session every side reads through, the
+/// request, and the cluster name `describe` reports.
+#[derive(Clone, Copy)]
+struct Planning<'a> {
+    session: &'a TenantSession,
+    context: &'a RequestContext,
+    cluster_name: &'a str,
+}
+
 /// Plan `query` for the tenant of `session`.
 ///
 /// The source resolves through the session's index catalog, case-sensitively, with the tenant
@@ -212,12 +222,17 @@ pub(crate) async fn plan_ppl(
     context: &RequestContext,
     cluster_name: &str,
 ) -> Result<PplPlan, PplError> {
+    let planning = Planning {
+        session,
+        context,
+        cluster_name,
+    };
     let mut pipeline = match &query.source {
         PplSource::Index { expression } => plan_index_source(expression, session).await?,
         PplSource::Describe { index } => plan_describe(index, session, context.now, cluster_name).await?,
     };
     for command in &query.commands {
-        pipeline = apply_command(pipeline, command, context.now)?;
+        pipeline = apply_command(pipeline, command, planning).await?;
     }
     finish_plan(pipeline.builder)
 }
@@ -358,11 +373,14 @@ fn union_branches(branches: Vec<(&str, LogicalPlanBuilder)>) -> Result<LogicalPl
     })
 }
 
-fn apply_command<'session>(
+/// `pipeline` after `command`. A command that plans a nested query (the right side of a `join`)
+/// awaits it with the same `planning`, so the nested plan reads through the same tenant session.
+async fn apply_command<'session>(
     pipeline: Pipeline<'session>,
     command: &PplCommand,
-    now: DateTime<Utc>,
+    planning: Planning<'session>,
 ) -> Result<Pipeline<'session>, PplError> {
+    let now = planning.context.now;
     let Pipeline {
         builder,
         mut source,
@@ -455,6 +473,10 @@ fn apply_command<'session>(
         }
         PplCommand::Timechart(chart) => {
             return Ok(build_aggregated_pipeline(chart_rows(builder, chart, &build_scope())?));
+        }
+        PplCommand::Join(join) => {
+            // The output holds both sides' columns in no row order: no source binding, no order.
+            return Ok(build_aggregated_pipeline(plan_join(builder, join, planning).await?));
         }
         PplCommand::Parse(parse) => {
             let (builder, sort_keys, groups) =
@@ -2445,6 +2467,206 @@ fn is_integer_type_within(source: &DataType, target: &DataType) -> bool {
 fn name_ppl_type(column: &str, data_type: &DataType) -> String {
     PplType::from_data_type(column, data_type)
         .map_or_else(|_| data_type.to_string(), |ppl_type| ppl_type.name().to_string())
+}
+
+/// The qualifier of a join's left input. No PPL name produces it, so it never meets a user's name.
+const JOIN_LEFT_QUALIFIER: &str = "__ppl_join_left";
+
+/// The qualifier of a join's right input.
+const JOIN_RIGHT_QUALIFIER: &str = "__ppl_join_right";
+
+/// Plans a nested query whose row order does not matter (a join's right side, a subsearch) with the parent's
+/// session, request and cluster name, as [`plan_ppl`] plans a top-level query.
+///
+/// `plan_ppl` reaches itself through these commands. A recursive `async fn` needs a boxed future, and
+/// boxing it as a `dyn Future + Send` here keeps the compiler's `Send` check of `plan_ppl` free of the
+/// cycle.
+fn plan_subquery<'a>(query: &'a PplQuery, planning: Planning<'a>) -> BoxFuture<'a, Result<PplPlan, PplError>> {
+    Box::pin(plan_ppl(
+        query,
+        planning.session,
+        planning.context,
+        planning.cluster_name,
+    ))
+}
+
+/// `plan` with every column qualified by `alias`, or unchanged without one.
+fn qualify_plan(plan: LogicalPlanBuilder, alias: Option<&str>) -> Result<LogicalPlanBuilder, PplError> {
+    if let Some(alias) = alias {
+        return Ok(plan.alias(TableReference::bare(alias))?);
+    }
+    Ok(plan)
+}
+
+/// Every column of `schema` as a column reference that keeps its qualifier, so a name with dots is never
+/// re-parsed as `relation.column`.
+fn list_columns(schema: &DFSchema) -> Vec<Expr> {
+    schema
+        .iter()
+        .map(|(qualifier, field)| Expr::Column(Column::from((qualifier, field))))
+        .collect()
+}
+
+/// Every name a join criteria may use for each column of one side, with the column's position: the bare
+/// name and, for a qualified column, `<table or alias>.<name>`.
+fn list_criteria_names(schema: &DFSchema) -> Vec<(usize, String)> {
+    schema
+        .iter()
+        .enumerate()
+        .flat_map(|(position, (qualifier, field))| {
+            let qualified_entry =
+                qualifier.map(|qualifier| (position, format!("{}.{}", qualifier.table(), field.name())));
+            std::iter::once((position, field.name().clone())).chain(qualified_entry)
+        })
+        .collect()
+}
+
+/// The name under which a join input carries its column at `position` to the output.
+fn format_carrier_name(qualifier: &str, position: usize) -> String {
+    format!("{qualifier}_{position}")
+}
+
+/// The reference to a join input's carrier column at `position`.
+fn build_carrier_column(qualifier: &str, position: usize) -> Expr {
+    Expr::Column(Column::new(
+        Some(TableReference::bare(qualifier)),
+        format_carrier_name(qualifier, position),
+    ))
+}
+
+/// Re-projects one join side: every column under its carrier name, plus one copy under each visible
+/// criteria name, all qualified by `qualifier`. The criteria then resolve as plain names of the joined
+/// schema, and the output projection reads only the carriers.
+fn project_join_input<'n>(
+    side: LogicalPlanBuilder,
+    qualifier: &str,
+    criteria_names: impl Iterator<Item = &'n (usize, String)>,
+) -> Result<LogicalPlanBuilder, PplError> {
+    let columns = list_columns(side.schema());
+    let mut projection: Vec<Expr> = columns
+        .iter()
+        .enumerate()
+        .map(|(position, column)| column.clone().alias(format_carrier_name(qualifier, position)))
+        .collect();
+    projection.extend(criteria_names.map(|(position, name)| columns[*position].clone().alias(name)));
+    Ok(side.project(projection)?.alias(TableReference::bare(qualifier))?)
+}
+
+/// The output names of the right side's columns: a name the left side already has becomes
+/// `<right qualifier>.<name>`.
+///
+/// # Errors
+///
+/// `Semantic` when such a column has no qualifier to be renamed by, or when an output name is still
+/// taken after renaming (a chained join that reuses a `right=` alias meets its earlier renamed column).
+fn name_right_join_columns(schema: &DFSchema, left_output: &[String]) -> Result<Vec<String>, PplError> {
+    let mut output_names: HashSet<&str> = left_output.iter().map(String::as_str).collect();
+    let right_output = schema
+        .iter()
+        .map(|(qualifier, field)| {
+            let name = field.name();
+            if !output_names.contains(name.as_str()) {
+                return Ok(name.clone());
+            }
+            qualifier
+                .map(|qualifier| format!("{}.{name}", qualifier.table()))
+                .ok_or_else(|| PplError::Semantic {
+                    reason: format!(
+                        "both join sides have a column `{name}`; \
+                         name the right side with right=<alias> so it can be renamed"
+                    ),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    output_names.reserve(right_output.len());
+    // A second pass, because a renamed name can only be checked once it exists, and the set borrows
+    // each output name rather than copying it.
+    if let Some(taken_name) = right_output.iter().find(|name| !output_names.insert(name.as_str())) {
+        return Err(PplError::Semantic {
+            reason: format!(
+                "the join output would have two columns `{taken_name}`; \
+                 name the right side with a different right=<alias>"
+            ),
+        });
+    }
+    Ok(right_output)
+}
+
+/// Plans `join`: one DataFusion join whose `on` predicate is the whole criteria.
+///
+/// The optimizer turns every equality between a left-only and a right-only expression into a hash key
+/// and keeps the rest as the join filter, evaluated while matching: a left join keeps a left row whose
+/// candidates all fail the residual, with NULL right columns, where a filter after the join would drop
+/// it. That split is pinned by `the_join_plan_hashes_on_the_equality_conjuncts_with_a_residual_filter` in
+/// `tests/opensearch/ppl_trust_delta.rs`. The right side is planned by [`plan_ppl`] through the same tenant
+/// session, so it reads only the tenant's rows, and nothing caps either side. Criteria names, output order
+/// and renaming are the contract stated in `ppl/README.md`.
+///
+/// # Errors
+///
+/// `Semantic` for `max` above zero, ill-typed criteria or criteria that are not boolean, or a colliding
+/// right column that cannot be renamed or whose renamed name is taken too; `FieldNotFound` for a
+/// criteria name no side offers alone; the right side's errors.
+async fn plan_join(
+    builder: LogicalPlanBuilder,
+    join: &JoinCommand,
+    planning: Planning<'_>,
+) -> Result<LogicalPlanBuilder, PplError> {
+    if join.max_matches > 0 {
+        return Err(PplError::Semantic {
+            reason: format!(
+                "join max={} is not supported; IceGate joins every matching right row (max=0)",
+                join.max_matches
+            ),
+        });
+    }
+    let right_side_plan = plan_subquery(&join.right, planning).await?;
+    let left_side = qualify_plan(builder, join.left_alias.as_deref())?;
+    let right_side = qualify_plan(
+        LogicalPlanBuilder::from(right_side_plan.plan),
+        join.right_alias.as_deref(),
+    )?;
+
+    let left_names = list_criteria_names(left_side.schema());
+    let right_names = list_criteria_names(right_side.schema());
+    let mut name_counts: HashMap<&str, usize> = HashMap::with_capacity(left_names.len() + right_names.len());
+    for (_, name) in left_names.iter().chain(&right_names) {
+        *name_counts.entry(name.as_str()).or_insert(0) += 1;
+    }
+    let is_visible = |entry: &&(usize, String)| name_counts.get(entry.1.as_str()) == Some(&1);
+
+    let left_output: Vec<String> = left_side.schema().fields().iter().map(|field| field.name().clone()).collect();
+    let right_output = name_right_join_columns(right_side.schema(), &left_output)?;
+    let left_input = project_join_input(left_side, JOIN_LEFT_QUALIFIER, left_names.iter().filter(is_visible))?;
+    let right_input = project_join_input(right_side, JOIN_RIGHT_QUALIFIER, right_names.iter().filter(is_visible))?;
+
+    let joined_schema = left_input.schema().join(right_input.schema())?;
+    let scope = ExpressionScope::new(&joined_schema, None, planning.context.now);
+    let criteria = lower_expression(&join.criteria, &scope)?;
+    let criteria_type = criteria.get_type(&joined_schema)?;
+    if criteria_type != DataType::Boolean {
+        return Err(PplError::Semantic {
+            reason: format!("join criteria must be a boolean expression; `{criteria}` has type {criteria_type}"),
+        });
+    }
+    let join_type = match join.kind {
+        JoinKind::Left => JoinType::Left,
+        JoinKind::Inner => JoinType::Inner,
+    };
+    let right_plan = right_input.build()?;
+    let joined_plan = left_input.join_on(right_plan, join_type, [criteria])?;
+    let output: Vec<Expr> = left_output
+        .iter()
+        .enumerate()
+        .map(|(position, name)| build_carrier_column(JOIN_LEFT_QUALIFIER, position).alias(name))
+        .chain(
+            right_output
+                .iter()
+                .enumerate()
+                .map(|(position, name)| build_carrier_column(JOIN_RIGHT_QUALIFIER, position).alias(name)),
+        )
+        .collect();
+    Ok(joined_plan.project(output)?)
 }
 
 #[cfg(test)]

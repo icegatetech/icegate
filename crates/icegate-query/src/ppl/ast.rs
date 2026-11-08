@@ -75,6 +75,36 @@ pub(crate) enum PplCommand {
     Parse(ParseCommand),
     /// `fillnull` in any of its four forms.
     Fillnull(FillnullCommand),
+    /// `join` with criteria; the pipeline so far is the left side.
+    Join(JoinCommand),
+}
+
+/// A `join` with `on` criteria: the pipeline so far is the left side.
+///
+/// The criteria stay one predicate; `plan_join` in `plan.rs` states how it is planned.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JoinCommand {
+    /// Inner or left.
+    pub(crate) kind: JoinKind,
+    /// `left=<alias>`: qualifies the left side's columns in the criteria.
+    pub(crate) left_alias: Option<String>,
+    /// `right=<alias>`, else the alias written after the right side.
+    pub(crate) right_alias: Option<String>,
+    /// The `on` (or `where`) predicate.
+    pub(crate) criteria: PplExpr,
+    /// `max=<n>`; `0`, also when absent, joins every matching right row.
+    pub(crate) max_matches: usize,
+    /// The right side: an index or a subsearch, planned through the same tenant session.
+    pub(crate) right: Box<PplQuery>,
+}
+
+/// The join types IceGate plans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinKind {
+    /// Every left row; the right columns are NULL where nothing matches.
+    Left,
+    /// Only rows with a match on both sides.
+    Inner,
 }
 
 /// `parse <field> '<pattern>'`: every named group of the pattern becomes a string field.

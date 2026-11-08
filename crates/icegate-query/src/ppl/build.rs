@@ -4,6 +4,7 @@
 //! plans into the AST and refuses every other one by name, so an unplanned construct is a 400
 //! naming it, never a silently different query.
 
+use std::num::IntErrorKind;
 use std::rc::Rc;
 
 use antlr4rust::parser_rule_context::ParserRuleContext;
@@ -28,33 +29,36 @@ use icegate_query_grammar::ppl::{
     FunctionCallContextAll, FunctionCallContextAttrs, FunctionCallExprContextAttrs, IdentContextAll, IdentContextAttrs,
     IdentsAsQualifiedNameContextAttrs, IdentsAsTableQualifiedNameContextAttrs,
     IdentsAsWildcardQualifiedNameContextAttrs, InExprContextAttrs, IntegerLiteralContextAll,
-    IsNullPredicateContextAttrs, LambdaContextAll, LambdaContextAttrs, LambdaExprContextAttrs, LiteralValueContextAll,
+    IsNullPredicateContextAttrs, JoinCommandContextAll, JoinCommandContextAttrs, JoinCriteriaContextAttrs,
+    JoinOptionContextAll, LambdaContextAll, LambdaContextAttrs, LambdaExprContextAttrs, LiteralValueContextAll,
     LiteralValueContextAttrs, LiteralValueExprContextAttrs, LogicalExprContextAttrs, LogicalExpressionContextAll,
-    LogicalNotContextAttrs, NestedValueExprContextAttrs, NullNotnullContextAttrs, NumericSpanValueContextAttrs,
-    ParseCommandContextAll, ParseCommandContextAttrs, PercentileApproxFunctionCallContextAttrs,
-    PercentileShortcutFunctionCallContextAttrs, PplCommandsContextAll, PplCommandsContextAttrs,
-    PplStatementContextAttrs, PrefixSortFieldContextAttrs, QualifiedNameContextAll, QueryStatementContextAll,
-    QueryStatementContextAttrs, RareTopCommandContextAll, RareTopCommandContextAttrs, RenameClauseContextAll,
-    RenameCommandContextAttrs, RenameFieldExpressionContextAll, RenameFieldExpressionContextAttrs,
-    ReplacementPairContextAttrs, RootContextAttrs, SearchCommandContextAll, SearchFromContextAttrs,
-    SelectFieldExpressionContextAll, SelectFieldExpressionContextAttrs, SortCommandContextAttrs, SortFieldContextAll,
-    SortFieldExpressionContextAll, SortFieldExpressionContextAttrs, SortbyClauseContextAttrs, SpanClauseContextAttrs,
-    SpanLiteralContextAll, SpanLiteralContextAttrs, StatsAggTermContextAll, StatsAggTermContextAttrs,
-    StatsArgsContextAttrs, StatsByClauseContextAll, StatsByClauseContextAttrs, StatsCommandContextAll,
-    StatsCommandContextAttrs, StatsFunctionCallContextAttrs, StatsFunctionContextAll, StringLiteralContextAll,
+    LogicalNotContextAttrs, MaxOptionContextAttrs, NestedValueExprContextAttrs, NullNotnullContextAttrs,
+    NumericSpanValueContextAttrs, ParseCommandContextAll, ParseCommandContextAttrs,
+    PercentileApproxFunctionCallContextAttrs, PercentileShortcutFunctionCallContextAttrs, PplCommandsContextAll,
+    PplCommandsContextAttrs, PplStatementContextAttrs, PrefixSortFieldContextAttrs, QualifiedNameContextAll,
+    QueryStatementContextAll, QueryStatementContextAttrs, RareTopCommandContextAll, RareTopCommandContextAttrs,
+    RenameClauseContextAll, RenameCommandContextAttrs, RenameFieldExpressionContextAll,
+    RenameFieldExpressionContextAttrs, ReplacementPairContextAttrs, RootContextAttrs, SearchCommandContextAll,
+    SearchFromContextAttrs, SelectFieldExpressionContextAll, SelectFieldExpressionContextAttrs,
+    SortCommandContextAttrs, SortFieldContextAll, SortFieldExpressionContextAll, SortFieldExpressionContextAttrs,
+    SortbyClauseContextAttrs, SpanClauseContextAttrs, SpanLiteralContextAll, SpanLiteralContextAttrs,
+    StatsAggTermContextAll, StatsAggTermContextAttrs, StatsArgsContextAttrs, StatsByClauseContextAll,
+    StatsByClauseContextAttrs, StatsCommandContextAll, StatsCommandContextAttrs, StatsFunctionCallContextAttrs,
+    StatsFunctionContextAll, StringLiteralContextAll, SubSearchContextAll, SubSearchContextAttrs,
     SuffixSortFieldContextAttrs, TableCommandContextAttrs, TableIdentContextAll, TableIdentContextAttrs,
-    TableOrSubqueryClauseContextAttrs, TableQualifiedNameContextAll, TableSourceClauseContextAll,
-    TableSourceClauseContextAttrs, TableSourceContextAll, TableSourceContextAttrs, TimechartCommandContextAll,
-    TimechartCommandContextAttrs, TimechartParameterContextAttrs, TimestampFunctionCallContextAttrs,
-    ValueExprContextAttrs, ValueExpressionContextAll, ValueListContextAttrs, ValuesAggFunctionCallContextAttrs,
-    ValuesAggFunctionContextAttrs, WcFieldExpressionContextAttrs, WcFieldListContextAttrs, WcQualifiedNameContextAll,
-    WhereCommandContextAttrs, WildcardContextAll, WildcardContextAttrs, parse_ppl_root, ruleNames,
+    TableOrSubqueryClauseContextAll, TableOrSubqueryClauseContextAttrs, TableQualifiedNameContextAll,
+    TableSourceClauseContextAll, TableSourceClauseContextAttrs, TableSourceContextAll, TableSourceContextAttrs,
+    TimechartCommandContextAll, TimechartCommandContextAttrs, TimechartParameterContextAttrs,
+    TimestampFunctionCallContextAttrs, TypeOptionContextAttrs, ValueExprContextAttrs, ValueExpressionContextAll,
+    ValueListContextAttrs, ValuesAggFunctionCallContextAttrs, ValuesAggFunctionContextAttrs,
+    WcFieldExpressionContextAttrs, WcFieldListContextAttrs, WcQualifiedNameContextAll, WhereCommandContextAttrs,
+    WildcardContextAll, WildcardContextAttrs, parse_ppl_root, ruleNames,
 };
 
 use super::ast::{
     ArithmeticOperator, BinCommand, BinSpan, CastTarget, CompareOperator, DedupCommand, FillnullCommand,
-    FillnullReplacements, ParseCommand, PplCommand, PplExpr, PplGroupKey, PplLiteral, PplQuery, PplSortKey, PplSource,
-    RankCommand, SpanUnit, StatsCommand, TimechartCommand,
+    FillnullReplacements, JoinCommand, JoinKind, ParseCommand, PplCommand, PplExpr, PplGroupKey, PplLiteral, PplQuery,
+    PplSortKey, PplSource, RankCommand, SpanUnit, StatsCommand, TimechartCommand,
 };
 use super::error::PplError;
 use super::plan::RESERVED_NAME_PREFIX;
@@ -150,7 +154,12 @@ fn build_source(first_command: &PplCommandsContextAll<'_>) -> Result<PplSource, 
     let Some(search) = first_command.searchCommand() else {
         return Err(build_unsupported_command_error(&name_first_child_rule(first_command)));
     };
-    let SearchCommandContextAll::SearchFromContext(search) = search.as_ref() else {
+    build_search_source(&search)
+}
+
+/// The source a search command names (`search source=…`, `source=…`, `index=…`).
+fn build_search_source(search: &SearchCommandContextAll<'_>) -> Result<PplSource, PplError> {
+    let SearchCommandContextAll::SearchFromContext(search) = search else {
         return Err(PplError::Internal {
             reason: "an unlabeled search command".to_string(),
         });
@@ -306,7 +315,166 @@ fn build_command(command: &CommandsContextAll<'_>) -> Result<PplCommand, PplErro
     if let Some(fillnull) = command.fillnullCommand() {
         return build_fillnull(&fillnull);
     }
+    if let Some(join) = command.joinCommand() {
+        return build_join_command(&join);
+    }
     Err(build_unsupported_command_error(&name_first_child_rule(command)))
+}
+
+/// The join type IceGate plans for a written join type; no type at all means inner.
+///
+/// # Errors
+///
+/// `Semantic` naming every other type (`right`, `full`, `cross`, `semi`, `anti` and their `left`
+/// spellings): IceGate plans inner and left joins only.
+fn build_join_kind(text: &str) -> Result<JoinKind, PplError> {
+    match text.to_ascii_lowercase().as_str() {
+        "inner" => Ok(JoinKind::Inner),
+        "left" | "left outer" | "outer" => Ok(JoinKind::Left),
+        other => Err(PplError::Semantic {
+            reason: format!("join type `{other}` is not supported; IceGate plans inner and left joins"),
+        }),
+    }
+}
+
+/// The tokens of `context` as the query wrote them, one space apart: `get_text` joins them with
+/// none, so `left outer` would read `leftouter`, a word the query never wrote.
+fn spell_tokens<'input, T: Tree<'input> + ?Sized>(context: &T) -> String {
+    context
+        .get_children()
+        .map(|child| child.get_text())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The name an alias declares, unquoted like a field name; a reserved name is refused
+/// ([`check_field_name`]).
+fn name_alias(name: &QualifiedNameContextAll<'_>) -> Result<String, PplError> {
+    join_qualified_name(name).and_then(check_field_name)
+}
+
+/// Builds a bracketed subsearch: its search command and the commands piped after it.
+fn build_subsearch(subsearch: &SubSearchContextAll<'_>) -> Result<PplQuery, PplError> {
+    let search = subsearch.searchCommand().ok_or_else(|| build_missing_part_error("subsearch"))?;
+    let commands = subsearch
+        .commands_all()
+        .iter()
+        .map(|command| build_command(command))
+        .collect::<Result<Vec<_>, PplError>>()?;
+    Ok(PplQuery {
+        source: build_search_source(&search)?,
+        commands,
+    })
+}
+
+/// Builds the side a `tableOrSubqueryClause` names, an index expression or a bracketed subsearch, with
+/// the alias written after it.
+fn build_table_or_subquery(
+    clause: &TableOrSubqueryClauseContextAll<'_>,
+) -> Result<(PplQuery, Option<String>), PplError> {
+    if let Some(subsearch) = clause.subSearch() {
+        let alias = clause.alias.as_deref().map(name_alias).transpose()?;
+        return Ok((build_subsearch(&subsearch)?, alias));
+    }
+    let sources = clause.tableSourceClause().ok_or_else(|| build_missing_part_error("source"))?;
+    let query = PplQuery {
+        source: PplSource::Index {
+            expression: name_table_sources(&sources)?,
+        },
+        commands: Vec::new(),
+    };
+    Ok((query, sources.alias.as_deref().map(name_alias).transpose()?))
+}
+
+/// Builds `join` in its criteria form.
+///
+/// # Errors
+///
+/// `Semantic` for a join type other than inner or left, two disagreeing types, a `max` that is not a
+/// non-negative integer, join hints, the field-list form, which has no criteria, or an alias with the
+/// reserved prefix.
+fn build_join_command(join: &JoinCommandContextAll<'_>) -> Result<PplCommand, PplError> {
+    let criteria = join.joinCriteria().ok_or_else(|| PplError::Semantic {
+        reason: "join needs criteria: write `join left=<l> right=<r> on <l>.<field> = <r>.<field> <right side>`"
+            .to_string(),
+    })?;
+    if join.joinHintList().is_some() {
+        return Err(PplError::Semantic {
+            reason: "join hints are not supported".to_string(),
+        });
+    }
+    let prefix = join
+        .sqlLikeJoinType()
+        .map(|join_type| {
+            let text = spell_tokens(&*join_type);
+            build_join_kind(&text).map(|kind| (text, kind))
+        })
+        .transpose()?;
+    // `Option` doubles as the "already written" flag: a second `type=` or `max=` would otherwise
+    // silently replace the first, so a query that wrote `max=1` could be planned as unlimited.
+    let mut option_kind = None;
+    let mut max_matches = None;
+    for option in join.joinOption_all() {
+        match option.as_ref() {
+            JoinOptionContextAll::TypeOptionContext(type_option) => {
+                if option_kind.is_some() {
+                    return Err(build_repeated_join_option_error("type"));
+                }
+                let text = spell_tokens(&*type_option.joinType().ok_or_else(|| build_missing_part_error("join"))?);
+                let written_kind = build_join_kind(&text)?;
+                if let Some((prefix_text, prefix_kind)) = &prefix
+                    && *prefix_kind != written_kind
+                {
+                    return Err(PplError::Semantic {
+                        reason: format!("join type={text} contradicts `{prefix_text}` written before `join`"),
+                    });
+                }
+                option_kind = Some(written_kind);
+            }
+            JoinOptionContextAll::MaxOptionContext(max_option) => {
+                if max_matches.is_some() {
+                    return Err(build_repeated_join_option_error("max"));
+                }
+                let text = max_option
+                    .integerLiteral()
+                    .ok_or_else(|| build_missing_part_error("join"))?
+                    .get_text();
+                let limit = text.parse::<usize>().map_err(|error| PplError::Semantic {
+                    reason: match error.kind() {
+                        IntErrorKind::PosOverflow => format!("join max={text} is out of range"),
+                        _ => format!("join max={text}: max must be a non-negative integer"),
+                    },
+                })?;
+                max_matches = Some(limit);
+            }
+            // The criteria form renames a colliding right column, so `overwrite=` has nothing to decide
+            // and is accepted unchanged.
+            JoinOptionContextAll::OverwriteOptionContext(_) => {}
+            JoinOptionContextAll::Error(_) => return Err(build_missing_part_error("join")),
+        }
+    }
+    let side = join.sideAlias();
+    let left_alias = side
+        .as_ref()
+        .and_then(|side| side.leftAlias.as_deref())
+        .map(name_alias)
+        .transpose()?;
+    let written_right_alias = side
+        .as_ref()
+        .and_then(|side| side.rightAlias.as_deref())
+        .map(name_alias)
+        .transpose()?;
+    let right_side = join.tableOrSubqueryClause().ok_or_else(|| build_missing_part_error("join"))?;
+    let (right, right_side_alias) = build_table_or_subquery(&right_side)?;
+    let predicate = criteria.logicalExpression().ok_or_else(|| build_missing_part_error("join"))?;
+    Ok(PplCommand::Join(JoinCommand {
+        kind: option_kind.or_else(|| prefix.map(|(_, kind)| kind)).unwrap_or(JoinKind::Inner),
+        left_alias,
+        right_alias: written_right_alias.or(right_side_alias),
+        criteria: build_logical_expression(&predicate)?,
+        max_matches: max_matches.unwrap_or(0),
+        right: Box::new(right),
+    }))
 }
 
 /// Builds `parse <expression> '<pattern>'`.
@@ -1499,6 +1667,13 @@ fn build_unsupported_function_error(function: &str) -> PplError {
     }
 }
 
+/// A `join` option written twice: refused, because neither value can be preferred over the other.
+fn build_repeated_join_option_error(option: &str) -> PplError {
+    PplError::Semantic {
+        reason: format!("join option {option}= is written more than once; write it once"),
+    }
+}
+
 /// A parse tree missing a part its rule requires: the grammar guarantees it, so this is a defect.
 fn build_missing_part_error(part: &str) -> PplError {
     PplError::Internal {
@@ -1939,6 +2114,9 @@ mod tests {
                 "__ppl_x",
             ),
             ("source=logs | bin __ppl_x span=1", "__ppl_x"),
+            ("source=logs | join left=__ppl_x on x = y spans", "__ppl_x"),
+            ("source=logs | join right=__ppl_x on x = y spans", "__ppl_x"),
+            ("source=logs | join on x = y spans as __ppl_x", "__ppl_x"),
         ];
         for (query, name) in cases {
             assert_eq!(
@@ -1969,5 +2147,150 @@ mod tests {
                 ],
             })
         );
+    }
+
+    #[test]
+    fn join_commands_build_their_ast_nodes() {
+        let query = parse_ppl(
+            "source=logs | left join max=0 left=l right=s on l.service_name = s.service_name \
+             [ source=spans | fields name ]",
+        )
+        .expect("join parses");
+        let [PplCommand::Join(join)] = query.commands.as_slice() else {
+            panic!("not one join: {:?}", query.commands);
+        };
+        assert_eq!(join.kind, JoinKind::Left);
+        assert_eq!(join.left_alias.as_deref(), Some("l"));
+        assert_eq!(join.right_alias.as_deref(), Some("s"));
+        assert_eq!(join.max_matches, 0);
+        assert_eq!(
+            join.criteria,
+            PplExpr::Compare {
+                operator: CompareOperator::Equal,
+                left: Box::new(PplExpr::Field("l.service_name".to_string())),
+                right: Box::new(PplExpr::Field("s.service_name".to_string())),
+            }
+        );
+        assert_eq!(
+            *join.right,
+            PplQuery {
+                source: PplSource::Index {
+                    expression: "spans".to_string(),
+                },
+                commands: vec![PplCommand::Fields {
+                    is_exclusion: false,
+                    fields: vec!["name".to_string()],
+                }],
+            }
+        );
+        // Every right side below reads `spans` with no commands, whether written as an index or a subsearch.
+        let bare_spans = PplQuery {
+            source: PplSource::Index {
+                expression: "spans".to_string(),
+            },
+            commands: Vec::new(),
+        };
+
+        for (text, expected_kind, expected_left_alias, expected_right_alias) in [
+            (
+                "source=logs | join type=left on l.x = r.x spans as r",
+                JoinKind::Left,
+                None,
+                Some("r"),
+            ),
+            (
+                "source=logs | inner join right=r on x = r.x [ source=spans ]",
+                JoinKind::Inner,
+                None,
+                Some("r"),
+            ),
+            (
+                "source=logs | join on x = y [ source=spans ] as r",
+                JoinKind::Inner,
+                None,
+                Some("r"),
+            ),
+            (
+                "source=logs | left outer join left=l on l.x = y spans",
+                JoinKind::Left,
+                Some("l"),
+                None,
+            ),
+            ("source=logs | outer join where x = y spans", JoinKind::Left, None, None),
+            (
+                "source=logs | inner join type=inner on x = y spans",
+                JoinKind::Inner,
+                None,
+                None,
+            ),
+            // `overwrite=` is accepted and changes nothing: the join stays inner and uncapped.
+            (
+                "source=logs | join overwrite=false on x = y spans",
+                JoinKind::Inner,
+                None,
+                None,
+            ),
+        ] {
+            let parsed_query = parse_ppl(text).expect(text);
+            let [PplCommand::Join(join)] = parsed_query.commands.as_slice() else {
+                panic!("{text}: not one join: {:?}", parsed_query.commands);
+            };
+            assert_eq!(join.kind, expected_kind, "{text}");
+            assert_eq!(join.left_alias.as_deref(), expected_left_alias, "{text}");
+            assert_eq!(join.right_alias.as_deref(), expected_right_alias, "{text}");
+            assert_eq!(join.max_matches, 0, "{text}");
+            assert_eq!(*join.right, bare_spans, "{text}");
+        }
+    }
+
+    #[test]
+    fn unsupported_join_forms_are_400s_naming_them() {
+        for (text, expected_name) in [
+            ("source=logs | right join on x = y spans", "right"),
+            ("source=logs | full join on x = y spans", "full"),
+            ("source=logs | cross join on x = y spans", "cross"),
+            ("source=logs | left semi join on x = y spans", "left semi"),
+            (
+                "source=logs | left outer join type=inner on x = y spans",
+                "type=inner contradicts `left outer` written before `join`",
+            ),
+            ("source=logs | anti join on x = y spans", "anti"),
+            (
+                "source=logs | left join type=inner on x = y spans",
+                "type=inner contradicts `left` written before `join`",
+            ),
+            (
+                "source=logs | join max=-1 on x = y spans",
+                "max=-1: max must be a non-negative integer",
+            ),
+            (
+                "source=logs | join max=99999999999999999999999 on x = y spans",
+                "max=99999999999999999999999 is out of range",
+            ),
+            (
+                "source=logs | join max=1 max=0 on x = y spans",
+                "max= is written more than once",
+            ),
+            (
+                "source=logs | join max=0 max=0 on x = y spans",
+                "max= is written more than once",
+            ),
+            (
+                "source=logs | join type=inner type=left on x = y spans",
+                "type= is written more than once",
+            ),
+            (
+                "source=logs | join type=left type=left on x = y spans",
+                "type= is written more than once",
+            ),
+            ("source=logs | join hint.left.x=y on a = b spans", "hints"),
+            ("source=logs | join [ source=spans ]", "on <"),
+        ] {
+            let result = parse_ppl(text);
+            assert!(
+                matches!(&result, Err(PplError::Semantic { reason }) if reason.contains(expected_name)),
+                "{text}: {result:?}"
+            );
+        }
     }
 }
