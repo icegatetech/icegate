@@ -45,7 +45,8 @@ dotted key is never split), `NaN` and the infinities as strings.
 index list is an index expression: comma-separated names, `*` wildcards and `-` exclusions,
 resolved like the `_search` path with `ignore_unavailable=false`, `allow_no_indices=false` and
 open, non-hidden indices. A name that matches nothing is a 404 `INDEX_NOT_FOUND`; names are
-case-sensitive. A source on system indices is a 400.
+case-sensitive. A source on system indices is a 400. `describe <index>` is a source of its own:
+see [`describe`](#describe).
 
 ## Commands
 
@@ -62,6 +63,8 @@ case-sensitive. A source on system indices is a 400.
 | `dedup [N] <field>, … [keepempty=true]` | Keeps the first N rows (`DEFAULT_DEDUP_COUNT` in `build.rs` when N is omitted) of each combination of the fields, in the incoming order. Rows with a NULL field are dropped, or with `keepempty=true` all kept. `consecutive=true` and N below 1 are a 400. |
 | `timechart [span=<length><unit>] [limit=N] [useother=bool] [timefield=<field>] <aggregation> [by <field>]` | See [Timechart](#timechart). |
 | `bin <field> span=<length>[<unit>]` | See [Bin](#bin). |
+| `parse <field> '<pattern>'` | See [`parse`](#parse). |
+| `fillnull with <v> [in <fields>]`, `fillnull using <f> = <v>, …`, `fillnull value=<v> [<fields>]` | See [`fillnull`](#fillnull). |
 
 The output columns of a source are the table's columns in table order. A field reference is
 resolved against the columns of the pipeline at that point, case-sensitively; a name that
@@ -76,7 +79,8 @@ A field name that starts with `RESERVED_NAME_PREFIX` of `plan.rs`, the prefix of
 columns, is a 400 `SEMANTIC_ERROR` naming it wherever the query writes it: a reference, a
 `fields` pattern, an `eval` or `rename` target, an alias, `timefield` or `countfield`.
 A promoted resource attribute whose column an earlier command removed, renamed, or replaced
-(a `rename` onto its name, an `eval` or `bin` assigning it) is a 400 `SEMANTIC_ERROR`, and so is a
+(a `rename` onto its name, an `eval`, `bin`, `parse` or `fillnull` writing it) is a 400
+`SEMANTIC_ERROR`, and so is a
 promoted attribute that the source indices disagree on (a column in some, not in others).
 Several source indices are combined with UNION ALL over the union of their columns, in the order
 the columns first appear; a column an index lacks is NULL in its rows, and a column typed
@@ -88,7 +92,8 @@ differently across the indices is a 400.
   400, because the engine would compare bytes, not the hex the client sees.
 - Timestamps are microseconds in UTC. A timestamp literal is `yyyy-MM-dd`, or
   `yyyy-MM-dd HH:mm:ss` (a `T` may separate date and time) with a fraction no finer than a
-  microsecond; any other form, and a finer fraction, is a 400.
+  microsecond; any other form, and a finer fraction, is a 400. See
+  [Timestamp literals](#timestamp-literals).
 
 ## Expressions
 
@@ -243,9 +248,70 @@ its own value, and a NULL series stays NULL.
 and without one the order is the scan's, so which rows of a combination are kept is unspecified.
 The order of a `sort` holds until the next `sort` or aggregation, whatever comes between: a
 `rename` of a sorted column carries the order to the new name, and a `fields`, `eval`, `bin` or
-`rename` that removes or replaces a sorted column keeps the sorted values in a hidden column
+`rename`, `parse` or `fillnull` that removes or replaces a sorted column keeps the sorted values in
+a hidden column
 that `dedup` orders by and the output never shows. `stats`, `top`, `rare` and `timechart` define
 their own output order, so a `sort` before them does not carry past them.
+
+## `describe`
+
+`describe <index>` answers a jdbc response whose `schema` is the 24 JDBC `getColumns` columns, in this
+order: `TABLE_CAT`, `TABLE_SCHEM`, `TABLE_NAME`, `COLUMN_NAME`, `DATA_TYPE`, `TYPE_NAME`, `COLUMN_SIZE`,
+`BUFFER_LENGTH`, `DECIMAL_DIGITS`, `NUM_PREC_RADIX`, `NULLABLE`, `REMARKS`, `COLUMN_DEF`,
+`SQL_DATA_TYPE`, `SQL_DATETIME_SUB`, `CHAR_OCTET_LENGTH`, `ORDINAL_POSITION`, `IS_NULLABLE`,
+`SCOPE_CATALOG`, `SCOPE_SCHEMA`, `SCOPE_TABLE`, `SOURCE_DATA_TYPE`, `IS_AUTOINCREMENT`,
+`IS_GENERATEDCOLUMN`. Columns typed `int`: `DATA_TYPE`, `COLUMN_SIZE`, `BUFFER_LENGTH`,
+`DECIMAL_DIGITS`, `NUM_PREC_RADIX`, `NULLABLE`, `SQL_DATA_TYPE`, `SQL_DATETIME_SUB`,
+`CHAR_OCTET_LENGTH`, `ORDINAL_POSITION`, `SOURCE_DATA_TYPE`; the rest are `string`.
+`SOURCE_DATA_TYPE` is a JDBC `smallint`; PPL has no such type, and the column is always null, so
+it is typed `int`.
+
+One row per field of the index's field model, in the order `_mapping` lists them: schema column order,
+each MAP column followed by its keys in byte order. A key containing dots is one row
+(`log_attributes.http.method`). Per row: `TABLE_CAT` is `opensearch.cluster_name`; `TABLE_NAME` is the
+index as written; `COLUMN_NAME` the field name; `TYPE_NAME` is `string` for `text` and `keyword`,
+`timestamp` for `date`, `int`, `bigint`, `double`, `boolean`, and `struct` for objects; `NUM_PREC_RADIX`
+10; `NULLABLE` 2; `ORDINAL_POSITION` the 0-based row number; `IS_NULLABLE` and `IS_GENERATEDCOLUMN`
+empty strings; `IS_AUTOINCREMENT` `NO`; every other column null. MAP keys come from field discovery, so
+keys only in the WAL are not listed. The source names exactly one data index: an unknown name is the
+`IndexNotFoundException` 404, several indices or system indices a 400. Later commands apply to the
+rows like to any source.
+
+## `parse`
+
+`parse <field> '<pattern>'` matches the pattern against the **whole** value. Each named group
+`(?<name>…)` becomes a `string` field; a group named like an existing field replaces it in place, other
+groups are appended in pattern order. A NULL value gives NULL; a value the pattern does not match, or a
+group that did not take part in the match, gives `""`. Patterns use the Rust `regex` dialect with this
+group syntax: look-around and back-references are a 400, and so are a pattern that does not compile on
+its own (an unbalanced one such as `x)|(?<a>.*` included), a pattern without a named group, a group
+name with the reserved prefix, and a source that is not a string. Each group field costs one match of
+the pattern per row.
+
+## `fillnull`
+
+`fillnull with <v> [in <fields>]`, `fillnull using <f> = <v>, …`, `fillnull value=<v> [<fields>]`.
+Without a field list every output column is filled and must accept `<v>`. Strings accept strings,
+numbers numbers, booleans booleans, timestamps timestamps; MAP, struct and list columns accept nothing,
+and fixed-size binary id columns accept no replacement. An integer column takes only an integer it
+holds exactly: a literal inside its range, or a computed integer whose type has no value outside that
+range. A fraction, a literal outside the range and a computed integer of a wider type (`1 + 1` is a
+`bigint`) are a 400 naming the field and the value. A floating-point or decimal column takes any
+number, rounded to its type; only a literal outside its range is a 400. The checks run when the
+query is planned, so the cast into an integer column never truncates or goes out of range while it
+runs; a computed replacement is itself evaluated as any expression is.
+An incompatible type is a 400 naming the field and the PPL types of both; a field listed twice is a
+400; an unknown field is `FIELD_NOT_FOUND`.
+
+## Timestamp literals
+
+A string literal compared with a timestamp field (`=`, `!=`, `<`, `<=`, `>`, `>=`, `between`, `in`),
+and the argument of `timestamp('…')`, is read as UTC by the one literal grammar of the function
+library: `yyyy-MM-dd HH:mm:ss[.f]` (a space or a `T` between date and time) with one to six fraction
+digits, or `yyyy-MM-dd` (midnight); surrounding whitespace is ignored. It becomes a microsecond
+literal, so the comparison stays a literal comparison in the stored unit, which the WAL and the
+Iceberg scans can prune with. More than six fraction digits, or another form, is a 400: stored
+timestamps are microseconds, and a finer literal could only be truncated.
 
 ## Limits
 

@@ -4,6 +4,8 @@
 //! plans into the AST and refuses every other one by name, so an unplanned construct is a 400
 //! naming it, never a silently different query.
 
+use std::rc::Rc;
+
 use antlr4rust::parser_rule_context::ParserRuleContext;
 use antlr4rust::rule_context::CustomRuleContext;
 use antlr4rust::token::Token;
@@ -14,40 +16,45 @@ use icegate_query_grammar::ppl::{
     BySpanClauseContextAttrs, CaseFunctionCallContextAll, CaseFunctionCallContextAttrs, CommandsContextAll,
     CommandsContextAttrs, CompareExprContextAttrs, ComparisonOperatorContextAll, ComparisonOperatorContextAttrs,
     CountEvalFunctionCallContextAttrs, DataTypeFunctionCallContextAttrs, DedupCommandContextAll,
-    DedupCommandContextAttrs, DefaultSortFieldContextAttrs, DistinctCountFunctionCallContextAttrs,
-    EvalClauseContextAll, EvalClauseContextAttrs, EvalCommandContextAttrs, EvalExpressionContextAttrs,
-    EvalFunctionCallContextAttrs, ExpressionContextAll, FieldExprContextAttrs, FieldExpressionContextAll,
-    FieldExpressionContextAttrs, FieldListContextAll, FieldListContextAttrs, FieldsCommandBodyContextAll,
-    FieldsCommandBodyContextAttrs, FieldsCommandContextAttrs, FromClauseContextAll, FromClauseContextAttrs,
-    FunctionArgContextAll, FunctionArgContextAttrs, FunctionArgExpressionContextAttrs, FunctionArgsContextAll,
-    FunctionArgsContextAttrs, FunctionCallContextAll, FunctionCallContextAttrs, FunctionCallExprContextAttrs,
-    IdentContextAll, IdentContextAttrs, IdentsAsQualifiedNameContextAttrs, IdentsAsTableQualifiedNameContextAttrs,
+    DedupCommandContextAttrs, DefaultSortFieldContextAttrs, DescribeCommandContextAttrs,
+    DistinctCountFunctionCallContextAttrs, EvalClauseContextAll, EvalClauseContextAttrs, EvalCommandContextAttrs,
+    EvalExpressionContextAttrs, EvalFunctionCallContextAttrs, ExpressionContextAll, FieldExprContextAttrs,
+    FieldExpressionContextAll, FieldExpressionContextAttrs, FieldListContextAll, FieldListContextAttrs,
+    FieldsCommandBodyContextAll, FieldsCommandBodyContextAttrs, FieldsCommandContextAttrs,
+    FillNullUsingClauseContextAttrs, FillNullUsingContextAttrs, FillNullValueAllFieldsContextAttrs,
+    FillNullValueWithFieldsContextAttrs, FillNullWithClauseContextAttrs, FillNullWithContextAttrs,
+    FillnullCommandContextAll, FromClauseContextAll, FromClauseContextAttrs, FunctionArgContextAll,
+    FunctionArgContextAttrs, FunctionArgExpressionContextAttrs, FunctionArgsContextAll, FunctionArgsContextAttrs,
+    FunctionCallContextAll, FunctionCallContextAttrs, FunctionCallExprContextAttrs, IdentContextAll, IdentContextAttrs,
+    IdentsAsQualifiedNameContextAttrs, IdentsAsTableQualifiedNameContextAttrs,
     IdentsAsWildcardQualifiedNameContextAttrs, InExprContextAttrs, IntegerLiteralContextAll,
     IsNullPredicateContextAttrs, LambdaContextAll, LambdaContextAttrs, LambdaExprContextAttrs, LiteralValueContextAll,
     LiteralValueContextAttrs, LiteralValueExprContextAttrs, LogicalExprContextAttrs, LogicalExpressionContextAll,
     LogicalNotContextAttrs, NestedValueExprContextAttrs, NullNotnullContextAttrs, NumericSpanValueContextAttrs,
-    PercentileApproxFunctionCallContextAttrs, PercentileShortcutFunctionCallContextAttrs, PplCommandsContextAll,
-    PplCommandsContextAttrs, PplStatementContextAttrs, PrefixSortFieldContextAttrs, QualifiedNameContextAll,
-    QueryStatementContextAll, QueryStatementContextAttrs, RareTopCommandContextAll, RareTopCommandContextAttrs,
-    RenameClauseContextAll, RenameCommandContextAttrs, RenameFieldExpressionContextAll,
-    RenameFieldExpressionContextAttrs, RootContextAttrs, SearchCommandContextAll, SearchFromContextAttrs,
+    ParseCommandContextAll, ParseCommandContextAttrs, PercentileApproxFunctionCallContextAttrs,
+    PercentileShortcutFunctionCallContextAttrs, PplCommandsContextAll, PplCommandsContextAttrs,
+    PplStatementContextAttrs, PrefixSortFieldContextAttrs, QualifiedNameContextAll, QueryStatementContextAll,
+    QueryStatementContextAttrs, RareTopCommandContextAll, RareTopCommandContextAttrs, RenameClauseContextAll,
+    RenameCommandContextAttrs, RenameFieldExpressionContextAll, RenameFieldExpressionContextAttrs,
+    ReplacementPairContextAttrs, RootContextAttrs, SearchCommandContextAll, SearchFromContextAttrs,
     SelectFieldExpressionContextAll, SelectFieldExpressionContextAttrs, SortCommandContextAttrs, SortFieldContextAll,
     SortFieldExpressionContextAll, SortFieldExpressionContextAttrs, SortbyClauseContextAttrs, SpanClauseContextAttrs,
     SpanLiteralContextAll, SpanLiteralContextAttrs, StatsAggTermContextAll, StatsAggTermContextAttrs,
     StatsArgsContextAttrs, StatsByClauseContextAll, StatsByClauseContextAttrs, StatsCommandContextAll,
     StatsCommandContextAttrs, StatsFunctionCallContextAttrs, StatsFunctionContextAll, StringLiteralContextAll,
     SuffixSortFieldContextAttrs, TableCommandContextAttrs, TableIdentContextAll, TableIdentContextAttrs,
-    TableOrSubqueryClauseContextAttrs, TableQualifiedNameContextAll, TableSourceClauseContextAttrs,
-    TableSourceContextAll, TableSourceContextAttrs, TimechartCommandContextAll, TimechartCommandContextAttrs,
-    TimechartParameterContextAttrs, TimestampFunctionCallContextAttrs, ValueExprContextAttrs,
-    ValueExpressionContextAll, ValueListContextAttrs, ValuesAggFunctionCallContextAttrs, ValuesAggFunctionContextAttrs,
-    WcFieldExpressionContextAttrs, WcFieldListContextAttrs, WcQualifiedNameContextAll, WhereCommandContextAttrs,
-    WildcardContextAll, WildcardContextAttrs, parse_ppl_root, ruleNames,
+    TableOrSubqueryClauseContextAttrs, TableQualifiedNameContextAll, TableSourceClauseContextAll,
+    TableSourceClauseContextAttrs, TableSourceContextAll, TableSourceContextAttrs, TimechartCommandContextAll,
+    TimechartCommandContextAttrs, TimechartParameterContextAttrs, TimestampFunctionCallContextAttrs,
+    ValueExprContextAttrs, ValueExpressionContextAll, ValueListContextAttrs, ValuesAggFunctionCallContextAttrs,
+    ValuesAggFunctionContextAttrs, WcFieldExpressionContextAttrs, WcFieldListContextAttrs, WcQualifiedNameContextAll,
+    WhereCommandContextAttrs, WildcardContextAll, WildcardContextAttrs, parse_ppl_root, ruleNames,
 };
 
 use super::ast::{
-    ArithmeticOperator, BinCommand, BinSpan, CastTarget, CompareOperator, DedupCommand, PplCommand, PplExpr,
-    PplGroupKey, PplLiteral, PplQuery, PplSortKey, PplSource, RankCommand, SpanUnit, StatsCommand, TimechartCommand,
+    ArithmeticOperator, BinCommand, BinSpan, CastTarget, CompareOperator, DedupCommand, FillnullCommand,
+    FillnullReplacements, ParseCommand, PplCommand, PplExpr, PplGroupKey, PplLiteral, PplQuery, PplSortKey, PplSource,
+    RankCommand, SpanUnit, StatsCommand, TimechartCommand,
 };
 use super::error::PplError;
 use super::plan::RESERVED_NAME_PREFIX;
@@ -132,6 +139,14 @@ fn build_query(query: &QueryStatementContextAll<'_>) -> Result<PplQuery, PplErro
 }
 
 fn build_source(first_command: &PplCommandsContextAll<'_>) -> Result<PplSource, PplError> {
+    if let Some(describe) = first_command.describeCommand() {
+        let clause = describe
+            .tableSourceClause()
+            .ok_or_else(|| build_missing_part_error("describe"))?;
+        return Ok(PplSource::Describe {
+            index: name_table_sources(&clause)?,
+        });
+    }
     let Some(search) = first_command.searchCommand() else {
         return Err(build_unsupported_command_error(&name_first_child_rule(first_command)));
     };
@@ -161,14 +176,19 @@ fn build_index_source(from: &FromClauseContextAll<'_>) -> Result<PplSource, PplE
     let Some(sources) = clause.tableSourceClause() else {
         return Err(build_unsupported_command_error("source=[subsearch]"));
     };
-    let names = sources
+    Ok(PplSource::Index {
+        expression: name_table_sources(&sources)?,
+    })
+}
+
+/// The index expression a `tableSourceClause` names: its table sources, comma-separated.
+fn name_table_sources(clause: &TableSourceClauseContextAll<'_>) -> Result<String, PplError> {
+    let names = clause
         .tableSource_all()
         .iter()
         .map(|source| name_table_source(source))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(PplSource::Index {
-        expression: names.join(","),
-    })
+    Ok(names.join(","))
 }
 
 fn name_table_source(source: &TableSourceContextAll<'_>) -> Result<String, PplError> {
@@ -280,7 +300,77 @@ fn build_command(command: &CommandsContextAll<'_>) -> Result<PplCommand, PplErro
     if let Some(bin) = command.binCommand() {
         return Ok(PplCommand::Bin(build_bin(&bin)?));
     }
+    if let Some(parse) = command.parseCommand() {
+        return build_parse(&parse);
+    }
+    if let Some(fillnull) = command.fillnullCommand() {
+        return build_fillnull(&fillnull);
+    }
     Err(build_unsupported_command_error(&name_first_child_rule(command)))
+}
+
+/// Builds `parse <expression> '<pattern>'`.
+fn build_parse(parse: &ParseCommandContextAll<'_>) -> Result<PplCommand, PplError> {
+    let source = parse.expression().ok_or_else(|| build_missing_part_error("parse"))?;
+    let pattern = parse.stringLiteral().ok_or_else(|| build_missing_part_error("parse"))?;
+    Ok(PplCommand::Parse(ParseCommand {
+        source: build_expression(&source)?,
+        pattern: unquote_string(&pattern),
+    }))
+}
+
+/// Builds the four `fillnull` forms; a form without a field list fills every output column.
+fn build_fillnull(fillnull: &FillnullCommandContextAll<'_>) -> Result<PplCommand, PplError> {
+    let replacements = match fillnull {
+        FillnullCommandContextAll::FillNullWithClauseContext(clause) => {
+            let with_clause = clause.fillNullWith().ok_or_else(|| build_missing_part_error("fillnull"))?;
+            let replacement = build_replacement(with_clause.valueExpression())?;
+            match with_clause.fieldList() {
+                Some(fields) => FillnullReplacements::Fields(pair_fields_with(&fields, &replacement)?),
+                None => FillnullReplacements::AllFields(replacement),
+            }
+        }
+        FillnullCommandContextAll::FillNullUsingClauseContext(clause) => {
+            let using_clause = clause.fillNullUsing().ok_or_else(|| build_missing_part_error("fillnull"))?;
+            let pairs = using_clause
+                .replacementPair_all()
+                .iter()
+                .map(|pair| {
+                    let field = pair.fieldExpression().ok_or_else(|| build_missing_part_error("fillnull"))?;
+                    Ok((name_field(&field)?, build_replacement(pair.valueExpression())?))
+                })
+                .collect::<Result<Vec<_>, PplError>>()?;
+            FillnullReplacements::Fields(pairs)
+        }
+        FillnullCommandContextAll::FillNullValueWithFieldsContext(clause) => {
+            let replacement = build_replacement(clause.valueExpression())?;
+            let fields = clause.fieldList().ok_or_else(|| build_missing_part_error("fillnull"))?;
+            FillnullReplacements::Fields(pair_fields_with(&fields, &replacement)?)
+        }
+        FillnullCommandContextAll::FillNullValueAllFieldsContext(clause) => {
+            FillnullReplacements::AllFields(build_replacement(clause.valueExpression())?)
+        }
+        FillnullCommandContextAll::Error(_) => return Err(build_missing_part_error("fillnull")),
+    };
+    Ok(PplCommand::Fillnull(FillnullCommand { replacements }))
+}
+
+/// Builds a `fillnull` replacement value.
+fn build_replacement(value: Option<Rc<ValueExpressionContextAll<'_>>>) -> Result<PplExpr, PplError> {
+    let value = value.ok_or_else(|| build_missing_part_error("fillnull"))?;
+    build_value(&value)
+}
+
+/// Pairs every field of a `fillnull` field list with one replacement value.
+fn pair_fields_with(
+    fields: &FieldListContextAll<'_>,
+    replacement: &PplExpr,
+) -> Result<Vec<(String, PplExpr)>, PplError> {
+    fields
+        .fieldExpression_all()
+        .iter()
+        .map(|field| Ok((name_field(field)?, replacement.clone())))
+        .collect()
 }
 
 /// A `stats` command; its `partitions`, `allnum`, `delim` and `dedup_splitvalues` options are
@@ -1428,7 +1518,6 @@ mod tests {
             ("source=logs | grok body 'client=.*'", "grok"),
             ("source=logs | trendline sma(2, severity_number)", "trendline"),
             ("source=logs | flatten resource_attributes", "flatten"),
-            ("describe logs", "describe"),
         ];
         for (query, command) in cases {
             assert_eq!(
@@ -1446,6 +1535,83 @@ mod tests {
                 function: "take".to_string()
             })
         );
+    }
+
+    #[test]
+    fn describe_parse_and_fillnull_build_their_ast_nodes() {
+        let describe_query = parse_ppl("describe logs").expect("describe parses");
+        assert_eq!(
+            describe_query,
+            PplQuery {
+                source: PplSource::Describe {
+                    index: "logs".to_string()
+                },
+                commands: vec![],
+            }
+        );
+
+        let parse_query = parse_ppl("source=logs | parse body '(?<host>[a-z]+) .*'").expect("parse parses");
+        assert_eq!(
+            parse_query.commands,
+            vec![PplCommand::Parse(ParseCommand {
+                source: PplExpr::Field("body".to_string()),
+                pattern: "(?<host>[a-z]+) .*".to_string(),
+            })]
+        );
+
+        let text = |value: &str| PplExpr::Literal(PplLiteral::String(value.to_string()));
+        let fill = |replacements: FillnullReplacements| vec![PplCommand::Fillnull(FillnullCommand { replacements })];
+        for (query, expected_commands) in [
+            (
+                "source=logs | fillnull with 'x' in service_name, body",
+                fill(FillnullReplacements::Fields(vec![
+                    ("service_name".to_string(), text("x")),
+                    ("body".to_string(), text("x")),
+                ])),
+            ),
+            (
+                "source=logs | fillnull using service_name = 'a', body = 'b'",
+                fill(FillnullReplacements::Fields(vec![
+                    ("service_name".to_string(), text("a")),
+                    ("body".to_string(), text("b")),
+                ])),
+            ),
+            (
+                "source=logs | fillnull value='x' service_name body",
+                fill(FillnullReplacements::Fields(vec![
+                    ("service_name".to_string(), text("x")),
+                    ("body".to_string(), text("x")),
+                ])),
+            ),
+            (
+                "source=logs | fillnull with 'x'",
+                fill(FillnullReplacements::AllFields(text("x"))),
+            ),
+            (
+                "source=logs | fillnull value=0",
+                fill(FillnullReplacements::AllFields(PplExpr::Literal(PplLiteral::Integer(
+                    0,
+                )))),
+            ),
+        ] {
+            let query_ast = parse_ppl(query).expect("fillnull parses");
+            assert_eq!(query_ast.commands, expected_commands, "{query}");
+        }
+
+        // A field name the query writes or reads keeps the reserved-prefix refusal in both commands.
+        for query in [
+            "source=logs | parse __ppl_x '(?<a>.*)'",
+            "source=logs | fillnull using __ppl_x = 'a'",
+            "source=logs | fillnull with 'a' in body, __ppl_x",
+        ] {
+            assert_eq!(
+                parse_ppl(query),
+                Err(PplError::Semantic {
+                    reason: format!("field name [__ppl_x] starts with the reserved prefix [{RESERVED_NAME_PREFIX}]"),
+                }),
+                "{query}"
+            );
+        }
     }
 
     #[test]

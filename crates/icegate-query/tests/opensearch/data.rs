@@ -21,8 +21,9 @@ use icegate_common::schema::{
     COL_SPAN_ID, COL_TENANT_ID, COL_TIMESTAMP, COL_TRACE_ID, COL_VALID_FROM, COL_VALID_FROM_SOURCE,
 };
 use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE, OPERATIONS_TABLE, PRICES_TABLE};
+use object_store::ObjectStore;
 
-pub use super::test_rows::{Cell, Row, RowWriteError, commit_rows, write_wal_segment};
+pub use super::test_rows::{COMMITTED_WAL_OFFSET, Cell, Row, RowWriteError, commit_rows, write_wal_segment};
 use super::test_rows::{FINISH_REASONS, TEMPERATURE, build_operation_row, commit_batch, read_arrow_schema};
 
 /// 2026-10-08T10:00:00Z in microseconds, the instant [`compute_micros_at_minute`] counts from.
@@ -134,6 +135,46 @@ pub async fn commit_log_rows(catalog: &Arc<dyn Catalog>, rows: &[LogRow<'_>]) ->
         .collect::<Result<Vec<ArrayRef>, RowWriteError>>()?;
     let batch = RecordBatch::try_new(arrow_schema, columns)?;
     commit_batch(catalog, LOGS_TABLE, batch).await
+}
+
+/// Write `rows` as the WAL segment `offset` of the `logs` topic, with the cells `commit_log_rows`
+/// writes for the same rows (observed and ingested timestamps equal to the event time, MAP columns
+/// empty rather than null). A table with a commit is read from the WAL from
+/// `COMMITTED_WAL_OFFSET + 1` on, so a test writes its first segment there.
+pub async fn write_log_wal_segment(
+    wal_store: &Arc<dyn ObjectStore>,
+    catalog: &Arc<dyn Catalog>,
+    offset: u64,
+    rows: &[LogRow<'_>],
+) -> Result<(), RowWriteError> {
+    let wal_rows: Vec<Row<'_>> = rows.iter().map(build_log_wal_row).collect();
+    write_wal_segment(wal_store, catalog, LOGS_TABLE, offset, &wal_rows).await
+}
+
+/// The generic row of one `LogRow`; a `None` text column is left out, so it is null.
+fn build_log_wal_row<'a>(row: &LogRow<'a>) -> Row<'a> {
+    let mut cells = vec![
+        (COL_TIMESTAMP, Cell::Micros(row.timestamp_micros)),
+        (COL_OBSERVED_TIMESTAMP, Cell::Micros(row.timestamp_micros)),
+        (COL_INGESTED_TIMESTAMP, Cell::Micros(row.timestamp_micros)),
+        (COL_RESOURCE_ATTRIBUTES, Cell::Map(row.resource_attributes)),
+        (COL_SCOPE_ATTRIBUTES, Cell::Map(&[])),
+        (COL_LOG_ATTRIBUTES, Cell::Map(row.log_attributes)),
+    ];
+    let text_columns = [
+        (COL_SERVICE_NAME, row.service_name),
+        (COL_SEVERITY_TEXT, row.severity_text),
+        (COL_BODY, row.body),
+    ];
+    cells.extend(
+        text_columns
+            .into_iter()
+            .filter_map(|(column, value)| value.map(|text| (column, Cell::Text(text)))),
+    );
+    Row {
+        tenant: row.tenant_id,
+        cells,
+    }
 }
 
 /// The column `field` of `logs` for `rows`.

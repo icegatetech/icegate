@@ -58,7 +58,7 @@ pub(crate) async fn execute_ppl_query(
         Ok(session) => session,
         Err(error) => return render_ppl_error(&error.into()),
     };
-    match run_ppl_query(&session, &limits, &context, &request).await {
+    match run_ppl_query(&session, &limits, &context, &request, &state.node.cluster_name).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => render_ppl_error(&error),
     }
@@ -133,15 +133,17 @@ fn build_fetch_size_error(value: &Value) -> OpenSearchError {
 /// `fetch_size` keeps the first N rows of the final output, as a trailing `| head N` does; it is
 /// a bound the client asked for, never reported as truncation. `limits.max_result_rows` is then
 /// checked against the output: the plan fetches one row beyond it, so a breach is detected
-/// without reading the rest, and is refused instead of truncated.
+/// without reading the rest, and is refused instead of truncated. `cluster_name` is the
+/// listener's `opensearch.cluster_name`, which `describe` reports.
 pub(crate) async fn run_ppl_query(
     session: &TenantSession,
     limits: &PplLimitsConfig,
     context: &RequestContext,
     request: &PplRequest,
+    cluster_name: &str,
 ) -> Result<Value, PplError> {
     let query = parse_ppl(&request.query)?;
-    let ppl_plan = plan_ppl(&query, session, context).await?;
+    let ppl_plan = plan_ppl(&query, session, context, cluster_name).await?;
     let plan = bound_output_rows(ppl_plan.plan, request.fetch_size, limits.max_result_rows)?;
     let batches = session.collect(plan).await?;
     refuse_rows_beyond_limit(&batches, limits.max_result_rows)?;

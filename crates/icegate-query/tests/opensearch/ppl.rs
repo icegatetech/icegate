@@ -22,7 +22,7 @@ use super::data::{
     Cell, LogRow, OperationRow, PriceRow, Row, RowWriteError, commit_log_rows, commit_operation_rows,
     commit_price_rows, commit_rows, create_exact_name_table, required_string,
 };
-use super::harness::{ServerOptions, TestServer};
+use super::harness::{PplReply, ServerOptions, TestServer};
 use super::search::NearlyFullMemory;
 use super::test_rows::TEMPERATURE;
 
@@ -118,31 +118,17 @@ struct PplAnswer {
     body: Value,
 }
 
-async fn read_answer(response: reqwest::Response) -> PplAnswer {
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let text = response.text().await.expect("response body");
-    let body = serde_json::from_str(&text).expect("JSON body");
+/// `reply` with its body parsed.
+fn read_answer(reply: PplReply) -> PplAnswer {
     PplAnswer {
-        status,
-        content_type,
-        body,
+        status: StatusCode::from_u16(reply.status).expect("HTTP status"),
+        body: reply.parse_json_body(),
+        content_type: reply.content_type,
     }
 }
 
 async fn post_ppl(server: &TestServer, tenant: &str, path_and_query: &str, body: &Value) -> PplAnswer {
-    let response = server
-        .request(Method::POST, Some(tenant), path_and_query)
-        .json(body)
-        .send()
-        .await
-        .expect("PPL request");
-    read_answer(response).await
+    read_answer(server.post_ppl(tenant, path_and_query, body).await)
 }
 
 async fn run_query(server: &TestServer, query: &str) -> PplAnswer {
@@ -477,7 +463,7 @@ async fn invalid_json_is_an_illegal_argument_envelope() {
         .send()
         .await
         .expect("PPL request");
-    let answer = read_answer(response).await;
+    let answer = read_answer(PplReply::from_response(response).await);
     let error = read_illegal_argument_error(&answer);
     assert!(error.get("key").is_none(), "error {error}");
     server.shutdown().await;
@@ -762,7 +748,7 @@ async fn middleware_refusals_on_the_ppl_route_answer_in_the_envelope() {
         .await
         .expect("PPL request under memory pressure");
     assert!(response.headers().contains_key("retry-after"));
-    let shed_answer = read_answer(response).await;
+    let shed_answer = read_answer(PplReply::from_response(response).await);
     assert_eq!(
         shed_answer.status,
         StatusCode::SERVICE_UNAVAILABLE,
@@ -800,7 +786,7 @@ async fn middleware_refusals_on_the_ppl_route_answer_in_the_envelope() {
         .send()
         .await
         .expect("PPL request without a tenant");
-    let tenant_refusal = read_answer(response).await;
+    let tenant_refusal = read_answer(PplReply::from_response(response).await);
     assert_eq!(
         tenant_refusal.status,
         StatusCode::BAD_REQUEST,
@@ -2434,4 +2420,600 @@ async fn percentile_values_lie_within_the_stated_tolerance() {
         assert!((value - exact).abs() <= 2.0, "column {index}: {value} vs {exact}");
     }
     server.shutdown().await;
+}
+
+/// `parse`, `fillnull`, `describe` and timestamp literals over real HTTP. Inputs are literal PPL text
+/// over rows written here; expected rows are stated by hand from the rules in `ppl/README.md`.
+mod commands_and_literals {
+    use icegate_common::schema::{
+        COL_BODY, COL_INGESTED_TIMESTAMP, COL_LOG_ATTRIBUTES, COL_OBSERVED_TIMESTAMP, COL_RESOURCE_ATTRIBUTES,
+        COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID,
+    };
+    use icegate_common::{LOGS_TABLE, OPERATIONS_TABLE, SPANS_TABLE};
+    use reqwest::StatusCode;
+    use serde_json::{Value, json};
+
+    use super::super::data::{
+        COMMITTED_WAL_OFFSET, Cell, LogRow, Row, commit_log_rows, commit_rows, write_log_wal_segment,
+    };
+    use super::super::harness::TestServer;
+    use super::super::test_rows::{OPERATION_NAME, STREAM, TEMPERATURE};
+    use super::{
+        NOON_MICROS, OTHER_TENANT, PplAnswer, TENANT, assert_ppl_error, read_rows, run_query, seed_token_operations,
+    };
+
+    /// `error.type` and `error.code` of a query the planner refuses as invalid.
+    const SEMANTIC_ERROR: (&str, &str) = ("SemanticCheckException", "SEMANTIC_ERROR");
+    /// `error.type` and `error.code` of a command or function IceGate does not plan.
+    const UNSUPPORTED_OPERATION: (&str, &str) = ("UnsupportedOperationException", "UNSUPPORTED_OPERATION");
+
+    const fn build_log_row<'a>(
+        tenant_id: &'a str,
+        timestamp_micros: i64,
+        service_name: Option<&'a str>,
+        severity_text: Option<&'a str>,
+        body: Option<&'a str>,
+    ) -> LogRow<'a> {
+        LogRow {
+            tenant_id,
+            timestamp_micros,
+            service_name,
+            severity_text,
+            body,
+            resource_attributes: &[],
+            log_attributes: &[],
+        }
+    }
+
+    /// Inside the default field-discovery window whatever the wall clock reads, so `describe` lists
+    /// the MAP keys committed here.
+    fn compute_recent_micros() -> i64 {
+        (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_micros()
+    }
+
+    /// `reason` and `details` of a PPL error envelope, joined, to check what the error names.
+    fn read_error_text(answer: &PplAnswer) -> String {
+        format!(
+            "{} {}",
+            answer.body["error"]["reason"].as_str().unwrap_or_default(),
+            answer.body["error"]["details"].as_str().unwrap_or_default()
+        )
+    }
+
+    /// A 400 PPL error envelope of `expected_error` (`error.type`, `error.code`) that names `named`.
+    fn assert_ppl_400(answer: &PplAnswer, expected_error: (&str, &str), named: &str) {
+        let (error_type, code) = expected_error;
+        assert_ppl_error(answer, StatusCode::BAD_REQUEST, error_type, code);
+        assert!(
+            read_error_text(answer).contains(named),
+            "error must name {named:?}: {}",
+            answer.body
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_extracts_named_groups_into_new_fields() {
+        let (server, catalog) = TestServer::start().await;
+        commit_log_rows(
+            &catalog,
+            &[
+                build_log_row(
+                    TENANT,
+                    NOON_MICROS,
+                    Some("checkout"),
+                    Some("A"),
+                    Some("Payment failed: connection timeout"),
+                ),
+                build_log_row(TENANT, NOON_MICROS, Some("checkout"), Some("B"), Some("no colon here")),
+                build_log_row(TENANT, NOON_MICROS, Some("checkout"), Some("C"), None),
+                build_log_row(
+                    TENANT,
+                    NOON_MICROS,
+                    Some("checkout"),
+                    Some("D"),
+                    Some("Disk full: /var 98%"),
+                ),
+                build_log_row(TENANT, NOON_MICROS, Some("checkout"), Some("E"), Some("abc def")),
+                build_log_row(
+                    OTHER_TENANT,
+                    NOON_MICROS,
+                    Some("checkout"),
+                    Some("A"),
+                    Some("Other tenant: secret"),
+                ),
+            ],
+        )
+        .await
+        .expect("commit logs");
+
+        let reply = run_query(&server, "source=logs | parse body '(?<errmsg>[^:]+): (?<detail>.+)' | fields severity_text, errmsg, detail | sort severity_text",
+        )
+        .await;
+        assert_eq!(
+            read_rows(&reply),
+            &json!([
+                ["A", "Payment failed", "connection timeout"],
+                ["B", "", ""],
+                ["C", null, null],
+                ["D", "Disk full", "/var 98%"],
+                ["E", "", ""]
+            ])
+        );
+
+        // The pattern must match the whole value: "abc" alone matching is no match.
+        let reply = run_query(
+            &server,
+            "source=logs | where severity_text = 'E' | parse body '(?<word>[a-z]+)' | fields word",
+        )
+        .await;
+        assert_eq!(read_rows(&reply), &json!([[""]]));
+
+        // A group named like an existing field replaces its values; an optional group that did not
+        // take part in the match yields "".
+        let reply = run_query(&server, "source=logs | where severity_text = 'D' | parse body '(?<severity_text>[A-Za-z]+) (?<unit>kB )?full: (?<path>[^ ]+) .*' | fields severity_text, unit, path",
+        )
+        .await;
+        assert_eq!(read_rows(&reply), &json!([["Disk", "", "/var"]]));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn parse_with_an_unsupported_pattern_or_a_non_string_source_is_a_400() {
+        let (server, _catalog) = TestServer::start().await;
+        for (query, named) in [
+            ("source=logs | parse body '[a-z]+'", "[a-z]+"),
+            ("source=logs | parse body '(?<a>x'", "(?<a>x"),
+            ("source=logs | parse body '(?<a>x)(?=y)'", "(?<a>x)(?=y)"),
+            ("source=logs | parse body '(?<=y)(?<a>x)'", "(?<=y)(?<a>x)"),
+            ("source=logs | parse body '(?<a>x)\\k<a>'", "(?<a>x)\\k<a>"),
+            ("source=logs | parse body '(?<a>x)\\1'", "(?<a>x)\\1"),
+            // Unbalanced on its own; wrapped in the anchoring group it would escape both anchors.
+            ("source=logs | parse body 'x)|(?<a>.*'", "x)|(?<a>.*"),
+            // Balanced on its own; the trailing comment would swallow the anchoring group's end.
+            ("source=logs | parse body '(?x)(?<a>.*) #'", "(?x)(?<a>.*) #"),
+            ("source=logs | parse body '(?<__ppl_a>.*)'", "__ppl_a"),
+            ("source=logs | parse timestamp '(?<a>.+)'", "timestamp"),
+        ] {
+            assert_ppl_400(&run_query(&server, query).await, SEMANTIC_ERROR, named);
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fillnull_replaces_nulls_with_the_stated_values() {
+        let (server, catalog) = TestServer::start().await;
+        commit_log_rows(
+            &catalog,
+            &[
+                build_log_row(TENANT, NOON_MICROS, Some("checkout"), Some("A"), None),
+                build_log_row(TENANT, NOON_MICROS, None, Some("B"), Some("ok")),
+                build_log_row(TENANT, NOON_MICROS, None, Some("C"), None),
+                build_log_row(OTHER_TENANT, NOON_MICROS, None, Some("A"), None),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        seed_token_operations(&catalog, &[Some(3), None])
+            .await
+            .expect("seed token operations");
+
+        for (query, expected) in [
+            (
+                "source=logs | fillnull with 'unknown' in service_name, body | fields severity_text, service_name, body | sort severity_text",
+                json!([
+                    ["A", "checkout", "unknown"],
+                    ["B", "unknown", "ok"],
+                    ["C", "unknown", "unknown"]
+                ]),
+            ),
+            (
+                "source=logs | fillnull using service_name = 'svc', body = 'none' | fields severity_text, service_name, body | sort severity_text",
+                json!([["A", "checkout", "none"], ["B", "svc", "ok"], ["C", "svc", "none"]]),
+            ),
+            (
+                "source=logs | fillnull value='-' body | fields severity_text, service_name, body | sort severity_text",
+                json!([["A", "checkout", "-"], ["B", null, "ok"], ["C", null, "-"]]),
+            ),
+            (
+                "source=logs | fields severity_text, service_name, body | fillnull with '?' | sort severity_text",
+                json!([["A", "checkout", "?"], ["B", "?", "ok"], ["C", "?", "?"]]),
+            ),
+        ] {
+            assert_eq!(read_rows(&run_query(&server, query).await), &expected, "{query}");
+        }
+
+        assert_ppl_400(
+            &run_query(&server, "source=logs | fillnull value=0 service_name").await,
+            SEMANTIC_ERROR,
+            "service_name",
+        );
+        assert_ppl_400(
+            &run_query(&server, "source=logs | fillnull using body = 'a', body = 'b'").await,
+            SEMANTIC_ERROR,
+            "body",
+        );
+        // An id column renders as a hex string but accepts no replacement.
+        assert_ppl_400(
+            &run_query(&server, &format!("source=logs | fillnull with 'x' in {COL_TRACE_ID}")).await,
+            SEMANTIC_ERROR,
+            COL_TRACE_ID,
+        );
+        // Without a field list every column must accept the value; `logs` has timestamps and MAPs.
+        assert_ppl_400(
+            &run_query(&server, "source=logs | fillnull with 'x'").await,
+            SEMANTIC_ERROR,
+            "fillnull",
+        );
+        // A number fills a numeric column only when the column's type holds it exactly: the integer
+        // column `input_tokens` takes 7 but refuses 1.5, which it would truncate.
+        assert_eq!(
+            read_rows(
+                &run_query(
+                    &server,
+                    "source=operations | fillnull value=7 input_tokens | sort timestamp | fields input_tokens"
+                )
+                .await
+            ),
+            &json!([[3], [7]])
+        );
+        assert_ppl_400(
+            &run_query(&server, "source=operations | fillnull value=1.5 input_tokens").await,
+            SEMANTIC_ERROR,
+            "field 'input_tokens' (type: bigint) cannot hold the replacement value 1.5",
+        );
+        let missing_field_reply = run_query(&server, "source=logs | fillnull with 'x' in no_such_field").await;
+        assert_ppl_error(
+            &missing_field_reply,
+            StatusCode::BAD_REQUEST,
+            "SemanticCheckException",
+            "FIELD_NOT_FOUND",
+        );
+        assert_eq!(missing_field_reply.body["error"]["context"]["field"], "no_such_field");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fillnull_fills_numeric_boolean_and_timestamp_columns_with_values_they_hold() {
+        let (server, catalog) = TestServer::start().await;
+        // `set` has every filled column set, `unset` none of them. `timestamp` is a required
+        // column, so the queries derive a nullable `seen` from it: NULL for `unset`, at 12:00:01.
+        let operation_rows = [
+            Row {
+                tenant: TENANT,
+                cells: vec![
+                    (OPERATION_NAME, Cell::Text("set")),
+                    (COL_TIMESTAMP, Cell::Micros(NOON_MICROS)),
+                    ("input_tokens", Cell::Long(3)),
+                    (TEMPERATURE, Cell::Double(0.5)),
+                    (STREAM, Cell::Bool(true)),
+                ],
+            },
+            Row {
+                tenant: TENANT,
+                cells: vec![
+                    (OPERATION_NAME, Cell::Text("unset")),
+                    (COL_TIMESTAMP, Cell::Micros(NOON_MICROS + 1_000_000)),
+                ],
+            },
+            Row {
+                tenant: OTHER_TENANT,
+                cells: vec![
+                    (OPERATION_NAME, Cell::Text("other-tenant")),
+                    (COL_TIMESTAMP, Cell::Micros(NOON_MICROS)),
+                ],
+            },
+        ];
+        commit_rows(&catalog, OPERATIONS_TABLE, &operation_rows)
+            .await
+            .expect("commit operations");
+        // One span; its `status_code` (an `int` column) is NULL.
+        let span_rows = [Row {
+            tenant: TENANT,
+            cells: vec![(COL_TIMESTAMP, Cell::Micros(NOON_MICROS))],
+        }];
+        commit_rows(&catalog, SPANS_TABLE, &span_rows).await.expect("commit spans");
+
+        // The double column takes the integer 2; the timestamp column takes a timestamp.
+        let filled_reply = run_query(
+            &server,
+            "source=operations | eval seen = nullif(timestamp, timestamp('2026-10-08 12:00:01')) \
+             | fillnull using input_tokens = 7, temperature = 2, stream = false, \
+             seen = timestamp('2026-10-09 00:00:00') | sort operation_name \
+             | fields operation_name, input_tokens, temperature, stream, seen",
+        )
+        .await;
+        assert_eq!(
+            read_rows(&filled_reply),
+            &json!([
+                ["set", 3, 0.5, true, "2026-10-08 12:00:00"],
+                ["unset", 7, 2.0, false, "2026-10-09 00:00:00"]
+            ])
+        );
+        // The largest 64-bit and 32-bit integers fill a `bigint` and an `int` column.
+        let bigint_reply = run_query(
+            &server,
+            "source=operations | fillnull value=9223372036854775807 input_tokens | sort operation_name \
+             | fields input_tokens",
+        )
+        .await;
+        assert_eq!(read_rows(&bigint_reply), &json!([[3], [9_223_372_036_854_775_807_i64]]));
+        let int_reply = run_query(
+            &server,
+            "source=spans | fillnull value=2147483647 status_code | fields status_code",
+        )
+        .await;
+        assert_eq!(read_rows(&int_reply), &json!([[2_147_483_647]]));
+
+        // An `int` column refuses a fraction and a literal one above its range, naming both.
+        for (query, named) in [
+            (
+                "source=spans | fillnull value=1.5 status_code",
+                "field 'status_code' (type: int) cannot hold the replacement value 1.5",
+            ),
+            (
+                "source=spans | fillnull value=2147483648 status_code",
+                "field 'status_code' (type: int) cannot hold the replacement value 2147483648",
+            ),
+        ] {
+            assert_ppl_400(&run_query(&server, query).await, SEMANTIC_ERROR, named);
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn parse_and_fillnull_keep_the_order_of_a_sort_on_a_column_they_rewrite() {
+        let (server, catalog) = TestServer::start().await;
+        commit_log_rows(
+            &catalog,
+            &[
+                build_log_row(TENANT, NOON_MICROS, Some("b"), Some("from-b1"), Some("b1")),
+                build_log_row(TENANT, NOON_MICROS, Some("a"), Some("from-a2"), Some("a2")),
+                build_log_row(TENANT, NOON_MICROS, None, Some("from-null"), Some("c3")),
+                build_log_row(OTHER_TENANT, NOON_MICROS, None, Some("other-tenant"), Some("a0")),
+            ],
+        )
+        .await
+        .expect("commit logs");
+
+        // `dedup` keeps the first row of the incoming order. Sorted by body the order is a2, b1, c3;
+        // sorted by the parsed body ("2", "1", "3") b1 would come first.
+        let reply = run_query(&server, "source=logs | sort body | parse body '.(?<body>.)' | eval group = 1 | dedup 1 group | fields severity_text, body",
+        )
+        .await;
+        assert_eq!(read_rows(&reply), &json!([["from-a2", "2"]]));
+
+        // Sorted by service_name NULL comes first; sorted by the filled value ("z") it would come
+        // last, after "a".
+        let reply = run_query(&server, "source=logs | sort service_name | fillnull with 'z' in service_name | eval group = 1 | dedup 1 group | fields severity_text, service_name",
+        )
+        .await;
+        assert_eq!(read_rows(&reply), &json!([["from-null", "z"]]));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn describe_lists_the_jdbc_column_rows_in_schema_order_with_flat_map_keys() {
+        let (server, catalog) = TestServer::start().await;
+        let recent_micros = compute_recent_micros();
+        commit_log_rows(
+            &catalog,
+            &[
+                LogRow {
+                    tenant_id: TENANT,
+                    timestamp_micros: recent_micros,
+                    service_name: Some("checkout"),
+                    severity_text: Some("INFO"),
+                    body: Some("payment accepted"),
+                    resource_attributes: &[],
+                    log_attributes: &[("Zone", "eu"), ("http", "1.1"), ("http.method", "GET")],
+                },
+                LogRow {
+                    tenant_id: OTHER_TENANT,
+                    timestamp_micros: recent_micros,
+                    service_name: Some("checkout"),
+                    severity_text: Some("INFO"),
+                    body: Some("other tenant"),
+                    resource_attributes: &[],
+                    log_attributes: &[("b_only", "x")],
+                },
+            ],
+        )
+        .await
+        .expect("commit logs");
+
+        let reply = run_query(&server, &format!("describe {LOGS_TABLE}")).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let body = &reply.body;
+        let expected_schema: Vec<Value> = [
+            ("TABLE_CAT", "string"),
+            ("TABLE_SCHEM", "string"),
+            ("TABLE_NAME", "string"),
+            ("COLUMN_NAME", "string"),
+            ("DATA_TYPE", "int"),
+            ("TYPE_NAME", "string"),
+            ("COLUMN_SIZE", "int"),
+            ("BUFFER_LENGTH", "int"),
+            ("DECIMAL_DIGITS", "int"),
+            ("NUM_PREC_RADIX", "int"),
+            ("NULLABLE", "int"),
+            ("REMARKS", "string"),
+            ("COLUMN_DEF", "string"),
+            ("SQL_DATA_TYPE", "int"),
+            ("SQL_DATETIME_SUB", "int"),
+            ("CHAR_OCTET_LENGTH", "int"),
+            ("ORDINAL_POSITION", "int"),
+            ("IS_NULLABLE", "string"),
+            ("SCOPE_CATALOG", "string"),
+            ("SCOPE_SCHEMA", "string"),
+            ("SCOPE_TABLE", "string"),
+            ("SOURCE_DATA_TYPE", "int"),
+            ("IS_AUTOINCREMENT", "string"),
+            ("IS_GENERATEDCOLUMN", "string"),
+        ]
+        .iter()
+        .map(|(name, column_type)| json!({ "name": name, "type": column_type }))
+        .collect();
+        assert_eq!(body["schema"], Value::Array(expected_schema));
+
+        // Field-model order: logs schema columns without tenant_id, each MAP followed by its keys in
+        // byte order ("Zone" < "http" < "http.method"); tenant B's key is absent.
+        let zone_key = format!("{COL_LOG_ATTRIBUTES}.Zone");
+        let http_key = format!("{COL_LOG_ATTRIBUTES}.http");
+        let http_method_key = format!("{COL_LOG_ATTRIBUTES}.http.method");
+        let expected_fields: [(&str, &str); 14] = [
+            (COL_SERVICE_NAME, "string"),
+            (COL_TIMESTAMP, "timestamp"),
+            (COL_OBSERVED_TIMESTAMP, "timestamp"),
+            (COL_INGESTED_TIMESTAMP, "timestamp"),
+            (COL_TRACE_ID, "string"),
+            (COL_SPAN_ID, "string"),
+            (COL_SEVERITY_TEXT, "string"),
+            (COL_BODY, "string"),
+            (COL_RESOURCE_ATTRIBUTES, "struct"),
+            (COL_SCOPE_ATTRIBUTES, "struct"),
+            (COL_LOG_ATTRIBUTES, "struct"),
+            (zone_key.as_str(), "string"),
+            (http_key.as_str(), "string"),
+            (http_method_key.as_str(), "string"),
+        ];
+        let expected_rows: Vec<Value> = expected_fields
+            .iter()
+            .enumerate()
+            .map(|(position, (field, type_name))| {
+                json!([
+                    "icegate", null, LOGS_TABLE, field, null, type_name, null, null, null, 10, 2, null, null, null,
+                    null, null, position, "", null, null, null, null, "NO", ""
+                ])
+            })
+            .collect();
+        assert_eq!(body["datarows"], Value::Array(expected_rows));
+        assert_eq!(body["total"], json!(expected_fields.len()));
+        assert_eq!(body["size"], json!(expected_fields.len()));
+
+        // Later commands read the JDBC column names.
+        let reply = run_query(
+            &server,
+            &format!("describe {LOGS_TABLE} | where TYPE_NAME = 'struct' | sort ORDINAL_POSITION | fields COLUMN_NAME"),
+        )
+        .await;
+        assert_eq!(
+            read_rows(&reply),
+            &json!([[COL_RESOURCE_ATTRIBUTES], [COL_SCOPE_ATTRIBUTES], [COL_LOG_ATTRIBUTES]])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn describe_of_an_unknown_index_is_index_not_found_and_of_several_or_system_indices_a_400() {
+        let (server, _catalog) = TestServer::start().await;
+        let unknown_index_reply = run_query(&server, "describe nope").await;
+        assert_ppl_error(
+            &unknown_index_reply,
+            StatusCode::NOT_FOUND,
+            "IndexNotFoundException",
+            "INDEX_NOT_FOUND",
+        );
+        assert!(
+            read_error_text(&unknown_index_reply).contains("nope"),
+            "{}",
+            unknown_index_reply.body
+        );
+
+        let several_indices_reply = run_query(&server, &format!("describe {LOGS_TABLE},{SPANS_TABLE}")).await;
+        assert_ppl_400(&several_indices_reply, SEMANTIC_ERROR, SPANS_TABLE);
+
+        let kibana_creation = server
+            .request(reqwest::Method::PUT, Some(TENANT), "/.kibana")
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("create .kibana");
+        assert_eq!(kibana_creation.status().as_u16(), 200);
+        assert_ppl_400(&run_query(&server, "describe .kibana").await, SEMANTIC_ERROR, ".kibana");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn patterns_and_take_are_400s_naming_them() {
+        let (server, _catalog) = TestServer::start().await;
+        let patterns_reply = run_query(&server, "source=logs | patterns body").await;
+        assert_ppl_400(&patterns_reply, UNSUPPORTED_OPERATION, "patterns");
+        assert_eq!(patterns_reply.body["error"]["context"]["command"], "patterns");
+        let take_reply = run_query(&server, "source=logs | stats take(body, 2)").await;
+        assert_ppl_400(&take_reply, UNSUPPORTED_OPERATION, "take");
+        assert_eq!(take_reply.body["error"]["context"]["function"], "take");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn discover_style_timestamp_strings_fold_to_microsecond_literals() {
+        let (server, catalog) = TestServer::start().await;
+        commit_log_rows(
+            &catalog,
+            &[
+                build_log_row(TENANT, NOON_MICROS - 1, Some("checkout"), Some("a"), None),
+                build_log_row(TENANT, NOON_MICROS, Some("checkout"), Some("b"), None),
+                build_log_row(TENANT, NOON_MICROS + 1, Some("checkout"), Some("c"), None),
+                build_log_row(OTHER_TENANT, NOON_MICROS + 1, Some("checkout"), Some("z"), None),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        write_log_wal_segment(
+            &server.wal_store,
+            &catalog,
+            COMMITTED_WAL_OFFSET + 1,
+            &[
+                build_log_row(TENANT, NOON_MICROS + 123_456, Some("checkout"), Some("d"), None),
+                build_log_row(TENANT, NOON_MICROS + 1_000_000, Some("checkout"), Some("e"), None),
+                build_log_row(OTHER_TENANT, NOON_MICROS + 123_456, Some("checkout"), Some("y"), None),
+            ],
+        )
+        .await
+        .expect("write WAL segment");
+
+        for (query, expected) in [
+            (
+                // A Discover-style millisecond window: 12:00:00.000 through 12:00:00.999 inclusive.
+                "source=logs | WHERE `timestamp` >= '2026-10-08 12:00:00.000' AND `timestamp` <= '2026-10-08 12:00:00.999' | fields severity_text | sort severity_text",
+                json!([["b"], ["c"], ["d"]]),
+            ),
+            (
+                "source=logs | where timestamp >= '2026-10-08 12:00:00.000001' and timestamp <= '2026-10-08 12:00:00.123456' | fields severity_text | sort severity_text",
+                json!([["c"], ["d"]]),
+            ),
+            (
+                "source=logs | where timestamp = timestamp('2026-10-08 12:00:00.123456') | fields severity_text",
+                json!([["d"]]),
+            ),
+            (
+                "source=logs | where timestamp < '2026-10-08 12:00:00' | fields severity_text",
+                json!([["a"]]),
+            ),
+        ] {
+            assert_eq!(read_rows(&run_query(&server, query).await), &expected, "{query}");
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn more_than_six_fraction_digits_is_a_400() {
+        let (server, _catalog) = TestServer::start().await;
+        for query in [
+            "source=logs | where timestamp >= '2026-10-08 12:00:00.1234567'",
+            "source=logs | where timestamp >= timestamp('2026-10-08 12:00:00.1234567')",
+            "source=logs | where timestamp between '2026-10-08 12:00:00.1234567' and '2026-10-09'",
+            "source=logs | where timestamp in ('2026-10-08 12:00:00.1234567')",
+        ] {
+            assert_ppl_400(
+                &run_query(&server, query).await,
+                SEMANTIC_ERROR,
+                "2026-10-08 12:00:00.1234567",
+            );
+        }
+        let six_digit_reply = run_query(&server, "source=logs | where timestamp >= '2026-10-08 12:00:00.123456'").await;
+        assert_eq!(six_digit_reply.status, StatusCode::OK, "{}", six_digit_reply.body);
+        server.shutdown().await;
+    }
 }

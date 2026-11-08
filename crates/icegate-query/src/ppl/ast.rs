@@ -23,6 +23,12 @@ pub(crate) enum PplSource {
         /// The index expression, the listed sources joined with commas.
         expression: String,
     },
+    /// `describe <index>`: one row per field of the index's field model (JDBC `getColumns` shape).
+    /// The index is kept as written; it names exactly one data index.
+    Describe {
+        /// The index expression as written in the query.
+        index: String,
+    },
 }
 
 /// One command after the source.
@@ -65,6 +71,39 @@ pub(crate) enum PplCommand {
     Timechart(TimechartCommand),
     /// `bin <field> span=<span>`.
     Bin(BinCommand),
+    /// `parse <field> '<pattern>'`.
+    Parse(ParseCommand),
+    /// `fillnull` in any of its four forms.
+    Fillnull(FillnullCommand),
+}
+
+/// `parse <field> '<pattern>'`: every named group of the pattern becomes a string field.
+///
+/// The pattern must match the whole value. A NULL source yields NULL in every group field; a value the
+/// pattern does not match, or a group that did not take part in the match, yields `""`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParseCommand {
+    /// The parsed value: a field reference or any expression of a string type.
+    pub(crate) source: PplExpr,
+    /// The pattern as written, unanchored, with `(?<name>…)` named groups.
+    pub(crate) pattern: String,
+}
+
+/// `fillnull`: which output columns take which value where they are NULL.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FillnullCommand {
+    /// The columns to fill and their replacement values.
+    pub(crate) replacements: FillnullReplacements,
+}
+
+/// The column selection of a `fillnull`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FillnullReplacements {
+    /// `fillnull with <v>` or `fillnull value=<v>`: every output column takes `<v>`, so every column
+    /// must accept its type.
+    AllFields(PplExpr),
+    /// Named columns, each with its own replacement, in the order written.
+    Fields(Vec<(String, PplExpr)>),
 }
 
 /// A `stats` command.

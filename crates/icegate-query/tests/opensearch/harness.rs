@@ -352,6 +352,18 @@ impl TestServer {
         builder
     }
 
+    /// `POST` `body` to a PPL-family path as `tenant`; keeps the status, content type and text.
+    pub async fn post_ppl(&self, tenant: &str, path_and_query: &str, body: &serde_json::Value) -> PplReply {
+        let response = self
+            .request(reqwest::Method::POST, Some(tenant), path_and_query)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("PPL request failed: {error}"));
+        PplReply::from_response(response).await
+    }
+
     /// Stop the listener. A panic or a hang of the server task fails the test.
     pub async fn shutdown(mut self) {
         self.cancel_token.cancel();
@@ -460,4 +472,47 @@ async fn is_serving(client: &reqwest::Client, base_url: &str) -> bool {
         tokio::time::sleep(READY_POLL_INTERVAL).await;
     }
     false
+}
+
+/// One answer of a PPL-family endpoint. The body stays text: PPL execution errors are `text/plain`,
+/// every other answer is JSON.
+pub struct PplReply {
+    /// HTTP status.
+    pub status: u16,
+    /// The `content-type` header, empty when absent.
+    pub content_type: String,
+    /// The body as text.
+    pub text: String,
+}
+
+impl PplReply {
+    /// The answer `response` carries, for a PPL-family request sent by hand; panics when its body
+    /// cannot be read.
+    pub async fn from_response(response: reqwest::Response) -> Self {
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap_or_else(|error| panic!("content type is not ASCII: {error}"))
+                    .to_owned()
+            })
+            .unwrap_or_default();
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|error| panic!("PPL response body: {error}"));
+        Self {
+            status,
+            content_type,
+            text,
+        }
+    }
+
+    /// The body parsed as JSON; panics with the body when it is not JSON.
+    pub fn parse_json_body(&self) -> serde_json::Value {
+        serde_json::from_str(&self.text).unwrap_or_else(|error| panic!("body is not JSON ({error}): {}", self.text))
+    }
 }

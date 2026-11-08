@@ -350,7 +350,7 @@ pub(crate) fn parse_timestamp_literal(text: &str) -> Result<i64, PplError> {
 /// timestamp column stays a literal comparison the scans can prune with; a timestamp or a string
 /// column converts to `Timestamp(µs)`.
 fn lower_timestamp(value: Expr, context: &FunctionContext<'_>) -> Result<Expr, PplError> {
-    if let Expr::Literal(ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)), _) = &value {
+    if let Some(text) = match_string_literal(&value) {
         let micros = parse_timestamp_literal(text)?;
         return Ok(lit(ScalarValue::TimestampMicrosecond(Some(micros), None)));
     }
@@ -645,11 +645,23 @@ fn render_timestamp_text(value: Expr) -> Expr {
 ///
 /// Returns [`PplError::Semantic`] for any other argument.
 fn read_string_literal(function: &str, value: &Expr) -> Result<String, PplError> {
-    match value {
-        Expr::Literal(ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)), _) => Ok(text.clone()),
-        _ => Err(PplError::Semantic {
+    match_string_literal(value)
+        .map(str::to_string)
+        .ok_or_else(|| PplError::Semantic {
             reason: format!("{function} takes a string literal here"),
-        }),
+        })
+}
+
+/// The text of a non-null string literal of any DataFusion string type (`Utf8`, `LargeUtf8`,
+/// `Utf8View`); `None` for every other expression. Every PPL fold of a string literal matches it
+/// through this one function, so no fold misses a string type the lowering may produce.
+pub(crate) fn match_string_literal(expression: &Expr) -> Option<&str> {
+    match expression {
+        Expr::Literal(
+            ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)) | ScalarValue::Utf8View(Some(text)),
+            _,
+        ) => Some(text),
+        _ => None,
     }
 }
 

@@ -10,37 +10,41 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use datafusion::arrow::datatypes::{DECIMAL128_MAX_PRECISION, DataType, FieldRef, TimeUnit};
+use datafusion::arrow::datatypes::{DECIMAL128_MAX_PRECISION, DataType, Field, FieldRef, Schema, TimeUnit};
+use datafusion::common::format::DEFAULT_CAST_OPTIONS;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, DFSchema, NullEquality, ScalarValue};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, NullEquality, ScalarValue};
 use datafusion::config::ConfigOptions;
+use datafusion::error::DataFusionError;
 use datafusion::functions::core::expr_fn::get_field;
-use datafusion::functions::expr_fn::{coalesce, date_part, floor, make_date, to_char};
+use datafusion::functions::expr_fn::{coalesce, date_part, floor, make_date, regexp_replace, to_char};
 use datafusion::functions_aggregate::expr_fn::{array_agg, avg, count, max, min, sum};
 use datafusion::functions_nested::expr_fn::array_element;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::expr::{Case, Lambda, LambdaVariable};
 use datafusion::logical_expr::{
-    Between, Expr, ExprFunctionExt, ExprSchemable, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, SortExpr,
-    binary_expr, cast, ident, lit, not, when,
+    Between, EmptyRelation, Expr, ExprFunctionExt, ExprSchemable, JoinType, LogicalPlan, LogicalPlanBuilder, Operator,
+    SortExpr, binary_expr, cast, col, ident, lit, not, when,
 };
 use datafusion::optimizer::Analyzer;
 use icegate_common::schema::COL_TENANT_ID;
+use regex::Regex;
 
 use super::ast::{
-    BinCommand, BinSpan, CompareOperator, DedupCommand, PplCommand, PplExpr, PplGroupKey, PplLiteral, PplQuery,
-    PplSortKey, PplSource, RankCommand, SpanUnit, StatsCommand, TimechartCommand,
+    BinCommand, BinSpan, CompareOperator, DedupCommand, FillnullCommand, FillnullReplacements, ParseCommand,
+    PplCommand, PplExpr, PplGroupKey, PplLiteral, PplQuery, PplSortKey, PplSource, RankCommand, SpanUnit, StatsCommand,
+    TimechartCommand,
 };
 use super::error::PplError;
 use super::functions::{
     FunctionContext, PlannedAggregate, is_higher_order_function, lower_arithmetic, lower_cast, lower_function_call,
-    plan_aggregate_call,
+    match_string_literal, parse_timestamp_literal, plan_aggregate_call,
 };
 use crate::opensearch::catalog::{
-    FieldValue, IndexEntry, IndexExpression, IndexOptions, IndexTarget, Profile, TenantSession,
+    FieldListing, FieldType, FieldValue, IndexEntry, IndexExpression, IndexField, IndexOptions, IndexTarget, Profile,
+    TenantSession,
 };
 use crate::opensearch::context::RequestContext;
-use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::extract::ExpandWildcards;
 use crate::opensearch::glob::matches_glob;
 use crate::opensearch::search::aggs::plan_exact_distinct;
@@ -192,7 +196,8 @@ impl<'a> ExpressionScope<'a> {
 /// scope of every scan; `tenant_id` is never a column of the output, and decimal columns read as
 /// doubles. Field references are case-sensitive. `where` follows SQL three-valued logic. A leaf
 /// `fields` keeps only the listed columns, so the scan reads only those. `now()` and the other
-/// request-time functions read `context.now`.
+/// request-time functions read `context.now`. `cluster_name` fills the `TABLE_CAT` column of
+/// `describe`.
 ///
 /// # Errors
 ///
@@ -205,9 +210,11 @@ pub(crate) async fn plan_ppl(
     query: &PplQuery,
     session: &TenantSession,
     context: &RequestContext,
+    cluster_name: &str,
 ) -> Result<PplPlan, PplError> {
     let mut pipeline = match &query.source {
         PplSource::Index { expression } => plan_index_source(expression, session).await?,
+        PplSource::Describe { index } => plan_describe(index, session, context.now, cluster_name).await?,
     };
     for command in &query.commands {
         pipeline = apply_command(pipeline, command, context.now)?;
@@ -226,25 +233,7 @@ async fn plan_index_source<'session>(
     expression: &str,
     session: &'session TenantSession,
 ) -> Result<Pipeline<'session>, PplError> {
-    let index_expression = IndexExpression::parse(expression)?;
-    let options = IndexOptions {
-        ignore_unavailable: false,
-        allow_no_indices: false,
-        expand_wildcards: ExpandWildcards {
-            is_open: true,
-            is_hidden: false,
-        },
-    };
-    let entries = match session.resolve_target(&index_expression, options).await? {
-        IndexTarget::Data(entries) => entries,
-        IndexTarget::System(names) => {
-            return Err(OpenSearchError::illegal_argument(format!(
-                "PPL reads data indices only; [{}] are system indices",
-                names.join(", ")
-            ))
-            .into());
-        }
-    };
+    let entries = resolve_data_entries(expression, session).await?;
     let mut branches = Vec::with_capacity(entries.len());
     for entry in &entries {
         branches.push((entry.name(), scan_entry(session, entry)?));
@@ -258,6 +247,34 @@ async fn plan_index_source<'session>(
         }),
         sort_keys: Vec::new(),
     })
+}
+
+/// The data indices `expression` names, resolved like every PPL source: open indices only, and an
+/// expression that matches nothing is an error, never an empty source.
+///
+/// # Errors
+///
+/// `IndexNotFound` for a name or pattern that matches no index; `Semantic` when the expression
+/// names system indices, which PPL never reads.
+async fn resolve_data_entries<'session>(
+    expression: &str,
+    session: &'session TenantSession,
+) -> Result<Vec<&'session IndexEntry>, PplError> {
+    let index_expression = IndexExpression::parse(expression)?;
+    let options = IndexOptions {
+        ignore_unavailable: false,
+        allow_no_indices: false,
+        expand_wildcards: ExpandWildcards {
+            is_open: true,
+            is_hidden: false,
+        },
+    };
+    match session.resolve_target(&index_expression, options).await? {
+        IndexTarget::Data(entries) => Ok(entries),
+        IndexTarget::System(names) => Err(PplError::Semantic {
+            reason: format!("PPL reads data indices only; [{}] are system indices", names.join(", ")),
+        }),
+    }
 }
 
 /// The columns of one index (see [`project_source_columns`]).
@@ -439,12 +456,56 @@ fn apply_command<'session>(
         PplCommand::Timechart(chart) => {
             return Ok(build_aggregated_pipeline(chart_rows(builder, chart, &build_scope())?));
         }
+        PplCommand::Parse(parse) => {
+            let (builder, sort_keys, groups) =
+                rewrite_columns(builder, sort_keys, source.as_ref(), now, |builder, scope| {
+                    plan_parse(builder, parse, scope)
+                })?;
+            if let Some(source) = source.as_mut() {
+                source.replaced_columns.extend(groups);
+            }
+            (builder, sort_keys)
+        }
+        PplCommand::Fillnull(fillnull) => {
+            let (builder, sort_keys, filled) =
+                rewrite_columns(builder, sort_keys, source.as_ref(), now, |builder, scope| {
+                    plan_fillnull(builder, fillnull, scope)
+                })?;
+            if let Some(source) = source.as_mut() {
+                source.replaced_columns.extend(filled);
+            }
+            (builder, sort_keys)
+        }
     };
     Ok(Pipeline {
         builder,
         source,
         sort_keys,
     })
+}
+
+/// `builder` and `sort_keys` after a command that writes columns in place, and the names of the
+/// columns it wrote. `plan_rewrite` plans the command over a scope and names the columns it wrote;
+/// when a sort key reads one of them, the key is hidden first ([`hide_touched_sort_keys`]) and the
+/// command is planned again over the columns with the hidden order column, so the order keeps the
+/// values the rows were sorted by.
+fn rewrite_columns(
+    builder: LogicalPlanBuilder,
+    sort_keys: Vec<SortExpr>,
+    source: Option<&SourceBinding<'_>>,
+    now: DateTime<Utc>,
+    plan_rewrite: impl Fn(LogicalPlanBuilder, &ExpressionScope<'_>) -> Result<(LogicalPlanBuilder, Vec<String>), PplError>,
+) -> Result<(LogicalPlanBuilder, Vec<SortExpr>, Vec<String>), PplError> {
+    let schema = Arc::clone(builder.schema());
+    let (rewritten_rows, written_columns) = plan_rewrite(builder.clone(), &ExpressionScope::new(&schema, source, now))?;
+    let is_written = |column: &str| written_columns.iter().any(|written| written == column);
+    if !sort_keys.iter().any(|sort| reads_column(sort, is_written)) {
+        return Ok((rewritten_rows, sort_keys, written_columns));
+    }
+    let (builder, sort_keys) = hide_touched_sort_keys(builder, sort_keys, is_written)?;
+    let hidden_schema = Arc::clone(builder.schema());
+    let (rewritten_rows, written_columns) = plan_rewrite(builder, &ExpressionScope::new(&hidden_schema, source, now))?;
+    Ok((rewritten_rows, sort_keys, written_columns))
 }
 
 /// The pipeline after a command that replaces the columns: no source columns remain and the
@@ -1660,6 +1721,7 @@ fn lower_expression(expression: &PplExpr, scope: &ExpressionScope<'_>) -> Result
         PplExpr::Compare { operator, left, right } => {
             let left = lower_expression(left, scope)?;
             let right = lower_expression(right, scope)?;
+            let (left, right) = coerce_timestamp_operands(left, right, scope.schema)?;
             refuse_id_comparison(&left, &right, scope)?;
             Ok(match operator {
                 CompareOperator::Equal => left.eq(right),
@@ -1719,23 +1781,32 @@ fn lower_expression(expression: &PplExpr, scope: &ExpressionScope<'_>) -> Result
             list,
             is_negated,
         } => {
-            let listed_values = list
-                .iter()
-                .map(|item| lower_expression(item, scope))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(lower_expression(value, scope)?.in_list(listed_values, *is_negated))
+            let mut value = lower_expression(value, scope)?;
+            let mut listed_values = Vec::with_capacity(list.len());
+            for item in list {
+                let (folded_value, item) =
+                    coerce_timestamp_operands(value, lower_expression(item, scope)?, scope.schema)?;
+                value = folded_value;
+                listed_values.push(item);
+            }
+            Ok(value.in_list(listed_values, *is_negated))
         }
         PplExpr::Between {
             value,
             low,
             high,
             is_negated,
-        } => Ok(Expr::Between(Between::new(
-            Box::new(lower_expression(value, scope)?),
-            *is_negated,
-            Box::new(lower_expression(low, scope)?),
-            Box::new(lower_expression(high, scope)?),
-        ))),
+        } => {
+            let value = lower_expression(value, scope)?;
+            let (value, low) = coerce_timestamp_operands(value, lower_expression(low, scope)?, scope.schema)?;
+            let (value, high) = coerce_timestamp_operands(value, lower_expression(high, scope)?, scope.schema)?;
+            Ok(Expr::Between(Between::new(
+                Box::new(value),
+                *is_negated,
+                Box::new(low),
+                Box::new(high),
+            )))
+        }
         PplExpr::IsNull { value, is_negated } => {
             let value = lower_expression(value, scope)?;
             Ok(if *is_negated {
@@ -1892,6 +1963,40 @@ fn refuse_id_comparison(left: &Expr, right: &Expr, scope: &ExpressionScope<'_>) 
     })
 }
 
+/// Folds a string literal compared with a timestamp operand into a microsecond timestamp literal,
+/// read by [`parse_timestamp_literal`] and carrying the operand's zone.
+///
+/// Folding here, rather than leaving the comparison to DataFusion's coercion, gives the literal the
+/// microsecond unit of the stored columns: the comparison stays a literal comparison in the stored
+/// unit, which the WAL and the Iceberg scans can prune with, and a literal finer than a microsecond
+/// is a 400 instead of a truncation. Operands of any other type pair are returned unchanged.
+///
+/// # Errors
+///
+/// `PplError::Semantic` when the string is not a timestamp literal, and when the type of the operand
+/// compared with a string literal cannot be computed against `schema` (an ill-typed expression of
+/// the query).
+pub(crate) fn coerce_timestamp_operands(left: Expr, right: Expr, schema: &DFSchema) -> Result<(Expr, Expr), PplError> {
+    let left = fold_string_operand(left, &right, schema)?;
+    let right = fold_string_operand(right, &left, schema)?;
+    Ok((left, right))
+}
+
+/// `operand` as a timestamp literal when it is a string literal and `other` a timestamp; otherwise
+/// unchanged. The type of `other` is computed only for a string literal.
+fn fold_string_operand(operand: Expr, other: &Expr, schema: &DFSchema) -> Result<Expr, PplError> {
+    let Some(text) = match_string_literal(&operand) else {
+        return Ok(operand);
+    };
+    let DataType::Timestamp(_, time_zone) = other.get_type(schema)? else {
+        return Ok(operand);
+    };
+    Ok(lit(ScalarValue::TimestampMicrosecond(
+        Some(parse_timestamp_literal(text)?),
+        time_zone,
+    )))
+}
+
 /// Build `builder` without its hidden order columns, run the analyzer so a type error is reported
 /// as the query's error rather than at execution, and describe the output columns.
 fn finish_plan(builder: LogicalPlanBuilder) -> Result<PplPlan, PplError> {
@@ -1923,17 +2028,443 @@ fn finish_plan(builder: LogicalPlanBuilder) -> Result<PplPlan, PplError> {
     Ok(PplPlan { plan, columns })
 }
 
+/// The jdbc type of one `describe` column.
+#[derive(Debug, Clone, Copy)]
+enum DescribeColumnType {
+    /// Rendered as `string`.
+    Text,
+    /// Rendered as `int`.
+    Integer,
+}
+
+impl DescribeColumnType {
+    /// The Arrow type a `describe` row carries in this column.
+    const fn data_type(self) -> DataType {
+        match self {
+            Self::Text => DataType::Utf8,
+            Self::Integer => DataType::Int32,
+        }
+    }
+}
+
+/// The JDBC `getColumns` columns of a `describe` row, in order. [`build_describe_row`] emits its
+/// values in exactly this order.
+const DESCRIBE_COLUMNS: [(&str, DescribeColumnType); 24] = [
+    ("TABLE_CAT", DescribeColumnType::Text),
+    ("TABLE_SCHEM", DescribeColumnType::Text),
+    ("TABLE_NAME", DescribeColumnType::Text),
+    ("COLUMN_NAME", DescribeColumnType::Text),
+    ("DATA_TYPE", DescribeColumnType::Integer),
+    ("TYPE_NAME", DescribeColumnType::Text),
+    ("COLUMN_SIZE", DescribeColumnType::Integer),
+    ("BUFFER_LENGTH", DescribeColumnType::Integer),
+    ("DECIMAL_DIGITS", DescribeColumnType::Integer),
+    ("NUM_PREC_RADIX", DescribeColumnType::Integer),
+    ("NULLABLE", DescribeColumnType::Integer),
+    ("REMARKS", DescribeColumnType::Text),
+    ("COLUMN_DEF", DescribeColumnType::Text),
+    ("SQL_DATA_TYPE", DescribeColumnType::Integer),
+    ("SQL_DATETIME_SUB", DescribeColumnType::Integer),
+    ("CHAR_OCTET_LENGTH", DescribeColumnType::Integer),
+    ("ORDINAL_POSITION", DescribeColumnType::Integer),
+    ("IS_NULLABLE", DescribeColumnType::Text),
+    ("SCOPE_CATALOG", DescribeColumnType::Text),
+    ("SCOPE_SCHEMA", DescribeColumnType::Text),
+    ("SCOPE_TABLE", DescribeColumnType::Text),
+    // Always null; typed `int` because `PplType` has no `smallint`.
+    ("SOURCE_DATA_TYPE", DescribeColumnType::Integer),
+    ("IS_AUTOINCREMENT", DescribeColumnType::Text),
+    ("IS_GENERATEDCOLUMN", DescribeColumnType::Text),
+];
+
+/// `NUM_PREC_RADIX` of every `describe` row.
+const DESCRIBE_NUM_PREC_RADIX: i32 = 10;
+
+/// `NULLABLE` of every `describe` row: JDBC `columnNullableUnknown`, since no field promises
+/// presence.
+const DESCRIBE_NULLABLE: i32 = 2;
+
+/// Plans `describe <index>`: one row per field of the index's field model, in field-model order
+/// (schema column order, each MAP column followed by its keys in byte order, keys never split).
+///
+/// The rows are no index's columns, so the pipeline carries no source binding and no order.
+///
+/// # Errors
+///
+/// `IndexNotFound` for an unknown name; `Semantic` when the expression names system indices or
+/// more than one data index.
+async fn plan_describe<'session>(
+    index: &str,
+    session: &'session TenantSession,
+    now: DateTime<Utc>,
+    cluster_name: &str,
+) -> Result<Pipeline<'session>, PplError> {
+    let entry = match resolve_data_entries(index, session).await?.as_slice() {
+        [entry] => *entry,
+        matched_entries => {
+            let names: Vec<&str> = matched_entries.iter().map(|entry| entry.name()).collect();
+            return Err(PplError::Semantic {
+                reason: format!("describe reads one index; [{index}] resolves to [{}]", names.join(", ")),
+            });
+        }
+    };
+    let fields = session.list_fields(entry, now, FieldListing::WithMapKeys).await?;
+    let builder = build_describe_plan(
+        cluster_name,
+        index,
+        fields.iter().map(|field: &IndexField| (field.name.as_str(), field.field_type)),
+    )?;
+    Ok(Pipeline {
+        builder,
+        source: None,
+        sort_keys: Vec::new(),
+    })
+}
+
+/// The `VALUES` plan of the `describe` rows, so later commands (`where`, `fields`, `sort`) apply to
+/// it like to any other source. Its columns carry the [`DESCRIBE_COLUMNS`] names and types.
+///
+/// # Errors
+///
+/// `Internal` when DataFusion refuses the plan: IceGate builds it from constants, so a refusal is a
+/// defect, never the query's.
+fn build_describe_plan<'a>(
+    cluster_name: &str,
+    index: &str,
+    fields: impl Iterator<Item = (&'a str, FieldType)>,
+) -> Result<LogicalPlanBuilder, PplError> {
+    let columns: Vec<Field> = DESCRIBE_COLUMNS
+        .iter()
+        .map(|(name, column_type)| Field::new(*name, column_type.data_type(), true))
+        .collect();
+    let report_defect = |error: DataFusionError| PplError::Internal {
+        reason: format!("the describe plan failed: {error}"),
+    };
+    let schema: DFSchemaRef = Arc::new(DFSchema::try_from(Schema::new(columns)).map_err(report_defect)?);
+    let rows = fields
+        .enumerate()
+        .map(|(position, (name, field_type))| build_describe_row(cluster_name, index, name, field_type, position))
+        .collect::<Result<Vec<_>, PplError>>()?;
+    // A `VALUES` plan needs at least one row; an index without fields answers the empty relation,
+    // which carries the named schema itself.
+    if rows.is_empty() {
+        return Ok(LogicalPlanBuilder::from(LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema,
+        })));
+    }
+    // `values_with_schema` takes only the types of `schema` and names its columns `column1`,
+    // `column2`, …, so a projection gives them the JDBC names.
+    let names = DESCRIBE_COLUMNS
+        .iter()
+        .enumerate()
+        .map(|(position, (name, _))| col(format!("column{}", position + 1)).alias(*name));
+    LogicalPlanBuilder::values_with_schema(rows, &schema)
+        .and_then(|values| values.project(names))
+        .map_err(report_defect)
+}
+
+/// One `describe` row, in [`DESCRIBE_COLUMNS`] order.
+fn build_describe_row(
+    cluster_name: &str,
+    index: &str,
+    field_name: &str,
+    field_type: FieldType,
+    position: usize,
+) -> Result<Vec<Expr>, PplError> {
+    let ordinal = i32::try_from(position).map_err(|_| PplError::Semantic {
+        reason: format!("[{index}] has more fields than describe can number"),
+    })?;
+    let build_text_literal = |value: &str| lit(ScalarValue::Utf8(Some(value.to_owned())));
+    let build_null_text = || lit(ScalarValue::Utf8(None));
+    let build_integer_literal = |value: i32| lit(ScalarValue::Int32(Some(value)));
+    let build_null_integer = || lit(ScalarValue::Int32(None));
+    Ok(vec![
+        build_text_literal(cluster_name),
+        build_null_text(),
+        build_text_literal(index),
+        build_text_literal(field_name),
+        build_null_integer(),
+        build_text_literal(name_describe_type(field_type)),
+        build_null_integer(),
+        build_null_integer(),
+        build_null_integer(),
+        build_integer_literal(DESCRIBE_NUM_PREC_RADIX),
+        build_integer_literal(DESCRIBE_NULLABLE),
+        build_null_text(),
+        build_null_text(),
+        build_null_integer(),
+        build_null_integer(),
+        build_null_integer(),
+        build_integer_literal(ordinal),
+        build_text_literal(""),
+        build_null_text(),
+        build_null_text(),
+        build_null_text(),
+        build_null_integer(),
+        build_text_literal("NO"),
+        build_text_literal(""),
+    ])
+}
+
+/// The PPL type name `describe` reports for a field-model type.
+const fn name_describe_type(field_type: FieldType) -> &'static str {
+    match field_type {
+        FieldType::Text | FieldType::Keyword => "string",
+        FieldType::Date => "timestamp",
+        FieldType::Integer => "int",
+        FieldType::Long => "bigint",
+        FieldType::Double => "double",
+        FieldType::Boolean => "boolean",
+        FieldType::Object => "struct",
+    }
+}
+
+/// Whether a type holds text.
+const fn is_string_type(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
+}
+
+/// Plans `parse`: every named group becomes a string column computed from the source value.
+/// Answers the plan and the names of the group columns, which replace or extend the input's
+/// columns. Each group column costs one match of the pattern per row.
+///
+/// # Errors
+///
+/// `Semantic` for a pattern the regex dialect refuses, a pattern without a named group, a group
+/// name with the reserved prefix, or a source that is not a string.
+fn plan_parse(
+    builder: LogicalPlanBuilder,
+    command: &ParseCommand,
+    scope: &ExpressionScope<'_>,
+) -> Result<(LogicalPlanBuilder, Vec<String>), PplError> {
+    let source = lower_expression(&command.source, scope)?;
+    let source_type = source.get_type(scope.schema)?;
+    if !is_string_type(&source_type) {
+        return Err(PplError::Semantic {
+            reason: format!("parse needs a string source; {source} has type {source_type}"),
+        });
+    }
+    let refuse_pattern = |error: regex::Error| PplError::Semantic {
+        reason: format!(
+            "parse pattern '{}' is not a supported regular expression: {error}",
+            command.pattern
+        ),
+    };
+    // The pattern compiles on its own first: an unbalanced pattern such as `x)|(?<a>.*` would
+    // otherwise close the wrapping group below and escape both anchors.
+    let regex = Regex::new(&command.pattern).map_err(refuse_pattern)?;
+    let groups: Vec<&str> = regex.capture_names().flatten().collect();
+    if groups.is_empty() {
+        return Err(PplError::Semantic {
+            reason: format!("parse pattern '{}' has no named group (?<name>…)", command.pattern),
+        });
+    }
+    if let Some(group) = groups.iter().find(|group| group.starts_with(RESERVED_NAME_PREFIX)) {
+        return Err(PplError::Semantic {
+            reason: format!("parse group [{group}] starts with the reserved prefix [{RESERVED_NAME_PREFIX}]"),
+        });
+    }
+    // The whole value must match, so the pattern is anchored at both ends; the non-capturing group
+    // keeps an alternation inside the pattern under both anchors and leaves group numbers
+    // unchanged. A value the pattern does not match falls to the second branch, which matches any
+    // whole value and takes part in no group, so every group's replacement there is "". The regex
+    // dialect's alternation is leftmost-first, so a value the pattern matches keeps its groups.
+    let extraction_pattern = format!("^(?:{})$|^(?s:.*)$", command.pattern);
+    // Compiling the wrapped pattern refuses a pattern whose end the wrapping cannot follow, such
+    // as one ending in an `(?x)` comment, which would swallow the closing parenthesis.
+    Regex::new(&extraction_pattern).map_err(refuse_pattern)?;
+    let mut projection = Vec::with_capacity(scope.schema.fields().len() + groups.len());
+    for (qualifier, field) in scope.schema.iter() {
+        let name = field.name().as_str();
+        projection.push(if groups.contains(&name) {
+            extract_named_group(&source, &extraction_pattern, name).alias(name)
+        } else {
+            Expr::Column(Column::from((qualifier, field)))
+        });
+    }
+    for group in &groups {
+        if !scope.schema.has_column_with_unqualified_name(group) {
+            projection.push(extract_named_group(&source, &extraction_pattern, group).alias(*group));
+        }
+    }
+    let group_names = groups.iter().map(|group| (*group).to_string()).collect();
+    Ok((builder.project(projection)?, group_names))
+}
+
+/// The value of one named group: NULL for a NULL source, the group's text when the pattern matches
+/// (`""` for a group that did not take part), `""` when it does not match (the catch-all branch of
+/// `extraction_pattern`). A whole-value `regexp_replace` with `${name}` yields exactly that text.
+fn extract_named_group(source: &Expr, extraction_pattern: &str, group: &str) -> Expr {
+    regexp_replace(
+        source.clone(),
+        lit(extraction_pattern),
+        lit(format!("${{{group}}}")),
+        None,
+    )
+}
+
+/// Plans `fillnull`: each selected column becomes `coalesce(column, replacement)` under its own
+/// name. Answers the plan and the names of the filled columns. Hidden order columns are never
+/// output columns, so a `fillnull` without a field list leaves them alone.
+///
+/// # Errors
+///
+/// `FieldNotFound` for a listed field that is not an output column; `Semantic` for a field listed
+/// twice or a replacement whose type the column does not accept.
+fn plan_fillnull(
+    builder: LogicalPlanBuilder,
+    command: &FillnullCommand,
+    scope: &ExpressionScope<'_>,
+) -> Result<(LogicalPlanBuilder, Vec<String>), PplError> {
+    let schema = scope.schema;
+    let replacements: Vec<(String, Expr)> = match &command.replacements {
+        FillnullReplacements::AllFields(replacement) => {
+            let value = lower_expression(replacement, scope)?;
+            schema
+                .fields()
+                .iter()
+                .filter(|field| !is_order_column(field.name()))
+                .map(|field| (field.name().clone(), value.clone()))
+                .collect()
+        }
+        FillnullReplacements::Fields(pairs) => {
+            let mut lowered_replacements: Vec<(String, Expr)> = Vec::with_capacity(pairs.len());
+            for (field, replacement) in pairs {
+                if !schema.has_column_with_unqualified_name(field) {
+                    return Err(PplError::FieldNotFound { field: field.clone() });
+                }
+                if lowered_replacements.iter().any(|(listed, _)| listed == field) {
+                    return Err(PplError::Semantic {
+                        reason: format!("fillnull lists field '{field}' more than once"),
+                    });
+                }
+                lowered_replacements.push((field.clone(), lower_expression(replacement, scope)?));
+            }
+            lowered_replacements
+        }
+    };
+    let mut projection = Vec::with_capacity(schema.fields().len());
+    for (qualifier, field) in schema.iter() {
+        let column = Expr::Column(Column::from((qualifier, field)));
+        match replacements.iter().find(|(name, _)| name == field.name()) {
+            Some((_, replacement)) => {
+                let typed_replacement = cast_fillnull_replacement(replacement, field, schema)?;
+                projection.push(coalesce(vec![column, typed_replacement]).alias(field.name()));
+            }
+            None => projection.push(column),
+        }
+    }
+    let filled = replacements.into_iter().map(|(name, _)| name).collect();
+    Ok((builder.project(projection)?, filled))
+}
+
+/// `replacement` cast to the type of `field` after checking that the column accepts it: strings
+/// take strings, numbers the numbers [`is_numeric_replacement_accepted`] admits, booleans
+/// booleans and timestamps timestamps. An id column (fixed-size binary), a MAP, struct or list
+/// column takes nothing.
+///
+/// # Errors
+///
+/// `Semantic` naming the field and the PPL types of both (the Arrow type where PPL has none); for
+/// a number the column refuses, naming the field, its type and the replacement value.
+fn cast_fillnull_replacement(replacement: &Expr, field: &Field, schema: &DFSchema) -> Result<Expr, PplError> {
+    let replacement_type = replacement.get_type(schema)?;
+    let target = field.data_type();
+    if target.is_numeric() && replacement_type.is_numeric() {
+        if !is_numeric_replacement_accepted(replacement, &replacement_type, target) {
+            return Err(PplError::Semantic {
+                reason: format!(
+                    "fillnull: field '{}' (type: {}) cannot hold the replacement value {} (type: {})",
+                    field.name(),
+                    name_ppl_type(field.name(), target),
+                    replacement.human_display(),
+                    name_ppl_type("replacement", &replacement_type)
+                ),
+            });
+        }
+        return Ok(cast(replacement.clone(), target.clone()));
+    }
+    let is_accepted = (is_string_type(target) && is_string_type(&replacement_type))
+        || (*target == DataType::Boolean && replacement_type == DataType::Boolean)
+        || (matches!(target, DataType::Timestamp(..)) && matches!(replacement_type, DataType::Timestamp(..)));
+    if !is_accepted {
+        let id_clause = if matches!(target, DataType::FixedSizeBinary(_)) {
+            "; id columns accept no replacement"
+        } else {
+            ""
+        };
+        return Err(PplError::Semantic {
+            reason: format!(
+                "fillnull: replacement value type {} is not compatible with field '{}' (type: {}){id_clause}",
+                name_ppl_type("replacement", &replacement_type),
+                field.name(),
+                name_ppl_type(field.name(), target)
+            ),
+        });
+    }
+    Ok(cast(replacement.clone(), target.clone()))
+}
+
+/// Whether the numeric column type `target` accepts the numeric `replacement` (of type
+/// `replacement_type`), decided while planning, so the cast of an integer column's replacement never
+/// truncates and never fails when the query runs.
+///
+/// An integer column takes only an integer it holds exactly: a literal inside the column's range,
+/// or a computed integer whose type has no value outside that range. A fraction, a literal outside
+/// the range and a computed integer of a wider type are refused. A floating-point or decimal column
+/// takes any number, rounded to its type; only a literal the type cannot represent at all (outside
+/// its range) is refused.
+fn is_numeric_replacement_accepted(replacement: &Expr, replacement_type: &DataType, target: &DataType) -> bool {
+    let literal = match replacement {
+        Expr::Literal(value, _) => Some(value),
+        _ => None,
+    };
+    if literal.is_some_and(|value| value.cast_to_with_options(target, &DEFAULT_CAST_OPTIONS).is_err()) {
+        return false;
+    }
+    if !target.is_integer() {
+        return true;
+    }
+    replacement_type.is_integer() && (literal.is_some() || is_integer_type_within(replacement_type, target))
+}
+
+/// Whether every value of the integer type `source` is a value of the integer type `target`.
+fn is_integer_type_within(source: &DataType, target: &DataType) -> bool {
+    let (Some(source_width), Some(target_width)) = (source.primitive_width(), target.primitive_width()) else {
+        return false;
+    };
+    if source.is_signed_integer() == target.is_signed_integer() {
+        source_width <= target_width
+    } else {
+        source.is_unsigned_integer() && source_width < target_width
+    }
+}
+
+/// The PPL type name of `data_type`, or its Arrow name when PPL has no type for it.
+fn name_ppl_type(column: &str, data_type: &DataType) -> String {
+    PplType::from_data_type(column, data_type)
+        .map_or_else(|_| data_type.to_string(), |ppl_type| ppl_type.name().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use chrono::{DateTime, Datelike, Months, NaiveTime, TimeZone, Utc, Weekday};
-    use datafusion::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StringArray, TimestampMicrosecondArray};
+    use datafusion::arrow::array::{
+        Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+        StringArray, TimestampMicrosecondArray,
+    };
     use datafusion::arrow::compute::concat_batches;
-    use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, TimestampMicrosecondType};
+    use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, TimeUnit, TimestampMicrosecondType};
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-    use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, LogicalTableSource, ident};
+    use datafusion::common::{DFSchema, ScalarValue};
+    use datafusion::error::DataFusionError;
+    use datafusion::logical_expr::{
+        Between, Expr, LogicalPlan, LogicalPlanBuilder, LogicalTableSource, col, ident, lit,
+    };
     use datafusion::prelude::SessionContext;
     use icegate_common::schema::COL_TENANT_ID;
     use icegate_common::{OPERATIONS_TABLE, TenantId};
@@ -1942,11 +2473,15 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     use super::{
-        ExpressionScope, PplColumn, PplType, aggregate_rows, bin_time, bucket_time, plan_ppl, project_source_columns,
-        select_fields, union_branches,
+        ExpressionScope, PplColumn, PplType, aggregate_rows, bin_time, bucket_time, build_describe_plan,
+        coerce_timestamp_operands, lower_expression, plan_fillnull, plan_ppl, project_source_columns, select_fields,
+        union_branches,
     };
+    use crate::opensearch::catalog::FieldType;
     use crate::opensearch::context::RequestContext;
-    use crate::ppl::ast::{PplCommand, SpanUnit};
+    use crate::ppl::ast::{FillnullCommand, PplCommand, PplExpr, PplLiteral, SpanUnit};
+    use crate::ppl::error::PplError;
+    use crate::ppl::functions::{FunctionContext, lower_function_call};
     use crate::ppl::parse_ppl;
     use crate::test_rows::{FINISH_REASONS, build_operation_row};
     use crate::test_support::{SearchFixture, TestCell};
@@ -2038,7 +2573,7 @@ mod tests {
             LogicalPlanBuilder::scan("logs", Arc::new(LogicalTableSource::new(Arc::new(table))), None).expect("scan");
         let source = project_source_columns(scan).expect("source columns");
         let schema = Arc::clone(source.schema());
-        let request_time = DateTime::from_timestamp_micros(NOON_MICROS).expect("noon");
+        let request_time = build_fixed_now();
         let scope = ExpressionScope::new(&schema, None, request_time);
         let dropped_names = ["severity_text".to_string(), "body".to_string()];
         let plan = select_fields(source, true, &dropped_names, &scope)
@@ -2166,11 +2701,11 @@ mod tests {
         let session = fixture.open_session(TENANT_A).await;
         let context = RequestContext {
             tenant: TenantId::new(TENANT_A).expect("a valid tenant"),
-            now: DateTime::from_timestamp_micros(NOON_MICROS).expect("noon"),
+            now: build_fixed_now(),
         };
         let query = parse_ppl("source=operations | fields finish_reasons").expect("query");
 
-        let ppl_plan = plan_ppl(&query, &session, &context).await.expect("plan");
+        let ppl_plan = plan_ppl(&query, &session, &context, "icegate").await.expect("plan");
 
         assert_eq!(
             ppl_plan.columns,
@@ -2303,7 +2838,7 @@ mod tests {
         let (_, input) = context.read_batch(batch).expect("frame").into_parts();
         let builder = LogicalPlanBuilder::from(input);
         let schema = Arc::clone(builder.schema());
-        let request_time = DateTime::from_timestamp_micros(NOON_MICROS).expect("noon");
+        let request_time = build_fixed_now();
         let scope = ExpressionScope::new(&schema, None, request_time);
         let query = parse_ppl(query_text).expect("query");
         let [PplCommand::Stats(stats)] = query.commands.as_slice() else {
@@ -2377,5 +2912,363 @@ mod tests {
         aggregate_names.dedup();
         assert_eq!(aggregate_names, vec!["array_agg".to_string(), "count".to_string()]);
         assert_eq!(distinct_names, Vec::<String>::new());
+    }
+
+    /// A schema of a microsecond `timestamp` column and a string `body`.
+    fn build_timestamp_and_body_schema() -> DFSchema {
+        DFSchema::try_from(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            Field::new("body", DataType::Utf8, true),
+        ]))
+        .expect("schema")
+    }
+
+    /// 2026-10-08T12:00:00Z, the request time of the unit tests that need one.
+    fn build_fixed_now() -> DateTime<Utc> {
+        DateTime::from_timestamp_micros(NOON_MICROS).expect("noon")
+    }
+
+    #[test]
+    fn a_string_compared_with_a_timestamp_operand_folds_and_other_operands_stay() {
+        // 2026-10-08T12:00:00Z = 1_791_460_800 s and 2026-10-08T00:00:00Z = 1_791_417_600 s after
+        // the epoch, computed outside the code.
+        let schema = build_timestamp_and_body_schema();
+        let (left, right) =
+            coerce_timestamp_operands(col("timestamp"), lit("2026-10-08 12:00:00.000001"), &schema).expect("fold");
+        assert_eq!(left, col("timestamp"));
+        assert_eq!(
+            right,
+            lit(ScalarValue::TimestampMicrosecond(Some(1_791_460_800_000_001), None))
+        );
+
+        let (left, right) =
+            coerce_timestamp_operands(lit("2026-10-08"), col("timestamp"), &schema).expect("fold on the left");
+        assert_eq!(
+            left,
+            lit(ScalarValue::TimestampMicrosecond(Some(1_791_417_600_000_000), None))
+        );
+        assert_eq!(right, col("timestamp"));
+
+        let (left, right) = coerce_timestamp_operands(col("body"), lit("2026-10-08"), &schema).expect("no fold");
+        assert_eq!((left, right), (col("body"), lit("2026-10-08")));
+
+        let (_, right) = coerce_timestamp_operands(
+            col("timestamp"),
+            lit(ScalarValue::Utf8View(Some("2026-10-08".to_owned()))),
+            &schema,
+        )
+        .expect("a Utf8View literal folds");
+        assert_eq!(
+            right,
+            lit(ScalarValue::TimestampMicrosecond(Some(1_791_417_600_000_000), None))
+        );
+
+        assert!(
+            matches!(
+                coerce_timestamp_operands(col("timestamp"), lit("2026-10-08 12:00:00.1234567"), &schema),
+                Err(PplError::Semantic { .. })
+            ),
+            "seven fraction digits must be refused, not truncated"
+        );
+    }
+
+    #[test]
+    fn between_bounds_and_in_items_compared_with_a_timestamp_fold_to_microsecond_literals() {
+        let schema = build_timestamp_and_body_schema();
+        let scope = ExpressionScope::new(&schema, None, build_fixed_now());
+        let timestamp_field = || Box::new(PplExpr::Field("timestamp".to_owned()));
+        let string_literal = |text: &str| PplExpr::Literal(PplLiteral::String(text.to_owned()));
+        let midnight = lit(ScalarValue::TimestampMicrosecond(Some(1_791_417_600_000_000), None));
+        let noon_and_a_microsecond = lit(ScalarValue::TimestampMicrosecond(Some(1_791_460_800_000_001), None));
+
+        let between = PplExpr::Between {
+            value: timestamp_field(),
+            low: Box::new(string_literal("2026-10-08")),
+            high: Box::new(string_literal("2026-10-08 12:00:00.000001")),
+            is_negated: false,
+        };
+        assert_eq!(
+            lower_expression(&between, &scope).expect("between folds"),
+            Expr::Between(Between::new(
+                Box::new(ident("timestamp")),
+                false,
+                Box::new(midnight.clone()),
+                Box::new(noon_and_a_microsecond.clone()),
+            ))
+        );
+
+        let membership = PplExpr::In {
+            value: timestamp_field(),
+            list: vec![
+                string_literal("2026-10-08"),
+                string_literal("2026-10-08 12:00:00.000001"),
+            ],
+            is_negated: true,
+        };
+        assert_eq!(
+            lower_expression(&membership, &scope).expect("in folds"),
+            ident("timestamp").in_list(vec![midnight, noon_and_a_microsecond], true)
+        );
+
+        let string_membership = PplExpr::In {
+            value: Box::new(PplExpr::Field("body".to_owned())),
+            list: vec![string_literal("2026-10-08")],
+            is_negated: false,
+        };
+        assert_eq!(
+            lower_expression(&string_membership, &scope).expect("a string list stays"),
+            ident("body").in_list(vec![lit("2026-10-08")], false)
+        );
+
+        for refused in [
+            PplExpr::Between {
+                value: timestamp_field(),
+                low: Box::new(string_literal("2026-10-08 12:00:00.1234567")),
+                high: Box::new(string_literal("2026-10-09")),
+                is_negated: false,
+            },
+            PplExpr::In {
+                value: timestamp_field(),
+                list: vec![string_literal("2026-10-08 12:00:00.1234567")],
+                is_negated: false,
+            },
+        ] {
+            assert!(
+                matches!(lower_expression(&refused, &scope), Err(PplError::Semantic { .. })),
+                "{refused:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_timestamp_call_folds_a_literal_of_every_string_type_and_refuses_seven_fraction_digits() {
+        let schema = DFSchema::empty();
+        let functions = FunctionContext {
+            schema: &schema,
+            now: build_fixed_now(),
+        };
+        for argument in [
+            ScalarValue::Utf8(Some("2026-10-08 12:00:00.000001".to_owned())),
+            ScalarValue::LargeUtf8(Some("2026-10-08 12:00:00.000001".to_owned())),
+            ScalarValue::Utf8View(Some("2026-10-08 12:00:00.000001".to_owned())),
+        ] {
+            let folded = lower_function_call("timestamp", vec![lit(argument.clone())], &functions).expect("folds");
+            assert_eq!(
+                folded,
+                lit(ScalarValue::TimestampMicrosecond(Some(1_791_460_800_000_001), None)),
+                "{argument:?}"
+            );
+        }
+        for argument in [
+            ScalarValue::Utf8(Some("2026-10-08 12:00:00.1234567".to_owned())),
+            ScalarValue::Utf8View(Some("2026-10-08 12:00:00.1234567".to_owned())),
+        ] {
+            assert!(
+                matches!(
+                    lower_function_call("timestamp", vec![lit(argument.clone())], &functions),
+                    Err(PplError::Semantic { .. })
+                ),
+                "{argument:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_describe_plan_names_and_types_its_columns_as_the_jdbc_columns() {
+        // The JDBC `getColumns` columns, in order; `int` columns are 32-bit, the rest strings.
+        let expected_columns: [(&str, DataType); 24] = [
+            ("TABLE_CAT", DataType::Utf8),
+            ("TABLE_SCHEM", DataType::Utf8),
+            ("TABLE_NAME", DataType::Utf8),
+            ("COLUMN_NAME", DataType::Utf8),
+            ("DATA_TYPE", DataType::Int32),
+            ("TYPE_NAME", DataType::Utf8),
+            ("COLUMN_SIZE", DataType::Int32),
+            ("BUFFER_LENGTH", DataType::Int32),
+            ("DECIMAL_DIGITS", DataType::Int32),
+            ("NUM_PREC_RADIX", DataType::Int32),
+            ("NULLABLE", DataType::Int32),
+            ("REMARKS", DataType::Utf8),
+            ("COLUMN_DEF", DataType::Utf8),
+            ("SQL_DATA_TYPE", DataType::Int32),
+            ("SQL_DATETIME_SUB", DataType::Int32),
+            ("CHAR_OCTET_LENGTH", DataType::Int32),
+            ("ORDINAL_POSITION", DataType::Int32),
+            ("IS_NULLABLE", DataType::Utf8),
+            ("SCOPE_CATALOG", DataType::Utf8),
+            ("SCOPE_SCHEMA", DataType::Utf8),
+            ("SCOPE_TABLE", DataType::Utf8),
+            ("SOURCE_DATA_TYPE", DataType::Int32),
+            ("IS_AUTOINCREMENT", DataType::Utf8),
+            ("IS_GENERATEDCOLUMN", DataType::Utf8),
+        ];
+        let expected: Vec<(&str, &DataType)> =
+            expected_columns.iter().map(|(name, data_type)| (*name, data_type)).collect();
+        for fields in [
+            vec![],
+            vec![("body", FieldType::Text), ("log_attributes", FieldType::Object)],
+        ] {
+            let builder = build_describe_plan("icegate", "logs", fields.into_iter()).expect("describe plan");
+            let columns: Vec<(&str, &DataType)> = builder
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| (field.name().as_str(), field.data_type()))
+                .collect();
+            assert_eq!(columns, expected);
+        }
+    }
+
+    /// The one `fillnull` command of `source=t | <fillnull_text>`.
+    fn parse_fillnull_command(fillnull_text: &str) -> FillnullCommand {
+        let query = parse_ppl(&format!("source=t | {fillnull_text}")).expect("parse");
+        let [PplCommand::Fillnull(command)] = query.commands.as_slice() else {
+            panic!("{fillnull_text} is one fillnull command");
+        };
+        command.clone()
+    }
+
+    /// `fillnull_text` planned over `builder`.
+    fn plan_fillnull_text(builder: LogicalPlanBuilder, fillnull_text: &str) -> Result<LogicalPlanBuilder, PplError> {
+        let schema = Arc::clone(builder.schema());
+        let scope = ExpressionScope::new(&schema, None, build_fixed_now());
+        plan_fillnull(builder, &parse_fillnull_command(fillnull_text), &scope).map(|(planned, _)| planned)
+    }
+
+    /// One row of values and one row of NULLs, of an `int`, a `bigint`, a `double`, a
+    /// `Decimal128(10, 2)`, a `boolean`, a microsecond `timestamp` and a `string` column.
+    fn build_fillnull_batch() -> RecordBatch {
+        let price = Decimal128Array::from(vec![Some(150), None])
+            .with_precision_and_scale(10, 2)
+            .expect("decimal");
+        let columns: [(&str, ArrayRef); 7] = [
+            ("retries", Arc::new(Int32Array::from(vec![Some(1), None]))),
+            ("bytes", Arc::new(Int64Array::from(vec![Some(1), None]))),
+            ("ratio", Arc::new(Float64Array::from(vec![Some(0.5), None]))),
+            ("price", Arc::new(price)),
+            ("cached", Arc::new(BooleanArray::from(vec![Some(true), None]))),
+            ("seen", Arc::new(TimestampMicrosecondArray::from(vec![Some(1), None]))),
+            ("note", Arc::new(StringArray::from(vec![Some("kept"), None]))),
+        ];
+        RecordBatch::try_from_iter(columns).expect("batch")
+    }
+
+    /// `fillnull_text` over [`build_fillnull_batch`], executed by DataFusion.
+    async fn execute_fillnull(fillnull_text: &str) -> Result<RecordBatch, DataFusionError> {
+        let context = SessionContext::new();
+        let frame = context.read_batch(build_fillnull_batch()).expect("frame");
+        let builder = LogicalPlanBuilder::from(frame.logical_plan().clone());
+        let plan = plan_fillnull_text(builder, fillnull_text)
+            .expect("planned")
+            .build()
+            .expect("plan");
+        let batches = context.execute_logical_plan(plan).await?.collect().await?;
+        let schema = batches.first().expect("at least one batch").schema();
+        Ok(concat_batches(&schema, &batches).expect("concatenate"))
+    }
+
+    #[tokio::test]
+    async fn fillnull_fills_each_column_type_with_a_value_it_accepts() {
+        // 2026-10-08T12:00:00Z = 1_791_460_800 s after the epoch, computed outside the code; the
+        // largest 32-bit integer is 2_147_483_647. 9_007_199_254_740_993 = 2^53 + 1 has no double, so
+        // the double column holds the nearest one, 2^53; 0.125 at scale 2 rounds half away from zero
+        // to 0.13 (unscaled 13).
+        let filled = execute_fillnull(
+            "fillnull using retries = 2147483647, bytes = 2 + 3, ratio = 9007199254740993, \
+             price = 0.125, cached = false, seen = timestamp('2026-10-08 12:00:00'), note = 'none'",
+        )
+        .await
+        .expect("execute");
+        let price = Decimal128Array::from(vec![150, 13])
+            .with_precision_and_scale(10, 2)
+            .expect("decimal");
+        let expected_columns: [(&str, ArrayRef); 7] = [
+            ("retries", Arc::new(Int32Array::from(vec![1, 2_147_483_647]))),
+            ("bytes", Arc::new(Int64Array::from(vec![1, 5]))),
+            (
+                "ratio",
+                Arc::new(Float64Array::from(vec![0.5, 9_007_199_254_740_992.0])),
+            ),
+            ("price", Arc::new(price)),
+            ("cached", Arc::new(BooleanArray::from(vec![true, false]))),
+            (
+                "seen",
+                Arc::new(TimestampMicrosecondArray::from(vec![1, 1_791_460_800_000_000])),
+            ),
+            ("note", Arc::new(StringArray::from(vec!["kept", "none"]))),
+        ];
+        for (name, expected) in expected_columns {
+            let column = filled.column_by_name(name).expect("filled column");
+            assert_eq!(column, &expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn fillnull_refuses_a_value_the_column_cannot_hold() {
+        let mut fields: Vec<Field> = build_fillnull_batch()
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect();
+        fields.push(build_labels_field("1", "2"));
+        let table = Arc::new(LogicalTableSource::new(Arc::new(Schema::new(fields))));
+        let numeric_refusals = [
+            // A fraction into an integer column would be truncated.
+            (
+                "fillnull using retries = 1.5",
+                "fillnull: field 'retries' (type: int) cannot hold the replacement value 1.5 (type: double)",
+            ),
+            (
+                "fillnull using bytes = 1.5",
+                "fillnull: field 'bytes' (type: bigint) cannot hold the replacement value 1.5 (type: double)",
+            ),
+            // One above the largest 32-bit integer.
+            (
+                "fillnull using retries = 2147483648",
+                "fillnull: field 'retries' (type: int) cannot hold the replacement value 2147483648 (type: bigint)",
+            ),
+            // A computed bigint may lie outside the int range, whatever its value turns out to be.
+            (
+                "fillnull using retries = 1 + 1",
+                "fillnull: field 'retries' (type: int) cannot hold the replacement value 1 + 1 (type: bigint)",
+            ),
+            (
+                "fillnull using retries = 2147483647 + 1",
+                "fillnull: field 'retries' (type: int) cannot hold the replacement value 2147483647 + 1 (type: bigint)",
+            ),
+            // 10^11 needs 12 integer digits; Decimal128(10, 2) has 8.
+            (
+                "fillnull using price = 100000000000",
+                "fillnull: field 'price' (type: Decimal128(10, 2)) cannot hold the replacement value 100000000000 (type: bigint)",
+            ),
+        ];
+        for (fillnull_text, expected_reason) in numeric_refusals {
+            let builder = LogicalPlanBuilder::scan("t", Arc::clone(&table) as _, None).expect("scan");
+            assert_eq!(
+                plan_fillnull_text(builder, fillnull_text).err(),
+                Some(PplError::Semantic {
+                    reason: expected_reason.to_string()
+                }),
+                "{fillnull_text}"
+            );
+        }
+        for fillnull_text in [
+            "fillnull using bytes = 'x'",
+            "fillnull using cached = 1",
+            "fillnull using seen = '2026-10-08'",
+            "fillnull using note = 1",
+            "fillnull using labels = 'x'",
+            "fillnull using labels = 1",
+        ] {
+            let builder = LogicalPlanBuilder::scan("t", Arc::clone(&table) as _, None).expect("scan");
+            assert!(
+                matches!(
+                    plan_fillnull_text(builder, fillnull_text),
+                    Err(PplError::Semantic { .. })
+                ),
+                "{fillnull_text} must be refused"
+            );
+        }
     }
 }
