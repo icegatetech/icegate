@@ -119,15 +119,17 @@ impl OpenSearchError {
         Self::illegal_argument(reason).with_metadata("aggregation", aggregation)
     }
 
-    /// An aggregation type of IceGate's surface that this listener does not plan yet (`400`,
-    /// `illegal_argument_exception`); `aggregation` carries the request's name for it and
-    /// `aggregation_type` the type.
-    pub(crate) fn unplanned_aggregation_type(aggregation: &str, aggregation_type: &str) -> Self {
-        Self::unsupported_aggregation(
-            aggregation,
-            format!("aggregation [{aggregation_type}] of [{aggregation}] is not supported yet"),
-        )
-        .with_metadata("aggregation_type", aggregation_type)
+    /// A script IceGate does not run (`400`, `illegal_argument_exception`): `script` carries the
+    /// source as the request wrote it, so a client can tell which of its scripts is refused.
+    pub(crate) fn unsupported_script(script: &str, reason: impl Into<String>) -> Self {
+        Self::illegal_argument(reason).with_metadata("script", script)
+    }
+
+    /// A pipeline aggregation whose placement, `buckets_path` or dependencies cannot be answered
+    /// (`400`, `aggregation_execution_exception`); `aggregation` carries the request's name for
+    /// the pipeline.
+    pub(crate) fn invalid_pipeline(aggregation: &str, reason: &str) -> Self {
+        Self::aggregation_execution(reason).with_metadata("aggregation", aggregation)
     }
 
     /// A field an aggregation cannot read in one index (`400`, `illegal_argument_exception`):

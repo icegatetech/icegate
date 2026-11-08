@@ -19,11 +19,12 @@ use serde_json::{Map, Number, Value, json};
 
 use super::parse::{
     AggregationKind, IGNORED_EXECUTION_KEYS, MetricPath, expect_object, expect_string, read_lenient_number,
-    read_strict_number, report_missing_key, report_unsupported_key,
+    read_strict_number, read_value_script, report_missing_key, report_unsupported_key,
 };
 use super::percentiles::{decode_quantiles, decode_rank_counts, render_percentile_ranks, render_percentiles};
 use super::plan::{FieldInput, MetricSlot};
 use crate::opensearch::error::OpenSearchError;
+use crate::opensearch::script::ArithmeticExpr;
 use crate::opensearch::search::doc_id::MICROS_PER_MILLISECOND;
 use crate::opensearch::search::execute::convert_plan_error;
 use crate::opensearch::search::hits::{DateRenderFormat, render_date, validate_date_micros};
@@ -33,9 +34,13 @@ use crate::opensearch::search::hits::{DateRenderFormat, render_date, validate_da
 pub(crate) struct MetricSpec {
     /// The field whose values the metric reads.
     pub(crate) field: String,
-    /// The value a row without the field contributes. Parsing accepts it on `avg`, `sum`, `min`,
-    /// `max`, `extended_stats` and `percentiles` only, as a JSON number or a numeric string.
+    /// The value a row without the field contributes; accepted where `value_script` is, as a JSON
+    /// number or a numeric string.
     pub(crate) missing: Option<f64>,
+    /// A recognized arithmetic over `_value`, applied to each row's value after `missing` is
+    /// coalesced; set only on `avg`, `sum`, `min`, `max`, `extended_stats` and `percentiles`. A
+    /// statistic it makes non-finite renders `null` ([`NonFiniteRendering::Null`]).
+    pub(crate) value_script: Option<ArithmeticExpr>,
 }
 
 /// The request type name of `extended_stats`.
@@ -53,24 +58,27 @@ pub(crate) struct ExtendedStatsSpec {
     pub(crate) sigma: f64,
 }
 
-/// Parse the `extended_stats` aggregation `name`: `field`, `missing`, `sigma`; the keys of
-/// [`IGNORED_EXECUTION_KEYS`] are accepted and ignored. Only numbers are read: a field of any
-/// other type is refused when the rows are planned.
+/// Parse the `extended_stats` aggregation `name`: `field`, `missing`, `script` (a value script),
+/// `sigma`; the keys of [`IGNORED_EXECUTION_KEYS`] are accepted and ignored. Only numbers are
+/// read: a field of any other type is refused when the rows are planned.
 ///
 /// # Errors
 ///
 /// `400 parsing_exception` for a body that is not an object, a missing `field`, an unknown key,
-/// a `missing` that is neither a JSON number nor a numeric string, and a `sigma` that is not a
-/// JSON number or is negative.
+/// a `missing` that is neither a JSON number nor a numeric string, a malformed `script` member,
+/// and a `sigma` that is not a JSON number or is negative; `400 illegal_argument_exception` for a
+/// script outside the arithmetic grammar.
 pub(super) fn parse_extended_stats(name: &str, value: &Value) -> Result<ExtendedStatsSpec, OpenSearchError> {
     let body = expect_object(name, EXTENDED_STATS, value)?;
     let mut field = None;
     let mut missing = None;
+    let mut value_script = None;
     let mut sigma = DEFAULT_SIGMA;
     for (key, value) in body {
         match key.as_str() {
             "field" => field = Some(expect_string(name, key, value)?.to_string()),
             "missing" => missing = Some(read_lenient_number(name, key, value)?),
+            "script" => value_script = Some(read_value_script(name, value)?),
             "sigma" => sigma = read_strict_number(name, key, value)?,
             ignored if IGNORED_EXECUTION_KEYS.contains(&ignored) => {}
             unknown => return Err(report_unsupported_key(EXTENDED_STATS, name, unknown)),
@@ -85,6 +93,7 @@ pub(super) fn parse_extended_stats(name: &str, value: &Value) -> Result<Extended
         metric: MetricSpec {
             field: field.ok_or_else(|| report_missing_key(EXTENDED_STATS, name, "field"))?,
             missing,
+            value_script,
         },
         sigma,
     })
@@ -105,6 +114,25 @@ pub(super) struct ExtendedStatsValues {
     pub(super) sum_of_squares: Option<f64>,
 }
 
+/// The numeric members a rendered `stats` carries; a `buckets_path` may name each of them.
+pub(super) const STATS_MEMBERS: &[&str] = &["count", "min", "max", "avg", "sum"];
+/// The numeric members a rendered `extended_stats` carries at its top level; a `buckets_path`
+/// may name each of them.
+pub(super) const EXTENDED_STATS_MEMBERS: &[&str] = &[
+    "count",
+    "min",
+    "max",
+    "avg",
+    "sum",
+    "sum_of_squares",
+    "variance",
+    "variance_population",
+    "variance_sampling",
+    "std_deviation",
+    "std_deviation_population",
+    "std_deviation_sampling",
+];
+
 /// Renders an `extended_stats` result over the `n` values `x` of a bucket.
 ///
 /// `avg = Σx / n`; `variance` and `variance_population` are `Σx² / n − avg²`;
@@ -114,10 +142,14 @@ pub(super) struct ExtendedStatsValues {
 /// `avg ± sigma · deviation`. A bucket without a value renders `count: 0`,
 /// `sum: 0.0` and every other number `null`.
 ///
+/// A statistic that is not finite renders as [`NonFiniteRendering::from_value_script`] states
+/// for the spec's value script.
+///
 /// # Errors
 ///
-/// `500` for a statistic that is not finite, such as a bound past the double range under a
-/// large `sigma`: an answer of `null` would claim the bucket has no value.
+/// `500` for a statistic that is not finite when the spec has no value script, such as a bound
+/// past the double range under a large `sigma`: an answer of `null` would claim the bucket has
+/// no value.
 pub(super) fn render_extended_stats(
     spec: &ExtendedStatsSpec,
     values: &ExtendedStatsValues,
@@ -148,37 +180,42 @@ pub(super) fn render_extended_stats(
     let sum = values.sum.unwrap_or(0.0);
     let sum_of_squares = values.sum_of_squares.unwrap_or(0.0);
     let average = sum / count;
-    let variance_population = average.mul_add(-average, sum_of_squares / count).max(0.0);
+    // `f64::max` would turn the NaN variance of infinite values (a value script dividing by zero)
+    // into a false 0; the comparison keeps it NaN, which renders as a non-finite statistic.
+    let clamp_variance = |variance: f64| if variance < 0.0 { 0.0 } else { variance };
+    let variance_population = clamp_variance(average.mul_add(-average, sum_of_squares / count));
     // `(Σx)² / n` is taken as `avg · Σx`: it never exceeds `Σx²`, so it stays finite whenever
     // `Σx²` is, where `Σx · Σx` alone could overflow and clamp the variance to a false 0.
     let variance_sampling =
-        (values.count > 1).then(|| (average.mul_add(-sum, sum_of_squares) / (count - 1.0)).max(0.0));
+        (values.count > 1).then(|| clamp_variance(average.mul_add(-sum, sum_of_squares) / (count - 1.0)));
     let deviation_population = variance_population.sqrt();
     let deviation_sampling = variance_sampling.map(f64::sqrt);
     let upper_population = spec.sigma.mul_add(deviation_population, average);
     let lower_population = (-spec.sigma).mul_add(deviation_population, average);
     let upper_sampling = deviation_sampling.map(|deviation| spec.sigma.mul_add(deviation, average));
     let lower_sampling = deviation_sampling.map(|deviation| (-spec.sigma).mul_add(deviation, average));
+    let rendering = NonFiniteRendering::from_value_script(spec.metric.value_script.as_ref());
+    let render_statistic = |value: Option<f64>| render_float(value, rendering);
     Ok(json!({
         "count": values.count,
-        "min": render_float(values.min)?,
-        "max": render_float(values.max)?,
-        "avg": render_float(Some(average))?,
-        "sum": render_float(Some(sum))?,
-        "sum_of_squares": render_float(Some(sum_of_squares))?,
-        "variance": render_float(Some(variance_population))?,
-        "variance_population": render_float(Some(variance_population))?,
-        "variance_sampling": render_float(variance_sampling)?,
-        "std_deviation": render_float(Some(deviation_population))?,
-        "std_deviation_population": render_float(Some(deviation_population))?,
-        "std_deviation_sampling": render_float(deviation_sampling)?,
+        "min": render_statistic(values.min)?,
+        "max": render_statistic(values.max)?,
+        "avg": render_statistic(Some(average))?,
+        "sum": render_statistic(Some(sum))?,
+        "sum_of_squares": render_statistic(Some(sum_of_squares))?,
+        "variance": render_statistic(Some(variance_population))?,
+        "variance_population": render_statistic(Some(variance_population))?,
+        "variance_sampling": render_statistic(variance_sampling)?,
+        "std_deviation": render_statistic(Some(deviation_population))?,
+        "std_deviation_population": render_statistic(Some(deviation_population))?,
+        "std_deviation_sampling": render_statistic(deviation_sampling)?,
         "std_deviation_bounds": {
-            "upper": render_float(Some(upper_population))?,
-            "lower": render_float(Some(lower_population))?,
-            "upper_population": render_float(Some(upper_population))?,
-            "lower_population": render_float(Some(lower_population))?,
-            "upper_sampling": render_float(upper_sampling)?,
-            "lower_sampling": render_float(lower_sampling)?
+            "upper": render_statistic(Some(upper_population))?,
+            "lower": render_statistic(Some(lower_population))?,
+            "upper_population": render_statistic(Some(upper_population))?,
+            "lower_population": render_statistic(Some(lower_population))?,
+            "upper_sampling": render_statistic(upper_sampling)?,
+            "lower_sampling": render_statistic(lower_sampling)?
         }
     }))
 }
@@ -333,7 +370,7 @@ pub(super) fn plan_statistic(statistic: Statistic, value: Expr) -> Result<Expr, 
 }
 
 /// What `kind` reads from each row of the rows-plan column `field`, `spec.missing` standing in
-/// for an absent value.
+/// for an absent value and `spec.value_script` applied after it.
 ///
 /// The rows plan holds every field in the Arrow type its field type maps to, and a field no
 /// searched index maps as a NULL column; `plan_aggregation_rows` has already refused a mapped
@@ -342,7 +379,8 @@ pub(super) fn plan_statistic(statistic: Statistic, value: Expr) -> Result<Expr, 
 ///
 /// # Errors
 ///
-/// `500` when the epoch-millisecond expression of a date fails to build.
+/// `400 illegal_argument_exception` for a value script over a date field; `500` when the
+/// epoch-millisecond expression of a date fails to build.
 pub(super) fn plan_metric_input(
     kind: MetricKind,
     spec: &MetricSpec,
@@ -363,6 +401,17 @@ pub(super) fn plan_metric_input(
     let value = match spec.missing {
         Some(missing) => coalesce(vec![value, lit(missing)]),
         None => value,
+    };
+    // A date has no `_value` arithmetic: its extremes render as dates, which a scaled value is not.
+    let value = match &spec.value_script {
+        None => value,
+        Some(_) if is_date => {
+            return Err(OpenSearchError::illegal_argument(format!(
+                "a value script runs only over numeric fields, and [{}] is a date",
+                spec.field
+            )));
+        }
+        Some(script) => script.lower_value_script(value),
     };
     Ok(MetricInput { value, is_date })
 }
@@ -453,7 +502,9 @@ pub(super) fn resolve_order_statistic(kind: MetricKind, path: &MetricPath) -> Re
 /// # Errors
 ///
 /// `500` for a statistic of another type than its aggregate or distinct branch computes, for a
-/// statistic that is not finite (a sum or mean that overflows, a quantile estimate), for a date
+/// statistic that is not finite (a sum or mean that overflows, a quantile estimate) of a metric
+/// without a value script (one with a value script renders it as
+/// [`NonFiniteRendering::from_value_script`] states), for a date
 /// extreme outside the range a date renders in, for a `quantiles` or `rank_counts` list whose
 /// length is not the one its request asks for, and for a slot whose kind and aggregation
 /// disagree, which `AggregationLayout` never builds.
@@ -463,24 +514,31 @@ pub(super) fn render_metric(
     read: &dyn Fn(Statistic) -> Result<ScalarValue, OpenSearchError>,
 ) -> Result<Value, OpenSearchError> {
     let mut object = Map::new();
+    let rendering = NonFiniteRendering::from_value_script(slot.spec.value_script.as_ref());
     match slot.kind {
         MetricKind::Avg => {
-            object.insert("value".to_string(), render_float(read_float(&read(Statistic::Avg)?)?)?);
+            object.insert(
+                "value".to_string(),
+                render_float(read_float(&read(Statistic::Avg)?)?, rendering)?,
+            );
         }
         MetricKind::Sum => {
-            object.insert("value".to_string(), render_sum(&read(Statistic::Sum)?)?);
+            object.insert("value".to_string(), render_sum(&read(Statistic::Sum)?, rendering)?);
         }
-        MetricKind::Min => insert_extreme(&mut object, "value", &read(Statistic::Min)?, is_date)?,
-        MetricKind::Max => insert_extreme(&mut object, "value", &read(Statistic::Max)?, is_date)?,
+        MetricKind::Min => insert_extreme(&mut object, "value", &read(Statistic::Min)?, is_date, rendering)?,
+        MetricKind::Max => insert_extreme(&mut object, "value", &read(Statistic::Max)?, is_date, rendering)?,
         MetricKind::ValueCount => {
             object.insert("value".to_string(), Value::from(read_count(&read(Statistic::Count)?)?));
         }
         MetricKind::Stats => {
             object.insert("count".to_string(), Value::from(read_count(&read(Statistic::Count)?)?));
-            insert_extreme(&mut object, "min", &read(Statistic::Min)?, is_date)?;
-            insert_extreme(&mut object, "max", &read(Statistic::Max)?, is_date)?;
-            object.insert("avg".to_string(), render_float(read_float(&read(Statistic::Avg)?)?)?);
-            object.insert("sum".to_string(), render_sum(&read(Statistic::Sum)?)?);
+            insert_extreme(&mut object, "min", &read(Statistic::Min)?, is_date, rendering)?;
+            insert_extreme(&mut object, "max", &read(Statistic::Max)?, is_date, rendering)?;
+            object.insert(
+                "avg".to_string(),
+                render_float(read_float(&read(Statistic::Avg)?)?, rendering)?,
+            );
+            object.insert("sum".to_string(), render_sum(&read(Statistic::Sum)?, rendering)?);
         }
         MetricKind::Cardinality => {
             object.insert(
@@ -492,7 +550,7 @@ pub(super) fn render_metric(
             let AggregationKind::Percentiles(spec) = slot.aggregation else {
                 return Err(report_mismatched_slot(slot));
             };
-            let quantiles = decode_quantiles(&read(Statistic::Quantiles)?)?;
+            let quantiles = decode_quantiles(&read(Statistic::Quantiles)?, rendering)?;
             check_statistic_length(slot, quantiles.as_ref().map(Vec::len), spec.percents.len())?;
             return Ok(render_percentiles(spec, quantiles.as_deref()));
         }
@@ -553,28 +611,55 @@ fn report_mismatched_slot(slot: &MetricSlot<'_>) -> OpenSearchError {
     ))
 }
 
-/// `value` as a JSON number, or `null` when the bucket has no value.
+/// How a metric renders a statistic that is not finite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NonFiniteRendering {
+    /// A `500`: only an overflow inside IceGate's own arithmetic produces it, and an answer of
+    /// `null` would claim the bucket has no value.
+    Refused,
+    /// `null`: the request's value script computed it, and an arithmetic script's non-finite
+    /// result renders `null` (a division by zero, the remainder of a division by zero).
+    Null,
+}
+
+impl NonFiniteRendering {
+    /// [`Self::Null`] for a metric with a value script, [`Self::Refused`] for one without.
+    pub(super) const fn from_value_script(value_script: Option<&ArithmeticExpr>) -> Self {
+        if value_script.is_some() {
+            Self::Null
+        } else {
+            Self::Refused
+        }
+    }
+}
+
+/// `value` as a JSON number, or `null` when the bucket has no value; a value that is not finite
+/// renders as `rendering` states.
 ///
 /// # Errors
 ///
-/// `500` for a value that is not finite, such as a sum that overflows: an answer of `null`
-/// would claim the bucket has no value.
-fn render_float(value: Option<f64>) -> Result<Value, OpenSearchError> {
+/// `500` for a value that is not finite under [`NonFiniteRendering::Refused`].
+fn render_float(value: Option<f64>, rendering: NonFiniteRendering) -> Result<Value, OpenSearchError> {
     let Some(number) = value else {
         return Ok(Value::Null);
     };
-    Number::from_f64(number)
-        .map(Value::Number)
-        .ok_or_else(|| OpenSearchError::internal(format!("metric statistic [{number}] is not finite")))
+    match Number::from_f64(number) {
+        Some(finite) => Ok(Value::Number(finite)),
+        None if rendering == NonFiniteRendering::Null => Ok(Value::Null),
+        None => Err(OpenSearchError::internal(format!(
+            "metric statistic [{number}] is not finite"
+        ))),
+    }
 }
 
 /// A sum statistic, 0 when the bucket has no value.
 ///
 /// # Errors
 ///
-/// `500` for a statistic that is not a `Float64` or not finite.
-fn render_sum(value: &ScalarValue) -> Result<Value, OpenSearchError> {
-    render_float(Some(read_float(value)?.unwrap_or(0.0)))
+/// `500` for a statistic that is not a `Float64`, or not finite under
+/// [`NonFiniteRendering::Refused`].
+fn render_sum(value: &ScalarValue, rendering: NonFiniteRendering) -> Result<Value, OpenSearchError> {
+    render_float(Some(read_float(value)?.unwrap_or(0.0)), rendering)
 }
 
 /// A `Float64` statistic; `None` when the bucket has no value.
@@ -614,16 +699,17 @@ fn read_count(value: &ScalarValue) -> Result<u64, OpenSearchError> {
 ///
 /// # Errors
 ///
-/// `500` for a statistic that is not a `Float64` or not finite, and for a date outside the range
-/// a date renders in.
+/// `500` for a statistic that is not a `Float64`, or not finite under
+/// [`NonFiniteRendering::Refused`], and for a date outside the range a date renders in.
 fn insert_extreme(
     object: &mut Map<String, Value>,
     key: &str,
     value: &ScalarValue,
     is_date: bool,
+    rendering: NonFiniteRendering,
 ) -> Result<(), OpenSearchError> {
     let number = read_float(value)?;
-    object.insert(key.to_string(), render_float(number)?);
+    object.insert(key.to_string(), render_float(number, rendering)?);
     if is_date && let Some(millis) = number {
         object.insert(format!("{key}_as_string"), render_epoch_millis(millis)?);
     }
@@ -655,6 +741,7 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::json;
 
+    use super::super::plan::Granularity;
     use super::*;
     use crate::opensearch::error::render_envelope;
 
@@ -664,6 +751,7 @@ mod tests {
             metric: MetricSpec {
                 field: "duration_micros".to_owned(),
                 missing: None,
+                value_script: None,
             },
             sigma,
         }
@@ -707,6 +795,62 @@ mod tests {
                 }
             })
         );
+    }
+
+    /// The keys of `rendered` whose values are numbers, sorted.
+    fn list_numeric_keys(rendered: &Value) -> Vec<String> {
+        let mut keys: Vec<String> = rendered
+            .as_object()
+            .expect("a rendered metric is an object")
+            .iter()
+            .filter(|(_, value)| value.is_number())
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// `members`, sorted.
+    fn sort_members(members: &[&str]) -> Vec<String> {
+        let mut sorted: Vec<String> = members.iter().map(|member| (*member).to_owned()).collect();
+        sorted.sort_unstable();
+        sorted
+    }
+
+    #[test]
+    fn the_buckets_path_member_lists_are_the_numeric_keys_rendered() {
+        // Every statistic finite and non-null, so each numeric member renders as a number.
+        let values = ExtendedStatsValues {
+            count: 4,
+            sum: Some(1200.0),
+            min: Some(100.0),
+            max: Some(600.0),
+            sum_of_squares: Some(500_000.0),
+        };
+        let extended = render_extended_stats(&build_extended_stats_spec(2.0), &values).expect("finite statistics");
+        assert_eq!(list_numeric_keys(&extended), sort_members(EXTENDED_STATS_MEMBERS));
+
+        let spec = MetricSpec {
+            field: "duration_micros".to_owned(),
+            missing: None,
+            value_script: None,
+        };
+        let aggregation = AggregationKind::Stats(spec.clone());
+        let slot = MetricSlot {
+            name: "1",
+            kind: MetricKind::Stats,
+            spec: &spec,
+            aggregation: &aggregation,
+            granularity: Granularity::Top,
+        };
+        let read = |statistic: Statistic| {
+            Ok(match statistic {
+                Statistic::Count => ScalarValue::Int64(Some(4)),
+                _ => ScalarValue::Float64(Some(300.0)),
+            })
+        };
+        let stats = render_metric(&slot, false, &read).expect("finite statistics");
+        assert_eq!(list_numeric_keys(&stats), sort_members(STATS_MEMBERS));
     }
 
     #[test]
@@ -832,6 +976,7 @@ mod tests {
                 metric: MetricSpec {
                     field: "duration_micros".to_owned(),
                     missing: Some(250.0),
+                    value_script: None,
                 },
                 sigma: 2.0,
             }

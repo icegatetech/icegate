@@ -5,8 +5,7 @@
 //! client asked for. The keys of [`IGNORED_EXECUTION_KEYS`] tune shard-level execution, which a
 //! single-shard listener does not have, so every kind accepts and ignores them. A kind outside
 //! IceGate's aggregation surface, or a name that is no aggregation type, is a `parsing_exception`
-//! whose `construct` names it; a kind of the surface that this listener does not plan yet is a
-//! `400 illegal_argument_exception` whose `aggregation_type` names it.
+//! whose `construct` names it.
 
 use std::fmt::Display;
 use std::time::Duration;
@@ -20,9 +19,15 @@ use super::multi_bucket::{
 use super::percentiles::{
     PercentileRanksSpec, PercentilesSpec, parse_percentile_ranks, parse_percentiles, split_percent_path,
 };
+use super::pipeline::{
+    BucketScriptSpec, DerivativeSpec, MovingAvgSpec, MovingFnSpec, PipelineSpec, SerialDiffSpec, parse_bucket_script,
+    parse_cumulative_sum, parse_derivative, parse_moving_avg, parse_moving_fn, parse_serial_diff,
+    parse_sibling_pipeline,
+};
 use super::terms::{TermsSpec, parse_terms};
 use super::top_hits::{TopHitsSpec, parse_top_hits};
 use crate::opensearch::error::OpenSearchError;
+use crate::opensearch::script::{ArithmeticExpr, VALUE_VARIABLE, read_script_source, recognize_arithmetic_script};
 use crate::opensearch::search::doc_id::{
     MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MILLISECOND, MICROS_PER_MINUTE, MICROS_PER_SECOND,
 };
@@ -47,20 +52,6 @@ const OUT_OF_SCOPE_KINDS: [&str; 6] = [
 
 /// Out-of-scope kinds whose name does not say so by a prefix.
 const OUT_OF_SCOPE_PIPELINES: [&str; 1] = ["extended_stats_bucket"];
-
-/// Kinds of the aggregation surface that are not planned yet.
-const NOT_YET_PLANNED_KINDS: [&str; 10] = [
-    "cumulative_sum",
-    "derivative",
-    "serial_diff",
-    "moving_fn",
-    "moving_avg",
-    "bucket_script",
-    "avg_bucket",
-    "sum_bucket",
-    "min_bucket",
-    "max_bucket",
-];
 
 /// The aggregations of one search request, in request order.
 #[derive(Debug)]
@@ -120,11 +111,31 @@ pub(crate) enum AggregationKind {
     Filters(FiltersSpec),
     /// The single bucket of the rows the query matches.
     Filter(Box<Query>),
+    /// `cumulative_sum`: the running total across the parent histogram's buckets.
+    CumulativeSum(PipelineSpec),
+    /// `derivative`: the difference to the previous bucket.
+    Derivative(DerivativeSpec),
+    /// `serial_diff`: the difference to the bucket `lag` positions earlier.
+    SerialDiff(SerialDiffSpec),
+    /// `moving_fn`: a recognized moving function over preceding buckets.
+    MovingFn(MovingFnSpec),
+    /// Legacy `moving_avg`: a moving model over preceding buckets.
+    MovingAvg(MovingAvgSpec),
+    /// `bucket_script`: arithmetic over values of the same bucket.
+    BucketScript(BucketScriptSpec),
+    /// `avg_bucket`: the mean over a sibling's buckets.
+    AvgBucket(PipelineSpec),
+    /// `sum_bucket`: the sum over a sibling's buckets.
+    SumBucket(PipelineSpec),
+    /// `min_bucket`: the minimum over a sibling's buckets and its keys.
+    MinBucket(PipelineSpec),
+    /// `max_bucket`: the maximum over a sibling's buckets and its keys.
+    MaxBucket(PipelineSpec),
 }
 
 impl AggregationKind {
     /// The field the aggregation reads; `None` for `filter` and `filters`, which read queries,
-    /// and `top_hits`, which reads whole rows.
+    /// `top_hits`, which reads whole rows, and the pipelines, which read the rendered tree.
     pub(crate) fn field(&self) -> Option<&str> {
         match self {
             Self::DateHistogram(spec) => Some(&spec.field),
@@ -142,7 +153,19 @@ impl AggregationKind {
             | Self::ExtendedStats(ExtendedStatsSpec { metric, .. }) => Some(&metric.field),
             Self::Range(spec) => Some(&spec.field),
             Self::DateRange(spec) => Some(&spec.field),
-            Self::Filters(_) | Self::Filter(_) | Self::TopHits(_) => None,
+            Self::Filters(_)
+            | Self::Filter(_)
+            | Self::TopHits(_)
+            | Self::CumulativeSum(_)
+            | Self::Derivative(_)
+            | Self::SerialDiff(_)
+            | Self::MovingFn(_)
+            | Self::MovingAvg(_)
+            | Self::BucketScript(_)
+            | Self::AvgBucket(_)
+            | Self::SumBucket(_)
+            | Self::MinBucket(_)
+            | Self::MaxBucket(_) => None,
         }
     }
 }
@@ -252,7 +275,7 @@ impl CalendarUnit {
 ///
 /// `400 parsing_exception` for a malformed object, an unknown key, an unknown or out-of-scope
 /// kind (the kind under `construct`); `400 illegal_argument_exception` for an invalid option
-/// value or a kind not planned yet.
+/// value.
 pub(crate) fn parse_aggregations(value: &Value) -> Result<AggregationTree, OpenSearchError> {
     Ok(AggregationTree {
         aggregations: parse_named_aggregations(value)?,
@@ -328,6 +351,24 @@ fn parse_kind(name: &str, kind_name: &str, value: &Value) -> Result<AggregationK
         "date_range" => Ok(AggregationKind::DateRange(parse_date_range(name, value)?)),
         "filters" => Ok(AggregationKind::Filters(parse_filters(name, value)?)),
         "filter" => Ok(AggregationKind::Filter(Box::new(parse_query(value)?))),
+        "cumulative_sum" => Ok(AggregationKind::CumulativeSum(parse_cumulative_sum(name, value)?)),
+        "derivative" => Ok(AggregationKind::Derivative(parse_derivative(name, value)?)),
+        "serial_diff" => Ok(AggregationKind::SerialDiff(parse_serial_diff(name, value)?)),
+        "moving_fn" => Ok(AggregationKind::MovingFn(parse_moving_fn(name, value)?)),
+        "moving_avg" => Ok(AggregationKind::MovingAvg(parse_moving_avg(name, value)?)),
+        "bucket_script" => Ok(AggregationKind::BucketScript(parse_bucket_script(name, value)?)),
+        "avg_bucket" => Ok(AggregationKind::AvgBucket(parse_sibling_pipeline(
+            name, kind_name, value,
+        )?)),
+        "sum_bucket" => Ok(AggregationKind::SumBucket(parse_sibling_pipeline(
+            name, kind_name, value,
+        )?)),
+        "min_bucket" => Ok(AggregationKind::MinBucket(parse_sibling_pipeline(
+            name, kind_name, value,
+        )?)),
+        "max_bucket" => Ok(AggregationKind::MaxBucket(parse_sibling_pipeline(
+            name, kind_name, value,
+        )?)),
         _ if OUT_OF_SCOPE_KINDS.contains(&kind_name)
             || OUT_OF_SCOPE_PIPELINES.contains(&kind_name)
             || kind_name.starts_with("geo_") =>
@@ -336,9 +377,6 @@ fn parse_kind(name: &str, kind_name: &str, value: &Value) -> Result<AggregationK
                 kind_name,
                 format!("aggregation [{kind_name}] of [{name}] is not supported"),
             ))
-        }
-        _ if NOT_YET_PLANNED_KINDS.contains(&kind_name) => {
-            Err(OpenSearchError::unplanned_aggregation_type(name, kind_name))
         }
         _ => Err(OpenSearchError::unsupported_construct(
             kind_name,
@@ -578,25 +616,28 @@ pub(crate) fn parse_metric_path(text: &str) -> Result<MetricPath, OpenSearchErro
 }
 
 /// A plain metric (`avg`, `sum`, `min`, `max`, `value_count`, `stats`, `cardinality`): `field`,
-/// and `missing` when `is_missing_accepted`.
+/// plus `missing` and a value `script` when `accepts_value_inputs` (`avg`, `sum`, `min`, `max`).
 ///
 /// # Errors
 ///
 /// `400 parsing_exception` for a body that is not an object, a missing `field`, a value of the
-/// wrong JSON type, and an unknown key (named under `construct`).
+/// wrong JSON type, a malformed `script` member, and an unknown key (named under `construct`);
+/// `400 illegal_argument_exception` for a script outside the arithmetic grammar.
 fn parse_metric(
     name: &str,
     kind_name: &str,
     value: &Value,
-    is_missing_accepted: bool,
+    accepts_value_inputs: bool,
 ) -> Result<MetricSpec, OpenSearchError> {
     let body = expect_object(name, kind_name, value)?;
     let mut field = None;
     let mut missing = None;
+    let mut value_script = None;
     for (key, value) in body {
         match key.as_str() {
             "field" => field = Some(expect_string(name, key, value)?.to_string()),
-            "missing" if is_missing_accepted => missing = Some(read_lenient_number(name, key, value)?),
+            "missing" if accepts_value_inputs => missing = Some(read_lenient_number(name, key, value)?),
+            "script" if accepts_value_inputs => value_script = Some(read_value_script(name, value)?),
             ignored if IGNORED_EXECUTION_KEYS.contains(&ignored) => {}
             unknown => return Err(report_unsupported_key(kind_name, name, unknown)),
         }
@@ -604,7 +645,19 @@ fn parse_metric(
     Ok(MetricSpec {
         field: field.ok_or_else(|| report_missing_key(kind_name, name, "field"))?,
         missing,
+        value_script,
     })
+}
+
+/// The value `script` of the metric aggregation `name`: arithmetic over `_value` and decimal
+/// literals.
+///
+/// # Errors
+///
+/// `400 parsing_exception` for a malformed `script` member; `400 illegal_argument_exception`
+/// naming any other script under `script`.
+pub(super) fn read_value_script(name: &str, value: &Value) -> Result<ArithmeticExpr, OpenSearchError> {
+    recognize_arithmetic_script(read_script_source(name, value)?, &[VALUE_VARIABLE])
 }
 
 /// A `histogram`: `field`, `interval`, `min_doc_count` (absent means 0) and `extended_bounds`.
@@ -1195,18 +1248,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_aggregation_served_later_is_a_400_naming_it() {
-        let error = parse_aggregations(&json!({"1": {"serial_diff": {"buckets_path": "_count"}}}))
-            .expect_err("serial_diff is not planned yet");
-
-        let (status, body) = render_envelope(error).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["type"], "illegal_argument_exception");
-        assert_eq!(body["error"]["aggregation"], "1");
-        assert_eq!(body["error"]["aggregation_type"], "serial_diff");
-    }
-
-    #[tokio::test]
     async fn an_unknown_key_in_a_date_histogram_is_a_parsing_exception() {
         let error = parse_aggregations(&json!({
             "2": {"date_histogram": {"field": "timestamp", "fixed_interval": "1h", "keyed": true}}
@@ -1420,7 +1461,8 @@ mod tests {
             numeric_missing,
             MetricSpec {
                 field: "duration_micros".to_string(),
-                missing: Some(0.0)
+                missing: Some(0.0),
+                value_script: None
             }
         );
         let Ok(AggregationKind::Max(textual_missing)) =
@@ -1432,7 +1474,8 @@ mod tests {
             textual_missing,
             MetricSpec {
                 field: "duration_micros".to_string(),
-                missing: Some(1.5)
+                missing: Some(1.5),
+                value_script: None
             }
         );
         let Ok(AggregationKind::Histogram(histogram)) = parse_first_kind(&json!({"h": {"histogram": {

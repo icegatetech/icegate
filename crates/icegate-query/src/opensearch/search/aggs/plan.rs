@@ -58,6 +58,7 @@ use super::parse::{
 use super::percentiles::{
     PercentilesSpec, SharedDigest, find_percentile_order_element, group_shared_digests, plan_rank_counts_aggregate,
 };
+use super::pipeline::{apply_pipelines, validate_pipelines};
 use super::render::render_aggregations;
 use super::terms::{TermsOrder, TermsSpec, build_filter_predicate, build_key_literal};
 use super::top_hits::{TopHitsResults, TopHitsSpec, collect_top_hits};
@@ -302,12 +303,15 @@ impl<'a> AggregationLayout<'a> {
                     MAX_BUCKET_LEVELS,
                 ));
             }
-            layout.top.push(node);
+            if let Some(node) = node {
+                layout.top.push(node);
+            }
         }
         Ok(layout)
     }
 
-    /// Add `aggregation`, nested under the levels `ancestors`, and its sub-aggregations.
+    /// Add `aggregation`, nested under the levels `ancestors`, and its sub-aggregations; `None` for
+    /// a pipeline, which runs over the rendered tree and takes no node.
     ///
     /// # Errors
     ///
@@ -316,8 +320,8 @@ impl<'a> AggregationLayout<'a> {
         &mut self,
         aggregation: &'a NamedAggregation,
         ancestors: &[usize],
-    ) -> Result<LayoutNode, OpenSearchError> {
-        match &aggregation.kind {
+    ) -> Result<Option<LayoutNode>, OpenSearchError> {
+        let node = match &aggregation.kind {
             AggregationKind::DateHistogram(spec) => {
                 let rounding = BucketRounding::from_spec(spec)?;
                 self.add_level(aggregation, LevelKind::DateHistogram { spec, rounding }, ancestors)
@@ -365,7 +369,19 @@ impl<'a> AggregationLayout<'a> {
                 self.add_metric(aggregation, MetricKind::ExtendedStats, &spec.metric, ancestors)
             }
             AggregationKind::TopHits(spec) => self.add_top_hits(aggregation, spec, ancestors),
-        }
+            // A pipeline runs over the rendered tree (`apply_pipelines`), so it takes no node.
+            AggregationKind::CumulativeSum(_)
+            | AggregationKind::Derivative(_)
+            | AggregationKind::SerialDiff(_)
+            | AggregationKind::MovingFn(_)
+            | AggregationKind::MovingAvg(_)
+            | AggregationKind::BucketScript(_)
+            | AggregationKind::AvgBucket(_)
+            | AggregationKind::SumBucket(_)
+            | AggregationKind::MinBucket(_)
+            | AggregationKind::MaxBucket(_) => return Ok(None),
+        };
+        node.map(Some)
     }
 
     /// Add the bucket aggregation `aggregation` as the next level, then its sub-aggregations,
@@ -405,6 +421,7 @@ impl<'a> AggregationLayout<'a> {
             .children
             .iter()
             .map(|child| self.add_node(child, &path))
+            .filter_map(Result::transpose)
             .collect::<Result<Vec<_>, _>>()?;
         let order_metrics = match ranking_spec {
             Some(spec) => self.resolve_order_metrics(&aggregation.name, spec, &children)?,
@@ -1083,7 +1100,8 @@ pub(super) fn compute_level_mask(grouped_levels: &[usize], path: &[usize]) -> Re
 /// holding a `cardinality` ([`plan_aggregations`]); every plan runs in `scope.session`, so the
 /// plans share its memory pool and its limit. A `top_hits` runs after assembly, over the buckets
 /// the response renders ([`collect_top_hits`]); `rows` then also carries the searched index's
-/// table columns.
+/// table columns. The pipelines of `tree`, which [`plan_aggregation_rows`] validated, run last,
+/// over the rendered tree ([`apply_pipelines`]).
 ///
 /// # Errors
 ///
@@ -1091,7 +1109,8 @@ pub(super) fn compute_level_mask(grouped_levels: &[usize], path: &[usize]) -> Re
 /// `400 too_many_buckets_exception` past `scope.max_buckets`; `400 illegal_argument_exception`
 /// naming a `histogram` whose bucket index for a value or a bound lies past the `i64` range;
 /// the session's execution errors,
-/// the memory limit among them; the errors of [`collect_top_hits`]; `500` when planning fails.
+/// the memory limit among them; the errors of [`collect_top_hits`]; the value errors of
+/// [`apply_pipelines`]; `500` when planning fails.
 pub(crate) async fn execute_aggregations(
     rows: LogicalPlan,
     tree: &AggregationTree,
@@ -1132,7 +1151,9 @@ pub(crate) async fn execute_aggregations(
         Some(hit_rows) => collect_top_hits(&hit_rows, &layout, &inputs, &assembled, scope).await?,
         None => TopHitsResults::default(),
     };
-    render_aggregations(&layout, &inputs, &assembled, top_hits_results)
+    let mut aggregations = render_aggregations(&layout, &inputs, &assembled, top_hits_results)?;
+    apply_pipelines(&tree.aggregations, &mut aggregations)?;
+    Ok(aggregations)
 }
 
 /// One field the aggregations read, resolved in every searched index.
@@ -1166,7 +1187,9 @@ struct AggregationField {
 /// different Arrow types, with `field` and `indices_by_type` naming the indices of each type; `400
 /// illegal_argument_exception` for a field an aggregation cannot read (as
 /// [`check_field_for_aggregation`] lists them), with the `field`, its `field_type`, the `index`,
-/// the `aggregation` and its `aggregation_type`; the lowering's errors; `500` when planning fails.
+/// the `aggregation` and its `aggregation_type`; the structural pipeline errors of
+/// [`validate_pipelines`], which are checked first, before any plan is built; the lowering's
+/// errors; `500` when planning fails.
 pub(crate) fn plan_aggregation_rows(
     session: &TenantSession,
     entries: &[&IndexEntry],
@@ -1174,6 +1197,7 @@ pub(crate) fn plan_aggregation_rows(
     now: DateTime<Utc>,
     tree: &AggregationTree,
 ) -> Result<LogicalPlan, OpenSearchError> {
+    validate_pipelines(&tree.aggregations)?;
     let layout = AggregationLayout::new(tree, now)?;
     if let Some(slot) = layout.top_hits.first()
         && entries.len() > 1
@@ -1279,8 +1303,8 @@ fn list_aggregations(tree: &AggregationTree) -> Vec<&NamedAggregation> {
 /// searched indices, and a field `aggregation` cannot read. A bucket or a numeric metric reads
 /// numbers (`histogram`, `range`; `avg`, `sum`, `min`, `max`, `stats`, `percentiles` and
 /// `percentile_ranks` also booleans and dates), a `date_histogram` and a `date_range` dates, a
-/// `terms`, a `value_count` and a `cardinality` anything but text and objects; `filter` and
-/// `filters` read no field. `extended_stats` reads numbers only.
+/// `terms`, a `value_count` and a `cardinality` anything but text and objects; `filter`,
+/// `filters` and the pipelines read no field. `extended_stats` reads numbers only.
 fn check_field_for_aggregation(
     aggregation: &NamedAggregation,
     field_name: &str,
@@ -1354,7 +1378,17 @@ fn check_field_for_aggregation(
         | AggregationKind::Filters(_)
         | AggregationKind::Filter(_)
         | AggregationKind::ExtendedStats(_)
-        | AggregationKind::TopHits(_) => Ok(()),
+        | AggregationKind::TopHits(_)
+        | AggregationKind::CumulativeSum(_)
+        | AggregationKind::Derivative(_)
+        | AggregationKind::SerialDiff(_)
+        | AggregationKind::MovingFn(_)
+        | AggregationKind::MovingAvg(_)
+        | AggregationKind::BucketScript(_)
+        | AggregationKind::AvgBucket(_)
+        | AggregationKind::SumBucket(_)
+        | AggregationKind::MinBucket(_)
+        | AggregationKind::MaxBucket(_) => Ok(()),
     }
 }
 
@@ -1408,7 +1442,19 @@ fn choose_row_data_type(aggregation: &NamedAggregation, resolved: &[Option<Resol
         | AggregationKind::Percentiles(_)
         | AggregationKind::PercentileRanks(_)
         | AggregationKind::ExtendedStats(_) => DataType::Float64,
-        AggregationKind::Filters(_) | AggregationKind::Filter(_) | AggregationKind::TopHits(_) => return None,
+        AggregationKind::Filters(_)
+        | AggregationKind::Filter(_)
+        | AggregationKind::TopHits(_)
+        | AggregationKind::CumulativeSum(_)
+        | AggregationKind::Derivative(_)
+        | AggregationKind::SerialDiff(_)
+        | AggregationKind::MovingFn(_)
+        | AggregationKind::MovingAvg(_)
+        | AggregationKind::BucketScript(_)
+        | AggregationKind::AvgBucket(_)
+        | AggregationKind::SumBucket(_)
+        | AggregationKind::MinBucket(_)
+        | AggregationKind::MaxBucket(_) => return None,
     };
     Some(resolved.iter().flatten().find_map(map_field_data_type).unwrap_or(fallback))
 }
@@ -4955,5 +5001,144 @@ mod bucket_tree_tests {
         .await
         .expect_err("a top_hits cannot order");
         render_refusal(error, "aggregation_execution_exception").await;
+    }
+
+    /// 2026-10-08T12:15:00Z in microseconds and the key of its hour in epoch milliseconds.
+    const AT_12_15: i64 = 1_791_461_700_000_000;
+    const HOUR_12_KEY: i64 = 1_791_460_800_000;
+
+    #[tokio::test]
+    async fn a_metric_value_script_with_missing_applies_missing_before_the_script() {
+        // Durations 1500, 2500 and one row without a duration.
+        let rows = [
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), Some(1500), None),
+            build_test_row(AT_10_40, Some("api"), Some("INFO"), Some(2500), None),
+            build_test_row(AT_11_10, Some("api"), Some("INFO"), None, None),
+        ];
+        let aggregations = run_aggregations(
+            &rows,
+            json!({
+                "1": {"avg": {"field": "duration_micros", "script": "_value / 1000", "missing": "0"}},
+                "2": {"sum": {"field": "duration_micros", "script": "_value / 1000"}},
+                "3": {"max": {"field": "duration_micros", "script": {"source": "(_value + 500) * 2", "lang": "painless"}}},
+                "4": {"percentiles": {"field": "duration_micros", "script": "_value / 1000", "missing": 0, "percents": [100]}},
+                "5": {"extended_stats": {"field": "duration_micros", "script": "_value / 1000"}}
+            }),
+        )
+        .await
+        .expect("aggregate the rows");
+        // The missing row becomes 0 before the script: (1.5 + 2.5 + 0) / 3.
+        assert_eq!(aggregations["1"], json!({"value": 1.333_333_333_333_333_3}));
+        // Without missing, the row without a duration is skipped: 1.5 + 2.5.
+        assert_eq!(aggregations["2"], json!({"value": 4.0}));
+        assert_eq!(aggregations["3"], json!({"value": 6000.0}));
+        assert_eq!(aggregations["4"], json!({"values": {"100.0": 2.5}}));
+        assert_eq!(aggregations["5"]["count"], json!(2));
+        assert_eq!(aggregations["5"]["sum"], json!(4.0));
+        // A value script's non-finite result renders `null`: `x / 0` is infinite and `x % 0` is
+        // not a number, and each statistic over them is too.
+        let non_finite = run_aggregations(
+            &rows,
+            json!({
+                "1": {"avg": {"field": "duration_micros", "script": "_value / 0"}},
+                "2": {"sum": {"field": "duration_micros", "script": "_value % 0"}},
+                "3": {"max": {"field": "duration_micros", "script": "-_value / 0"}},
+                "4": {"percentiles": {"field": "duration_micros", "script": "_value / 0", "percents": [50]}},
+                "5": {"extended_stats": {"field": "duration_micros", "script": "_value / 0"}}
+            }),
+        )
+        .await
+        .expect("aggregate the rows");
+        assert_eq!(non_finite["1"], json!({"value": null}));
+        assert_eq!(non_finite["2"], json!({"value": null}));
+        assert_eq!(non_finite["3"], json!({"value": null}));
+        assert_eq!(non_finite["4"], json!({"values": {"50.0": null}}));
+        assert_eq!(non_finite["5"]["count"], json!(2));
+        for statistic in [
+            "min",
+            "max",
+            "avg",
+            "sum",
+            "sum_of_squares",
+            "variance",
+            "std_deviation",
+        ] {
+            assert_eq!(non_finite["5"][statistic], json!(null), "{statistic}");
+        }
+        for (aggregation, expected_type) in [
+            (
+                json!({"1": {"avg": {"field": "duration_micros", "script": "Math.log(_value)"}}}),
+                "illegal_argument_exception",
+            ),
+            (
+                json!({"1": {"value_count": {"field": "duration_micros", "script": "_value"}}}),
+                "parsing_exception",
+            ),
+            (
+                json!({"1": {"min": {"field": "timestamp", "script": "_value / 1000"}}}),
+                "illegal_argument_exception",
+            ),
+        ] {
+            let error = run_aggregations(&rows, aggregation.clone()).await.expect_err("refused");
+            let (status, body) = render_envelope(error).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{aggregation}");
+            assert_eq!(body["error"]["type"], json!(expected_type), "{aggregation}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pipelines_run_over_the_executed_date_histogram() {
+        // Hour 10: 100 and 200; hour 11: no row (a filled gap); hour 12: 600.
+        let rows = [
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), Some(100), None),
+            build_test_row(AT_10_40, Some("api"), Some("INFO"), Some(200), None),
+            build_test_row(AT_12_15, Some("api"), Some("INFO"), Some(600), None),
+        ];
+        let aggregations = run_aggregations(
+            &rows,
+            json!({
+                "hours": {
+                    "date_histogram": {"field": "timestamp", "fixed_interval": "1h", "min_doc_count": 0, "format": "epoch_millis"},
+                    "aggs": {
+                        "1": {"sum": {"field": "duration_micros"}},
+                        "3": {"cumulative_sum": {"buckets_path": "1"}},
+                        "4": {"derivative": {"buckets_path": "1"}},
+                        "5": {"moving_fn": {"buckets_path": "1", "window": 2, "script": "MovingFunctions.unweightedAvg(values)"}},
+                        "6": {"bucket_script": {"buckets_path": {"s": "1", "c": "_count"}, "script": "params.s / params.c"}}
+                    }
+                },
+                "7": {"max_bucket": {"buckets_path": "hours>1"}}
+            }),
+        )
+        .await
+        .expect("aggregate the rows");
+        let hours = aggregations["hours"]["buckets"].as_array().expect("hour buckets");
+        // `null` stands for a key the bucket does not carry; a carried `{value: null}` is written
+        // as such.
+        let summary: Vec<Value> = hours
+            .iter()
+            .map(|hour| {
+                json!([
+                    hour["key"],
+                    hour["doc_count"],
+                    hour.get("3"),
+                    hour.get("4"),
+                    hour.get("5"),
+                    hour.get("6")
+                ])
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                json!([HOUR_10_KEY, 2, {"value": 300.0}, null, {"value": null}, {"value": 150.0}]),
+                json!([HOUR_11_KEY, 0, {"value": 300.0}, {"value": null}, null, null]),
+                json!([HOUR_12_KEY, 1, {"value": 900.0}, {"value": null}, {"value": 300.0}, {"value": 600.0}]),
+            ]
+        );
+        assert_eq!(
+            aggregations["7"],
+            json!({"value": 600.0, "keys": [HOUR_12_KEY.to_string()]})
+        );
     }
 }

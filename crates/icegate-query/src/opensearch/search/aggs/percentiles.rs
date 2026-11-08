@@ -28,10 +28,10 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion_functions_aggregate_common::tdigest::{DEFAULT_MAX_SIZE, TDigest};
 use serde_json::{Map, Value, json};
 
-use super::metrics::{MetricSpec, Statistic};
+use super::metrics::{MetricSpec, NonFiniteRendering, Statistic};
 use super::parse::{
     IGNORED_EXECUTION_KEYS, MetricPath, expect_flag, expect_object, expect_string, read_lenient_number,
-    read_strict_number, report_missing_key, report_unsupported_key,
+    read_strict_number, read_value_script, report_missing_key, report_unsupported_key,
 };
 use super::plan::{name_statistic_column, name_value_column};
 use crate::opensearch::error::OpenSearchError;
@@ -63,7 +63,7 @@ pub(crate) struct PercentilesSpec {
 /// or below each requested value.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PercentileRanksSpec {
-    /// The field; `missing` is never set for this kind.
+    /// The field; `missing` and `value_script` are never set for this kind.
     pub(crate) metric: MetricSpec,
     /// Requested values, in request order.
     pub(crate) values: Vec<f64>,
@@ -71,25 +71,29 @@ pub(crate) struct PercentileRanksSpec {
     pub(crate) is_keyed: bool,
 }
 
-/// Parses the `percentiles` aggregation `name`: `field`, `missing`, `percents`, `keyed`.
+/// Parses the `percentiles` aggregation `name`: `field`, `missing`, `script` (a value script),
+/// `percents`, `keyed`.
 ///
 /// `percents` defaults to [`DEFAULT_PERCENTS`] and `keyed` to `true`.
 ///
 /// # Errors
 ///
 /// `parsing_exception` for a body that is not an object, a missing `field`, an unknown key
-/// (named under `construct`), a percent that is neither a JSON number nor a numeric string or
-/// lies outside `[0, 100]`, an empty or non-array `percents`, or a non-boolean `keyed`.
+/// (named under `construct`), a malformed `script` member, a percent that is neither a JSON
+/// number nor a numeric string or lies outside `[0, 100]`, an empty or non-array `percents`, or a
+/// non-boolean `keyed`; `illegal_argument_exception` for a script outside the arithmetic grammar.
 pub(super) fn parse_percentiles(name: &str, value: &Value) -> Result<PercentilesSpec, OpenSearchError> {
     let body = expect_object(name, PERCENTILES, value)?;
     let mut field = None;
     let mut missing = None;
+    let mut value_script = None;
     let mut percents = None;
     let mut is_keyed = true;
     for (key, value) in body {
         match key.as_str() {
             "field" => field = Some(expect_string(name, key, value)?.to_string()),
             "missing" => missing = Some(read_lenient_number(name, key, value)?),
+            "script" => value_script = Some(read_value_script(name, value)?),
             "percents" => percents = Some(read_percents(name, value)?),
             "keyed" => is_keyed = expect_flag(name, key, value)?,
             ignored if IGNORED_EXECUTION_KEYS.contains(&ignored) => {}
@@ -100,6 +104,7 @@ pub(super) fn parse_percentiles(name: &str, value: &Value) -> Result<Percentiles
         metric: MetricSpec {
             field: field.ok_or_else(|| report_missing_key(PERCENTILES, name, "field"))?,
             missing,
+            value_script,
         },
         percents: percents.unwrap_or_else(|| DEFAULT_PERCENTS.to_vec()),
         is_keyed,
@@ -143,6 +148,7 @@ pub(super) fn parse_percentile_ranks(name: &str, value: &Value) -> Result<Percen
         metric: MetricSpec {
             field: field.ok_or_else(|| report_missing_key(PERCENTILE_RANKS, name, "field"))?,
             missing: None,
+            value_script: None,
         },
         values: values.ok_or_else(|| report_missing_key(PERCENTILE_RANKS, name, "values"))?,
         is_keyed,
@@ -419,19 +425,27 @@ pub(super) fn select_quantile_element(value: &ScalarValue, element: usize) -> Re
 }
 
 /// Decodes a `quantiles` statistic; `None` for a bucket without a value. Every
-/// estimate returned is finite or NULL.
+/// estimate returned is finite or NULL: a non-finite estimate is NULL under
+/// [`NonFiniteRendering::Null`].
 ///
 /// # Errors
 ///
-/// `internal` when `value` is not a list of `Float64`, and for a non-finite estimate:
-/// a `null` would claim the bucket has no value.
-pub(super) fn decode_quantiles(value: &ScalarValue) -> Result<Option<Vec<Option<f64>>>, OpenSearchError> {
+/// `internal` when `value` is not a list of `Float64`, and for a non-finite estimate
+/// under [`NonFiniteRendering::Refused`]: a `null` would claim the bucket has no value.
+pub(super) fn decode_quantiles(
+    value: &ScalarValue,
+    rendering: NonFiniteRendering,
+) -> Result<Option<Vec<Option<f64>>>, OpenSearchError> {
     let Some(estimates) = read_quantile_estimates(value)? else {
         return Ok(None);
     };
     estimates
         .iter()
-        .map(|estimate| estimate.map(check_finite_estimate).transpose())
+        .map(|estimate| match estimate {
+            Some(estimate) if !estimate.is_finite() && rendering == NonFiniteRendering::Null => Ok(None),
+            Some(estimate) => check_finite_estimate(estimate).map(Some),
+            None => Ok(None),
+        })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
 }
@@ -899,6 +913,7 @@ mod tests {
         MetricSpec {
             field: field.to_owned(),
             missing: None,
+            value_script: None,
         }
     }
 
@@ -1006,7 +1021,12 @@ mod tests {
         .await;
         let decoded_quantiles: Vec<(String, Option<Vec<Option<f64>>>)> = results
             .iter()
-            .map(|(group, value)| (group.clone(), decode_quantiles(value).expect("a quantile list")))
+            .map(|(group, value)| {
+                (
+                    group.clone(),
+                    decode_quantiles(value, NonFiniteRendering::Refused).expect("a quantile list"),
+                )
+            })
             .collect();
         assert_eq!(
             decoded_quantiles,
@@ -1047,7 +1067,7 @@ mod tests {
         let group_names: Vec<&str> = results.iter().map(|(group, _)| group.as_str()).collect();
         assert_eq!(group_names, vec!["tail", "uniform"]);
         for ((group, result), sorted_values) in results.iter().zip([&tail, &uniform]) {
-            let estimates = decode_quantiles(result)
+            let estimates = decode_quantiles(result, NonFiniteRendering::Refused)
                 .expect("a quantile list")
                 .expect("a non-empty group has estimates");
             assert_eq!(estimates.len(), percents.len(), "group {group}");
@@ -1131,7 +1151,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "a");
         assert_eq!(
-            decode_quantiles(&results[0].1).expect("a quantile list"),
+            decode_quantiles(&results[0].1, NonFiniteRendering::Refused).expect("a quantile list"),
             Some(vec![Some(100.0), Some(400.0)])
         );
     }
@@ -1172,7 +1192,7 @@ mod tests {
             .expect("merge the second states");
         let result = accumulator.evaluate().expect("an estimate list");
         assert_eq!(
-            decode_quantiles(&result).expect("a quantile list"),
+            decode_quantiles(&result, NonFiniteRendering::Refused).expect("a quantile list"),
             Some(vec![Some(100.0), Some(400.0)])
         );
     }
@@ -1361,7 +1381,7 @@ mod tests {
             ],
             &DataType::Float64,
         ));
-        let error = decode_quantiles(&list).expect_err("an infinite estimate is refused");
+        let error = decode_quantiles(&list, NonFiniteRendering::Refused).expect_err("an infinite estimate is refused");
         assert_eq!(
             render_refusal(error).await,
             (StatusCode::INTERNAL_SERVER_ERROR, json!("exception"))

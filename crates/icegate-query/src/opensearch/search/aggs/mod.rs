@@ -8,6 +8,7 @@ mod metrics;
 mod multi_bucket;
 mod parse;
 mod percentiles;
+mod pipeline;
 mod plan;
 mod render;
 mod terms;

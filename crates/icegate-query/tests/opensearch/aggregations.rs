@@ -813,3 +813,26 @@ async fn a_top_hits_over_two_indices_and_an_extended_stats_over_a_keyword_are_40
     assert_eq!(answer["error"]["aggregation_type"], "extended_stats");
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_parent_pipeline_outside_a_histogram_is_a_400_naming_it() {
+    let (server, catalog) = TestServer::start().await;
+    commit_log_rows(&catalog, &[build_log_row_at_minute(TENANT_A, 5, "INFO", "tenant-a")])
+        .await
+        .expect("commit logs");
+
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/logs/_search",
+        Some(&json!({"size": 0, "aggs": {"d": {"derivative": {"buckets_path": "_count"}}}})),
+    )
+    .await
+    .expect("search");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["error"]["type"], "aggregation_execution_exception");
+    assert_eq!(answer["error"]["aggregation"], "d");
+    server.shutdown().await;
+}
