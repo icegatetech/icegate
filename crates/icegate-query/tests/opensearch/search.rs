@@ -24,6 +24,7 @@ use icegate_query::opensearch::{OpenSearchConfig, SearchLimitsConfig, SystemIndi
 use reqwest::Method;
 use serde_json::{Map, Value, json};
 
+use super::answers::read_sorted_source_texts;
 use super::data::{Cell, Row, RowWriteError, commit_rows, create_exact_name_table, required_string, write_wal_segment};
 use super::harness::{ServerOptions, TestServer};
 use super::test_rows::{
@@ -60,16 +61,6 @@ fn read_source_values(answer: &Value, column: &str) -> Vec<Value> {
         .iter()
         .map(|hit| hit["_source"][column].clone())
         .collect()
-}
-
-/// The same values, sorted, for hit lists whose order is not a contract.
-fn read_sorted_source_texts(answer: &Value, column: &str) -> Vec<String> {
-    let mut texts: Vec<String> = read_source_values(answer, column)
-        .into_iter()
-        .map(|value| value.as_str().expect("a text value").to_string())
-        .collect();
-    texts.sort();
-    texts
 }
 
 fn build_log_row<'a>(tenant: &'a str, micros: i64, body: &'a str, severity: &'a str) -> Row<'a> {
@@ -182,7 +173,10 @@ async fn rest_total_hits_as_int_renders_the_total_as_an_integer() {
 
     assert_eq!(status, 200, "{answer}");
     assert_eq!(answer["hits"]["total"], json!(2));
-    assert_eq!(read_sorted_source_texts(&answer, COL_BODY), vec!["a-one", "a-two"]);
+    assert_eq!(
+        read_sorted_source_texts(&answer, COL_BODY).expect("sorted source texts"),
+        vec!["a-one", "a-two"]
+    );
     server.shutdown().await;
 }
 
@@ -653,7 +647,7 @@ async fn search_never_returns_another_tenants_rows_from_one_wal_segment_or_one_p
     let (status, tenant_a) = post_json(&server, Some(TENANT_A), "/logs/_search", &json!({})).await;
     assert_eq!(status, 200, "{tenant_a}");
     assert_eq!(
-        read_sorted_source_texts(&tenant_a, COL_BODY),
+        read_sorted_source_texts(&tenant_a, COL_BODY).expect("sorted source texts"),
         vec!["a-iceberg", "a-wal"]
     );
     assert_eq!(tenant_a["hits"]["total"]["value"], 2);
@@ -661,7 +655,7 @@ async fn search_never_returns_another_tenants_rows_from_one_wal_segment_or_one_p
     let (status, tenant_b) = post_json(&server, Some(TENANT_B), "/logs/_search", &json!({})).await;
     assert_eq!(status, 200, "{tenant_b}");
     assert_eq!(
-        read_sorted_source_texts(&tenant_b, COL_BODY),
+        read_sorted_source_texts(&tenant_b, COL_BODY).expect("sorted source texts"),
         vec!["b-iceberg", "b-wal", "b-wal-2"]
     );
     assert_eq!(tenant_b["hits"]["total"]["value"], 3);
@@ -862,7 +856,11 @@ async fn numeric_boolean_and_date_terms_filter_rows_over_http() {
         let (status, answer) =
             post_json(&server, Some(TENANT_A), "/operations/_search", &json!({"query": query})).await;
         assert_eq!(status, 200, "{query}: {answer}");
-        assert_eq!(read_sorted_source_texts(&answer, OPERATION_NAME), expected, "{query}");
+        assert_eq!(
+            read_sorted_source_texts(&answer, OPERATION_NAME).expect("sorted source texts"),
+            expected,
+            "{query}"
+        );
     }
 
     let (status, day) = post_json(
@@ -873,7 +871,10 @@ async fn numeric_boolean_and_date_terms_filter_rows_over_http() {
     )
     .await;
     assert_eq!(status, 200, "{day}");
-    assert_eq!(read_sorted_source_texts(&day, COL_BODY), vec!["a-on-the-day"]);
+    assert_eq!(
+        read_sorted_source_texts(&day, COL_BODY).expect("sorted source texts"),
+        vec!["a-on-the-day"]
+    );
 
     // The smallest positive double rounds to 0 at the decimal's scale; compared as a double,
     // `gt 0` still excludes the zero rate.
@@ -885,7 +886,10 @@ async fn numeric_boolean_and_date_terms_filter_rows_over_http() {
     )
     .await;
     assert_eq!(status, 200, "{rates}");
-    assert_eq!(read_sorted_source_texts(&rates, RATE_LABEL_COLUMN), vec!["a-one"]);
+    assert_eq!(
+        read_sorted_source_texts(&rates, RATE_LABEL_COLUMN).expect("sorted source texts"),
+        vec!["a-one"]
+    );
 
     let (status, refusal_answer) = post_json(
         &server,
@@ -1287,7 +1291,10 @@ async fn an_ids_query_finds_a_span_by_its_natural_key_and_a_log_by_its_hashed_id
     )
     .await;
     assert_eq!(status, 200, "{keep_answer}");
-    assert_eq!(read_sorted_source_texts(&keep_answer, COL_BODY), vec!["keep"]);
+    assert_eq!(
+        read_sorted_source_texts(&keep_answer, COL_BODY).expect("sorted source texts"),
+        vec!["keep"]
+    );
     assert_eq!(keep_answer["hits"]["hits"][0]["_id"], keep_id);
 
     // Several hashed ids in one query each select their own row.
@@ -1306,7 +1313,7 @@ async fn an_ids_query_finds_a_span_by_its_natural_key_and_a_log_by_its_hashed_id
     .await;
     assert_eq!(status, 200, "{every_id_answer}");
     assert_eq!(
-        read_sorted_source_texts(&every_id_answer, COL_BODY),
+        read_sorted_source_texts(&every_id_answer, COL_BODY).expect("sorted source texts"),
         vec!["keep", "other"]
     );
 
@@ -2738,7 +2745,10 @@ async fn score_and_max_score_are_null_when_sorting_on_a_field_and_one_otherwise(
     }
     // Unsorted hits come in no promised order, so they are compared as a set.
     let (_, unsorted) = post_json(&server, Some(TENANT_A), "/logs/_search", &json!({})).await;
-    assert_eq!(read_sorted_source_texts(&unsorted, COL_BODY), vec!["first", "second"]);
+    assert_eq!(
+        read_sorted_source_texts(&unsorted, COL_BODY).expect("sorted source texts"),
+        vec!["first", "second"]
+    );
     server.shutdown().await;
 }
 

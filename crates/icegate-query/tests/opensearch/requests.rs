@@ -1,5 +1,5 @@
-//! Request helpers shared by the system-index test modules: one JSON request, one NDJSON request,
-//! each answering its status and parsed body, and the result type a test returns.
+//! Request helpers shared by the system-index and data-index test modules: one JSON request, one
+//! NDJSON request, each answering its status and parsed body, and the result type a test returns.
 
 use std::error::Error;
 

@@ -2139,3 +2139,116 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod pruning_tests {
+    //! Which query forms reach the scan as a filter it can prune on: a field-qualified id term
+    //! reaches it as a top-level equality; unqualified free text reaches it only as one
+    //! disjunction over every field, which prunes nothing.
+
+    use chrono::{DateTime, Utc};
+    use datafusion::common::ScalarValue;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::utils::split_conjunction;
+    use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, LogicalPlanBuilder, Operator};
+    use datafusion::prelude::SessionContext;
+    use icegate_common::LOGS_TABLE;
+    use icegate_common::schema::COL_TRACE_ID;
+    use serde_json::{Value, json};
+
+    use crate::opensearch::catalog::TenantSession;
+    use crate::query_dsl::lower::{LoweringScope, lower_query};
+    use crate::query_dsl::parse::parse_query;
+    use crate::test_support::{SearchFixture, find_index_entry};
+
+    const TRACE_ID_HEX: &str = "5b8efff798038103d269b633813fc60c";
+    /// The bytes of `TRACE_ID_HEX`, written out.
+    const TRACE_ID: [u8; 16] = [
+        0x5b, 0x8e, 0xff, 0xf7, 0x98, 0x03, 0x81, 0x03, 0xd2, 0x69, 0xb6, 0x33, 0x81, 0x3f, 0xc6, 0x0c,
+    ];
+
+    /// The filters the optimizer pushes into the scans of the plan of `query` over `logs`.
+    fn collect_optimized_scan_filters(session: &TenantSession, query: &Value) -> Vec<Expr> {
+        let entry = find_index_entry(session, LOGS_TABLE);
+        let now: DateTime<Utc> = DateTime::parse_from_rfc3339("2026-10-08T12:00:00Z")
+            .expect("now")
+            .with_timezone(&Utc);
+        let parsed_query = parse_query(query).expect("query");
+        let predicate = lower_query(&parsed_query, &LoweringScope { session, entry, now }).expect("lowered");
+        let plan = session
+            .scan_index(entry)
+            .expect("scan")
+            .filter(predicate)
+            .and_then(LogicalPlanBuilder::build)
+            .expect("plan");
+        let optimized_plan = SessionContext::new().state().optimize(&plan).expect("optimized");
+        let mut filters = Vec::new();
+        optimized_plan
+            .apply(|node| {
+                if let LogicalPlan::TableScan(scan) = node {
+                    filters.extend(scan.filters.iter().cloned());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("walk the plan");
+        filters
+    }
+
+    /// Whether `expression` is exactly `trace_id = TRACE_ID`, the literal being the column's own
+    /// fixed-width bytes: the form a scan prunes on when it is a top-level conjunct.
+    fn is_trace_id_equality(expression: &Expr) -> bool {
+        match expression {
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Eq,
+                right,
+            }) => matches!(
+                (left.as_ref(), right.as_ref()),
+                (Expr::Column(column), Expr::Literal(ScalarValue::FixedSizeBinary(16, Some(bytes)), _))
+                    | (Expr::Literal(ScalarValue::FixedSizeBinary(16, Some(bytes)), _), Expr::Column(column))
+                    if column.name == COL_TRACE_ID && bytes.as_slice() == TRACE_ID
+            ),
+            _ => false,
+        }
+    }
+
+    /// Whether one top-level conjunct of `filter` is the trace id equality. The same equality
+    /// nested under an `Or` is not such a conjunct.
+    fn has_trace_id_equality_conjunct(filter: &Expr) -> bool {
+        split_conjunction(filter).into_iter().any(is_trace_id_equality)
+    }
+
+    /// Whether the trace id equality appears anywhere in `filter`, nested or not.
+    fn contains_trace_id_equality(filter: &Expr) -> bool {
+        filter
+            .exists(|expression| Ok(is_trace_id_equality(expression)))
+            .expect("walk the filter")
+    }
+
+    #[tokio::test]
+    async fn field_qualified_id_terms_prune_and_unqualified_text_does_not() {
+        let fixture = SearchFixture::new().await;
+        let session = fixture.open_session("tenant-a").await;
+
+        let qualified_filters = collect_optimized_scan_filters(&session, &json!({"term": {"trace_id": TRACE_ID_HEX}}));
+        let unqualified_filters = collect_optimized_scan_filters(
+            &session,
+            &json!({"query_string": {"query": format!("\"{TRACE_ID_HEX}\"")}}),
+        );
+
+        assert!(
+            qualified_filters.iter().any(has_trace_id_equality_conjunct),
+            "a field-qualified id term reaches the scan as a top-level fixed-width equality: {qualified_filters:?}"
+        );
+        // The unqualified text reaches the scan with the same equality inside it, so the negative
+        // assertion below holds because of where the equality sits, not because nothing arrived.
+        assert!(
+            unqualified_filters.iter().any(contains_trace_id_equality),
+            "unqualified free text carries the trace id equality into the scan: {unqualified_filters:?}"
+        );
+        assert!(
+            !unqualified_filters.iter().any(has_trace_id_equality_conjunct),
+            "unqualified free text reaches the scan only as one disjunction over every field: {unqualified_filters:?}"
+        );
+    }
+}

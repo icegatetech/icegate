@@ -23,21 +23,39 @@ use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE};
 pub use super::test_rows::{Cell, Row, RowWriteError, commit_rows, write_wal_segment};
 use super::test_rows::{commit_batch, read_arrow_schema};
 
-/// 2026-10-08T10:00:00Z in microseconds, the instant [`build_log_row_at_minute`] counts from.
+/// 2026-10-08T10:00:00Z in microseconds, the instant [`compute_micros_at_minute`] counts from.
 const TEN_O_CLOCK_MICROS: i64 = 1_791_453_600_000_000;
 const MINUTE_MICROS: i64 = 60_000_000;
 
-/// A `checkout` log of `tenant_id` at `minute` minutes past 2026-10-08T10:00:00Z.
+/// The instant `minute` minutes past [`TEN_O_CLOCK_MICROS`], in microseconds: the time base every
+/// minute-based row builder here counts from.
+pub const fn compute_micros_at_minute(minute: i64) -> i64 {
+    TEN_O_CLOCK_MICROS + minute * MINUTE_MICROS
+}
+
+/// A `checkout` log of `tenant_id` at the instant [`compute_micros_at_minute`] gives for `minute`.
 pub const fn build_log_row_at_minute<'a>(
     tenant_id: &'a str,
     minute: i64,
     severity_text: &'a str,
     body: &'a str,
 ) -> LogRow<'a> {
+    build_service_log_row_at_minute(tenant_id, minute, "checkout", severity_text, body)
+}
+
+/// A log of `tenant_id` and `service_name` at the instant [`compute_micros_at_minute`] gives for
+/// `minute`.
+pub const fn build_service_log_row_at_minute<'a>(
+    tenant_id: &'a str,
+    minute: i64,
+    service_name: &'a str,
+    severity_text: &'a str,
+    body: &'a str,
+) -> LogRow<'a> {
     LogRow {
         tenant_id,
-        timestamp_micros: TEN_O_CLOCK_MICROS + minute * MINUTE_MICROS,
-        service_name: Some("checkout"),
+        timestamp_micros: compute_micros_at_minute(minute),
+        service_name: Some(service_name),
         severity_text: Some(severity_text),
         body: Some(body),
         resource_attributes: &[],
@@ -50,12 +68,38 @@ pub fn build_wal_log_row_at_minute<'a>(tenant: &'a str, minute: i64, severity_te
     Row {
         tenant,
         cells: vec![
-            (COL_TIMESTAMP, Cell::Micros(TEN_O_CLOCK_MICROS + minute * MINUTE_MICROS)),
+            (COL_TIMESTAMP, Cell::Micros(compute_micros_at_minute(minute))),
             (COL_SERVICE_NAME, Cell::Text("checkout")),
             (COL_SEVERITY_TEXT, Cell::Text(severity_text)),
             (COL_BODY, Cell::Text(body)),
         ],
     }
+}
+
+/// Commit five logs of `tenant_id` as one append, by minute past [`TEN_O_CLOCK_MICROS`]:
+///
+/// | minute | `service_name` | `severity_text` | `body`                          |
+/// |--------|----------------|-----------------|---------------------------------|
+/// | 5      | `checkout`     | `ERROR`         | `payment declined for order 17` |
+/// | 20     | `checkout`     | `INFO`          | `payment accepted for order 18` |
+/// | 40     | `cart`         | `ERROR`         | `cart service unavailable`      |
+/// | 70     | `checkout`     | `ERROR`         | `payment declined for order 19` |
+/// | 150    | `checkout`     | `ERROR`         | `payment declined for order 20` |
+pub async fn commit_five_checkout_and_cart_logs(
+    catalog: &Arc<dyn Catalog>,
+    tenant_id: &str,
+) -> Result<(), RowWriteError> {
+    commit_log_rows(
+        catalog,
+        &[
+            build_service_log_row_at_minute(tenant_id, 5, "checkout", "ERROR", "payment declined for order 17"),
+            build_service_log_row_at_minute(tenant_id, 20, "checkout", "INFO", "payment accepted for order 18"),
+            build_service_log_row_at_minute(tenant_id, 40, "cart", "ERROR", "cart service unavailable"),
+            build_service_log_row_at_minute(tenant_id, 70, "checkout", "ERROR", "payment declined for order 19"),
+            build_service_log_row_at_minute(tenant_id, 150, "checkout", "ERROR", "payment declined for order 20"),
+        ],
+    )
+    .await
 }
 
 /// One `logs` row. Every column not named here is null, except the observed and ingested

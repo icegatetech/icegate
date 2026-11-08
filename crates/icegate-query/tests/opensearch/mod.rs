@@ -1,9 +1,12 @@
 mod aggregations;
+mod answers;
 mod cat;
 mod cluster;
 mod dashboards_migration;
 mod data;
+mod discover;
 mod fields;
+mod grafana_logs;
 mod harness;
 mod indices;
 mod listener;
@@ -12,6 +15,7 @@ mod requests;
 mod rustfs_conditional;
 mod saved_objects;
 mod search;
+mod search_tenant;
 mod system_indices;
 mod system_store_rustfs;
 #[path = "../../src/test_rows.rs"]
