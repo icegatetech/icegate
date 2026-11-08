@@ -1,10 +1,12 @@
-//! Plain metric aggregations: `avg`, `sum`, `min`, `max`, `value_count` and `stats`.
+//! Plain metric aggregations: `avg`, `sum`, `min`, `max`, `value_count`, `stats` and
+//! `cardinality`.
 //!
 //! A metric is computed by the stage aggregate at the granularity of the level that declares
 //! it, or over every matching row for a top-level metric. Numeric and boolean fields are read as
 //! doubles (a boolean as 0 or 1), dates as epoch milliseconds floored from the stored
 //! microseconds, and a metric's `missing` stands in for an absent value before it is
-//! aggregated. `value_count` counts the values of the field as they are.
+//! aggregated. `value_count` counts the values of the field as they are. A `cardinality` is
+//! counted exactly by a branch of its own (`plan.rs`), never by the stage aggregate.
 
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::ScalarValue;
@@ -45,6 +47,8 @@ pub(super) enum MetricKind {
     ValueCount,
     /// `stats`: `count`, `min`, `max`, `avg` and `sum` together.
     Stats,
+    /// `cardinality`: the exact number of distinct values.
+    Cardinality,
 }
 
 impl MetricKind {
@@ -57,10 +61,12 @@ impl MetricKind {
             Self::Max => "max",
             Self::ValueCount => "value_count",
             Self::Stats => "stats",
+            Self::Cardinality => "cardinality",
         }
     }
 
-    /// The statistics the stage aggregate computes per bucket for this metric.
+    /// The statistics the stage aggregate computes per bucket for this metric; none for
+    /// `cardinality`, which a distinct branch counts.
     pub(super) const fn list_statistics(self) -> &'static [Statistic] {
         match self {
             Self::Avg => &[Statistic::Avg],
@@ -75,11 +81,13 @@ impl MetricKind {
                 Statistic::Avg,
                 Statistic::Sum,
             ],
+            Self::Cardinality => &[],
         }
     }
 }
 
-/// A statistic the stage aggregate computes per bucket for a metric.
+/// A statistic of a metric per bucket: computed by the stage aggregate, or, for `Distinct`, by a
+/// distinct branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Statistic {
     /// The number of values (`Int64`).
@@ -92,6 +100,9 @@ pub(super) enum Statistic {
     Avg,
     /// The sum of the values (`Float64`).
     Sum,
+    /// The exact number of distinct values (`Int64`), counted by a distinct branch, never by the
+    /// stage aggregate.
+    Distinct,
 }
 
 impl Statistic {
@@ -103,6 +114,7 @@ impl Statistic {
             Self::Max => "max",
             Self::Avg => "avg",
             Self::Sum => "sum",
+            Self::Distinct => "distinct",
         }
     }
 }
@@ -110,20 +122,27 @@ impl Statistic {
 /// What a metric reads from each matching row.
 pub(super) struct MetricInput {
     /// The per-row value: a `Float64` (a date in epoch milliseconds) for every metric but
-    /// `value_count`, which reads the field's own value.
+    /// `value_count` and `cardinality`, which read the field's own value.
     pub(super) value: Expr,
     /// Whether the field is a date, so an extreme also renders as a string.
     pub(super) is_date: bool,
 }
 
 /// The aggregate expression computing `statistic` over `value`.
-pub(super) fn plan_statistic(statistic: Statistic, value: Expr) -> Expr {
+///
+/// # Errors
+///
+/// `500` for `Distinct`, which no stage aggregate computes.
+pub(super) fn plan_statistic(statistic: Statistic, value: Expr) -> Result<Expr, OpenSearchError> {
     match statistic {
-        Statistic::Count => count(value),
-        Statistic::Min => min(value),
-        Statistic::Max => max(value),
-        Statistic::Avg => avg(value),
-        Statistic::Sum => sum(value),
+        Statistic::Count => Ok(count(value)),
+        Statistic::Min => Ok(min(value)),
+        Statistic::Max => Ok(max(value)),
+        Statistic::Avg => Ok(avg(value)),
+        Statistic::Sum => Ok(sum(value)),
+        Statistic::Distinct => Err(OpenSearchError::internal(
+            "distinct counts are planned by their own branch",
+        )),
     }
 }
 
@@ -143,7 +162,7 @@ pub(super) fn plan_metric_input(
     spec: &MetricSpec,
     field: FieldInput,
 ) -> Result<MetricInput, OpenSearchError> {
-    if matches!(kind, MetricKind::ValueCount) {
+    if matches!(kind, MetricKind::ValueCount | MetricKind::Cardinality) {
         return Ok(MetricInput {
             value: field.expr,
             is_date: false,
@@ -191,6 +210,7 @@ pub(super) fn resolve_order_statistic(kind: MetricKind, path: &MetricPath) -> Re
         (MetricKind::Min, None | Some("value")) | (MetricKind::Stats, Some("min")) => Some(Statistic::Min),
         (MetricKind::Max, None | Some("value")) | (MetricKind::Stats, Some("max")) => Some(Statistic::Max),
         (MetricKind::ValueCount, None | Some("value")) | (MetricKind::Stats, Some("count")) => Some(Statistic::Count),
+        (MetricKind::Cardinality, None | Some("value")) => Some(Statistic::Distinct),
         // A statistic the metric does not compute, or `stats` without a statistic.
         (
             MetricKind::Avg
@@ -198,7 +218,8 @@ pub(super) fn resolve_order_statistic(kind: MetricKind, path: &MetricPath) -> Re
             | MetricKind::Min
             | MetricKind::Max
             | MetricKind::ValueCount
-            | MetricKind::Stats,
+            | MetricKind::Stats
+            | MetricKind::Cardinality,
             _,
         ) => None,
     };
@@ -219,14 +240,15 @@ pub(super) fn resolve_order_statistic(kind: MetricKind, path: &MetricPath) -> Re
 /// (NULL for a bucket without an aggregated row).
 ///
 /// A single-value metric renders `value`: `null` when the bucket has no value, 0 for an empty
-/// `sum` and `value_count`. `stats` renders `count`, `min`, `max`, `avg` and `sum` (an empty sum is
-/// 0). An extreme of a date field also renders `<key>_as_string` at millisecond precision.
+/// `sum`, `value_count` and `cardinality`. `stats` renders `count`, `min`, `max`, `avg` and
+/// `sum` (an empty sum is 0). An extreme of a date field also renders `<key>_as_string` at
+/// millisecond precision.
 ///
 /// # Errors
 ///
-/// `500` for a statistic of another type than the stage aggregate computes, for a statistic
-/// that is not finite (a sum or mean that overflows), and for a date extreme outside the range
-/// a date renders in.
+/// `500` for a statistic of another type than its aggregate or distinct branch computes, for a
+/// statistic that is not finite (a sum or mean that overflows), and for a date extreme outside
+/// the range a date renders in.
 pub(super) fn render_metric(
     kind: MetricKind,
     is_date: bool,
@@ -251,6 +273,12 @@ pub(super) fn render_metric(
             insert_extreme(&mut object, "max", &read(Statistic::Max)?, is_date)?;
             object.insert("avg".to_string(), render_float(read_float(&read(Statistic::Avg)?)?)?);
             object.insert("sum".to_string(), render_sum(&read(Statistic::Sum)?)?);
+        }
+        MetricKind::Cardinality => {
+            object.insert(
+                "value".to_string(),
+                Value::from(read_count(&read(Statistic::Distinct)?)?),
+            );
         }
     }
     Ok(Value::Object(object))

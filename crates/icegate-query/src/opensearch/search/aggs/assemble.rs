@@ -11,7 +11,8 @@
 //! the request lists, in request order, an empty one with no rows. A level's candidates may come
 //! from another stage aggregate than its parent's: they are matched by the parent's keys. Every
 //! answered bucket, empty ones included, counts against `search.max_buckets` before it is
-//! materialized.
+//! materialized. The exact counts of a `cardinality` come from the distinct branches instead,
+//! filed by metric and by the keys of the bucket's path, which a bucket of any level is read by.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
@@ -22,11 +23,12 @@ use datafusion::arrow::datatypes::{Int32Type, Int64Type};
 use datafusion::common::ScalarValue;
 
 use super::date_histogram::{BucketRounding, fill_empty_buckets};
+use super::distinct::name_distinct_count_column;
 use super::metrics::Statistic;
 use super::parse::{DateHistogramSpec, HistogramSpec};
 use super::plan::{
     AggregationLayout, BucketLevel, DOC_COUNT_COLUMN, Granularity, LEVEL_MASK_COLUMN, LevelKind, OrderMetric,
-    name_key_column, name_statistic_column,
+    list_granularity_levels, name_key_column, name_statistic_column,
 };
 use super::terms::{RankedBucket, TermsSpec, compare_buckets};
 use crate::opensearch::error::OpenSearchError;
@@ -178,6 +180,27 @@ impl StageOutput {
     }
 }
 
+/// The rows one executed distinct-count branch produced.
+pub(super) struct DistinctOutput {
+    granularity: Granularity,
+    metrics: Vec<usize>,
+    batches: Vec<RecordBatch>,
+}
+
+impl DistinctOutput {
+    /// The batches of an executed distinct branch, with what it counted.
+    pub(super) const fn new(granularity: Granularity, metrics: Vec<usize>, batches: Vec<RecordBatch>) -> Self {
+        Self {
+            granularity,
+            metrics,
+            batches,
+        }
+    }
+}
+
+/// Exact distinct counts by metric, then by the keys of the bucket's path.
+type DistinctCounts = HashMap<usize, HashMap<Vec<BucketKey>, i64>>;
+
 /// Where one aggregated row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RowRef {
@@ -210,6 +233,7 @@ pub(super) struct LevelInstance {
 /// The selected buckets of every level and the rows their metrics are read from.
 pub(super) struct AssembledAggregations {
     outputs: Vec<StageOutput>,
+    distinct_counts: DistinctCounts,
     /// Per level, keyed by the keys of the parent bucket's path: what the level answers under
     /// that bucket. Every surviving parent bucket has an entry.
     pub(super) instances: Vec<HashMap<Vec<BucketKey>, LevelInstance>>,
@@ -218,21 +242,25 @@ pub(super) struct AssembledAggregations {
 }
 
 impl AssembledAggregations {
-    /// A reader of the metric statistics the aggregates computed.
+    /// A reader of the metric statistics the aggregates and distinct branches computed.
     pub(super) const fn create_reader(&self) -> AggregateReader<'_> {
         AggregateReader {
             outputs: self.outputs.as_slice(),
+            distinct_counts: &self.distinct_counts,
         }
     }
 }
 
-/// Reads metric statistics from the executed aggregates.
+/// Reads metric statistics from the executed aggregates and distinct branches.
 pub(super) struct AggregateReader<'a> {
     outputs: &'a [StageOutput],
+    distinct_counts: &'a DistinctCounts,
 }
 
 impl AggregateReader<'_> {
-    /// One statistic of `metric` in the aggregated row `row`; NULL for a bucket without a row.
+    /// One statistic of `metric` in the bucket at `path` whose aggregated row is `row`. A
+    /// distinct count is read by path, and a bucket no branch row names holds no value (0). Any
+    /// other statistic is read from the row: NULL for a bucket without one.
     ///
     /// # Errors
     ///
@@ -242,7 +270,17 @@ impl AggregateReader<'_> {
         metric: usize,
         statistic: Statistic,
         row: Option<RowRef>,
+        path: &[BucketKey],
     ) -> Result<ScalarValue, OpenSearchError> {
+        if statistic == Statistic::Distinct {
+            let count = self
+                .distinct_counts
+                .get(&metric)
+                .and_then(|counts| counts.get(path))
+                .copied()
+                .unwrap_or(0);
+            return Ok(ScalarValue::Int64(Some(count)));
+        }
         let Some(row) = row else {
             return Ok(ScalarValue::Null);
         };
@@ -267,7 +305,7 @@ struct Candidate {
 /// The candidates of one level, by the keys of their parent bucket's path.
 type CandidatesByParent = HashMap<Vec<BucketKey>, Vec<Candidate>>;
 
-/// Select the buckets every level answers from the executed aggregates.
+/// Select the buckets every level answers from the executed aggregates and distinct branches.
 ///
 /// # Errors
 ///
@@ -277,10 +315,15 @@ type CandidatesByParent = HashMap<Vec<BucketKey>, Vec<Candidate>>;
 pub(super) fn assemble_aggregations(
     layout: &AggregationLayout<'_>,
     outputs: Vec<StageOutput>,
+    distinct_outputs: &[DistinctOutput],
     max_buckets: usize,
 ) -> Result<AssembledAggregations, OpenSearchError> {
+    let distinct_counts = collect_distinct_counts(layout, distinct_outputs)?;
     let (mut candidates, top_row) = collect_candidates(layout, &outputs)?;
-    let reader = AggregateReader { outputs: &outputs };
+    let reader = AggregateReader {
+        outputs: &outputs,
+        distinct_counts: &distinct_counts,
+    };
     let mut budget = BucketBudget::new(max_buckets);
     let mut instances: Vec<HashMap<Vec<BucketKey>, LevelInstance>> = Vec::with_capacity(layout.levels.len());
     for (level, bucket_level) in layout.levels.iter().enumerate() {
@@ -288,13 +331,14 @@ pub(super) fn assemble_aggregations(
         let mut level_instances = HashMap::with_capacity(parent_paths.len());
         for parent_path in parent_paths {
             let level_candidates = candidates[level].remove(&parent_path).unwrap_or_default();
-            let instance = select_level(bucket_level, level_candidates, &reader, &mut budget)?;
+            let instance = select_level(bucket_level, &parent_path, level_candidates, &reader, &mut budget)?;
             level_instances.insert(parent_path, instance);
         }
         instances.push(level_instances);
     }
     Ok(AssembledAggregations {
         outputs,
+        distinct_counts,
         instances,
         top_row,
     })
@@ -311,19 +355,62 @@ fn list_parent_paths(
     };
     let mut parent_paths: Vec<Vec<BucketKey>> = instances[parent]
         .iter()
-        .flat_map(|(path, instance)| {
-            instance.buckets.iter().map(move |bucket| {
-                let mut child_path = Vec::with_capacity(path.len() + 1);
-                child_path.extend_from_slice(path);
-                child_path.push(bucket.key.clone());
-                child_path
-            })
-        })
+        .flat_map(|(path, instance)| instance.buckets.iter().map(move |bucket| extend_path(path, &bucket.key)))
         .collect();
     // The bucket budget is charged parent by parent, so a fixed order keeps the count a
     // refusal reports the same on every run of one request.
     parent_paths.sort_unstable();
     parent_paths
+}
+
+/// `parent_path` followed by `key`: the path of a bucket of the level below.
+fn extend_path(parent_path: &[BucketKey], key: &BucketKey) -> Vec<BucketKey> {
+    let mut path = Vec::with_capacity(parent_path.len() + 1);
+    path.extend_from_slice(parent_path);
+    path.push(key.clone());
+    path
+}
+
+/// The exact distinct counts of every distinct branch, by metric and bucket path. A branch row
+/// whose path holds a NULL key belongs to no bucket and is skipped.
+///
+/// # Errors
+///
+/// `500` for a row the plans cannot have produced.
+fn collect_distinct_counts(
+    layout: &AggregationLayout<'_>,
+    distinct_outputs: &[DistinctOutput],
+) -> Result<DistinctCounts, OpenSearchError> {
+    let mut counts = DistinctCounts::new();
+    for output in distinct_outputs {
+        let path_levels = list_granularity_levels(layout, output.granularity);
+        for batch in &output.batches {
+            let key_columns = list_key_columns(layout, batch);
+            let count_columns = (0..output.metrics.len())
+                .map(|position| {
+                    read_column(batch, &name_distinct_count_column(position))?
+                        .as_primitive_opt::<Int64Type>()
+                        .ok_or_else(|| OpenSearchError::internal("a distinct count is not Int64"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (Some((last_metric, leading_metrics)), Some((last_column, leading_columns))) =
+                (output.metrics.split_last(), count_columns.split_last())
+            else {
+                return Err(OpenSearchError::internal("a distinct branch counted no metric"));
+            };
+            for row in 0..batch.num_rows() {
+                let Some(path) = read_path(layout, path_levels, &key_columns, row)? else {
+                    continue;
+                };
+                for (metric, count_column) in leading_metrics.iter().zip(leading_columns) {
+                    counts.entry(*metric).or_default().insert(path.clone(), count_column.value(row));
+                }
+                // The last metric takes the path itself, so a branch of one metric clones none.
+                counts.entry(*last_metric).or_default().insert(path, last_column.value(row));
+            }
+        }
+    }
+    Ok(counts)
 }
 
 /// Every aggregated row of `outputs` as a candidate bucket of its level, filed under its parent
@@ -470,19 +557,28 @@ pub(super) fn read_level_key(
     Ok(Some(key))
 }
 
-/// The buckets `level` answers under one parent bucket, from that bucket's `candidates`.
+/// The buckets `level` answers under the parent bucket at `parent_path`, from that bucket's
+/// `candidates`.
 ///
 /// # Errors
 ///
 /// The errors of [`assemble_aggregations`] for one level instance.
 fn select_level(
     level: &BucketLevel<'_>,
+    parent_path: &[BucketKey],
     candidates: Vec<Candidate>,
     reader: &AggregateReader<'_>,
     budget: &mut BucketBudget,
 ) -> Result<LevelInstance, OpenSearchError> {
     match &level.kind {
-        LevelKind::Terms { spec } => select_terms(spec, &level.order_metrics, candidates, reader, budget),
+        LevelKind::Terms { spec } => {
+            let order_scope = TermsOrderScope {
+                order_metrics: &level.order_metrics,
+                is_ordered_by_a_distinct_count: level.is_ordered_by_a_distinct_count,
+                parent_path,
+            };
+            select_terms(spec, order_scope, candidates, reader, budget)
+        }
         LevelKind::DateHistogram { spec, rounding } => {
             select_date_histogram(level.name, spec, rounding, candidates, budget)
         }
@@ -537,8 +633,21 @@ fn select_fixed_buckets(
     })
 }
 
+/// What a `terms` order reads under one parent bucket: the metric each criterion reads, and
+/// the parent's path, under which a candidate's distinct counts are looked up.
+#[derive(Debug, Clone, Copy)]
+struct TermsOrderScope<'a> {
+    /// The metric of each order criterion; `None` for `_count` and `_key`.
+    order_metrics: &'a [Option<OrderMetric>],
+    /// Whether a criterion reads a distinct count, so a candidate's path must be built.
+    is_ordered_by_a_distinct_count: bool,
+    /// The path of the parent bucket.
+    parent_path: &'a [BucketKey],
+}
+
 /// Rank a parent's `terms` candidates and keep `size` of them. Only keys present in the matching
-/// rows are candidates, so `min_doc_count: 0` adds no empty bucket.
+/// rows are candidates, so `min_doc_count: 0` adds no empty bucket. A distinct count an order
+/// reads is looked up by the candidate's path, which is built only when the order reads one.
 ///
 /// # Errors
 ///
@@ -546,22 +655,28 @@ fn select_fixed_buckets(
 /// cannot have produced.
 fn select_terms(
     spec: &TermsSpec,
-    order_metrics: &[Option<OrderMetric>],
+    order_scope: TermsOrderScope<'_>,
     candidates: Vec<Candidate>,
     reader: &AggregateReader<'_>,
     budget: &mut BucketBudget,
 ) -> Result<LevelInstance, OpenSearchError> {
     let minimum = spec.min_doc_count.max(1);
-    // Without a metric criterion the ranking reads no order value, and an empty `Vec` allocates
-    // nothing.
-    let has_metric_order = order_metrics.iter().any(Option::is_some);
+    // Without a metric criterion the ranking reads no order value, and without a distinct count
+    // no path: an empty `Vec` allocates nothing.
+    let has_metric_order = order_scope.order_metrics.iter().any(Option::is_some);
     let mut ranked_candidates = Vec::with_capacity(candidates.len());
     for candidate in candidates.into_iter().filter(|candidate| candidate.doc_count >= minimum) {
         let order_values = if has_metric_order {
-            order_metrics
+            let path = if order_scope.is_ordered_by_a_distinct_count {
+                extend_path(order_scope.parent_path, &candidate.key)
+            } else {
+                Vec::new()
+            };
+            order_scope
+                .order_metrics
                 .iter()
                 .map(|order_metric| match order_metric {
-                    Some(metric) => read_order_value(reader, *metric, candidate.row),
+                    Some(metric) => read_order_value(reader, *metric, candidate.row, &path),
                     None => Ok(None),
                 })
                 .collect::<Result<Vec<_>, _>>()?
@@ -603,8 +718,8 @@ fn select_terms(
     })
 }
 
-/// The value of an ordering metric in the aggregated row `row`, as a double; `None` when the
-/// bucket has no value for it.
+/// The value of an ordering metric of the bucket at `path` whose aggregated row is `row`, as a
+/// double; `None` when the bucket has no value for it.
 ///
 /// # Errors
 ///
@@ -613,8 +728,9 @@ pub(super) fn read_order_value(
     reader: &AggregateReader<'_>,
     metric: OrderMetric,
     row: RowRef,
+    path: &[BucketKey],
 ) -> Result<Option<f64>, OpenSearchError> {
-    convert_order_value(&reader.read_statistic(metric.metric, metric.statistic, Some(row))?)
+    convert_order_value(&reader.read_statistic(metric.metric, metric.statistic, Some(row), path)?)
 }
 
 /// An ordering statistic as a double; `None` when the bucket has no value for it.

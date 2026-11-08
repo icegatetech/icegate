@@ -3,6 +3,7 @@
 
 mod assemble;
 mod date_histogram;
+mod distinct;
 mod metrics;
 mod multi_bucket;
 mod parse;

@@ -73,7 +73,7 @@ impl Renderer<'_, '_> {
                 let slot = &self.layout.metrics[metric];
                 let is_date = self.inputs.metric_inputs[metric].is_date;
                 let value = render_metric(slot.kind, is_date, &|statistic| {
-                    self.reader.read_statistic(metric, statistic, row)
+                    self.reader.read_statistic(metric, statistic, row, bucket_path)
                 })?;
                 Ok((slot.name.to_string(), value))
             }

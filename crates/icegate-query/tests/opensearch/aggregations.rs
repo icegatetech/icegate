@@ -475,3 +475,98 @@ async fn filter_and_filters_buckets_lower_their_queries_per_index() {
     );
     server.shutdown().await;
 }
+
+/// Both tenants share services and severities in one commit, so a row read across tenants
+/// changes a count.
+#[tokio::test]
+async fn filters_date_ranges_and_cardinality_count_only_the_requesting_tenants_rows() {
+    let (server, catalog) = TestServer::start().await;
+    commit_log_rows(
+        &catalog,
+        &[
+            build_service_log_row_at_minute(TENANT_A, 5, "checkout", "ERROR", "an aggregation row"),
+            build_service_log_row_at_minute(TENANT_A, 10, "cart", "ERROR", "an aggregation row"),
+            build_service_log_row_at_minute(TENANT_A, 20, "checkout", "INFO", "an aggregation row"),
+            build_service_log_row_at_minute(TENANT_A, 40, "cart", "INFO", "an aggregation row"),
+            build_service_log_row_at_minute(TENANT_A, 70, "search", "INFO", "an aggregation row"),
+            build_service_log_row_at_minute(TENANT_B, 5, "checkout", "ERROR", "an aggregation row"),
+            build_service_log_row_at_minute(TENANT_B, 15, "checkout", "INFO", "an aggregation row"),
+            build_service_log_row_at_minute(TENANT_B, 50, "cart", "WARN", "an aggregation row"),
+            build_service_log_row_at_minute(TENANT_B, 55, "payments", "WARN", "an aggregation row"),
+        ],
+    )
+    .await
+    .expect("commit logs");
+    // `levels` and `windows` overlap, so both unnest; the cardinalities run in branches of their
+    // own.
+    let body = json!({
+        "size": 0,
+        "aggs": {
+            "levels": {
+                "filters": {"filters": {
+                    "errors": {"term": {"severity_text": "ERROR"}},
+                    "all": {"match_all": {}}
+                }},
+                "aggs": {"services": {"cardinality": {"field": "service_name"}}}
+            },
+            "windows": {"date_range": {"field": "timestamp", "ranges": [
+                {"from": "2026-10-08T10:00:00.000Z", "to": "2026-10-08T10:30:00.000Z"},
+                {"from": "2026-10-08T10:15:00.000Z", "to": "2026-10-08T11:00:00.000Z"}
+            ]}},
+            "services": {"cardinality": {"field": "service_name"}}
+        }
+    });
+    let windows = |early: u64, late: u64| {
+        json!({"buckets": [
+            {
+                "key": "2026-10-08T10:00:00.000Z-2026-10-08T10:30:00.000Z",
+                "from": 1_791_453_600_000.0, "from_as_string": "2026-10-08T10:00:00.000Z",
+                "to": 1_791_455_400_000.0, "to_as_string": "2026-10-08T10:30:00.000Z",
+                "doc_count": early
+            },
+            {
+                "key": "2026-10-08T10:15:00.000Z-2026-10-08T11:00:00.000Z",
+                "from": 1_791_454_500_000.0, "from_as_string": "2026-10-08T10:15:00.000Z",
+                "to": 1_791_457_200_000.0, "to_as_string": "2026-10-08T11:00:00.000Z",
+                "doc_count": late
+            }
+        ]})
+    };
+
+    let (status_a, answer_a) = send_request(&server, Method::POST, TENANT_A, "/logs/_search", Some(&body))
+        .await
+        .expect("search request");
+    let (status_b, answer_b) = send_request(&server, Method::POST, TENANT_B, "/logs/_search", Some(&body))
+        .await
+        .expect("search request");
+
+    // tenant-a: errors {checkout, cart}; all five rows {checkout, cart, search}; 10:00–10:30
+    // holds minutes 5, 10 and 20, 10:15–11:00 minutes 20 and 40.
+    assert_eq!(status_a, StatusCode::OK);
+    assert_eq!(
+        answer_a["aggregations"],
+        json!({
+            "levels": {"buckets": {
+                "errors": {"doc_count": 2, "services": {"value": 2}},
+                "all": {"doc_count": 5, "services": {"value": 3}}
+            }},
+            "windows": windows(3, 2),
+            "services": {"value": 3}
+        })
+    );
+    // tenant-b: errors {checkout}; all four rows {checkout, cart, payments}; 10:00–10:30 holds
+    // minutes 5 and 15, 10:15–11:00 minutes 15, 50 and 55.
+    assert_eq!(status_b, StatusCode::OK);
+    assert_eq!(
+        answer_b["aggregations"],
+        json!({
+            "levels": {"buckets": {
+                "errors": {"doc_count": 1, "services": {"value": 1}},
+                "all": {"doc_count": 4, "services": {"value": 3}}
+            }},
+            "windows": windows(2, 3),
+            "services": {"value": 3}
+        })
+    );
+    server.shutdown().await;
+}

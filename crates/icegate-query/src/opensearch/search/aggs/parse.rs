@@ -45,8 +45,7 @@ const OUT_OF_SCOPE_KINDS: [&str; 6] = [
 const OUT_OF_SCOPE_PIPELINES: [&str; 1] = ["extended_stats_bucket"];
 
 /// Kinds of the aggregation surface that are not planned yet.
-const NOT_YET_PLANNED_KINDS: [&str; 15] = [
-    "cardinality",
+const NOT_YET_PLANNED_KINDS: [&str; 14] = [
     "percentiles",
     "percentile_ranks",
     "extended_stats",
@@ -102,6 +101,8 @@ pub(crate) enum AggregationKind {
     ValueCount(MetricSpec),
     /// `count`, `min`, `max`, `avg` and `sum` together.
     Stats(MetricSpec),
+    /// The exact number of distinct values of the field in the bucket.
+    Cardinality(MetricSpec),
     /// Numeric `[from, to)` buckets; a row counts in every range it lies in.
     Range(RangeBucketsSpec),
     /// Date-math `[from, to)` buckets resolved against the request's `now`.
@@ -124,7 +125,8 @@ impl AggregationKind {
             | Self::Min(spec)
             | Self::Max(spec)
             | Self::ValueCount(spec)
-            | Self::Stats(spec) => Some(&spec.field),
+            | Self::Stats(spec)
+            | Self::Cardinality(spec) => Some(&spec.field),
             Self::Range(spec) => Some(&spec.field),
             Self::DateRange(spec) => Some(&spec.field),
             Self::Filters(_) | Self::Filter(_) => None,
@@ -299,6 +301,9 @@ fn parse_kind(name: &str, kind_name: &str, value: &Value) -> Result<AggregationK
             name, kind_name, value, false,
         )?)),
         "stats" => Ok(AggregationKind::Stats(parse_metric(name, kind_name, value, false)?)),
+        "cardinality" => Ok(AggregationKind::Cardinality(parse_metric(
+            name, kind_name, value, false,
+        )?)),
         "range" => Ok(AggregationKind::Range(parse_range(name, value)?)),
         "date_range" => Ok(AggregationKind::DateRange(parse_date_range(name, value)?)),
         "filters" => Ok(AggregationKind::Filters(parse_filters(name, value)?)),
@@ -547,8 +552,8 @@ pub(crate) fn parse_metric_path(text: &str) -> Result<MetricPath, OpenSearchErro
     })
 }
 
-/// A plain metric (`avg`, `sum`, `min`, `max`, `value_count`, `stats`): `field`, and `missing`
-/// when `is_missing_accepted`.
+/// A plain metric (`avg`, `sum`, `min`, `max`, `value_count`, `stats`, `cardinality`): `field`,
+/// and `missing` when `is_missing_accepted`.
 ///
 /// # Errors
 ///

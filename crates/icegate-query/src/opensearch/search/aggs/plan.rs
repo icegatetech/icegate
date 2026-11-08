@@ -14,8 +14,11 @@
 //! such levels share one stage, which reads the matching rows with those lists unnested, so a
 //! row repeats only for the buckets it belongs to at those levels and below them. Every other
 //! level and the top-level metrics share the stage without an unnest. A request without
-//! overlapping buckets therefore has one stage, and each stage executes once, so it reads the
-//! matching rows once.
+//! overlapping buckets therefore has at most one stage, and each stage executes once, so it
+//! reads the matching rows once. A `cardinality` is not computed by a stage: each is counted
+//! exactly by a branch of its own over its granularity's unnested rows (`distinct`), which reads
+//! the matching rows once more per counted metric; the counts of one granularity are joined on
+//! its keys.
 //!
 //! Selection reads the collected rows in Rust (`assemble`): a level's buckets are read only
 //! under the surviving buckets of its parent, which is the semi-join to the surviving ancestors,
@@ -37,8 +40,11 @@ use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, cast, col,
 use futures::future::try_join_all;
 use serde_json::{Map, Value, json};
 
-use super::assemble::{HISTOGRAM_INDEX_LIMIT, HISTOGRAM_INDEX_OUT_OF_RANGE, StageOutput, assemble_aggregations};
+use super::assemble::{
+    DistinctOutput, HISTOGRAM_INDEX_LIMIT, HISTOGRAM_INDEX_OUT_OF_RANGE, StageOutput, assemble_aggregations,
+};
 use super::date_histogram::BucketRounding;
+use super::distinct::plan_exact_distinct;
 use super::metrics::{
     MetricInput, MetricKind, MetricSpec, Statistic, plan_metric_input, plan_statistic, resolve_order_statistic,
 };
@@ -190,6 +196,9 @@ pub(super) struct BucketLevel<'a> {
     /// For `terms`, the metric each criterion of the order reads, aligned with the spec's
     /// `order` (`None` for `_count` and `_key`); empty for the other kinds.
     pub(super) order_metrics: Vec<Option<OrderMetric>>,
+    /// Whether a criterion of the order reads a distinct count, which is looked up by bucket
+    /// path; decided once for the level, so ranking a parent's candidates does not re-derive it.
+    pub(super) is_ordered_by_a_distinct_count: bool,
 }
 
 impl BucketLevel<'_> {
@@ -305,6 +314,9 @@ impl<'a> AggregationLayout<'a> {
             AggregationKind::Max(spec) => self.add_metric(aggregation, MetricKind::Max, spec, ancestors),
             AggregationKind::ValueCount(spec) => self.add_metric(aggregation, MetricKind::ValueCount, spec, ancestors),
             AggregationKind::Stats(spec) => self.add_metric(aggregation, MetricKind::Stats, spec, ancestors),
+            AggregationKind::Cardinality(spec) => {
+                self.add_metric(aggregation, MetricKind::Cardinality, spec, ancestors)
+            }
         }
     }
 
@@ -339,6 +351,7 @@ impl<'a> AggregationLayout<'a> {
             path: path.clone(),
             children: Vec::new(),
             order_metrics: Vec::new(),
+            is_ordered_by_a_distinct_count: false,
         });
         let children = aggregation
             .children
@@ -351,6 +364,10 @@ impl<'a> AggregationLayout<'a> {
         };
         let added_level = &mut self.levels[level];
         added_level.children = children;
+        added_level.is_ordered_by_a_distinct_count = order_metrics
+            .iter()
+            .flatten()
+            .any(|order_metric| order_metric.statistic == Statistic::Distinct);
         added_level.order_metrics = order_metrics;
         Ok(LayoutNode::Bucket(level))
     }
@@ -609,6 +626,24 @@ pub(super) struct StagePlan {
     pub(super) has_grouping_sets: bool,
 }
 
+/// One exact distinct-count branch: the counts of `metrics` per bucket of `granularity`.
+pub(super) struct DistinctPlan {
+    /// The two-level distinct plan over the projected rows.
+    pub(super) plan: LogicalPlan,
+    /// The granularity whose buckets the counts belong to.
+    pub(super) granularity: Granularity,
+    /// The `cardinality` metrics counted, in the order of the plan's count columns.
+    pub(super) metrics: Vec<usize>,
+}
+
+/// Every plan an aggregation request executes.
+pub(super) struct AggregationPlans {
+    /// The stage aggregates computing the buckets and the other metrics.
+    pub(super) stages: Vec<StagePlan>,
+    /// One distinct-count branch per granularity that holds a `cardinality`.
+    pub(super) distinct_branches: Vec<DistinctPlan>,
+}
+
 /// The levels whose keys `granularity` groups by: the level's path, nothing at the top.
 pub(super) fn list_granularity_levels<'l>(layout: &'l AggregationLayout<'_>, granularity: Granularity) -> &'l [usize] {
     match granularity {
@@ -622,8 +657,11 @@ pub(super) fn list_granularity_levels<'l>(layout: &'l AggregationLayout<'_>, gra
 ///
 /// Granularities whose paths cross the same membership-list levels share one stage aggregate
 /// over the rows with those lists unnested. A row therefore repeats for the buckets it belongs to
-/// at those levels and below them, never for an ancestor or a sibling. Each stage reads the
-/// matching rows once; a request without membership-list levels has one stage.
+/// at those levels and below them, never for an ancestor or a sibling. A request without
+/// membership-list levels has at most one stage, and none when it has no bucket level and no
+/// top-level metric but `cardinality`. `cardinality` metrics are counted exactly by one distinct
+/// branch per granularity, over the same unnested rows. Each stage reads the matching rows once,
+/// and each counted `cardinality` once more.
 ///
 /// # Errors
 ///
@@ -632,7 +670,7 @@ pub(super) fn plan_aggregations(
     rows: LogicalPlan,
     layout: &AggregationLayout<'_>,
     inputs: &PlanInputs,
-) -> Result<Vec<StagePlan>, OpenSearchError> {
+) -> Result<AggregationPlans, OpenSearchError> {
     let mut stages: Vec<(Vec<usize>, Vec<Granularity>)> = Vec::new();
     for level in 0..layout.levels.len() {
         let granularity = Granularity::Level(level);
@@ -642,16 +680,75 @@ pub(super) fn plan_aggregations(
             granularity,
         );
     }
-    if layout.metrics.iter().any(|slot| slot.granularity == Granularity::Top) {
+    // A `cardinality` computes no stage statistic, so it alone opens no top-level member.
+    if layout
+        .metrics
+        .iter()
+        .any(|slot| slot.granularity == Granularity::Top && !slot.kind.list_statistics().is_empty())
+    {
         add_stage_member(&mut stages, Vec::new(), Granularity::Top);
     }
-    if stages.is_empty() {
-        return Ok(Vec::new());
+    let cardinalities_by_granularity = group_cardinalities(layout);
+    if stages.is_empty() && cardinalities_by_granularity.is_empty() {
+        return Ok(AggregationPlans {
+            stages: Vec::new(),
+            distinct_branches: Vec::new(),
+        });
     }
     let projected_rows = project_inputs(rows, inputs)?.build().map_err(convert_plan_error)?;
-    stages
+    let distinct_branches = plan_distinct_branches(&projected_rows, layout, inputs, cardinalities_by_granularity)?;
+    let stages = stages
         .into_iter()
         .map(|(chain, members)| plan_stage(unnest_memberships(&projected_rows, &chain)?, layout, &members))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AggregationPlans {
+        stages,
+        distinct_branches,
+    })
+}
+
+/// The `cardinality` metrics of `layout`, grouped by the granularity they are read at, the
+/// granularities in the order of their first metric.
+fn group_cardinalities(layout: &AggregationLayout<'_>) -> Vec<(Granularity, Vec<usize>)> {
+    let mut cardinalities_by_granularity: Vec<(Granularity, Vec<usize>)> = Vec::new();
+    for (metric, slot) in layout.metrics.iter().enumerate() {
+        if slot.kind == MetricKind::Cardinality {
+            add_group_member(&mut cardinalities_by_granularity, slot.granularity, metric);
+        }
+    }
+    cardinalities_by_granularity
+}
+
+/// One distinct-count branch per granularity of `cardinalities_by_granularity`, every
+/// `cardinality` of the granularity counted by the same branch.
+///
+/// # Errors
+///
+/// `500` when a plan fails to type-check.
+fn plan_distinct_branches(
+    projected_rows: &LogicalPlan,
+    layout: &AggregationLayout<'_>,
+    inputs: &PlanInputs,
+    cardinalities_by_granularity: Vec<(Granularity, Vec<usize>)>,
+) -> Result<Vec<DistinctPlan>, OpenSearchError> {
+    cardinalities_by_granularity
+        .into_iter()
+        .map(|(granularity, metrics)| {
+            let relation = unnest_memberships(projected_rows, &list_membership_chain(layout, inputs, granularity))?;
+            let keys: Vec<Expr> = list_granularity_levels(layout, granularity)
+                .iter()
+                .map(|level| col(name_key_column(*level)))
+                .collect();
+            let counted_expressions: Vec<Expr> = metrics.iter().map(|metric| col(name_value_column(*metric))).collect();
+            let plan = plan_exact_distinct(relation, &keys, &counted_expressions)?
+                .build()
+                .map_err(convert_plan_error)?;
+            Ok(DistinctPlan {
+                plan,
+                granularity,
+                metrics,
+            })
+        })
         .collect()
 }
 
@@ -674,11 +771,17 @@ pub(super) fn add_stage_member(
     chain: Vec<usize>,
     member: Granularity,
 ) {
-    if let Some((_, members)) = stages.iter_mut().find(|(stage_chain, _)| *stage_chain == chain) {
+    add_group_member(stages, chain, member);
+}
+
+/// Add `member` to the group of `key` in `groups`, opening that group, after the others, when it
+/// is the first member: groups keep the order their first members arrived in.
+fn add_group_member<K: PartialEq, M>(groups: &mut Vec<(K, Vec<M>)>, key: K, member: M) {
+    if let Some((_, members)) = groups.iter_mut().find(|(group_key, _)| *group_key == key) {
         members.push(member);
         return;
     }
-    stages.push((chain, vec![member]));
+    groups.push((key, vec![member]));
 }
 
 /// The projected rows with the membership list of every level of `chain` unnested and its NULL
@@ -741,7 +844,7 @@ pub(super) fn plan_stage(
         if members.contains(&slot.granularity) {
             for &statistic in slot.kind.list_statistics() {
                 aggregates.push(
-                    plan_statistic(statistic, col(name_value_column(metric)))
+                    plan_statistic(statistic, col(name_value_column(metric)))?
                         .alias(name_statistic_column(metric, statistic)),
                 );
             }
@@ -822,9 +925,10 @@ pub(super) fn compute_level_mask(grouped_levels: &[usize], path: &[usize]) -> Re
 /// field's single type across the searched indices (a row lacking the field holds NULL), and one
 /// `Boolean` column per `filter` / `filters` bucket query ([`plan_aggregation_rows`] builds it).
 /// The answer maps each top-level aggregation's request name to its rendered result. The
-/// aggregations are computed by one stage aggregate, plus one per distinct chain of levels whose
-/// buckets overlap ([`plan_aggregations`]), and every plan runs in `scope.session`, so the plans
-/// share its memory pool and its limit.
+/// aggregations are computed by at most one stage aggregate without an unnest, plus one per
+/// distinct chain of levels whose buckets overlap, plus one distinct-count branch per granularity
+/// holding a `cardinality` ([`plan_aggregations`]); every plan runs in `scope.session`, so the
+/// plans share its memory pool and its limit.
 ///
 /// # Errors
 ///
@@ -840,9 +944,9 @@ pub(crate) async fn execute_aggregations(
 ) -> Result<Map<String, Value>, OpenSearchError> {
     let layout = AggregationLayout::new(tree, scope.now)?;
     let inputs = resolve_plan_inputs(&layout, rows.schema())?;
-    let stages = plan_aggregations(rows, &layout, &inputs)?;
+    let plans = plan_aggregations(rows, &layout, &inputs)?;
     let session = scope.session;
-    let outputs = try_join_all(stages.into_iter().map(
+    let stage_outputs = try_join_all(plans.stages.into_iter().map(
         |StagePlan {
              plan,
              members,
@@ -854,9 +958,18 @@ pub(crate) async fn execute_aggregations(
                 session.collect(plan).await?,
             ))
         },
-    ))
-    .await?;
-    let assembled = assemble_aggregations(&layout, outputs, scope.max_buckets)?;
+    ));
+    let distinct_outputs = try_join_all(plans.distinct_branches.into_iter().map(
+        |DistinctPlan {
+             plan,
+             granularity,
+             metrics,
+         }| async move {
+            Ok::<_, OpenSearchError>(DistinctOutput::new(granularity, metrics, session.collect(plan).await?))
+        },
+    ));
+    let (outputs, distinct_outputs) = futures::try_join!(stage_outputs, distinct_outputs)?;
+    let assembled = assemble_aggregations(&layout, outputs, &distinct_outputs, scope.max_buckets)?;
     render_aggregations(&layout, &inputs, &assembled)
 }
 
@@ -980,8 +1093,8 @@ fn list_aggregations(tree: &AggregationTree) -> Vec<&NamedAggregation> {
 /// Refuse a field mapped to different types, or stored as different Arrow types, across the
 /// searched indices, and a field `aggregation` cannot read. A bucket or a numeric metric reads
 /// numbers (`histogram`, `range`; `avg`, `sum`, `min`, `max` and `stats` also booleans and
-/// dates), a `date_histogram` and a `date_range` dates, a `terms` and a `value_count` anything
-/// but text and objects; `filter` and `filters` read no field.
+/// dates), a `date_histogram` and a `date_range` dates, a `terms`, a `value_count` and a
+/// `cardinality` anything but text and objects; `filter` and `filters` read no field.
 fn check_field_for_aggregation(
     aggregation: &NamedAggregation,
     field_name: &str,
@@ -1034,6 +1147,7 @@ fn check_field_for_aggregation(
         AggregationKind::Max(_) if !is_metric_input => refuse("max"),
         AggregationKind::Stats(_) if !is_metric_input => refuse("stats"),
         AggregationKind::ValueCount(_) if is_text_or_object => refuse("value_count"),
+        AggregationKind::Cardinality(_) if is_text_or_object => refuse("cardinality"),
         AggregationKind::DateHistogram(_)
         | AggregationKind::Terms(_)
         | AggregationKind::Histogram(_)
@@ -1043,6 +1157,7 @@ fn check_field_for_aggregation(
         | AggregationKind::Max(_)
         | AggregationKind::ValueCount(_)
         | AggregationKind::Stats(_)
+        | AggregationKind::Cardinality(_)
         | AggregationKind::Range(_)
         | AggregationKind::DateRange(_)
         | AggregationKind::Filters(_)
@@ -1089,7 +1204,7 @@ fn choose_row_data_type(aggregation: &NamedAggregation, resolved: &[Option<Resol
         AggregationKind::DateHistogram(_) | AggregationKind::DateRange(_) => {
             DataType::Timestamp(TimeUnit::Microsecond, None)
         }
-        AggregationKind::Terms(_) | AggregationKind::ValueCount(_) => DataType::Utf8,
+        AggregationKind::Terms(_) | AggregationKind::ValueCount(_) | AggregationKind::Cardinality(_) => DataType::Utf8,
         AggregationKind::Histogram(_)
         | AggregationKind::Range(_)
         | AggregationKind::Avg(_)
@@ -2186,6 +2301,12 @@ mod tests {
                 "text",
                 "value_count",
             ),
+            (
+                json!({"cardinality": {"field": COL_BODY}}),
+                COL_BODY,
+                "text",
+                "cardinality",
+            ),
         ] {
             let tree = parse_aggregations(&json!({"refused": aggregation.clone()})).expect("an aggregation");
 
@@ -2200,15 +2321,57 @@ mod tests {
             assert_eq!(envelope["error"]["aggregation"], "refused", "{aggregation}");
             assert_eq!(envelope["error"]["aggregation_type"], aggregation_type, "{aggregation}");
         }
-        // `value_count` counts the values of a keyword, and the numeric metrics read a date.
+        // `value_count` and `cardinality` count the values of a keyword, and the numeric metrics
+        // read a date.
         for aggregation in [
             json!({"value_count": {"field": COL_SEVERITY_TEXT}}),
+            json!({"cardinality": {"field": COL_SEVERITY_TEXT}}),
             json!({"min": {"field": COL_TIMESTAMP}}),
         ] {
             let tree = parse_aggregations(&json!({"accepted": aggregation.clone()})).expect("an aggregation");
 
             plan_aggregation_rows(&session, &[entry], &query, now, &tree).expect("the field is read");
         }
+    }
+
+    #[tokio::test]
+    async fn a_cardinality_of_a_field_no_index_maps_counts_zero_over_matching_rows() {
+        // The rows plan holds a field no index maps as a NULL column of the type the kind falls
+        // back to; `instants` proves the rows reach the distinct branch.
+        let fixture = SearchFixture::new().await;
+        fixture
+            .commit_rows(
+                LOGS_TABLE,
+                &[
+                    build_timestamped_log("tenant-a", "2026-10-08T10:05:00Z"),
+                    build_timestamped_log("tenant-a", "2026-10-08T10:40:00Z"),
+                ],
+            )
+            .await;
+        let session = fixture.open_session("tenant-a").await;
+        let entry = find_index_entry(&session, LOGS_TABLE);
+        let tree = parse_aggregations(&json!({
+            "unmapped": {"cardinality": {"field": "no_such_field"}},
+            "instants": {"cardinality": {"field": COL_TIMESTAMP}}
+        }))
+        .expect("two cardinalities");
+        let query = parse_query(&json!({"match_all": {}})).expect("match_all");
+        let now = read_request_now();
+
+        let rows = plan_aggregation_rows(&session, &[entry], &query, now, &tree).expect("the rows plan");
+        let scope = AggregationScope {
+            session: &session,
+            max_buckets: read_default_max_buckets(),
+            now,
+        };
+        let answer = execute_aggregations(rows, &tree, &scope)
+            .await
+            .expect("the aggregations answer");
+
+        assert_eq!(
+            Value::Object(answer),
+            json!({"unmapped": {"value": 0}, "instants": {"value": 2}})
+        );
     }
 
     #[tokio::test]
@@ -2590,13 +2753,15 @@ mod bucket_tree_tests {
         Array, ArrayRef, AsArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
         TimestampMicrosecondArray,
     };
-    use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema, TimeUnit};
+    use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Int64Type, Schema, TimeUnit};
     use datafusion::common::Column;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::functions::expr_fn::coalesce;
-    use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, col, lit};
+    use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, col, lit};
     use datafusion::prelude::SessionContext;
     use serde_json::{Value, json};
 
+    use super::super::distinct::{name_distinct_count_column, plan_exact_distinct};
     use super::tests::{
         aggregate_plan, assert_too_many_buckets, read_default_max_buckets, read_request_now, scan_rows,
     };
@@ -2606,6 +2771,7 @@ mod bucket_tree_tests {
     };
     use crate::opensearch::error::{OpenSearchError, render_envelope};
     use crate::opensearch::search::aggs::parse::parse_aggregations;
+    use crate::opensearch::search::execute::convert_plan_error;
 
     // Instants of 2026-10-08 UTC, in microseconds since the epoch.
     const AT_10_05_00_000999: i64 = 1_791_453_900_000_999;
@@ -2790,9 +2956,9 @@ mod bucket_tree_tests {
         let layout = AggregationLayout::new(&tree, read_request_now()).expect("lay out the aggregations");
         let rows = scan_test_rows(&build_hourly_rows());
         let inputs = resolve_plan_inputs(&layout, rows.schema()).expect("resolve the inputs");
-        let mut stages = plan_aggregations(rows, &layout, &inputs).expect("plan the aggregate");
-        assert_eq!(stages.len(), 1);
-        let stage = stages.remove(0);
+        let mut plans = plan_aggregations(rows, &layout, &inputs).expect("plan the aggregate");
+        assert_eq!(plans.stages.len(), 1);
+        let stage = plans.stages.remove(0);
 
         let batches = SessionContext::new()
             .execute_logical_plan(stage.plan)
@@ -3021,6 +3187,7 @@ mod bucket_tree_tests {
             json!({"score_stats.median": "desc"}),
             // A single-value metric read through a statistic other than `value`.
             json!({"max_score.min": "desc"}),
+            json!({"distinct_scores.max": "desc"}),
         ] {
             let error = run_aggregations(
                 &build_tied_score_rows(),
@@ -3028,6 +3195,7 @@ mod bucket_tree_tests {
                     "terms": {"field": "service_name", "order": order.clone()},
                     "aggs": {
                         "max_score": {"max": {"field": "score"}},
+                        "distinct_scores": {"cardinality": {"field": "score"}},
                         "score_stats": {"stats": {"field": "score"}},
                         "per_hour": {"date_histogram": {"field": "timestamp", "fixed_interval": "1h"}}
                     }
@@ -3051,6 +3219,21 @@ mod bucket_tree_tests {
         .await
         .expect("aggregate the rows");
         assert_eq!(list_bucket_keys(&by_value["services"]), vec![json!("cache")]);
+        // And a cardinality's: api has two distinct scores, the others one, so the descending
+        // order puts api first.
+        let by_distinct_value = run_aggregations(
+            &build_tied_score_rows(),
+            json!({"services": {
+                "terms": {"field": "service_name", "size": 1, "order": {"distinct_scores.value": "desc"}},
+                "aggs": {"distinct_scores": {"cardinality": {"field": "score"}}}
+            }}),
+        )
+        .await
+        .expect("aggregate the rows");
+        assert_eq!(
+            summarize_buckets(&by_distinct_value["services"], "distinct_scores"),
+            vec![json!(["api", 2, {"value": 2}])]
+        );
     }
 
     #[tokio::test]
@@ -3801,5 +3984,358 @@ mod bucket_tree_tests {
                 }
             ]})
         );
+    }
+
+    #[tokio::test]
+    async fn cardinality_is_exact_over_a_high_cardinality_column_written_by_the_test() {
+        // 6000 rows cycle the services svc-0000 … svc-2499 (2500 distinct). Even rows are INFO
+        // and odd rows ERROR; 2500 is even, so each severity sees the 1250 services of its
+        // parity. The durations 0 … 5999 are all distinct. Ten more INFO rows have neither a
+        // service nor a duration and count in no distinct value.
+        let services: Vec<String> = (0..6000_i64).map(|index| format!("svc-{:04}", index % 2500)).collect();
+        let mut rows: Vec<SourceRow> = services
+            .iter()
+            .zip(0_i64..)
+            .map(|(service, index)| {
+                let severity = if index % 2 == 0 { "INFO" } else { "ERROR" };
+                build_test_row(
+                    AT_10_05_00_000999 + index,
+                    Some(service.as_str()),
+                    Some(severity),
+                    Some(index),
+                    None,
+                )
+            })
+            .collect();
+        rows.extend((0..10_i64).map(|index| build_test_row(AT_11_10 + index, None, Some("INFO"), None, None)));
+
+        let aggregations = run_aggregations(
+            &rows,
+            json!({
+                "services": {"cardinality": {"field": "service_name"}},
+                "durations": {"cardinality": {"field": "duration_micros"}},
+                "severities": {
+                    "terms": {"field": "severity_text", "order": {"_key": "asc"}},
+                    "aggs": {"services": {"cardinality": {"field": "service_name"}}}
+                }
+            }),
+        )
+        .await
+        .expect("aggregate the rows");
+
+        assert_eq!(aggregations["services"], json!({"value": 2500}));
+        assert_eq!(aggregations["durations"], json!({"value": 6000}));
+        assert_eq!(
+            summarize_buckets(&aggregations["severities"], "services"),
+            vec![
+                json!(["ERROR", 3000, {"value": 1250}]),
+                json!(["INFO", 3010, {"value": 1250}])
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn terms_ordered_by_cardinality_under_a_date_histogram_rank_by_the_exact_count() {
+        let rows = vec![
+            // Hour 10: api has 3 severities, db 2, web 1.
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), None, None),
+            build_test_row(AT_10_05_00_000999 + 1, Some("api"), Some("ERROR"), None, None),
+            build_test_row(AT_10_05_00_000999 + 2, Some("api"), Some("WARN"), None, None),
+            build_test_row(AT_10_15_30_123456, Some("web"), Some("INFO"), None, None),
+            build_test_row(AT_10_15_30_123456 + 1, Some("web"), Some("INFO"), None, None),
+            build_test_row(AT_10_40, Some("db"), Some("INFO"), None, None),
+            build_test_row(AT_10_40 + 1, Some("db"), Some("ERROR"), None, None),
+            // Hour 11: web has 4 severities, db 2, api 1.
+            build_test_row(AT_11_10, Some("api"), Some("INFO"), None, None),
+            build_test_row(AT_11_30, Some("web"), Some("INFO"), None, None),
+            build_test_row(AT_11_30 + 1, Some("web"), Some("ERROR"), None, None),
+            build_test_row(AT_11_30 + 2, Some("web"), Some("WARN"), None, None),
+            build_test_row(AT_11_30 + 3, Some("web"), Some("DEBUG"), None, None),
+            build_test_row(AT_11_45_10_456789, Some("db"), Some("INFO"), None, None),
+            build_test_row(AT_11_45_10_456789 + 1, Some("db"), Some("ERROR"), None, None),
+        ];
+        let aggregations = run_aggregations(
+            &rows,
+            json!({"per_hour": {
+                "date_histogram": {"field": "timestamp", "fixed_interval": "1h"},
+                "aggs": {"services": {
+                    "terms": {"field": "service_name", "size": 2, "order": {"severities": "desc"}},
+                    "aggs": {"severities": {"cardinality": {"field": "severity_text"}}}
+                }}
+            }}),
+        )
+        .await
+        .expect("aggregate the rows");
+
+        let hours = &aggregations["per_hour"]["buckets"];
+        assert_eq!(hours[0]["key"], json!(HOUR_10_KEY));
+        assert_eq!(hours[0]["doc_count"], json!(7));
+        assert_eq!(
+            summarize_buckets(&hours[0]["services"], "severities"),
+            vec![json!(["api", 3, {"value": 3}]), json!(["db", 2, {"value": 2}])]
+        );
+        assert_eq!(hours[0]["services"]["sum_other_doc_count"], json!(2));
+        assert_eq!(hours[1]["key"], json!(HOUR_11_KEY));
+        assert_eq!(hours[1]["doc_count"], json!(7));
+        assert_eq!(
+            summarize_buckets(&hours[1]["services"], "severities"),
+            vec![json!(["web", 4, {"value": 4}]), json!(["db", 2, {"value": 2}])]
+        );
+        assert_eq!(hours[1]["services"]["sum_other_doc_count"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn a_two_level_pie_with_cardinality_at_both_levels_answers_the_stated_values() {
+        let rows = vec![
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), Some(100), None),
+            build_test_row(AT_10_15_30_123456, Some("api"), Some("INFO"), Some(100), None),
+            build_test_row(AT_10_40, Some("api"), Some("INFO"), Some(200), None),
+            build_test_row(AT_11_10, Some("api"), Some("ERROR"), Some(300), None),
+            build_test_row(AT_11_30, Some("web"), Some("INFO"), Some(100), None),
+            build_test_row(AT_11_30 + 1, Some("web"), Some("ERROR"), Some(100), None),
+            build_test_row(AT_11_45_10_456789, Some("web"), Some("ERROR"), Some(400), None),
+        ];
+        // A pie-style request: the metric "1" at both levels, each level ordered by it.
+        let aggregations = run_aggregations(
+            &rows,
+            json!({"2": {
+                "terms": {"field": "service_name", "size": 5, "order": {"1": "desc"}},
+                "aggs": {
+                    "1": {"cardinality": {"field": "duration_micros"}},
+                    "3": {
+                        "terms": {"field": "severity_text", "size": 5, "order": {"1": "desc"}},
+                        "aggs": {"1": {"cardinality": {"field": "duration_micros"}}}
+                    }
+                }
+            }}),
+        )
+        .await
+        .expect("aggregate the rows");
+
+        // api's durations {100, 200, 300}; web's {100, 400}.
+        assert_eq!(
+            summarize_buckets(&aggregations["2"], "1"),
+            vec![json!(["api", 4, {"value": 3}]), json!(["web", 3, {"value": 2}])]
+        );
+        // api INFO {100, 200}, api ERROR {300}; web ERROR {100, 400}, web INFO {100}.
+        assert_eq!(
+            summarize_buckets(&aggregations["2"]["buckets"][0]["3"], "1"),
+            vec![json!(["INFO", 3, {"value": 2}]), json!(["ERROR", 1, {"value": 1}])]
+        );
+        assert_eq!(
+            summarize_buckets(&aggregations["2"]["buckets"][1]["3"], "1"),
+            vec![json!(["ERROR", 2, {"value": 2}]), json!(["INFO", 1, {"value": 1}])]
+        );
+    }
+
+    #[test]
+    fn no_grouped_distinct_aggregate_over_a_non_integer_column_remains_in_the_plan() {
+        let tree = parse_aggregations(&json!({
+            "severities": {
+                "terms": {"field": "severity_text"},
+                "aggs": {"services": {"cardinality": {"field": "service_name"}}}
+            },
+            "all_services": {"cardinality": {"field": "service_name"}},
+            "all_scores": {"cardinality": {"field": "score"}}
+        }))
+        .expect("parse the aggregations");
+        let layout = AggregationLayout::new(&tree, read_request_now()).expect("lay out the aggregations");
+        let rows = scan_test_rows(&build_hourly_rows());
+        let inputs = resolve_plan_inputs(&layout, rows.schema()).expect("resolve the inputs");
+        let plans = plan_aggregations(rows, &layout, &inputs).expect("plan the aggregations");
+        assert_eq!(
+            plans.distinct_branches.len(),
+            2,
+            "one distinct branch per granularity: the top and the severities level"
+        );
+
+        let state = SessionContext::new().state();
+        let mut distinct_aggregates = Vec::new();
+        let checked_plans = plans
+            .stages
+            .iter()
+            .map(|stage| &stage.plan)
+            .chain(plans.distinct_branches.iter().map(|branch| &branch.plan));
+        for plan in checked_plans {
+            let optimized = state.optimize(plan).expect("optimize the plan");
+            optimized
+                .apply(|node| {
+                    if let LogicalPlan::Aggregate(aggregate) = node {
+                        for expression in &aggregate.aggr_expr {
+                            if let Expr::AggregateFunction(function) = expression.clone().unalias()
+                                && function.params.distinct
+                            {
+                                let schema = aggregate.input.schema();
+                                for argument in &function.params.args {
+                                    if !argument.get_type(schema.as_ref())?.is_integer() {
+                                        distinct_aggregates.push(expression.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .expect("walk the plan");
+        }
+        assert!(
+            distinct_aggregates.is_empty(),
+            "distinct aggregates over non-integer columns remain: {distinct_aggregates:?}"
+        );
+    }
+
+    /// Six rows: four with a service and a severity, one without a service (INFO) and one without
+    /// a severity (db); one of api's two ERROR rows has no duration.
+    fn build_rows_with_null_keys_and_values() -> Vec<SourceRow> {
+        vec![
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), Some(100), None),
+            build_test_row(AT_10_15_30_123456, Some("web"), Some("INFO"), Some(100), None),
+            build_test_row(AT_10_40, None, Some("INFO"), Some(200), None),
+            build_test_row(AT_11_10, Some("api"), Some("ERROR"), Some(300), None),
+            build_test_row(AT_11_30, Some("api"), Some("ERROR"), None, None),
+            build_test_row(AT_11_45_10_456789, Some("db"), None, Some(400), None),
+        ]
+    }
+
+    #[tokio::test]
+    async fn exact_distinct_counts_keep_the_null_key_group_once_and_count_no_null_value() {
+        // Two counted expressions join their branches on the key; the NULL severity is a group of
+        // its own on both sides, so the join keeps it once.
+        let relation = LogicalPlanBuilder::from(scan_test_rows(&build_rows_with_null_keys_and_values()));
+        let plan = plan_exact_distinct(
+            relation,
+            &[col("severity_text")],
+            &[col("service_name"), col("duration_micros")],
+        )
+        .and_then(|builder| builder.build().map_err(convert_plan_error))
+        .expect("plan the exact distinct counts");
+
+        let batches = SessionContext::new()
+            .execute_logical_plan(plan)
+            .await
+            .expect("plan the execution")
+            .collect()
+            .await
+            .expect("execute the distinct counts");
+
+        let mut counts_by_severity: BTreeMap<Option<String>, (i64, i64)> = BTreeMap::new();
+        for batch in &batches {
+            let severities = batch.column_by_name("severity_text").expect("the key column");
+            let severities = severities.as_string::<i32>();
+            let column = |position: usize| {
+                batch
+                    .column_by_name(&name_distinct_count_column(position))
+                    .expect("a count column")
+                    .as_primitive::<Int64Type>()
+                    .clone()
+            };
+            let (services, durations) = (column(0), column(1));
+            for row in 0..batch.num_rows() {
+                let severity = severities.is_valid(row).then(|| severities.value(row).to_string());
+                let previous = counts_by_severity.insert(severity, (services.value(row), durations.value(row)));
+                assert_eq!(previous, None, "one row per group");
+            }
+        }
+        assert_eq!(
+            counts_by_severity,
+            BTreeMap::from([
+                (None, (1, 1)),
+                (Some("ERROR".to_string()), (1, 1)),
+                (Some("INFO".to_string()), (2, 2)),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn two_cardinalities_under_one_terms_level_skip_the_null_key_and_null_values() {
+        let aggregations = run_aggregations(
+            &build_rows_with_null_keys_and_values(),
+            json!({"severities": {
+                "terms": {"field": "severity_text", "order": {"_key": "asc"}},
+                "aggs": {
+                    "services": {"cardinality": {"field": "service_name"}},
+                    "durations": {"cardinality": {"field": "duration_micros"}}
+                }
+            }}),
+        )
+        .await
+        .expect("aggregate the rows");
+
+        // ERROR: {api} and {300}; INFO: {api, web} and {100, 200}. db's row has no severity and
+        // forms no bucket.
+        assert_eq!(
+            aggregations["severities"]["buckets"],
+            json!([
+                {"key": "ERROR", "doc_count": 2, "services": {"value": 1}, "durations": {"value": 1}},
+                {"key": "INFO", "doc_count": 3, "services": {"value": 2}, "durations": {"value": 2}}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn three_top_level_cardinalities_plan_no_stage_and_answer_their_own_counts() {
+        let request = json!({
+            "services": {"cardinality": {"field": "service_name"}},
+            "severities": {"cardinality": {"field": "severity_text"}},
+            "durations": {"cardinality": {"field": "duration_micros"}}
+        });
+        let tree = parse_aggregations(&request).expect("parse the aggregations");
+        let layout = AggregationLayout::new(&tree, read_request_now()).expect("lay out the aggregations");
+        let rows = scan_test_rows(&build_hourly_rows());
+        let inputs = resolve_plan_inputs(&layout, rows.schema()).expect("resolve the inputs");
+        let plans = plan_aggregations(rows, &layout, &inputs).expect("plan the aggregations");
+        // No bucket level and no metric a stage computes: a stage would count rows nothing reads.
+        assert_eq!(plans.stages.len(), 0, "no stage aggregate");
+        assert_eq!(plans.distinct_branches.len(), 1, "one branch for the top granularity");
+
+        let aggregations = run_aggregations(&build_hourly_rows(), request)
+            .await
+            .expect("aggregate the rows");
+
+        // Services {api, web, db}; severities {INFO, ERROR}; durations {100, 300, 200, 500, 50},
+        // web's ERROR row having none.
+        assert_eq!(
+            aggregations,
+            json!({
+                "services": {"value": 3},
+                "severities": {"value": 2},
+                "durations": {"value": 5}
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_bucket_and_a_field_no_index_maps_count_zero_distinct_values() {
+        // 12:40 UTC on 2026-10-08, and the key of its hour in epoch milliseconds.
+        const AT_12_40: i64 = 1_791_463_200_000_000;
+        const HOUR_12_KEY: i64 = 1_791_460_800_000;
+        let rows = vec![
+            build_test_row(AT_10_05_00_000999, Some("api"), Some("INFO"), None, None),
+            build_test_row(AT_10_40, Some("web"), Some("INFO"), None, None),
+            build_test_row(AT_12_40, Some("api"), Some("INFO"), None, None),
+        ];
+
+        let aggregations = run_aggregations(
+            &rows,
+            json!({
+                "per_hour": {
+                    "date_histogram": {"field": "timestamp", "fixed_interval": "1h", "min_doc_count": 0},
+                    "aggs": {"services": {"cardinality": {"field": "service_name"}}}
+                },
+                "unmapped": {"cardinality": {"field": "absent_field"}}
+            }),
+        )
+        .await
+        .expect("aggregate the rows");
+
+        assert_eq!(
+            summarize_buckets(&aggregations["per_hour"], "services"),
+            vec![
+                json!([HOUR_10_KEY, 2, {"value": 2}]),
+                json!([HOUR_11_KEY, 0, {"value": 0}]),
+                json!([HOUR_12_KEY, 1, {"value": 1}]),
+            ]
+        );
+        assert_eq!(aggregations["unmapped"], json!({"value": 0}));
     }
 }
