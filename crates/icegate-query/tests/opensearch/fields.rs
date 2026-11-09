@@ -371,9 +371,9 @@ async fn field_caps_reports_exactly_the_id_index_and_source_metadata_fields() {
 }
 
 /// Without an index in the path, `_field_caps` (by GET and by POST) and `_mapping` select every
-/// wildcard-visible index, `spans` and `otel-v1-apm-span` among them: one table reached through
-/// two profiles without naming either index, which each endpoint refuses, naming the table and
-/// its profiles.
+/// wildcard-visible index, `logs` and `ss4o_logs-icegate-default` among them: one table reached
+/// through two profiles without naming either index, which each endpoint refuses, naming the
+/// first such table in name order and its profiles.
 #[tokio::test]
 async fn field_caps_and_mapping_without_an_index_refuse_a_table_reached_through_two_profiles() {
     let (server, _catalog) = TestServer::start().await;
@@ -389,11 +389,8 @@ async fn field_caps_and_mapping_without_an_index_refuse_a_table_reached_through_
 
         assert_eq!(status, 400, "{method} {path}: {body}");
         assert_eq!(body["error"]["type"], "illegal_argument_exception", "{method} {path}");
-        assert_eq!(body["error"]["table"], "spans", "{method} {path}");
-        let profiles = body["error"]["profiles"].as_array().expect("the profiles");
-        for profile in ["native", "data_prepper"] {
-            assert!(profiles.contains(&json!(profile)), "{method} {path}: {profiles:?}");
-        }
+        assert_eq!(body["error"]["table"], "logs", "{method} {path}");
+        assert_eq!(body["error"]["profiles"], json!(["native", "ss4o"]), "{method} {path}");
     }
     server.shutdown().await;
 }

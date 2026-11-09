@@ -13,6 +13,7 @@ mod field;
 mod map_key_cache;
 mod native;
 mod registry;
+mod ss4o;
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -40,7 +41,7 @@ use tokio::sync::OnceCell;
 use self::data_prepper::DATA_PREPPER_TABLE;
 pub(crate) use self::encoding::{
     EncodedField, ProfileTable, lower_derived_exists, lower_derived_range, lower_derived_term, lower_encoded_exists,
-    lower_encoded_range, lower_encoded_term, render_profile_document, render_profile_field,
+    lower_encoded_range, lower_encoded_term, render_derived_value, render_profile_document, render_profile_field,
 };
 use self::encoding::{is_nullable_encoded_id, list_profile_fields, resolve_profile_field};
 use self::expression::ExpressionPart;
@@ -48,9 +49,10 @@ pub(crate) use self::expression::IndexExpression;
 pub(crate) use self::field::{FieldType, FieldValue, IndexField, ResolvedField, SelectedField};
 use self::map_key_cache::{MapKeyCache, MapKeys, MapKeysVersion};
 pub(crate) use self::native::native_column_type;
-use self::native::{list_native_fields, resolve_native_field};
+use self::native::{add_metric_value_field, list_native_fields, resolve_native_field};
 pub(crate) use self::registry::{IndexEntry, IndexOptions, IndexSet, IndexTarget, Profile, read_index_options};
 use self::registry::{check_table_uniqueness, choose_index_target, find_telemetry_table, select_system_names};
+use self::ss4o::find_ss4o_table;
 use super::error::OpenSearchError;
 use super::system_index::{CurrentSnapshot, SystemIndexStore, SystemSnapshot};
 use crate::engine::QueryEngine;
@@ -193,10 +195,11 @@ impl IndexCatalog {
 
 /// The field table of a non-native profile index; `None` for a native index, whose fields are
 /// its columns.
-pub(crate) const fn find_profile_table(entry: &IndexEntry) -> Option<&'static ProfileTable> {
+pub(crate) fn find_profile_table(entry: &IndexEntry) -> Option<&'static ProfileTable> {
     match entry.profile() {
         Profile::Native => None,
         Profile::DataPrepper => Some(&DATA_PREPPER_TABLE),
+        Profile::Ss4o => find_ss4o_table(entry.table()),
     }
 }
 
@@ -595,10 +598,14 @@ impl TenantSession {
         };
         let empty_map_keys = MapKeys::new();
         let map_keys = listed_map_keys.as_deref().unwrap_or(&empty_map_keys);
-        find_profile_table(entry).map_or_else(
-            || list_native_fields(&arrow_schema, map_keys),
-            |table| list_profile_fields(table, &arrow_schema, map_keys),
-        )
+        match find_profile_table(entry) {
+            None => {
+                let mut fields = list_native_fields(&arrow_schema, map_keys)?;
+                add_metric_value_field(entry.table(), &mut fields);
+                Ok(fields)
+            }
+            Some(table) => list_profile_fields(table, &arrow_schema, map_keys),
+        }
     }
 
     /// The tenant's committed footprint in `entry`'s table; `None` for a view, which has no

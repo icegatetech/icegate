@@ -34,7 +34,10 @@ async fn resolve_index_lists_the_telemetry_indices_sorted_and_open() {
                 build_open_index("metrics"),
                 build_open_index("operations"),
                 build_open_index("otel-v1-apm-span"),
-                build_open_index("spans")
+                build_open_index("spans"),
+                build_open_index("ss4o_logs-icegate-default"),
+                build_open_index("ss4o_metrics-icegate-default"),
+                build_open_index("ss4o_traces-icegate-default")
             ],
             "aliases": [],
             "data_streams": []

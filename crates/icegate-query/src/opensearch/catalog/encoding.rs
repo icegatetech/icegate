@@ -14,28 +14,31 @@ use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Int64Type, Schema
 use datafusion::functions::core::expr_fn::{coalesce, get_field};
 use datafusion::functions_nested::expr_fn::cardinality;
 use datafusion::logical_expr::expr::Case;
-use datafusion::logical_expr::{Expr, in_list, lit};
+use datafusion::logical_expr::{Expr, cast, in_list, lit};
 use datafusion::prelude::ident;
 use icegate_common::schema::{
-    COL_ATTRIBUTES, COL_DROPPED_ATTRIBUTES_COUNT, COL_DURATION_MICROS, COL_EVENTS, COL_LINKS, COL_NAME, COL_SPAN_ID,
-    COL_TIMESTAMP, COL_TRACE_ID, COL_TRACE_STATE,
+    AGGREGATION_TEMPORALITY_CUMULATIVE, AGGREGATION_TEMPORALITY_DELTA, COL_AGGREGATION_TEMPORALITY, COL_ATTRIBUTES,
+    COL_DROPPED_ATTRIBUTES_COUNT, COL_DURATION_MICROS, COL_EVENTS, COL_EXEMPLARS, COL_LINKS, COL_METRIC_TYPE, COL_NAME,
+    COL_QUANTILE_VALUES, COL_RESOURCE_ATTRIBUTES, COL_SCALE, COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID, COL_TRACE_STATE,
+    COL_VALUE_DOUBLE, COL_VALUE_INT, METRIC_TYPE_EXPONENTIAL_HISTOGRAM, METRIC_TYPE_GAUGE, METRIC_TYPE_HISTOGRAM,
+    METRIC_TYPE_SUM, METRIC_TYPE_SUMMARY, QUANTILE_FIELD_QUANTILE, QUANTILE_FIELD_VALUE, promoted_resource_keys,
 };
-use serde_json::{Map, Value};
+use serde_json::{Map, Number, Value};
 
 use super::data_prepper::DURATION_IN_NANOS_FIELD;
 use super::field::{
     FieldType, FieldValue, IndexField, ResolvedField, SelectedField, covers_every_key, glob_matches_some_extension,
 };
 use super::map_key_cache::MapKeys;
-use super::native::native_column_type;
+use super::native::{METRIC_VALUE_FIELD, find_promoted_resource_key, native_column_type};
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::glob::matches_glob;
 use crate::opensearch::search::request::SourceFilter;
 use crate::opensearch::search::{render_array_value, render_iso_micros};
 use crate::query_dsl::ast::RangeBound;
-use crate::query_dsl::literal::parse_java_double;
-use crate::query_dsl::lower::render_literal_text;
+use crate::query_dsl::literal::{parse_java_double, step_exclusive_double};
+use crate::query_dsl::lower::{classify_bound_side, render_literal_text};
 
 /// The `OTel` span kinds by stored integer. Ingest stores kind `0` as NULL; both read as
 /// `SPAN_KIND_UNSPECIFIED`.
@@ -48,6 +51,22 @@ const SPAN_KINDS: [(i32, &str); 6] = [
     (5, "SPAN_KIND_CONSUMER"),
 ];
 
+/// The metric types as `metric_type` stores them and the `kind` names this profile renders for
+/// them; [`METRIC_TYPE_SUMMARY`] renders no `kind`.
+const METRIC_KINDS: [(&str, &str); 4] = [
+    (METRIC_TYPE_GAUGE, "GAUGE"),
+    (METRIC_TYPE_SUM, "SUM"),
+    (METRIC_TYPE_HISTOGRAM, "HISTOGRAM"),
+    (METRIC_TYPE_EXPONENTIAL_HISTOGRAM, "EXPONENTIAL_HISTOGRAM"),
+];
+
+/// The aggregation temporalities as `aggregation_temporality` stores them and the
+/// `aggregationTemporality` names this profile renders.
+const TEMPORALITIES: [(&str, &str); 2] = [
+    (AGGREGATION_TEMPORALITY_DELTA, "AGGREGATION_TEMPORALITY_DELTA"),
+    (AGGREGATION_TEMPORALITY_CUMULATIVE, "AGGREGATION_TEMPORALITY_CUMULATIVE"),
+];
+
 /// How an escaping profile writes a dot inside a stored attribute key.
 const ESCAPED_KEY_DOT: char = '@';
 
@@ -57,6 +76,8 @@ pub(crate) enum AttributeKeys {
     /// Each `.` written as `@`, so a dotted stored key stays one property when a client splits
     /// the document on dots; a stored key holding `@` is refused.
     Escaped,
+    /// Stored keys as they are; a key with dots stays one flat key.
+    Stored,
 }
 
 impl AttributeKeys {
@@ -68,6 +89,15 @@ impl AttributeKeys {
     fn spell_key(self, key: &str) -> Result<String, OpenSearchError> {
         match self {
             Self::Escaped => escape_attribute_key(key),
+            Self::Stored => Ok(key.to_string()),
+        }
+    }
+
+    /// The stored key a requested `spelled_key` names.
+    fn read_stored_key(self, spelled_key: &str) -> String {
+        match self {
+            Self::Escaped => unescape_attribute_key(spelled_key),
+            Self::Stored => spelled_key.to_string(),
         }
     }
 }
@@ -122,6 +152,20 @@ pub(crate) enum EncodedField {
     Events,
     /// The span's links: rendered in `_source`, never searchable.
     Links,
+    /// The metric type as its `kind` name; `summary` renders absent.
+    MetricKindName,
+    /// The aggregation temporality as its `aggregationTemporality` name; NULL renders absent.
+    TemporalityName,
+    /// Exponential-histogram buckets as `{count, min, max}` objects. Rendered only: the bounds
+    /// come from the row's scale and offset, which rendering reads through the profile table.
+    ExponentialBuckets {
+        /// The stored bucket counts.
+        counts_column: &'static str,
+    },
+    /// Summary quantiles as `{quantile, value}` objects. Rendered only.
+    QuantileValues,
+    /// Exemplars as `{time, traceId, spanId}` objects. Rendered only.
+    Exemplars,
 }
 
 /// A per-row expression over stored columns.
@@ -129,12 +173,23 @@ pub(crate) enum EncodedField {
 pub(crate) enum DerivedField {
     /// `duration_micros × 1000`: a span's duration in nanoseconds at microsecond precision.
     DurationInNanos,
+    /// The length of a list column: absent for a NULL list, `0` for an empty one.
+    ArrayLength {
+        /// The stored list column.
+        column: &'static str,
+        /// The field name a request uses for the length; refusals name it.
+        field: &'static str,
+    },
+    /// A metric point's value: `coalesce(value_double, cast(value_int as double))`, NULL on
+    /// histogram and summary rows.
+    MetricValue,
 }
 
 impl EncodedField {
     /// The client-visible value as an expression over the stored columns, for sorts and
     /// aggregations. Ids stay bytes (their renderers write hex); NULL becomes `""`, `0` or
-    /// `SPAN_KIND_UNSPECIFIED` where the encoding says so.
+    /// `SPAN_KIND_UNSPECIFIED` where the encoding says so, and an enum name with no stored match
+    /// reads NULL.
     pub(crate) fn build_read_expr(&self) -> Expr {
         match self {
             Self::HexIdOrEmpty { column, .. } | Self::Rfc3339Time { column } => ident(*column),
@@ -144,7 +199,20 @@ impl EncodedField {
             Self::EscapedMapKey { column, key } => get_field(ident(*column), key.as_str()),
             Self::Events => ident(COL_EVENTS),
             Self::Links => ident(COL_LINKS),
+            Self::MetricKindName => build_enum_name_expr(COL_METRIC_TYPE, &METRIC_KINDS),
+            Self::TemporalityName => build_enum_name_expr(COL_AGGREGATION_TEMPORALITY, &TEMPORALITIES),
+            Self::ExponentialBuckets { counts_column } => ident(*counts_column),
+            Self::QuantileValues => ident(COL_QUANTILE_VALUES),
+            Self::Exemplars => ident(COL_EXEMPLARS),
         }
+    }
+
+    /// Whether the field has no filter inverse: it renders in `_source` and no query reaches it.
+    pub(crate) const fn is_render_only(&self) -> bool {
+        matches!(
+            self,
+            Self::ExponentialBuckets { .. } | Self::QuantileValues | Self::Exemplars
+        )
     }
 }
 
@@ -153,6 +221,11 @@ impl DerivedField {
     pub(crate) fn build_read_expr(self) -> Expr {
         match self {
             Self::DurationInNanos => ident(COL_DURATION_MICROS) * lit(NANOS_PER_MICRO),
+            Self::ArrayLength { column, .. } => cast(cardinality(ident(column)), DataType::Int64),
+            Self::MetricValue => coalesce(vec![
+                ident(COL_VALUE_DOUBLE),
+                cast(ident(COL_VALUE_INT), DataType::Float64),
+            ]),
         }
     }
 }
@@ -167,6 +240,79 @@ fn build_span_kind_name_expr(column: &str) -> Expr {
             .map(|(kind, name)| (Box::new(ident(column).eq(lit(*kind))), Box::new(lit(*name)))),
     );
     Expr::Case(Case::new(None, when_then, None))
+}
+
+/// `CASE column WHEN stored THEN name … END` over `names`; a stored value outside `names` reads
+/// NULL.
+fn build_enum_name_expr(column: &'static str, names: &[(&'static str, &'static str)]) -> Expr {
+    let when_then = names
+        .iter()
+        .map(|(stored_value, name)| (Box::new(lit(*stored_value)), Box::new(lit(*name))))
+        .collect();
+    Expr::Case(Case::new(Some(Box::new(ident(column))), when_then, None))
+}
+
+/// Rows whose stored value in `column` is one whose name in `names` satisfies `is_selected`;
+/// `false` when no name does.
+fn select_enum_names(column: &'static str, names: &[(&str, &str)], is_selected: impl Fn(&str) -> bool) -> Expr {
+    let stored_values: Vec<Expr> = names
+        .iter()
+        .filter(|(_, name)| is_selected(name))
+        .map(|(stored_value, _)| lit(*stored_value))
+        .collect();
+    if stored_values.is_empty() {
+        lit(false)
+    } else {
+        in_list(ident(column), stored_values, false)
+    }
+}
+
+/// The texts of a range's lower and upper bounds, each with whether it is inclusive; `None` on
+/// an unbounded side.
+type TextBounds = (Option<(bool, String)>, Option<(bool, String)>);
+
+/// The bounds of a range on the field the request named `field_name`, as texts.
+///
+/// # Errors
+///
+/// Returns `parsing_exception` naming `field_name` for a bound that is no string, number or
+/// boolean.
+fn read_text_bounds(
+    lower: Option<&RangeBound>,
+    upper: Option<&RangeBound>,
+    field_name: &str,
+) -> Result<TextBounds, OpenSearchError> {
+    let read_bound_text = |bound: Option<&RangeBound>| {
+        bound
+            .map(|bound| render_literal_text(&bound.value, field_name).map(|text| (bound.is_inclusive, text)))
+            .transpose()
+    };
+    Ok((read_bound_text(lower)?, read_bound_text(upper)?))
+}
+
+/// Whether `name` lies inside `bounds`, compared lexicographically like a keyword range.
+fn is_text_in_range(name: &str, bounds: &TextBounds) -> bool {
+    bounds.0.as_ref().is_none_or(|(is_inclusive, text)| {
+        if *is_inclusive {
+            name >= text.as_str()
+        } else {
+            name > text.as_str()
+        }
+    }) && bounds.1.as_ref().is_none_or(|(is_inclusive, text)| {
+        if *is_inclusive {
+            name <= text.as_str()
+        } else {
+            name < text.as_str()
+        }
+    })
+}
+
+/// The name of the stored `value` among `names`; `None` when it has none.
+fn find_enum_name<'n>(names: &[(&str, &'n str)], value: &str) -> Option<&'n str> {
+    names
+        .iter()
+        .find(|(stored_value, _)| *stored_value == value)
+        .map(|(_, name)| *name)
 }
 
 /// The escaped spelling of a stored attribute key: each `.` written as `@`.
@@ -280,7 +426,8 @@ fn compare_with_bound(column_value: Expr, literal: Expr, is_lower: bool, is_incl
 /// Returns `parsing_exception` for a value that is no string, number or boolean, the
 /// [`OpenSearchError::malformed_field_literal`] 400 for a malformed hex id or status code, and
 /// `500` for an encoding that lowers through its stored column instead (times and escaped keys,
-/// see [`ResolvedField::into_lowering_view`]).
+/// see [`ResolvedField::into_lowering_view`]) and for a render-only field (see
+/// [`EncodedField::is_render_only`]), which the leaf lowering refuses before it gets here.
 pub(crate) fn lower_encoded_term(
     field: &EncodedField,
     field_name: &str,
@@ -321,9 +468,22 @@ pub(crate) fn lower_encoded_term(
                 ident(*column).eq(lit(code))
             })
         }
+        EncodedField::MetricKindName => {
+            let text = render_literal_text(value, field_name)?;
+            Ok(select_enum_names(COL_METRIC_TYPE, &METRIC_KINDS, |name| name == text))
+        }
+        EncodedField::TemporalityName => {
+            let text = render_literal_text(value, field_name)?;
+            Ok(select_enum_names(COL_AGGREGATION_TEMPORALITY, &TEMPORALITIES, |name| {
+                name == text
+            }))
+        }
         EncodedField::Events | EncodedField::Links => Ok(lit(false)),
         EncodedField::Rfc3339Time { column } | EncodedField::EscapedMapKey { column, .. } => {
             Err(report_stored_view_field(column))
+        }
+        EncodedField::ExponentialBuckets { .. } | EncodedField::QuantileValues | EncodedField::Exemplars => {
+            Err(report_render_only_field(field_name))
         }
     }
 }
@@ -398,17 +558,11 @@ pub(crate) fn lower_encoded_range(
             ))
         }
         EncodedField::SpanKindName { column } => {
-            let lower_text = lower.map(|bound| render_literal_text(&bound.value, field_name)).transpose()?;
-            let upper_text = upper.map(|bound| render_literal_text(&bound.value, field_name)).transpose()?;
-            let kinds =
-                find_span_kinds(|name| {
-                    lower.zip(lower_text.as_deref()).is_none_or(|(bound, text)| {
-                        if bound.is_inclusive { name >= text } else { name > text }
-                    }) && upper.zip(upper_text.as_deref()).is_none_or(|(bound, text)| {
-                        if bound.is_inclusive { name <= text } else { name < text }
-                    })
-                });
-            Ok(select_span_kinds(column, &kinds))
+            let bounds = read_text_bounds(lower, upper, field_name)?;
+            Ok(select_span_kinds(
+                column,
+                &find_span_kinds(|name| is_text_in_range(name, &bounds)),
+            ))
         }
         EncodedField::StatusCodeOrZero { column } => {
             let Some(bounds) = integer_bounds(lower, upper, field_name, index)? else {
@@ -423,19 +577,37 @@ pub(crate) fn lower_encoded_range(
                 },
             )
         }
+        EncodedField::MetricKindName => {
+            let bounds = read_text_bounds(lower, upper, field_name)?;
+            Ok(select_enum_names(COL_METRIC_TYPE, &METRIC_KINDS, |name| {
+                is_text_in_range(name, &bounds)
+            }))
+        }
+        EncodedField::TemporalityName => {
+            let bounds = read_text_bounds(lower, upper, field_name)?;
+            Ok(select_enum_names(COL_AGGREGATION_TEMPORALITY, &TEMPORALITIES, |name| {
+                is_text_in_range(name, &bounds)
+            }))
+        }
         EncodedField::Events | EncodedField::Links => Ok(lit(false)),
         EncodedField::Rfc3339Time { column } | EncodedField::EscapedMapKey { column, .. } => {
             Err(report_stored_view_field(column))
+        }
+        EncodedField::ExponentialBuckets { .. } | EncodedField::QuantileValues | EncodedField::Exemplars => {
+            Err(report_render_only_field(field_name))
         }
     }
 }
 
 /// Lower `exists` on an encoded field. Every encoding that renders NULL as a value is present on
-/// every row; events and links exist when the list holds an element.
+/// every row; events and links exist when the list holds an element; an enum name exists where
+/// the stored value has a name.
 ///
 /// # Errors
 ///
-/// Returns `500` for an encoding that lowers through its stored column instead.
+/// Returns `500` for an encoding that lowers through its stored column instead, and for a
+/// render-only field (see [`report_render_only_field`]), which this lowering names by its
+/// encoding: it receives no field name.
 pub(crate) fn lower_encoded_exists(field: &EncodedField) -> Result<Expr, OpenSearchError> {
     match field {
         EncodedField::HexIdOrEmpty { .. }
@@ -444,9 +616,14 @@ pub(crate) fn lower_encoded_exists(field: &EncodedField) -> Result<Expr, OpenSea
         | EncodedField::StatusCodeOrZero { .. } => Ok(lit(true)),
         EncodedField::Events => Ok(cardinality(ident(COL_EVENTS)).gt(lit(0_u64))),
         EncodedField::Links => Ok(cardinality(ident(COL_LINKS)).gt(lit(0_u64))),
+        EncodedField::MetricKindName => Ok(select_enum_names(COL_METRIC_TYPE, &METRIC_KINDS, |_| true)),
+        EncodedField::TemporalityName => Ok(select_enum_names(COL_AGGREGATION_TEMPORALITY, &TEMPORALITIES, |_| true)),
         EncodedField::Rfc3339Time { column } | EncodedField::EscapedMapKey { column, .. } => {
             Err(report_stored_view_field(column))
         }
+        EncodedField::ExponentialBuckets { .. } => Err(report_render_only_field("exponential buckets")),
+        EncodedField::QuantileValues => Err(report_render_only_field("quantile values")),
+        EncodedField::Exemplars => Err(report_render_only_field("exemplars")),
     }
 }
 
@@ -458,8 +635,19 @@ fn report_stored_view_field(column: &str) -> OpenSearchError {
     ))
 }
 
-/// Lower `term value` on a derived field to a predicate on its source column. Every refusal names
-/// the derived field, never its source column.
+/// The `500` for a render-only field that reached a filter lowering: the leaf lowering refuses
+/// those with a 400 naming the field before it lowers anything. `subject` is the field name the
+/// request sent where the caller has it, and otherwise the field's encoding; never a stored
+/// column.
+fn report_render_only_field(subject: &str) -> OpenSearchError {
+    OpenSearchError::internal(format!("a render-only field ({subject}) reached a filter lowering"))
+}
+
+/// Lower `term value` on a derived field to a predicate on its source columns. Every refusal names
+/// the derived field, never its source column. A value the field cannot take (a fractional
+/// duration in nanoseconds or list length, a negative length) matches nothing. The metric value
+/// matches `value_double` under IEEE totalOrder and `value_int` when the value is an integer
+/// other than `-0.0`, which sorts below every integer `0`.
 ///
 /// # Errors
 ///
@@ -482,11 +670,37 @@ pub(crate) fn lower_derived_term(field: DerivedField, value: &Value, index: &str
             }
             Ok(ident(COL_DURATION_MICROS).eq(lit(nanos.div_euclid(NANOS_PER_MICRO))))
         }
+        DerivedField::ArrayLength { field: field_name, .. } => {
+            let length = parse_finite_term(&render_literal_text(value, field_name)?, field_name, index)?;
+            if !is_integral(length) || !(0.0..TWO_TO_THE_63).contains(&length) {
+                return Ok(lit(false));
+            }
+            Ok(field.build_read_expr().eq(lit(convert_integral_double(length))))
+        }
+        DerivedField::MetricValue => {
+            let number = parse_finite_term(
+                &render_literal_text(value, METRIC_VALUE_FIELD)?,
+                METRIC_VALUE_FIELD,
+                index,
+            )?;
+            let double_side = ident(COL_VALUE_DOUBLE).eq(lit(number));
+            // `-0.0` sorts just below `+0.0`, so no integer equals it.
+            let is_integer_match =
+                is_integral(number) && !is_negative_zero(number) && (-TWO_TO_THE_63..TWO_TO_THE_63).contains(&number);
+            Ok(if is_integer_match {
+                double_side.or(ident(COL_VALUE_INT).eq(lit(convert_integral_double(number))))
+            } else {
+                double_side
+            })
+        }
     }
 }
 
 /// Lower a range on a derived field. `durationInNanos` is monotonic in `duration_micros`, so
-/// the nanosecond bounds rewrite to microsecond bounds on the stored column and keep pruning.
+/// the nanosecond bounds rewrite to microsecond bounds on the stored column and keep pruning. A
+/// list length compares its integer bounds with the length per row, which no scan can prune by.
+/// The metric value is `value_double` inside the bounds (exclusive bounds stepped to the adjacent
+/// double, IEEE totalOrder) or `value_int` inside the integer bounds (see [`integer_bounds`]).
 ///
 /// # Errors
 ///
@@ -514,13 +728,49 @@ pub(crate) fn lower_derived_range(
                     .unwrap_or_else(|| lit(false)),
             )
         }
+        DerivedField::ArrayLength { field: field_name, .. } => {
+            let Some(lengths) = integer_bounds(lower, upper, field_name, index)? else {
+                return Ok(lit(false));
+            };
+            Ok(build_integer_range(field.build_read_expr(), lengths, IntegerWidth::I64).unwrap_or_else(|| lit(false)))
+        }
+        DerivedField::MetricValue => {
+            let value_double_expr = ident(COL_VALUE_DOUBLE);
+            let mut double_bounds: Vec<Expr> = Vec::with_capacity(2);
+            for (is_lower, bound) in [(true, lower), (false, upper)] {
+                if let Some(bound) = bound {
+                    let value = read_double_bound(bound, METRIC_VALUE_FIELD, index)?;
+                    let literal = lit(step_exclusive_double(value, classify_bound_side(is_lower, bound)));
+                    double_bounds.push(if is_lower {
+                        value_double_expr.clone().gt_eq(literal)
+                    } else {
+                        value_double_expr.clone().lt_eq(literal)
+                    });
+                }
+            }
+            let double_side = double_bounds
+                .into_iter()
+                .reduce(Expr::and)
+                .unwrap_or_else(|| value_double_expr.is_not_null());
+            let integer_side = integer_bounds(lower, upper, METRIC_VALUE_FIELD, index)?
+                .and_then(|bounds| build_integer_range(ident(COL_VALUE_INT), bounds, IntegerWidth::I64));
+            Ok(match integer_side {
+                Some(integer_side) => double_side.or(integer_side),
+                None => double_side,
+            })
+        }
     }
 }
 
-/// Lower `exists` on a derived field: present wherever its source column is.
+/// Lower `exists` on a derived field: present wherever its source column is; a list length
+/// wherever the list is not NULL, and the metric value wherever either value column is set. The
+/// list test reads the length, so it stays out of the scan, which cannot evaluate a predicate on
+/// a list column.
 pub(crate) fn lower_derived_exists(field: DerivedField) -> Expr {
     match field {
         DerivedField::DurationInNanos => ident(COL_DURATION_MICROS).is_not_null(),
+        DerivedField::ArrayLength { .. } => field.build_read_expr().is_not_null(),
+        DerivedField::MetricValue => ident(COL_VALUE_DOUBLE).is_not_null().or(ident(COL_VALUE_INT).is_not_null()),
     }
 }
 
@@ -942,8 +1192,10 @@ fn render_links(array: &ArrayRef, row: usize, keys: AttributeKeys) -> Result<Val
 ///
 /// # Errors
 ///
-/// Returns `500` for a column of another type or a stored span kind outside the `OTel` kinds, and
-/// the 400 of [`escape_attribute_key`] for an event or link attribute key holding `@`.
+/// Returns `500` for a column of another type, a stored span kind outside the `OTel` kinds, a
+/// stored metric type or aggregation temporality with no name, and exponential buckets, which
+/// render from their whole row (see [`render_profile_document`]); and the 400 of
+/// [`escape_attribute_key`] for an event or link attribute key holding `@`.
 pub(crate) fn render_encoded_value(
     field: &EncodedField,
     array: &ArrayRef,
@@ -968,6 +1220,28 @@ pub(crate) fn render_encoded_value(
         EncodedField::EscapedMapKey { key, .. } => render_map_key(array, row, key),
         EncodedField::Events => render_events(array, row, AttributeKeys::Escaped),
         EncodedField::Links => render_links(array, row, AttributeKeys::Escaped),
+        EncodedField::MetricKindName => match read_text(array, row)? {
+            None | Some(METRIC_TYPE_SUMMARY) => Ok(Value::Null),
+            Some(stored_type) => find_enum_name(&METRIC_KINDS, stored_type)
+                .map(|name| Value::String(name.to_string()))
+                .ok_or_else(|| {
+                    OpenSearchError::internal(format!("stored metric type [{stored_type}] has no kind name"))
+                }),
+        },
+        EncodedField::TemporalityName => read_text(array, row)?.map_or(Ok(Value::Null), |stored_temporality| {
+            find_enum_name(&TEMPORALITIES, stored_temporality)
+                .map(|name| Value::String(name.to_string()))
+                .ok_or_else(|| {
+                    OpenSearchError::internal(format!(
+                        "stored aggregation temporality [{stored_temporality}] has no name"
+                    ))
+                })
+        }),
+        EncodedField::QuantileValues => render_quantiles(array, row),
+        EncodedField::Exemplars => render_exemplars(array, row),
+        EncodedField::ExponentialBuckets { .. } => Err(OpenSearchError::internal(
+            "exponential buckets render from their row: they read the scale and the offset too",
+        )),
     }
 }
 
@@ -975,7 +1249,8 @@ pub(crate) fn render_encoded_value(
 ///
 /// # Errors
 ///
-/// Returns `500` when the source column is missing, of another type, or the product overflows.
+/// Returns `500` when a source column is missing or of another type, or the duration product
+/// overflows.
 pub(crate) fn render_derived_value(
     field: DerivedField,
     batch: &RecordBatch,
@@ -993,16 +1268,177 @@ pub(crate) fn render_derived_value(
                 .transpose()
                 .map(|value| value.unwrap_or(Value::Null))
         }
+        DerivedField::ArrayLength { column, .. } => {
+            let lists = read_batch_column(batch, column)?;
+            if lists.is_null(row) {
+                return Ok(Value::Null);
+            }
+            let length = lists
+                .as_list_opt::<i32>()
+                .ok_or_else(|| report_unexpected_type("a list", lists.data_type()))?
+                .value_length(row);
+            u64::try_from(length)
+                .map(Value::from)
+                .map_err(|_| OpenSearchError::internal(format!("the list `{column}` has length {length}")))
+        }
+        DerivedField::MetricValue => {
+            let doubles = read_batch_column(batch, COL_VALUE_DOUBLE)?;
+            if !doubles.is_null(row) {
+                return render_array_value(doubles.as_ref(), row);
+            }
+            Ok(read_i64(read_batch_column(batch, COL_VALUE_INT)?, row)?
+                .map_or(Value::Null, |integer| Value::from(convert_integer_to_double(integer))))
+        }
     }
+}
+
+/// `value` as the nearest double, as `cast(value_int as double)` computes it.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the metrics value is the double nearest to an integer point, as its read expression casts it"
+)]
+const fn convert_integer_to_double(value: i64) -> f64 {
+    value as f64
+}
+
+/// A finite double as a JSON number.
+///
+/// # Errors
+///
+/// Returns `500` for a `NaN` or an infinity, which no computed bucket bound reaches at a scale and
+/// offset ingest stores.
+fn render_finite_double(value: f64) -> Result<Value, OpenSearchError> {
+    Number::from_f64(value)
+        .map(Value::Number)
+        .ok_or_else(|| OpenSearchError::internal(format!("the double {value} has no JSON rendering")))
+}
+
+/// The bounds `(min, max)` of exponential-histogram bucket `index` at `scale` and `offset`:
+/// bucket `k` covers `(base^(offset+k), base^(offset+k+1)]` with `base = 2^(2^-scale)`, and a
+/// negative bucket is its mirror image. `None` when `index` or the exponent `offset + index + 1`
+/// does not fit `i32`.
+pub(crate) fn compute_exponential_bucket_bounds(
+    scale: i32,
+    offset: i32,
+    index: usize,
+    is_negative: bool,
+) -> Option<(f64, f64)> {
+    let first_exponent = offset.checked_add(i32::try_from(index).ok()?)?;
+    let last_exponent = first_exponent.checked_add(1)?;
+    // base^i = 2^(i · 2^-scale).
+    let exponent_per_index = f64::exp2(f64::from(scale.checked_neg()?));
+    let lower_bound = f64::exp2(f64::from(first_exponent) * exponent_per_index);
+    let upper_bound = f64::exp2(f64::from(last_exponent) * exponent_per_index);
+    Some(if is_negative {
+        (-upper_bound, -lower_bound)
+    } else {
+        (lower_bound, upper_bound)
+    })
+}
+
+/// The exponential-histogram buckets at `row`: one `{count, min, max}` per stored count, in
+/// stored order, a NULL count absent from its bucket as [`render_quantiles`] leaves out a NULL
+/// member; `Value::Null` when the counts are NULL.
+///
+/// # Errors
+///
+/// Returns `500` when the row holds counts but no scale or offset, or the bounds overflow.
+fn render_exponential_buckets(
+    batch: &RecordBatch,
+    row: usize,
+    counts_column: &str,
+    offset_column: &str,
+    is_negative: bool,
+) -> Result<Value, OpenSearchError> {
+    let counts = read_batch_column(batch, counts_column)?;
+    if counts.is_null(row) {
+        return Ok(Value::Null);
+    }
+    let scale = read_i32(read_batch_column(batch, COL_SCALE)?, row)?
+        .ok_or_else(|| OpenSearchError::internal("an exponential histogram row has no scale"))?;
+    let offset = read_i32(read_batch_column(batch, offset_column)?, row)?
+        .ok_or_else(|| OpenSearchError::internal(format!("an exponential histogram row has no `{offset_column}`")))?;
+    let elements = counts
+        .as_list_opt::<i32>()
+        .ok_or_else(|| report_unexpected_type("a list", counts.data_type()))?
+        .value(row);
+    let mut rendered_buckets = Vec::with_capacity(elements.len());
+    for bucket_index in 0..elements.len() {
+        let (min, max) = compute_exponential_bucket_bounds(scale, offset, bucket_index, is_negative)
+            .ok_or_else(|| OpenSearchError::internal("exponential bucket bounds overflow"))?;
+        let mut bucket = Map::new();
+        let count = render_array_value(elements.as_ref(), bucket_index)?;
+        if !count.is_null() {
+            bucket.insert("count".to_string(), count);
+        }
+        bucket.insert("min".to_string(), render_finite_double(min)?);
+        bucket.insert("max".to_string(), render_finite_double(max)?);
+        rendered_buckets.push(Value::Object(bucket));
+    }
+    Ok(Value::Array(rendered_buckets))
+}
+
+/// The summary quantiles at `row` as `{quantile, value}` objects, a NULL member absent;
+/// `Value::Null` for a NULL list.
+fn render_quantiles(array: &ArrayRef, row: usize) -> Result<Value, OpenSearchError> {
+    let Some(entries) = read_struct_list(array, row)? else {
+        return Ok(Value::Null);
+    };
+    let quantiles = read_member(&entries, QUANTILE_FIELD_QUANTILE)?;
+    let values = read_member(&entries, QUANTILE_FIELD_VALUE)?;
+    let mut rendered_quantiles = Vec::with_capacity(entries.len());
+    for quantile_index in 0..entries.len() {
+        let mut object = Map::new();
+        for (name, members) in [("quantile", quantiles), ("value", values)] {
+            let member_value = render_array_value(members.as_ref(), quantile_index)?;
+            if !member_value.is_null() {
+                object.insert(name.to_string(), member_value);
+            }
+        }
+        rendered_quantiles.push(Value::Object(object));
+    }
+    Ok(Value::Array(rendered_quantiles))
+}
+
+/// The exemplars at `row` as `{time, traceId, spanId}` objects, each member absent when NULL;
+/// `Value::Null` for a NULL list. The exemplar struct names its members like the columns they
+/// mirror.
+fn render_exemplars(array: &ArrayRef, row: usize) -> Result<Value, OpenSearchError> {
+    let Some(exemplars) = read_struct_list(array, row)? else {
+        return Ok(Value::Null);
+    };
+    let times = read_member(&exemplars, COL_TIMESTAMP)?;
+    let trace_ids = read_member(&exemplars, COL_TRACE_ID)?;
+    let span_ids = read_member(&exemplars, COL_SPAN_ID)?;
+    let mut rendered_exemplars = Vec::with_capacity(exemplars.len());
+    for exemplar_index in 0..exemplars.len() {
+        let mut exemplar = Map::new();
+        if let Some(micros) = read_micros(times, exemplar_index)? {
+            exemplar.insert("time".to_string(), Value::String(format_rfc3339_micros(micros)?));
+        }
+        if let Some(trace_id) = read_hex(trace_ids, exemplar_index)? {
+            exemplar.insert("traceId".to_string(), Value::String(trace_id));
+        }
+        if let Some(span_id) = read_hex(span_ids, exemplar_index)? {
+            exemplar.insert("spanId".to_string(), Value::String(span_id));
+        }
+        rendered_exemplars.push(Value::Object(exemplar));
+    }
+    Ok(Value::Array(rendered_exemplars))
 }
 
 /// What one field of a non-native profile reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProfileFieldSource {
-    /// A stored column under its own value: an alias.
+    /// A stored column under its own value.
     Column(&'static str),
+    /// Another name of the declared field it names: it filters, sorts and aggregates like that
+    /// field and is not repeated in `_source`.
+    Alias(&'static str),
     /// A fixed-width id as hex, NULL as `""`.
     HexIdOrEmpty(&'static str),
+    /// A fixed-width id as hex, absent when NULL.
+    StoredHexId(&'static str),
     /// A string whose NULL renders `""`.
     EmptyWhenNull(&'static str),
     /// The span kind as its `OTel` name.
@@ -1013,6 +1449,27 @@ pub(crate) enum ProfileFieldSource {
     DurationInNanos,
     /// A status code, NULL as `0`.
     StatusCode(&'static str),
+    /// The metric type as its `kind` name.
+    MetricKind,
+    /// The aggregation temporality as its `aggregationTemporality` name.
+    Temporality,
+    /// A metric point's value, whether stored as an integer or a double.
+    MetricValue,
+    /// The length of a list column.
+    ArrayLength(&'static str),
+    /// Exponential-histogram buckets.
+    ExponentialBuckets {
+        /// The stored bucket counts.
+        counts: &'static str,
+        /// The stored bucket offset.
+        offset: &'static str,
+        /// Whether the buckets lie below zero.
+        is_negative: bool,
+    },
+    /// Summary quantiles.
+    Quantiles,
+    /// Exemplars.
+    Exemplars,
     /// A structural object grouping the fields below it.
     Object,
     /// An attribute MAP: each stored key is a `keyword` leaf below this object.
@@ -1028,6 +1485,8 @@ pub(crate) enum ProfileFieldSource {
 /// in segments so that two profiles of one table share the segment they have in common.
 #[derive(Debug)]
 pub(crate) struct ProfileTable {
+    /// The table the profile index reads; its promoted resource keys resolve to their columns.
+    pub(crate) table: &'static str,
     /// Every field, by its client name, segment after segment.
     pub(crate) fields: &'static [&'static [(&'static str, ProfileFieldSource)]],
     /// How the attribute objects spell stored keys.
@@ -1040,15 +1499,56 @@ impl ProfileTable {
         self.fields.iter().flat_map(|segment| segment.iter())
     }
 
-    /// The source of the declared field `name`; `None` for a name the table does not declare.
-    fn find_field_source(&self, name: &str) -> Option<ProfileFieldSource> {
-        self.iter_fields().find(|(field, _)| *field == name).map(|(_, source)| *source)
+    /// The declared field `name`, under its `'static` name; `None` for a name the table does not
+    /// declare.
+    fn find_field(&self, name: &str) -> Option<(&'static str, ProfileFieldSource)> {
+        self.iter_fields().find(|(field, _)| *field == name).copied()
+    }
+
+    /// The source the declared field `name` reads through: an alias's target source, any other
+    /// field's own. `None` for an undeclared name, and for an alias whose target is undeclared or
+    /// another alias, so an alias never chains.
+    fn find_read_source(&self, name: &str) -> Option<ProfileFieldSource> {
+        match self.find_field(name)?.1 {
+            ProfileFieldSource::Alias(target) => self
+                .find_field(target)
+                .map(|(_, target_source)| target_source)
+                .filter(|target_source| !matches!(target_source, ProfileFieldSource::Alias(_))),
+            source => Some(source),
+        }
     }
 }
 
 /// The structural object a dotted field name sits under.
 fn find_parent(name: &str) -> Option<String> {
     name.rsplit_once('.').map(|(parent, _)| parent.to_string())
+}
+
+/// The stored column a source that shows one column under a conversion reads (see
+/// [`map_column_encoding`]); `None` for every other source.
+const fn find_encoded_column(source: ProfileFieldSource) -> Option<&'static str> {
+    match source {
+        ProfileFieldSource::HexIdOrEmpty(column)
+        | ProfileFieldSource::EmptyWhenNull(column)
+        | ProfileFieldSource::SpanKind(column)
+        | ProfileFieldSource::Time(column)
+        | ProfileFieldSource::StatusCode(column)
+        | ProfileFieldSource::ExponentialBuckets { counts: column, .. } => Some(column),
+        ProfileFieldSource::MetricKind => Some(COL_METRIC_TYPE),
+        ProfileFieldSource::Temporality => Some(COL_AGGREGATION_TEMPORALITY),
+        ProfileFieldSource::Quantiles => Some(COL_QUANTILE_VALUES),
+        ProfileFieldSource::Exemplars => Some(COL_EXEMPLARS),
+        ProfileFieldSource::Column(_)
+        | ProfileFieldSource::Alias(_)
+        | ProfileFieldSource::StoredHexId(_)
+        | ProfileFieldSource::DurationInNanos
+        | ProfileFieldSource::MetricValue
+        | ProfileFieldSource::ArrayLength(_)
+        | ProfileFieldSource::Object
+        | ProfileFieldSource::Attributes(_)
+        | ProfileFieldSource::Events
+        | ProfileFieldSource::Links => None,
+    }
 }
 
 /// The client type and encoding of a source that shows one stored column under a conversion,
@@ -1067,8 +1567,20 @@ const fn map_column_encoding(source: ProfileFieldSource, column_type: &DataType)
         ProfileFieldSource::SpanKind(column) => Some((FieldType::Keyword, EncodedField::SpanKindName { column })),
         ProfileFieldSource::Time(column) => Some((FieldType::Date, EncodedField::Rfc3339Time { column })),
         ProfileFieldSource::StatusCode(column) => Some((FieldType::Integer, EncodedField::StatusCodeOrZero { column })),
+        ProfileFieldSource::MetricKind => Some((FieldType::Keyword, EncodedField::MetricKindName)),
+        ProfileFieldSource::Temporality => Some((FieldType::Keyword, EncodedField::TemporalityName)),
+        ProfileFieldSource::ExponentialBuckets { counts, .. } => Some((
+            FieldType::Object,
+            EncodedField::ExponentialBuckets { counts_column: counts },
+        )),
+        ProfileFieldSource::Quantiles => Some((FieldType::Object, EncodedField::QuantileValues)),
+        ProfileFieldSource::Exemplars => Some((FieldType::Object, EncodedField::Exemplars)),
         ProfileFieldSource::Column(_)
+        | ProfileFieldSource::Alias(_)
+        | ProfileFieldSource::StoredHexId(_)
         | ProfileFieldSource::DurationInNanos
+        | ProfileFieldSource::MetricValue
+        | ProfileFieldSource::ArrayLength(_)
         | ProfileFieldSource::Object
         | ProfileFieldSource::Attributes(_)
         | ProfileFieldSource::Events
@@ -1076,9 +1588,40 @@ const fn map_column_encoding(source: ProfileFieldSource, column_type: &DataType)
     }
 }
 
-/// The resolution of one declared field against its table's schema; `None` for a structural
+/// The derived field a source computes, for the declared field `name`: the one mapping from a
+/// source to its [`DerivedField`], which resolution and rendering share. `None` for every other
+/// source.
+const fn map_derived_field(name: &'static str, source: ProfileFieldSource) -> Option<(FieldType, DerivedField)> {
+    match source {
+        ProfileFieldSource::DurationInNanos => Some((FieldType::Long, DerivedField::DurationInNanos)),
+        ProfileFieldSource::MetricValue => Some((FieldType::Double, DerivedField::MetricValue)),
+        ProfileFieldSource::ArrayLength(column) => {
+            Some((FieldType::Long, DerivedField::ArrayLength { column, field: name }))
+        }
+        ProfileFieldSource::Column(_)
+        | ProfileFieldSource::Alias(_)
+        | ProfileFieldSource::HexIdOrEmpty(_)
+        | ProfileFieldSource::StoredHexId(_)
+        | ProfileFieldSource::EmptyWhenNull(_)
+        | ProfileFieldSource::SpanKind(_)
+        | ProfileFieldSource::Time(_)
+        | ProfileFieldSource::StatusCode(_)
+        | ProfileFieldSource::MetricKind
+        | ProfileFieldSource::Temporality
+        | ProfileFieldSource::ExponentialBuckets { .. }
+        | ProfileFieldSource::Quantiles
+        | ProfileFieldSource::Exemplars
+        | ProfileFieldSource::Object
+        | ProfileFieldSource::Attributes(_)
+        | ProfileFieldSource::Events
+        | ProfileFieldSource::Links => None,
+    }
+}
+
+/// The resolution of the declared field `name`, which reads `source` (an alias's target source,
+/// see [`ProfileTable::find_read_source`]), against its table's schema; `None` for a structural
 /// object or an attribute object, which no leaf filters on, and for a column the schema lacks.
-fn resolve_profile_source(schema: &Schema, name: &str, source: ProfileFieldSource) -> Option<ResolvedField> {
+fn resolve_profile_source(schema: &Schema, name: &'static str, source: ProfileFieldSource) -> Option<ResolvedField> {
     let (field_type, value) = match source {
         ProfileFieldSource::Column(column) => (
             native_column_type(schema.field_with_name(column).ok()?).ok()?,
@@ -1086,19 +1629,39 @@ fn resolve_profile_source(schema: &Schema, name: &str, source: ProfileFieldSourc
                 column: column.to_string(),
             },
         ),
-        ProfileFieldSource::HexIdOrEmpty(column)
-        | ProfileFieldSource::EmptyWhenNull(column)
-        | ProfileFieldSource::SpanKind(column)
-        | ProfileFieldSource::Time(column)
-        | ProfileFieldSource::StatusCode(column) => {
-            let (field_type, encoded_field) =
-                map_column_encoding(source, schema.field_with_name(column).ok()?.data_type())?;
+        ProfileFieldSource::StoredHexId(column) => {
+            let DataType::FixedSizeBinary(width) = schema.field_with_name(column).ok()?.data_type() else {
+                return None;
+            };
+            (
+                FieldType::Keyword,
+                FieldValue::HexId {
+                    column: column.to_string(),
+                    width: *width,
+                },
+            )
+        }
+        ProfileFieldSource::HexIdOrEmpty(_)
+        | ProfileFieldSource::EmptyWhenNull(_)
+        | ProfileFieldSource::SpanKind(_)
+        | ProfileFieldSource::Time(_)
+        | ProfileFieldSource::StatusCode(_)
+        | ProfileFieldSource::MetricKind
+        | ProfileFieldSource::Temporality
+        | ProfileFieldSource::ExponentialBuckets { .. }
+        | ProfileFieldSource::Quantiles
+        | ProfileFieldSource::Exemplars => {
+            let column_type = schema.field_with_name(find_encoded_column(source)?).ok()?.data_type();
+            let (field_type, encoded_field) = map_column_encoding(source, column_type)?;
             (field_type, FieldValue::Encoded(encoded_field))
         }
-        ProfileFieldSource::DurationInNanos => (FieldType::Long, FieldValue::Derived(DerivedField::DurationInNanos)),
+        ProfileFieldSource::DurationInNanos | ProfileFieldSource::MetricValue | ProfileFieldSource::ArrayLength(_) => {
+            let (field_type, derived_field) = map_derived_field(name, source)?;
+            (field_type, FieldValue::Derived(derived_field))
+        }
         ProfileFieldSource::Events => (FieldType::Object, FieldValue::Encoded(EncodedField::Events)),
         ProfileFieldSource::Links => (FieldType::Object, FieldValue::Encoded(EncodedField::Links)),
-        ProfileFieldSource::Object | ProfileFieldSource::Attributes(_) => return None,
+        ProfileFieldSource::Alias(_) | ProfileFieldSource::Object | ProfileFieldSource::Attributes(_) => return None,
     };
     Some(ResolvedField {
         name: name.to_string(),
@@ -1107,35 +1670,92 @@ fn resolve_profile_source(schema: &Schema, name: &str, source: ProfileFieldSourc
     })
 }
 
+/// The resolution of the declared field `name` of `table`, an alias as its target.
+fn resolve_declared_field(table: &ProfileTable, schema: &Schema, name: &'static str) -> Option<ResolvedField> {
+    resolve_profile_source(schema, name, table.find_read_source(name)?)
+}
+
 /// The resolution of the attribute path `name`, whose key part `spelled_key` names a stored key
-/// of the MAP `column` in the `keys` spelling.
-fn resolve_attribute_key(keys: AttributeKeys, column: &'static str, name: &str, spelled_key: &str) -> ResolvedField {
-    let value = match keys {
-        AttributeKeys::Escaped => FieldValue::Encoded(EncodedField::EscapedMapKey {
-            column,
-            key: unescape_attribute_key(spelled_key),
-        }),
+/// of the MAP `column` in `table`'s spelling. A resource key `table` promotes to a column (dotted
+/// or underscored, the way ingest moves it) reads that column.
+fn resolve_attribute_key(
+    table: &ProfileTable,
+    schema: &Schema,
+    column: &'static str,
+    name: &str,
+    spelled_key: &str,
+) -> Option<ResolvedField> {
+    let key = table.attribute_keys.read_stored_key(spelled_key);
+    if column == COL_RESOURCE_ATTRIBUTES
+        && let Some(promoted) = find_promoted_resource_key(table.table, &key)
+    {
+        return Some(ResolvedField {
+            name: name.to_string(),
+            field_type: native_column_type(schema.field_with_name(promoted.column).ok()?).ok()?,
+            value: FieldValue::Column {
+                column: promoted.column.to_string(),
+            },
+        });
+    }
+    let value = match table.attribute_keys {
+        AttributeKeys::Escaped => FieldValue::Encoded(EncodedField::EscapedMapKey { column, key }),
+        AttributeKeys::Stored => FieldValue::MapKey {
+            column: column.to_string(),
+            key,
+        },
     };
-    ResolvedField {
+    Some(ResolvedField {
         name: name.to_string(),
         field_type: FieldType::Keyword,
         value,
-    }
+    })
 }
 
 /// Resolve `name` against `table` over its table's `schema`. `<attributes object>.<key>`
-/// reads the stored key the spelling names, with no enumeration. A structural object and an
-/// unknown name resolve to nothing, so a leaf on either matches nothing.
+/// reads the stored key the spelling names, with no enumeration; a path below a render-only
+/// field resolves to that field under the requested path, so a leaf on it is refused naming the
+/// path. An alias resolves as its target under its own name. A structural object and an unknown
+/// name resolve to nothing, so a leaf on either matches nothing.
 pub(crate) fn resolve_profile_field(table: &ProfileTable, schema: &Schema, name: &str) -> Option<ResolvedField> {
-    if let Some(source) = table.find_field_source(name) {
-        return resolve_profile_source(schema, name, source);
+    if let Some((declared_name, _)) = table.find_field(name) {
+        return resolve_declared_field(table, schema, declared_name);
     }
     table.iter_fields().find_map(|(prefix, source)| {
-        let ProfileFieldSource::Attributes(column) = source else {
-            return None;
-        };
-        let spelled_key = name.strip_prefix(prefix)?.strip_prefix('.')?;
-        (!spelled_key.is_empty()).then(|| resolve_attribute_key(table.attribute_keys, column, name, spelled_key))
+        let sub_path = name.strip_prefix(prefix)?.strip_prefix('.')?;
+        match source {
+            ProfileFieldSource::Attributes(column) => {
+                if sub_path.is_empty() {
+                    None
+                } else {
+                    resolve_attribute_key(table, schema, column, name, sub_path)
+                }
+            }
+            // The render-only fields: a leaf on a path below one is refused like a leaf on it.
+            ProfileFieldSource::ExponentialBuckets { .. }
+            | ProfileFieldSource::Quantiles
+            | ProfileFieldSource::Exemplars => {
+                resolve_profile_source(schema, prefix, *source).map(|resolved_field| ResolvedField {
+                    name: name.to_string(),
+                    ..resolved_field
+                })
+            }
+            ProfileFieldSource::Column(_)
+            | ProfileFieldSource::Alias(_)
+            | ProfileFieldSource::HexIdOrEmpty(_)
+            | ProfileFieldSource::StoredHexId(_)
+            | ProfileFieldSource::EmptyWhenNull(_)
+            | ProfileFieldSource::SpanKind(_)
+            | ProfileFieldSource::Time(_)
+            | ProfileFieldSource::DurationInNanos
+            | ProfileFieldSource::StatusCode(_)
+            | ProfileFieldSource::MetricKind
+            | ProfileFieldSource::Temporality
+            | ProfileFieldSource::MetricValue
+            | ProfileFieldSource::ArrayLength(_)
+            | ProfileFieldSource::Object
+            | ProfileFieldSource::Events
+            | ProfileFieldSource::Links => None,
+        }
     })
 }
 
@@ -1164,7 +1784,7 @@ pub(crate) fn is_nullable_encoded_id(schema: &Schema, value: &FieldValue) -> boo
 /// lists one `keyword` leaf per key of `map_keys` under its MAP column, in the table's
 /// spelling. Events list `events.time` (date) and `events.name`, neither searchable nor
 /// aggregatable. A nullable encoded id (see [`is_nullable_encoded_id`]) is searchable but not
-/// aggregatable.
+/// aggregatable. An alias lists with its target's type; a render-only field is an `object`.
 ///
 /// # Errors
 ///
@@ -1205,15 +1825,31 @@ pub(crate) fn list_profile_fields(
                 }
             }
             ProfileFieldSource::Column(_)
+            | ProfileFieldSource::Alias(_)
             | ProfileFieldSource::HexIdOrEmpty(_)
+            | ProfileFieldSource::StoredHexId(_)
             | ProfileFieldSource::EmptyWhenNull(_)
             | ProfileFieldSource::SpanKind(_)
             | ProfileFieldSource::Time(_)
             | ProfileFieldSource::DurationInNanos
-            | ProfileFieldSource::StatusCode(_) => {
-                let resolved_field = resolve_profile_source(schema, name, *source).ok_or_else(|| {
+            | ProfileFieldSource::StatusCode(_)
+            | ProfileFieldSource::MetricKind
+            | ProfileFieldSource::Temporality
+            | ProfileFieldSource::MetricValue
+            | ProfileFieldSource::ArrayLength(_)
+            | ProfileFieldSource::ExponentialBuckets { .. }
+            | ProfileFieldSource::Quantiles
+            | ProfileFieldSource::Exemplars => {
+                let resolved_field = resolve_declared_field(table, schema, name).ok_or_else(|| {
                     OpenSearchError::internal(format!("the table lacks the column behind profile field [{name}]"))
                 })?;
+                if resolved_field.field_type == FieldType::Object {
+                    fields.push(IndexField {
+                        parent,
+                        ..IndexField::object((*name).to_string())
+                    });
+                    continue;
+                }
                 let leaf = IndexField::leaf((*name).to_string(), resolved_field.field_type, parent);
                 fields.push(IndexField {
                     is_aggregatable: leaf.is_aggregatable && !is_nullable_encoded_id(schema, &resolved_field.value),
@@ -1226,7 +1862,10 @@ pub(crate) fn list_profile_fields(
 }
 
 /// The fields a full-text pattern reaches on `table`: the leaves whose names it matches, and each
-/// attribute MAP whose every key path it covers, selected whole, as a native MAP column is.
+/// attribute MAP whose every key path it covers, selected whole, as a native MAP column is. A
+/// pattern covering the resource attributes also reaches the columns `table` promotes resource
+/// keys to, as a native index's pattern does. Objects, lists and render-only fields are never
+/// reached.
 ///
 /// # Errors
 ///
@@ -1238,14 +1877,23 @@ pub(crate) fn expand_profile_pattern(
     pattern: &str,
 ) -> Result<Vec<SelectedField>, OpenSearchError> {
     let mut selected_fields = Vec::new();
+    let mut promoted_fields = Vec::new();
     for (name, source) in table.iter_fields() {
         match source {
-            ProfileFieldSource::Object | ProfileFieldSource::Events | ProfileFieldSource::Links => {}
+            ProfileFieldSource::Object
+            | ProfileFieldSource::Events
+            | ProfileFieldSource::Links
+            | ProfileFieldSource::ExponentialBuckets { .. }
+            | ProfileFieldSource::Quantiles
+            | ProfileFieldSource::Exemplars => {}
             ProfileFieldSource::Attributes(column) => {
                 if covers_every_key(pattern, name) {
                     selected_fields.push(SelectedField::AllMapValues {
                         column: (*column).to_string(),
                     });
+                    if *column == COL_RESOURCE_ATTRIBUTES {
+                        promoted_fields.extend(list_promoted_resource_fields(table, schema, name)?);
+                    }
                 } else if glob_matches_some_extension(pattern, &format!("{name}.")) {
                     return Err(OpenSearchError::illegal_argument(format!(
                         "field pattern [{pattern}] selects some keys of [{name}]: name one key, or select every key \
@@ -1254,21 +1902,62 @@ pub(crate) fn expand_profile_pattern(
                 }
             }
             ProfileFieldSource::Column(_)
+            | ProfileFieldSource::Alias(_)
             | ProfileFieldSource::HexIdOrEmpty(_)
+            | ProfileFieldSource::StoredHexId(_)
             | ProfileFieldSource::EmptyWhenNull(_)
             | ProfileFieldSource::SpanKind(_)
             | ProfileFieldSource::Time(_)
             | ProfileFieldSource::DurationInNanos
-            | ProfileFieldSource::StatusCode(_) => {
+            | ProfileFieldSource::StatusCode(_)
+            | ProfileFieldSource::MetricKind
+            | ProfileFieldSource::Temporality
+            | ProfileFieldSource::MetricValue
+            | ProfileFieldSource::ArrayLength(_) => {
                 if matches_glob(pattern, name)
-                    && let Some(resolved_field) = resolve_profile_source(schema, name, *source)
+                    && let Some(resolved_field) = resolve_declared_field(table, schema, name)
                 {
                     selected_fields.push(SelectedField::Field(resolved_field));
                 }
             }
         }
     }
+    for promoted_field in promoted_fields {
+        let is_selected = selected_fields
+            .iter()
+            .any(|candidate| matches!(candidate, SelectedField::Field(field) if field.value == promoted_field.value));
+        if !is_selected {
+            selected_fields.push(SelectedField::Field(promoted_field));
+        }
+    }
     Ok(selected_fields)
+}
+
+/// The columns `table` promotes resource keys to, each resolved under its attribute path below
+/// the resource attribute object `object_name`.
+///
+/// # Errors
+///
+/// Returns the 400 of [`escape_attribute_key`] for a promoted key the spelling cannot write.
+fn list_promoted_resource_fields(
+    table: &ProfileTable,
+    schema: &Schema,
+    object_name: &str,
+) -> Result<Vec<ResolvedField>, OpenSearchError> {
+    let mut promoted_fields = Vec::new();
+    for promoted_key in promoted_resource_keys(table.table) {
+        let spelled_key = table.attribute_keys.spell_key(promoted_key.attribute_key)?;
+        if let Some(resolved_field) = resolve_attribute_key(
+            table,
+            schema,
+            COL_RESOURCE_ATTRIBUTES,
+            &format!("{object_name}.{spelled_key}"),
+            &spelled_key,
+        ) {
+            promoted_fields.push(resolved_field);
+        }
+    }
+    Ok(promoted_fields)
 }
 
 /// The column `column` of `batch`.
@@ -1278,32 +1967,51 @@ fn read_batch_column<'b>(batch: &'b RecordBatch, column: &str) -> Result<&'b Arr
         .ok_or_else(|| OpenSearchError::internal(format!("a row lacks the column `{column}`")))
 }
 
-/// The value of one declared field at `row`; `Value::Null` when absent.
+/// The value at `row` of the declared field `name`, which reads `source`; `Value::Null` when
+/// absent, and for an alias, whose target renders instead.
 fn render_source_field(
     table: &ProfileTable,
     batch: &RecordBatch,
     row: usize,
+    name: &'static str,
     source: ProfileFieldSource,
 ) -> Result<Value, OpenSearchError> {
     match source {
-        ProfileFieldSource::Column(column) => render_array_value(read_batch_column(batch, column)?.as_ref(), row),
-        ProfileFieldSource::HexIdOrEmpty(column)
-        | ProfileFieldSource::EmptyWhenNull(column)
-        | ProfileFieldSource::SpanKind(column)
-        | ProfileFieldSource::Time(column)
-        | ProfileFieldSource::StatusCode(column) => {
+        ProfileFieldSource::Column(column) | ProfileFieldSource::StoredHexId(column) => {
+            render_array_value(read_batch_column(batch, column)?.as_ref(), row)
+        }
+        ProfileFieldSource::HexIdOrEmpty(_)
+        | ProfileFieldSource::EmptyWhenNull(_)
+        | ProfileFieldSource::SpanKind(_)
+        | ProfileFieldSource::Time(_)
+        | ProfileFieldSource::StatusCode(_)
+        | ProfileFieldSource::MetricKind
+        | ProfileFieldSource::Temporality
+        | ProfileFieldSource::Quantiles
+        | ProfileFieldSource::Exemplars => {
+            let column = find_encoded_column(source)
+                .ok_or_else(|| OpenSearchError::internal(format!("profile field [{name}] reads no column")))?;
             let array = read_batch_column(batch, column)?;
             let (_, encoded_field) = map_column_encoding(source, array.data_type())
                 .ok_or_else(|| report_unexpected_type("the type its encoding reads", array.data_type()))?;
             render_encoded_value(&encoded_field, array, row)
         }
-        ProfileFieldSource::DurationInNanos => render_derived_value(DerivedField::DurationInNanos, batch, row),
+        ProfileFieldSource::ExponentialBuckets {
+            counts,
+            offset,
+            is_negative,
+        } => render_exponential_buckets(batch, row, counts, offset, is_negative),
+        ProfileFieldSource::DurationInNanos | ProfileFieldSource::MetricValue | ProfileFieldSource::ArrayLength(_) => {
+            let (_, derived_field) = map_derived_field(name, source)
+                .ok_or_else(|| OpenSearchError::internal(format!("profile field [{name}] derives no value")))?;
+            render_derived_value(derived_field, batch, row)
+        }
         ProfileFieldSource::Attributes(column) => {
             render_attribute_map(read_batch_column(batch, column)?, row, table.attribute_keys)
         }
         ProfileFieldSource::Events => render_events(read_batch_column(batch, COL_EVENTS)?, row, table.attribute_keys),
         ProfileFieldSource::Links => render_links(read_batch_column(batch, COL_LINKS)?, row, table.attribute_keys),
-        ProfileFieldSource::Object => Ok(Value::Null),
+        ProfileFieldSource::Alias(_) | ProfileFieldSource::Object => Ok(Value::Null),
     }
 }
 
@@ -1377,7 +2085,7 @@ pub(crate) fn render_profile_document(
 ) -> Result<Value, OpenSearchError> {
     let mut document = Map::new();
     for (name, source) in table.iter_fields() {
-        let value = render_source_field(table, batch, row, *source)?;
+        let value = render_source_field(table, batch, row, name, *source)?;
         if !value.is_null() {
             insert_nested_value(&mut document, name, value);
         }
@@ -1390,7 +2098,8 @@ pub(crate) fn render_profile_document(
 }
 
 /// The value of the field `name` of `table` at `row`, for `fields` and `docvalue_fields`;
-/// `Value::Null` when absent or when `name` is no leaf of the table.
+/// `Value::Null` when absent or when `name` is no leaf of the table. An alias renders its
+/// target's value.
 ///
 /// # Errors
 ///
@@ -1401,14 +2110,18 @@ pub(crate) fn render_profile_field(
     row: usize,
     name: &str,
 ) -> Result<Value, OpenSearchError> {
-    if let Some(source) = table.find_field_source(name) {
-        return render_source_field(table, batch, row, source);
+    if let Some((declared_name, _)) = table.find_field(name) {
+        return table.find_read_source(declared_name).map_or(Ok(Value::Null), |source| {
+            render_source_field(table, batch, row, declared_name, source)
+        });
     }
     match resolve_profile_field(table, &batch.schema(), name).map(|resolved_field| resolved_field.value) {
         Some(FieldValue::Encoded(EncodedField::EscapedMapKey { column, key })) => {
             render_map_key(read_batch_column(batch, column)?, row, &key)
         }
-        _ => Ok(Value::Null),
+        Some(FieldValue::MapKey { column, key }) => render_map_key(read_batch_column(batch, &column)?, row, &key),
+        Some(FieldValue::Column { column }) => render_array_value(read_batch_column(batch, &column)?.as_ref(), row),
+        Some(FieldValue::HexId { .. } | FieldValue::Encoded(_) | FieldValue::Derived(_)) | None => Ok(Value::Null),
     }
 }
 
@@ -1419,29 +2132,33 @@ mod tests {
 
     use chrono::{DateTime, Utc};
     use datafusion::arrow::array::{
-        Array, ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, RecordBatch, StringArray,
+        Array, ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
         TimestampMicrosecondArray,
     };
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema};
     use datafusion::logical_expr::{Expr, lit};
     use datafusion::prelude::{SessionContext, ident};
-    use icegate_common::SPANS_TABLE;
     use icegate_common::schema::{
-        COL_ATTRIBUTES, COL_DROPPED_ATTRIBUTES_COUNT, COL_DURATION_MICROS, COL_END_TIMESTAMP, COL_EVENTS,
-        COL_INGESTED_TIMESTAMP, COL_NAME, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES,
-        COL_SPAN_ID, COL_STATUS_CODE, COL_TIMESTAMP, COL_TRACE_ID, spans_schema,
+        COL_ATTRIBUTES, COL_BUCKET_COUNTS, COL_DROPPED_ATTRIBUTES_COUNT, COL_DURATION_MICROS, COL_END_TIMESTAMP,
+        COL_EVENTS, COL_EXPLICIT_BOUNDS, COL_INGESTED_TIMESTAMP, COL_METRIC_NAME, COL_METRIC_TYPE, COL_NAME,
+        COL_NEGATIVE_BUCKET_COUNTS, COL_NEGATIVE_OFFSET, COL_POSITIVE_BUCKET_COUNTS, COL_POSITIVE_OFFSET,
+        COL_RESOURCE_ATTRIBUTES, COL_SCALE, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES, COL_SPAN_ID, COL_STATUS_CODE,
+        COL_TIMESTAMP, COL_TRACE_ID, COL_VALUE_DOUBLE, COL_VALUE_INT, spans_schema,
     };
+    use icegate_common::{METRICS_TABLE, SPANS_TABLE};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use serde_json::{Value, json};
 
     use super::{
-        DerivedField, EncodedField, IntegerBounds, IntegerWidth, build_integer_range, escape_attribute_key,
-        expand_profile_pattern, format_rfc3339_micros, integer_bounds, lower_derived_range, lower_derived_term,
-        lower_encoded_range, lower_encoded_term, render_encoded_value, render_profile_field, unescape_attribute_key,
+        DerivedField, EncodedField, IntegerBounds, IntegerWidth, build_integer_range,
+        compute_exponential_bucket_bounds, escape_attribute_key, expand_profile_pattern, format_rfc3339_micros,
+        integer_bounds, lower_derived_range, lower_derived_term, lower_encoded_range, lower_encoded_term,
+        render_encoded_value, render_exponential_buckets, render_profile_field, unescape_attribute_key,
     };
     use crate::opensearch::catalog::SelectedField;
     use crate::opensearch::catalog::data_prepper::{DATA_PREPPER_SPAN_INDEX, DATA_PREPPER_TABLE};
+    use crate::opensearch::catalog::ss4o::find_ss4o_table;
     use crate::opensearch::error::{OpenSearchError, render_envelope};
     use crate::query_dsl::ast::RangeBound;
     use crate::query_dsl::date_math::{BoundSide, DateFormat, resolve_date_bound};
@@ -2096,5 +2813,190 @@ mod tests {
             assert_eq!(cause["field"], expected_field, "{body}");
             assert_eq!(cause["index"], INDEX, "{body}");
         }
+    }
+
+    /// Bucket `k` covers `(base^(offset+k), base^(offset+k+1)]` with `base = 2^(2^-scale)`; a
+    /// negative bucket mirrors it. Scales 0 and -1 give bases 2 and 4, whose bounds are exact
+    /// powers of two, stated here by hand.
+    #[test]
+    fn exponential_bucket_bounds_follow_the_scale_and_the_offset() {
+        let cases: [((i32, i32, usize, bool), (f64, f64)); 7] = [
+            ((0, -1, 0, false), (0.5, 1.0)),
+            ((0, -1, 1, false), (1.0, 2.0)),
+            ((0, 2, 0, false), (4.0, 8.0)),
+            ((-1, 1, 0, false), (4.0, 16.0)),
+            ((-1, -1, 0, false), (0.25, 1.0)),
+            ((0, 0, 0, true), (-2.0, -1.0)),
+            ((0, 0, 2, true), (-8.0, -4.0)),
+        ];
+        for ((scale, offset, index, is_negative), (min, max)) in cases {
+            let bounds = compute_exponential_bucket_bounds(scale, offset, index, is_negative).expect("in range");
+            assert_eq!(
+                bounds,
+                (min, max),
+                "scale {scale} offset {offset} bucket {index} negative {is_negative}"
+            );
+        }
+    }
+
+    /// The overflow boundary of the bucket exponent `offset + index + 1`: one below it is the last
+    /// bucket that has bounds (infinite at that exponent, so only their presence is stated), at it
+    /// the exponent overflows, and an index beyond `i32` has no exponent at all.
+    #[test]
+    fn exponential_bucket_bounds_end_where_the_bucket_exponent_overflows() {
+        assert!(compute_exponential_bucket_bounds(0, i32::MAX - 1, 0, false).is_some());
+        assert_eq!(compute_exponential_bucket_bounds(0, i32::MAX, 0, false), None);
+        assert_eq!(compute_exponential_bucket_bounds(0, 0, usize::MAX, false), None);
+    }
+
+    /// A NULL bucket count is absent from its bucket, which keeps its bounds, as a NULL quantile
+    /// member is absent. The stored count element is required, so the list here is built by hand
+    /// with a nullable element: scale 0 and offset -1 give buckets `(2^-1, 2^0]`, `(2^0, 2^1]`
+    /// and `(2^1, 2^2]`.
+    #[test]
+    fn a_null_exponential_bucket_count_is_absent_and_its_bounds_stay() {
+        let counts: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([Some([
+            Some(3),
+            None,
+            Some(5),
+        ])]));
+        let schema = Schema::new(vec![
+            Field::new(COL_SCALE, DataType::Int32, true),
+            Field::new(COL_POSITIVE_OFFSET, DataType::Int32, true),
+            Field::new(COL_POSITIVE_BUCKET_COUNTS, counts.data_type().clone(), true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(vec![0])),
+                Arc::new(Int32Array::from(vec![-1])),
+                counts,
+            ],
+        )
+        .expect("a batch");
+
+        let buckets = render_exponential_buckets(&batch, 0, COL_POSITIVE_BUCKET_COUNTS, COL_POSITIVE_OFFSET, false)
+            .expect("buckets");
+
+        assert_eq!(
+            buckets,
+            json!([
+                {"count": 3, "min": 0.5, "max": 1.0},
+                {"min": 1.0, "max": 2.0},
+                {"count": 5, "min": 2.0, "max": 4.0}
+            ])
+        );
+    }
+
+    /// A metrics row of `tenant` at `T0` named `name`, of `metric_type`, with `cells`.
+    fn build_metric_row<'a>(
+        tenant: &'a str,
+        name: &'a str,
+        metric_type: &'a str,
+        mut cells: Vec<(&'a str, TestCell<'a>)>,
+    ) -> TestRow<'a> {
+        cells.extend([
+            (COL_TIMESTAMP, TestCell::Micros(T0)),
+            (COL_INGESTED_TIMESTAMP, TestCell::Micros(T0)),
+            (COL_METRIC_NAME, TestCell::Text(name)),
+            (COL_METRIC_TYPE, TestCell::Text(metric_type)),
+        ]);
+        TestRow { tenant, cells }
+    }
+
+    /// `fields` and `docvalue_fields` render the derived and bucket fields of the metrics
+    /// profile from the committed row: exponential buckets with their bounds at scale 0 (base 2,
+    /// positive offset -1 gives `(2^-1, 2^0]` and `(2^0, 2^1]`, negative offset 0 gives
+    /// `[-2^1, -2^0)`), list lengths with `0` for an empty list and absent for a NULL one, and
+    /// the metric value as a double from `value_int` and from `value_double`. Tenant B's row sits
+    /// in the same commit; tenant A's scan holds only its own four.
+    #[tokio::test]
+    async fn metrics_profile_fields_render_buckets_lengths_and_values_from_the_committed_row() {
+        let fixture = SearchFixture::new().await;
+        fixture
+            .commit_rows(
+                METRICS_TABLE,
+                &[
+                    build_metric_row(
+                        TENANT_A,
+                        "payload",
+                        "exponential_histogram",
+                        vec![
+                            (COL_SCALE, TestCell::Int(0)),
+                            (COL_POSITIVE_OFFSET, TestCell::Int(-1)),
+                            (COL_POSITIVE_BUCKET_COUNTS, TestCell::Longs(&[3, 5])),
+                            (COL_NEGATIVE_OFFSET, TestCell::Int(0)),
+                            (COL_NEGATIVE_BUCKET_COUNTS, TestCell::Longs(&[7])),
+                            (COL_BUCKET_COUNTS, TestCell::Longs(&[])),
+                        ],
+                    ),
+                    build_metric_row(
+                        TENANT_A,
+                        "latency",
+                        "histogram",
+                        vec![
+                            (COL_BUCKET_COUNTS, TestCell::Longs(&[1, 2, 3])),
+                            (COL_EXPLICIT_BOUNDS, TestCell::Doubles(&[0.5, 1.0])),
+                        ],
+                    ),
+                    build_metric_row(TENANT_A, "requests", "sum", vec![(COL_VALUE_INT, TestCell::Long(20))]),
+                    build_metric_row(
+                        TENANT_A,
+                        "ratio",
+                        "gauge",
+                        vec![(COL_VALUE_DOUBLE, TestCell::Double(0.5))],
+                    ),
+                    build_metric_row(
+                        TENANT_B,
+                        "latency",
+                        "gauge",
+                        vec![(COL_VALUE_DOUBLE, TestCell::Double(9.5))],
+                    ),
+                ],
+            )
+            .await;
+        let session = fixture.open_session(TENANT_A).await;
+        let entry = find_index_entry(&session, "ss4o_metrics-icegate-default");
+        let table = find_ss4o_table(METRICS_TABLE).expect("the ss4o metrics table");
+        let plan = session.scan_index(entry).expect("scan").build().expect("plan");
+
+        let batches = session.collect(plan).await.expect("rows");
+
+        let field_names = [
+            "name",
+            "positiveBuckets",
+            "negativeBuckets",
+            "bucketCount",
+            "explicitBoundsCount",
+            "value",
+        ];
+        let mut rendered_rows: Vec<Value> = Vec::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let mut rendered_fields = serde_json::Map::new();
+                for field_name in field_names {
+                    let value = render_profile_field(table, batch, row, field_name).expect(field_name);
+                    if !value.is_null() {
+                        rendered_fields.insert(field_name.to_string(), value);
+                    }
+                }
+                rendered_rows.push(Value::Object(rendered_fields));
+            }
+        }
+        rendered_rows.sort_by_key(|rendered_row| rendered_row["name"].to_string());
+        assert_eq!(
+            rendered_rows,
+            [
+                json!({"name": "latency", "bucketCount": 3, "explicitBoundsCount": 2}),
+                json!({
+                    "name": "payload",
+                    "positiveBuckets": [{"count": 3, "min": 0.5, "max": 1.0}, {"count": 5, "min": 1.0, "max": 2.0}],
+                    "negativeBuckets": [{"count": 7, "min": -2.0, "max": -1.0}],
+                    "bucketCount": 0
+                }),
+                json!({"name": "ratio", "value": 0.5}),
+                json!({"name": "requests", "value": 20.0}),
+            ]
+        );
     }
 }

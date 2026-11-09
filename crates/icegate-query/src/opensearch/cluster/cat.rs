@@ -534,12 +534,13 @@ mod tests {
 
     /// An index `uuid` is stable for one tenant and one index, and no two tenants or indices share
     /// one, so a client keying state by it never mixes two tenants' indices; two indices over one
-    /// table (`spans` and its span profile index) are two indices.
+    /// table (`spans` and its span profile indices) are two indices.
     #[test]
     fn index_uuids_differ_between_tenants_and_between_indices() {
         let index_set = IndexSet::from_table_names(["logs".to_string(), "spans".to_string()]);
-        let [logs_entry, span_profile_entry, spans_entry] =
-            <&[IndexEntry; 3]>::try_from(index_set.entries()).expect("logs, otel-v1-apm-span and spans");
+        let [logs_entry, span_profile_entry, spans_entry, _, ss4o_traces_entry] =
+            <&[IndexEntry; 5]>::try_from(index_set.entries())
+                .expect("logs, otel-v1-apm-span, spans and the ss4o logs and traces indices");
         let tenant_a = build_tenant("tenant-a");
         let tenant_b = build_tenant("tenant-b");
         let render_uuid = |entry: &IndexEntry, tenant: &TenantId| {
@@ -566,6 +567,15 @@ mod tests {
         assert_ne!(
             render_uuid(span_profile_entry, &tenant_a),
             render_uuid(spans_entry, &tenant_a)
+        );
+        assert_eq!(ss4o_traces_entry.name(), "ss4o_traces-icegate-default");
+        assert_ne!(
+            render_uuid(ss4o_traces_entry, &tenant_a),
+            render_uuid(spans_entry, &tenant_a)
+        );
+        assert_ne!(
+            render_uuid(ss4o_traces_entry, &tenant_a),
+            render_uuid(span_profile_entry, &tenant_a)
         );
     }
 

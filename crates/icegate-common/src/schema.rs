@@ -1477,41 +1477,42 @@ pub fn metrics_schema() -> Result<Schema> {
     let quantile_struct = Type::Struct(StructType::new(vec![
         Arc::new(NestedField::required(
             36,
-            "quantile",
+            QUANTILE_FIELD_QUANTILE,
             Type::Primitive(PrimitiveType::Double),
         )),
         Arc::new(NestedField::required(
             37,
-            "value",
+            QUANTILE_FIELD_VALUE,
             Type::Primitive(PrimitiveType::Double),
         )),
     ]));
 
-    // Exemplar struct for histogram/gauge/sum metrics
+    // Exemplar struct for histogram/gauge/sum metrics; its members share the names of the
+    // point columns they mirror.
     let exemplar_struct = Type::Struct(StructType::new(vec![
         Arc::new(NestedField::optional(
             38,
-            "timestamp",
+            COL_TIMESTAMP,
             Type::Primitive(PrimitiveType::Timestamp),
         )),
         Arc::new(NestedField::optional(
             39,
-            "value_double",
+            COL_VALUE_DOUBLE,
             Type::Primitive(PrimitiveType::Double),
         )),
         Arc::new(NestedField::optional(
             40,
-            "value_int",
+            COL_VALUE_INT,
             Type::Primitive(PrimitiveType::Long),
         )),
         Arc::new(NestedField::optional(
             41,
-            "span_id",
+            COL_SPAN_ID,
             Type::Primitive(PrimitiveType::Fixed(8)),
         )),
         Arc::new(NestedField::optional(
             42,
-            "trace_id",
+            COL_TRACE_ID,
             Type::Primitive(PrimitiveType::Fixed(16)),
         )),
         Arc::new(NestedField::required(43, COL_ATTRIBUTES, exemplar_attributes_map)),
@@ -1555,33 +1556,33 @@ pub fn metrics_schema() -> Result<Schema> {
             // Metric identification
             Arc::new(NestedField::required(
                 7,
-                "metric_name",
+                COL_METRIC_NAME,
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::required(
                 8,
-                "metric_type",
+                COL_METRIC_TYPE,
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
                 9,
-                "description",
+                COL_DESCRIPTION,
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
                 10,
-                "unit",
+                COL_UNIT,
                 Type::Primitive(PrimitiveType::String),
             )),
             // Metric metadata
             Arc::new(NestedField::optional(
                 11,
-                "aggregation_temporality",
+                COL_AGGREGATION_TEMPORALITY,
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
                 12,
-                "is_monotonic",
+                COL_IS_MONOTONIC,
                 Type::Primitive(PrimitiveType::Boolean),
             )),
             // Data-point attributes (OTLP `<X>DataPoint.attributes`). Renamed
@@ -1611,7 +1612,7 @@ pub fn metrics_schema() -> Result<Schema> {
             // Standard histogram fields
             Arc::new(NestedField::optional(
                 20,
-                "bucket_counts",
+                COL_BUCKET_COUNTS,
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     44,
                     Type::Primitive(PrimitiveType::Long),
@@ -1620,7 +1621,7 @@ pub fn metrics_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 21,
-                "explicit_bounds",
+                COL_EXPLICIT_BOUNDS,
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     45,
                     Type::Primitive(PrimitiveType::Double),
@@ -1628,7 +1629,11 @@ pub fn metrics_schema() -> Result<Schema> {
                 )))),
             )),
             // Exponential histogram fields
-            Arc::new(NestedField::optional(22, "scale", Type::Primitive(PrimitiveType::Int))),
+            Arc::new(NestedField::optional(
+                22,
+                COL_SCALE,
+                Type::Primitive(PrimitiveType::Int),
+            )),
             Arc::new(NestedField::optional(
                 23,
                 "zero_count",
@@ -1641,12 +1646,12 @@ pub fn metrics_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 25,
-                "positive_offset",
+                COL_POSITIVE_OFFSET,
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
                 26,
-                "positive_bucket_counts",
+                COL_POSITIVE_BUCKET_COUNTS,
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     46,
                     Type::Primitive(PrimitiveType::Long),
@@ -1655,12 +1660,12 @@ pub fn metrics_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 27,
-                "negative_offset",
+                COL_NEGATIVE_OFFSET,
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
                 28,
-                "negative_bucket_counts",
+                COL_NEGATIVE_BUCKET_COUNTS,
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     47,
                     Type::Primitive(PrimitiveType::Long),
@@ -1670,7 +1675,7 @@ pub fn metrics_schema() -> Result<Schema> {
             // Summary fields
             Arc::new(NestedField::optional(
                 29,
-                "quantile_values",
+                COL_QUANTILE_VALUES,
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     48,
                     quantile_struct,
@@ -1685,7 +1690,7 @@ pub fn metrics_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 31,
-                "exemplars",
+                COL_EXEMPLARS,
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     49,
                     exemplar_struct,
@@ -1749,7 +1754,7 @@ pub fn metrics_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
 /// - `service_instance_id` (ascending)
 /// - `timestamp` (descending) - recent-first ordering
 pub fn metrics_sort_order(schema: &Schema) -> Result<SortOrder> {
-    let metric_name_id_field = schema.field_by_name("metric_name").ok_or_else(|| {
+    let metric_name_id_field = schema.field_by_name(COL_METRIC_NAME).ok_or_else(|| {
         Error::new(
             ErrorKind::DataInvalid,
             "field 'metric_name' not found in metrics schema",
@@ -1925,6 +1930,61 @@ pub const COL_MIN: &str = "min";
 pub const COL_MAX: &str = "max";
 /// Metrics — exponential-histogram zero threshold (`DOUBLE`).
 pub const COL_ZERO_THRESHOLD: &str = "zero_threshold";
+/// Metrics — metric name (`STRING`).
+pub const COL_METRIC_NAME: &str = "metric_name";
+/// Metrics — metric type (`STRING`).
+///
+/// One of [`METRIC_TYPE_GAUGE`], [`METRIC_TYPE_SUM`], [`METRIC_TYPE_HISTOGRAM`],
+/// [`METRIC_TYPE_EXPONENTIAL_HISTOGRAM`] and [`METRIC_TYPE_SUMMARY`].
+pub const COL_METRIC_TYPE: &str = "metric_type";
+/// Metrics — metric description (`STRING`).
+pub const COL_DESCRIPTION: &str = "description";
+/// Metrics — metric unit (`STRING`).
+pub const COL_UNIT: &str = "unit";
+/// Metrics — aggregation temporality (`STRING`).
+///
+/// [`AGGREGATION_TEMPORALITY_DELTA`], [`AGGREGATION_TEMPORALITY_CUMULATIVE`], or NULL for a
+/// metric type without one.
+pub const COL_AGGREGATION_TEMPORALITY: &str = "aggregation_temporality";
+/// Metrics — whether a sum is monotonic (`BOOLEAN`).
+pub const COL_IS_MONOTONIC: &str = "is_monotonic";
+/// Metrics — exponential-histogram scale (`INT`).
+pub const COL_SCALE: &str = "scale";
+/// Metrics — exponential-histogram positive bucket offset (`INT`).
+pub const COL_POSITIVE_OFFSET: &str = "positive_offset";
+/// Metrics — exponential-histogram negative bucket offset (`INT`).
+pub const COL_NEGATIVE_OFFSET: &str = "negative_offset";
+/// Metrics — histogram bucket counts (`List<BIGINT>`).
+pub const COL_BUCKET_COUNTS: &str = "bucket_counts";
+/// Metrics — histogram explicit bounds (`List<DOUBLE>`).
+pub const COL_EXPLICIT_BOUNDS: &str = "explicit_bounds";
+/// Metrics — exponential-histogram positive bucket counts (`List<BIGINT>`).
+pub const COL_POSITIVE_BUCKET_COUNTS: &str = "positive_bucket_counts";
+/// Metrics — exponential-histogram negative bucket counts (`List<BIGINT>`).
+pub const COL_NEGATIVE_BUCKET_COUNTS: &str = "negative_bucket_counts";
+/// Metrics — summary quantiles (`List<Struct>`), each element
+/// `{QUANTILE_FIELD_QUANTILE, QUANTILE_FIELD_VALUE}`.
+pub const COL_QUANTILE_VALUES: &str = "quantile_values";
+/// Metrics — exemplars (`List<Struct>`).
+pub const COL_EXEMPLARS: &str = "exemplars";
+/// Metrics — the quantile member of a `quantile_values` element (`DOUBLE`).
+pub const QUANTILE_FIELD_QUANTILE: &str = "quantile";
+/// Metrics — the value member of a `quantile_values` element (`DOUBLE`).
+pub const QUANTILE_FIELD_VALUE: &str = "value";
+/// Metrics — the [`COL_METRIC_TYPE`] of an `OTel` gauge.
+pub const METRIC_TYPE_GAUGE: &str = "gauge";
+/// Metrics — the [`COL_METRIC_TYPE`] of an `OTel` sum.
+pub const METRIC_TYPE_SUM: &str = "sum";
+/// Metrics — the [`COL_METRIC_TYPE`] of an `OTel` explicit-bucket histogram.
+pub const METRIC_TYPE_HISTOGRAM: &str = "histogram";
+/// Metrics — the [`COL_METRIC_TYPE`] of an `OTel` exponential histogram.
+pub const METRIC_TYPE_EXPONENTIAL_HISTOGRAM: &str = "exponential_histogram";
+/// Metrics — the [`COL_METRIC_TYPE`] of an `OTel` summary.
+pub const METRIC_TYPE_SUMMARY: &str = "summary";
+/// Metrics — the [`COL_AGGREGATION_TEMPORALITY`] of a delta point.
+pub const AGGREGATION_TEMPORALITY_DELTA: &str = "DELTA";
+/// Metrics — the [`COL_AGGREGATION_TEMPORALITY`] of a cumulative point.
+pub const AGGREGATION_TEMPORALITY_CUMULATIVE: &str = "CUMULATIVE";
 /// Grafana-compatible alias for [`COL_SEVERITY_TEXT`].
 pub const LEVEL_ALIAS: &str = "level";
 
@@ -2935,6 +2995,77 @@ mod tests {
         assert_eq!(
             tenant_scoped_tables,
             ["logs", "spans", "events", "metrics", "operations"]
+        );
+    }
+
+    /// Every metrics column constant names a column of the metrics schema, spelled as written
+    /// here; the quantile members name the members of the `quantile_values` element struct, and
+    /// the exemplar struct names its members with the point-column constants they mirror.
+    #[test]
+    fn every_metrics_column_constant_names_a_column_of_the_metrics_schema() {
+        let schema = metrics_schema().expect("metrics schema");
+        let constants = [
+            (COL_METRIC_NAME, "metric_name"),
+            (COL_METRIC_TYPE, "metric_type"),
+            (COL_DESCRIPTION, "description"),
+            (COL_UNIT, "unit"),
+            (COL_AGGREGATION_TEMPORALITY, "aggregation_temporality"),
+            (COL_IS_MONOTONIC, "is_monotonic"),
+            (COL_SCALE, "scale"),
+            (COL_POSITIVE_OFFSET, "positive_offset"),
+            (COL_NEGATIVE_OFFSET, "negative_offset"),
+            (COL_BUCKET_COUNTS, "bucket_counts"),
+            (COL_EXPLICIT_BOUNDS, "explicit_bounds"),
+            (COL_POSITIVE_BUCKET_COUNTS, "positive_bucket_counts"),
+            (COL_NEGATIVE_BUCKET_COUNTS, "negative_bucket_counts"),
+            (COL_QUANTILE_VALUES, "quantile_values"),
+            (COL_EXEMPLARS, "exemplars"),
+        ];
+        for (constant, spelled_name) in constants {
+            assert_eq!(constant, spelled_name);
+            assert!(schema.field_by_name(constant).is_some(), "metrics lacks `{constant}`");
+        }
+
+        let quantiles = schema.field_by_name(COL_QUANTILE_VALUES).expect("quantile_values");
+        let Type::List(list) = quantiles.field_type.as_ref() else {
+            panic!("quantile_values is a list");
+        };
+        let Type::Struct(element) = list.element_field.field_type.as_ref() else {
+            panic!("quantile_values holds structs");
+        };
+        let members: Vec<&str> = element.fields().iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(members, [QUANTILE_FIELD_QUANTILE, QUANTILE_FIELD_VALUE]);
+        assert_eq!((QUANTILE_FIELD_QUANTILE, QUANTILE_FIELD_VALUE), ("quantile", "value"));
+
+        let exemplars = schema.field_by_name(COL_EXEMPLARS).expect("exemplars");
+        let Type::List(list) = exemplars.field_type.as_ref() else {
+            panic!("exemplars is a list");
+        };
+        let Type::Struct(element) = list.element_field.field_type.as_ref() else {
+            panic!("exemplars holds structs");
+        };
+        let members: Vec<&str> = element.fields().iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(
+            members,
+            [
+                COL_TIMESTAMP,
+                COL_VALUE_DOUBLE,
+                COL_VALUE_INT,
+                COL_SPAN_ID,
+                COL_TRACE_ID,
+                COL_ATTRIBUTES
+            ]
+        );
+        assert_eq!(
+            members,
+            [
+                "timestamp",
+                "value_double",
+                "value_int",
+                "span_id",
+                "trace_id",
+                "attributes"
+            ]
         );
     }
 }

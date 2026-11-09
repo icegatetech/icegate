@@ -501,14 +501,21 @@ enum ProfileLeaf<'q> {
 ///
 /// # Errors
 ///
-/// A term pattern on an encoded or derived field is the query-shard 400 of a term pattern on a
-/// typed field; otherwise the errors of the field's lowering. Each refusal names the field as the
-/// request did (`field.name`), never the column behind it.
+/// A leaf on a render-only field (see [`EncodedField::is_render_only`]), or on a path below one,
+/// is [`OpenSearchError::render_only_field`]; a term pattern on another encoded or derived field
+/// is the query-shard 400 of a term pattern on a typed field; otherwise the errors of the field's
+/// lowering. Each refusal names the field as the request did (`field.name`), never the column
+/// behind it.
 fn lower_profile_leaf(
     field: &ResolvedField,
     leaf: ProfileLeaf<'_>,
     scope: &LoweringScope<'_>,
 ) -> Result<Option<Expr>, OpenSearchError> {
+    if let FieldValue::Encoded(encoded_field) = &field.value
+        && encoded_field.is_render_only()
+    {
+        return Err(OpenSearchError::render_only_field(&field.name));
+    }
     let index = scope.entry.name();
     let lowered_predicate = match (&field.value, leaf) {
         (FieldValue::Column { .. } | FieldValue::MapKey { .. } | FieldValue::HexId { .. }, _) => return Ok(None),
@@ -754,7 +761,7 @@ fn lower_keyword_range(
 }
 
 /// The side a range bound is on.
-const fn classify_bound_side(is_lower: bool, bound: &RangeBound) -> BoundSide {
+pub(crate) const fn classify_bound_side(is_lower: bool, bound: &RangeBound) -> BoundSide {
     match (is_lower, bound.is_inclusive) {
         (true, true) => BoundSide::LowerInclusive,
         (true, false) => BoundSide::LowerExclusive,

@@ -7,6 +7,7 @@ use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, 
 
 use super::data_prepper::DATA_PREPPER_SPAN_INDEX;
 use super::expression::{ExpressionPart, IndexExpression, Selection, has_wildcard};
+use super::ss4o::{SS4O_LOGS_INDEX, SS4O_METRICS_INDEX, SS4O_TRACES_INDEX};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::extract::ExpandWildcards;
 use crate::opensearch::glob::matches_glob;
@@ -57,6 +58,8 @@ pub(crate) enum Profile {
     Native,
     /// The Data Prepper span index: camel-case names, hex ids, enum names, nested `_source`.
     DataPrepper,
+    /// The ss4o logs, traces and metrics indices.
+    Ss4o,
 }
 
 impl Profile {
@@ -65,13 +68,19 @@ impl Profile {
         match self {
             Self::Native => "native",
             Self::DataPrepper => "data_prepper",
+            Self::Ss4o => "ss4o",
         }
     }
 }
 
 /// The indices a non-native profile serves: index name, the table it reads, its profile. Each is
 /// listed when its table is, and is wildcard-visible.
-const PROFILE_INDICES: [(&str, &str, Profile); 1] = [(DATA_PREPPER_SPAN_INDEX, SPANS_TABLE, Profile::DataPrepper)];
+const PROFILE_INDICES: [(&str, &str, Profile); 4] = [
+    (DATA_PREPPER_SPAN_INDEX, SPANS_TABLE, Profile::DataPrepper),
+    (SS4O_LOGS_INDEX, LOGS_TABLE, Profile::Ss4o),
+    (SS4O_TRACES_INDEX, SPANS_TABLE, Profile::Ss4o),
+    (SS4O_METRICS_INDEX, METRICS_TABLE, Profile::Ss4o),
+];
 
 /// Something an index expression selects by name: a data index, or a system index or alias name.
 trait SelectableIndex {
@@ -422,7 +431,17 @@ mod tests {
 
     #[test]
     fn star_selects_registry_indices_in_name_order_but_no_exact_name_table() {
-        let visible_names = ["events", "logs", "metrics", "operations", "otel-v1-apm-span", "spans"];
+        let visible_names = [
+            "events",
+            "logs",
+            "metrics",
+            "operations",
+            "otel-v1-apm-span",
+            "spans",
+            "ss4o_logs-icegate-default",
+            "ss4o_metrics-icegate-default",
+            "ss4o_traces-icegate-default",
+        ];
         assert_eq!(resolve_names("*", build_search_options()), visible_names);
         assert_eq!(resolve_names("_all", build_search_options()), visible_names);
         assert_eq!(resolve_names("", build_search_options()), visible_names);
@@ -440,7 +459,8 @@ mod tests {
 
     /// A table reached through two profiles is read twice only when each of its indices is
     /// named: a wildcard reaching `spans` and `otel-v1-apm-span` is refused naming the
-    /// expression, the table and both profiles, while naming both, or excluding one, resolves.
+    /// expression, the first such table in name order and its profiles in index-name order,
+    /// while naming both, or excluding all but one, resolves.
     #[tokio::test]
     async fn a_table_reached_through_two_profiles_needs_every_index_named() {
         let index_set = build_index_set();
@@ -453,14 +473,24 @@ mod tests {
                 .map(|entries| entries.into_iter().map(|entry| entry.name().to_string()).collect::<Vec<_>>())
         };
 
-        for text in ["*", "_all", "", "sp*,otel*", "spans,otel*", "otel*,s*", "*,-logs"] {
+        let refusals = [
+            ("*", "logs", json!(["native", "ss4o"])),
+            ("_all", "logs", json!(["native", "ss4o"])),
+            ("", "logs", json!(["native", "ss4o"])),
+            ("sp*,otel*", "spans", json!(["data_prepper", "native"])),
+            ("spans,otel*", "spans", json!(["data_prepper", "native"])),
+            ("otel*,s*", "spans", json!(["data_prepper", "native", "ss4o"])),
+            ("*,-logs", "metrics", json!(["native", "ss4o"])),
+            ("*,-otel*", "logs", json!(["native", "ss4o"])),
+        ];
+        for (text, table, profiles) in refusals {
             let (status, body) = render_envelope(resolve_entry_names(text).expect_err(text)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{text:?}");
             for cause in [&body["error"], &body["error"]["root_cause"][0]] {
                 assert_eq!(cause["type"], "illegal_argument_exception", "{text:?}");
                 assert_eq!(cause["index"], text, "{text:?}");
-                assert_eq!(cause["table"], "spans", "{text:?}");
-                assert_eq!(cause["profiles"], json!(["data_prepper", "native"]), "{text:?}");
+                assert_eq!(cause["table"], table, "{text:?}");
+                assert_eq!(cause["profiles"], profiles, "{text:?}");
             }
         }
         assert_eq!(
@@ -472,7 +502,7 @@ mod tests {
             ["events", "logs", "metrics", "operations", "otel-v1-apm-span"]
         );
         assert_eq!(
-            resolve_entry_names("*,-otel*").expect("one profile of each table left"),
+            resolve_entry_names("*,-otel*,-ss4o*").expect("one profile of each table left"),
             ["events", "logs", "metrics", "operations", "spans"]
         );
         assert_eq!(
@@ -579,8 +609,10 @@ mod tests {
     async fn dot_prefixed_table_names_are_not_data_indices() {
         let index_set = IndexSet::from_table_names([".kibana".to_string(), "logs".to_string()]);
 
+        // The listing, not `resolve`: `*` reaches `logs` through two profiles, which only a read
+        // refuses, and this test is about which names a wildcard selects.
         let wildcard_entries = index_set
-            .resolve(
+            .resolve_listing(
                 &IndexExpression::parse("*").expect("a valid expression"),
                 build_search_options(),
             )
@@ -594,7 +626,7 @@ mod tests {
 
         assert_eq!(
             wildcard_entries.iter().map(|entry| entry.name()).collect::<Vec<_>>(),
-            ["logs"]
+            ["logs", "ss4o_logs-icegate-default"]
         );
         let (status, body) = render_envelope(exact_name_error).await;
         assert_eq!(status, StatusCode::NOT_FOUND);

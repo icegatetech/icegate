@@ -579,6 +579,14 @@ impl OpenSearchError {
         .with_metadata("index", index)
     }
 
+    /// A query leaf on the field `field`, or on a path below it, that renders in `_source` only
+    /// and has no filter inverse (`400`); `field` is the name the request used, carried for a
+    /// client.
+    pub(crate) fn render_only_field(field: &str) -> Self {
+        Self::illegal_argument(format!("field [{field}] renders in _source only and cannot be queried"))
+            .with_metadata("field", field)
+    }
+
     /// The index expression `expression` reaches the table `table` through the indices of several
     /// `profiles` without naming each of them (`400`), so a wildcard would return one row more
     /// than once. `index` (the expression), `table` and `profiles` (in the indices' name order)

@@ -3,12 +3,19 @@
 use std::collections::BTreeSet;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use icegate_common::matches_wire_name;
-use icegate_common::schema::{COL_BODY, COL_RESOURCE_ATTRIBUTES, COL_TENANT_ID, promoted_resource_keys};
+use icegate_common::schema::{
+    COL_BODY, COL_RESOURCE_ATTRIBUTES, COL_TENANT_ID, COL_VALUE_INT, PromotedResourceKey, promoted_resource_keys,
+};
+use icegate_common::{METRICS_TABLE, matches_wire_name};
 
+use super::encoding::DerivedField;
 use super::field::{FieldType, FieldValue, IndexField, ResolvedField};
 use super::map_key_cache::MapKeys;
 use crate::opensearch::error::OpenSearchError;
+
+/// The derived metrics field `value`: a point's value whether it was recorded as an integer or a
+/// double.
+pub(crate) const METRIC_VALUE_FIELD: &str = "value";
 
 /// The fields of a table whose client-visible Arrow schema is `schema`, in schema column order.
 /// The tenant scope has already removed `tenant_id` from that schema.
@@ -41,6 +48,31 @@ pub(crate) fn list_native_fields(schema: &Schema, map_keys: &MapKeys) -> Result<
         }
     }
     Ok(fields)
+}
+
+/// List the derived fields of the native table `table` after their sources: `metrics` gains
+/// `value` (`double`) right after `value_int`, or last when the table lacks that column.
+pub(super) fn add_metric_value_field(table: &str, fields: &mut Vec<IndexField>) {
+    if table != METRICS_TABLE {
+        return;
+    }
+    let position = fields
+        .iter()
+        .position(|field| field.name == COL_VALUE_INT)
+        .map_or(fields.len(), |index| index + 1);
+    fields.insert(
+        position,
+        IndexField::leaf(METRIC_VALUE_FIELD.to_string(), FieldType::Double, None),
+    );
+}
+
+/// The resource attribute `key` that `table` promotes to a column, matched as stored (dotted) or
+/// in its underscored wire spelling, the way ingest moves it; `None` for a key the table keeps in
+/// its resource map.
+pub(super) fn find_promoted_resource_key(table: &str, key: &str) -> Option<&'static PromotedResourceKey> {
+    promoted_resource_keys(table)
+        .iter()
+        .find(|promoted| promoted.attribute_key == key || matches_wire_name(promoted.attribute_key, key))
 }
 
 /// The `OpenSearch` type of a native column, the one mapping every surface types columns by.
@@ -83,12 +115,21 @@ pub(crate) fn native_column_type(field: &Field) -> Result<FieldType, OpenSearchE
 /// `<map>.<key>` resolves to the stored key `<key>` of the MAP column `<map>` with no
 /// enumeration, so an unlisted key still filters. A `resource_attributes` key that `table`
 /// promotes to a column (dotted or underscored, the way ingest moves it) resolves to that column.
-/// `tenant_id`, an unknown name and an empty key resolve to nothing. A column of a type no
-/// `OpenSearch` type represents names no field either, so it resolves to nothing here; a query
-/// leaf tells it from an unknown name by the column's type and refuses it.
+/// On `metrics`, `value` resolves to the derived metric value, the field [`add_metric_value_field`]
+/// lists; the metrics schema has no column of that name. `tenant_id`, an unknown name and an empty
+/// key resolve to nothing. A column of a type no `OpenSearch` type represents names no field
+/// either, so it resolves to nothing here; a query leaf tells it from an unknown name by the
+/// column's type and refuses it.
 pub(super) fn resolve_native_field(schema: &Schema, table: &str, name: &str) -> Option<ResolvedField> {
     if name == COL_TENANT_ID {
         return None;
+    }
+    if table == METRICS_TABLE && name == METRIC_VALUE_FIELD {
+        return Some(ResolvedField {
+            name: name.to_string(),
+            field_type: FieldType::Double,
+            value: FieldValue::Derived(DerivedField::MetricValue),
+        });
     }
     if let Ok(field) = schema.field_with_name(name) {
         return resolve_column(field, name);
@@ -98,9 +139,7 @@ pub(super) fn resolve_native_field(schema: &Schema, table: &str, name: &str) -> 
         return None;
     }
     if column == COL_RESOURCE_ATTRIBUTES
-        && let Some(promoted) = promoted_resource_keys(table)
-            .iter()
-            .find(|promoted| promoted.attribute_key == key || matches_wire_name(promoted.attribute_key, key))
+        && let Some(promoted) = find_promoted_resource_key(table, key)
     {
         let promoted_field = schema.field_with_name(promoted.column).ok()?;
         return resolve_column(promoted_field, name);

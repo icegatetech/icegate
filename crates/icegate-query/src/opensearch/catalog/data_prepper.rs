@@ -4,6 +4,7 @@
 //! its `OTel` name, times are RFC 3339 text, and `_source` is a nested object. Attribute keys write
 //! each `.` as `@`, so a dotted stored key stays one property when the document is split on dots.
 
+use icegate_common::SPANS_TABLE;
 use icegate_common::schema::{
     COL_DROPPED_ATTRIBUTES_COUNT, COL_DROPPED_EVENTS_COUNT, COL_DROPPED_LINKS_COUNT, COL_END_TIMESTAMP, COL_KIND,
     COL_NAME, COL_PARENT_SPAN_ID, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME, COL_SPAN_ATTRIBUTES,
@@ -64,6 +65,7 @@ pub(super) const SPAN_FIELDS: [(&str, ProfileFieldSource); 24] = [
 
 /// The field table of `otel-v1-apm-span`.
 pub(crate) static DATA_PREPPER_TABLE: ProfileTable = ProfileTable {
+    table: SPANS_TABLE,
     fields: &[&SPAN_FIELDS],
     attribute_keys: AttributeKeys::Escaped,
 };

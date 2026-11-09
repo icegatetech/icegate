@@ -170,6 +170,10 @@ pub enum Cell<'a> {
     /// The elements of a list of structs, each element given by its cells, which fill the
     /// struct's members by name like a [`Row`]'s cells fill a table's columns.
     Structs(&'a [&'a [(&'a str, Self)]]),
+    /// The elements of a `LIST<BIGINT>` column, in stored order; `&[]` is the empty list.
+    Longs(&'a [i64]),
+    /// The elements of a `LIST<DOUBLE>` column, in stored order; `&[]` is the empty list.
+    Doubles(&'a [f64]),
 }
 
 /// One table row with explicit values: its tenant and the cells it sets. Every other column is
@@ -385,10 +389,11 @@ fn build_rows_column(field: &Field, rows: &[Row<'_>]) -> Result<ArrayRef, RowWri
     Ok(column)
 }
 
-/// A list column: `Structs` cells give each row's elements; a row without a cell is NULL when the
-/// column is nullable and empty otherwise. A struct element's cells fill the struct's members by
-/// name, recursively, with the defaults of [`build_rows_column`]. A list of any other element type
-/// takes no cells. Panics on a cell of another kind.
+/// A list column: `Structs`, `Longs` or `Doubles` cells give each row's elements, by the list's
+/// element type; a row without a cell is NULL when the column is nullable and empty otherwise. A
+/// struct element's cells fill the struct's members by name, recursively, with the defaults of
+/// [`build_rows_column`]. A list of any other element type takes no cells. Panics on a cell of
+/// another kind.
 ///
 /// # Errors
 ///
@@ -406,18 +411,28 @@ fn build_list_column(
     let mut validity: Vec<bool> = Vec::with_capacity(rows.len());
     // The struct elements borrow from `rows` only, so they live as long as the slice.
     let mut elements: Vec<Row<'_>> = Vec::new();
+    let mut long_elements: Vec<i64> = Vec::new();
+    let mut double_elements: Vec<f64> = Vec::new();
     for row in rows {
         let cell = find_row_cell(row, name).copied();
-        let element_count = match cell {
-            Some(Cell::Structs(values)) => {
+        let element_count = match (cell, item.data_type()) {
+            (Some(Cell::Structs(values)), DataType::Struct(_)) => {
                 elements.extend(values.iter().map(|cells| Row {
                     tenant: row.tenant,
                     cells: cells.to_vec(),
                 }));
                 values.len()
             }
-            None => 0,
-            Some(_) => panic!("`{name}` takes Structs"),
+            (Some(Cell::Longs(values)), DataType::Int64) => {
+                long_elements.extend_from_slice(values);
+                values.len()
+            }
+            (Some(Cell::Doubles(values)), DataType::Float64) => {
+                double_elements.extend_from_slice(values);
+                values.len()
+            }
+            (None, _) => 0,
+            (Some(_), element_type) => panic!("`{name}` takes no cell of this kind for {element_type} elements"),
         };
         validity.push(cell.is_some() || is_required);
         end_offset = end_offset
@@ -433,6 +448,8 @@ fn build_list_column(
                 .collect::<Result<Vec<ArrayRef>, RowWriteError>>()?;
             Arc::new(StructArray::try_new(members.clone(), member_columns, None)?)
         }
+        DataType::Int64 => Arc::new(Int64Array::from(long_elements)),
+        DataType::Float64 => Arc::new(Float64Array::from(double_elements)),
         other => {
             assert_no_cells(rows, name);
             new_empty_array(other)

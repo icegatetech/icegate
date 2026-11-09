@@ -50,7 +50,7 @@ use crate::error::QueryError;
 use crate::opensearch::SearchLimitsConfig;
 use crate::opensearch::catalog::{
     EncodedField, FieldType, FieldValue, IndexEntry, ProfileTable, ResolvedField, TenantSession, find_profile_table,
-    native_column_type, render_profile_field,
+    native_column_type, render_derived_value, render_profile_field,
 };
 use crate::opensearch::context::RequestContext;
 use crate::opensearch::error::OpenSearchError;
@@ -1785,12 +1785,12 @@ const fn decide_profile_field_read(
 ///
 /// # Errors
 ///
-/// Returns `500` for a value [`render_field_value`], [`render_array_value`] or
-/// [`render_profile_field`] cannot render, a column of a type no `OpenSearch` type represents, a
-/// MAP column that is not a MAP of `Utf8` keys, a resolved column the hit's batch does not hold
-/// (the batch holds every column of the index's table, so a missing one is a broken invariant,
-/// not a missing value), and a plan without the hit's index; and the 400 of
-/// [`render_profile_field`] for a stored attribute key its profile cannot spell.
+/// Returns `500` for a value [`render_field_value`], [`render_array_value`],
+/// [`render_derived_value`] or [`render_profile_field`] cannot render, a column of a type no
+/// `OpenSearch` type represents, a MAP column that is not a MAP of `Utf8` keys, a resolved column
+/// the hit's batch does not hold (the batch holds every column of the index's table, so a missing
+/// one is a broken invariant, not a missing value), and a plan without the hit's index; and the
+/// 400 of [`render_profile_field`] for a stored attribute key its profile cannot spell.
 fn render_field_values(
     session: &TenantSession,
     candidate: &Candidate<'_>,
@@ -1843,8 +1843,12 @@ fn render_field_values(
                     .map(|entry| render_array_value(map_values.as_ref(), entry))
                     .transpose()?
             }
-            // A native index resolves no encoded or derived field.
-            FieldValue::Encoded(_) | FieldValue::Derived(_) => None,
+            // The metrics `value` is the one derived field of a native index; it renders from its row.
+            FieldValue::Derived(derived_field) => {
+                Some(render_derived_value(*derived_field, batch, row)?).filter(|value| !value.is_null())
+            }
+            // A native index resolves no encoded field.
+            FieldValue::Encoded(_) => None,
         };
         if let Some(value) = value {
             values.insert(field_request.field.clone(), json!([value]));

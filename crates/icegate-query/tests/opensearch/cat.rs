@@ -101,7 +101,8 @@ async fn cat_indices_counts_only_the_requesting_tenants_rows() {
 /// Without an expression every index the tenant sees is listed, in name order, exact-name tables
 /// included: the global `prices` table counted whole (empty here) and its views
 /// `prices_effective` and `prices_effective_by_time_of_day`, whose counts are null. The span
-/// profile index `otel-v1-apm-span` is listed beside `spans`, the table it reads and counts.
+/// profile index `otel-v1-apm-span` is listed beside `spans`, the table it reads and counts, and
+/// so are the three ss4o indices beside `logs`, `metrics` and `spans`.
 #[tokio::test]
 async fn cat_indices_without_an_expression_lists_exact_name_tables_and_a_view_count_as_null() {
     let (server, _catalog) = TestServer::start().await;
@@ -122,7 +123,10 @@ async fn cat_indices_without_an_expression_lists_exact_name_tables_and_a_view_co
             {"index": "prices", "docs.count": "0"},
             {"index": "prices_effective", "docs.count": null},
             {"index": "prices_effective_by_time_of_day", "docs.count": null},
-            {"index": "spans", "docs.count": "0"}
+            {"index": "spans", "docs.count": "0"},
+            {"index": "ss4o_logs-icegate-default", "docs.count": "0"},
+            {"index": "ss4o_metrics-icegate-default", "docs.count": "0"},
+            {"index": "ss4o_traces-icegate-default", "docs.count": "0"}
         ])
     );
     server.shutdown().await;
@@ -302,7 +306,7 @@ async fn cat_indices_with_an_h_list_renders_exactly_those_columns_in_that_order(
 
     assert_eq!(status, 200);
     let rows = body.as_array().expect("rows");
-    assert_eq!(rows.len(), 9);
+    assert_eq!(rows.len(), 12);
     for row in rows {
         let columns: Vec<&str> = row.as_object().expect("a row object").keys().map(String::as_str).collect();
         assert_eq!(columns, ["index", "status", "health", "docs.count"], "{row}");

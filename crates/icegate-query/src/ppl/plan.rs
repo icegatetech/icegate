@@ -2464,7 +2464,8 @@ fn find_promoted_column(name: &str, scope: &ExpressionScope<'_>) -> Result<Optio
         .map(
             |entry| match source.session.resolve_field(entry, name).map(|field| field.value) {
                 Some(FieldValue::Column { column }) if column != name => Some(column),
-                // A native index, the only one PPL reads, resolves no encoded or derived field.
+                // A native index, the only one PPL reads, resolves no encoded field, and its one
+                // derived field, the metrics `value`, is no promoted column.
                 Some(
                     FieldValue::Column { .. }
                     | FieldValue::MapKey { .. }

@@ -704,7 +704,17 @@ async fn resolve_and_cat_indices_list_a_system_index_only_when_hidden_indices_ar
     };
     assert_eq!(
         list_index_names(&open_resolution),
-        ["events", "logs", "metrics", "operations", "otel-v1-apm-span", "spans"]
+        [
+            "events",
+            "logs",
+            "metrics",
+            "operations",
+            "otel-v1-apm-span",
+            "spans",
+            "ss4o_logs-icegate-default",
+            "ss4o_metrics-icegate-default",
+            "ss4o_traces-icegate-default"
+        ]
     );
     assert_eq!(open_resolution["aliases"], json!([]));
     assert_eq!(
@@ -716,7 +726,10 @@ async fn resolve_and_cat_indices_list_a_system_index_only_when_hidden_indices_ar
             "metrics",
             "operations",
             "otel-v1-apm-span",
-            "spans"
+            "spans",
+            "ss4o_logs-icegate-default",
+            "ss4o_metrics-icegate-default",
+            "ss4o_traces-icegate-default"
         ]
     );
     assert_eq!(

@@ -1,17 +1,22 @@
-//! The Data Prepper span profile over real HTTP. Every row is written with explicit values and
-//! every expected document, field list and row set is stated here.
+//! The Data Prepper and ss4o profiles over real HTTP, and the derived metrics `value` of the
+//! native `metrics` index. Every row is written with explicit values and every expected document,
+//! field list and row set is stated here.
 #![allow(clippy::expect_used)]
 
 use std::error::Error;
 use std::sync::Arc;
 
 use iceberg::Catalog;
-use icegate_common::SPANS_TABLE;
 use icegate_common::schema::{
-    COL_ATTRIBUTES, COL_DROPPED_ATTRIBUTES_COUNT, COL_DURATION_MICROS, COL_END_TIMESTAMP, COL_EVENTS,
-    COL_INGESTED_TIMESTAMP, COL_KIND, COL_NAME, COL_PARENT_SPAN_ID, COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME,
-    COL_SPAN_ATTRIBUTES, COL_SPAN_ID, COL_STATUS_CODE, COL_TIMESTAMP, COL_TRACE_ID, COL_TRACE_STATE,
+    COL_AGGREGATION_TEMPORALITY, COL_ATTRIBUTES, COL_BODY, COL_BUCKET_COUNTS, COL_DROPPED_ATTRIBUTES_COUNT,
+    COL_DURATION_MICROS, COL_END_TIMESTAMP, COL_EVENTS, COL_EXEMPLARS, COL_EXPLICIT_BOUNDS, COL_INGESTED_TIMESTAMP,
+    COL_KIND, COL_LOG_ATTRIBUTES, COL_METRIC_NAME, COL_METRIC_TYPE, COL_NAME, COL_NEGATIVE_BUCKET_COUNTS,
+    COL_NEGATIVE_OFFSET, COL_OBSERVED_TIMESTAMP, COL_PARENT_SPAN_ID, COL_POSITIVE_BUCKET_COUNTS, COL_POSITIVE_OFFSET,
+    COL_QUANTILE_VALUES, COL_RESOURCE_ATTRIBUTES, COL_SCALE, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ATTRIBUTES,
+    COL_SPAN_ID, COL_STATUS_CODE, COL_TIMESTAMP, COL_TRACE_ID, COL_TRACE_STATE, COL_VALUE_DOUBLE, COL_VALUE_INT,
+    QUANTILE_FIELD_QUANTILE, QUANTILE_FIELD_VALUE,
 };
+use icegate_common::{LOGS_TABLE, METRICS_TABLE, SPANS_TABLE};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
@@ -167,19 +172,20 @@ async fn commit_three_spans(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteEr
     .await
 }
 
-/// A wildcard reaching `spans` and `otel-v1-apm-span` reads one table through two profiles
-/// without naming either index, so it is refused: the refusal names the expression, the table
-/// and both profiles. The check runs before any row is read.
+/// A wildcard reaching one table through two or more profiles without naming either index is
+/// refused: the refusal names the expression, the first such table in name order and its profiles
+/// in index-name order. `*` reaches `logs` through the native and ss4o indices first; the other
+/// expressions reach `spans`. The check runs before any row is read.
 #[tokio::test]
-async fn a_wildcard_reaching_two_profiles_of_spans_is_a_400_naming_them() {
+async fn a_wildcard_reaching_one_table_through_two_profiles_is_a_400_naming_them() {
     let (server, catalog) = TestServer::start().await;
     commit_three_spans(&catalog).await.expect("commit spans");
 
-    for path in [
-        "/*/_search",
-        "/sp*,otel*/_search",
-        "/spans,otel*/_search",
-        "/otel*,s*/_search",
+    for (path, table, profiles) in [
+        ("/*/_search", "logs", json!(["native", "ss4o"])),
+        ("/sp*,otel*/_search", "spans", json!(["data_prepper", "native"])),
+        ("/spans,otel*/_search", "spans", json!(["data_prepper", "native"])),
+        ("/otel*,s*/_search", "spans", json!(["data_prepper", "native", "ss4o"])),
     ] {
         let (status, answer) = send_request(
             &server,
@@ -196,8 +202,8 @@ async fn a_wildcard_reaching_two_profiles_of_spans_is_a_400_naming_them() {
         for cause in [&answer["error"], &answer["error"]["root_cause"][0]] {
             assert_eq!(cause["type"], "illegal_argument_exception", "{path}");
             assert_eq!(cause["index"], expression, "{path}");
-            assert_eq!(cause["table"], "spans", "{path}");
-            assert_eq!(cause["profiles"], json!(["data_prepper", "native"]), "{path}");
+            assert_eq!(cause["table"], table, "{path}");
+            assert_eq!(cause["profiles"], profiles, "{path}");
         }
     }
     server.shutdown().await;
@@ -1185,6 +1191,976 @@ async fn a_case_insensitive_term_on_kind_and_trace_state_matches_the_rendered_va
         let span_ids = search_span_ids(&server, query.clone()).await.expect("search");
 
         assert_eq!(span_ids, expected_span_ids, "{query}");
+    }
+    server.shutdown().await;
+}
+
+const SS4O_LOGS: &str = "ss4o_logs-icegate-default";
+const SS4O_TRACES: &str = "ss4o_traces-icegate-default";
+const SS4O_METRICS: &str = "ss4o_metrics-icegate-default";
+const LOG_TRACE: [u8; 16] = [0x0c; 16];
+
+/// Search `index` as tenant A with `query` and return the status and the answer.
+async fn search_tenant_a_index(
+    server: &TestServer,
+    index: &str,
+    query: Value,
+) -> Result<(StatusCode, Value), Box<dyn Error>> {
+    send_request(
+        server,
+        Method::POST,
+        TENANT_A,
+        &format!("/{index}/_search"),
+        Some(&json!({"query": query})),
+    )
+    .await
+}
+
+/// The `_source.<field>` text of every hit, sorted: the order of an unsorted search is no
+/// contract.
+fn read_sorted_source_texts(answer: &Value, field: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut texts: Vec<String> = answer["hits"]["hits"]
+        .as_array()
+        .ok_or_else(|| format!("no hits in {answer}"))?
+        .iter()
+        .map(|hit| {
+            hit["_source"][field]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("no text `{field}` in {hit}"))
+        })
+        .collect::<Result<_, _>>()?;
+    texts.sort();
+    Ok(texts)
+}
+
+/// A log row of `tenant` at `micros`, observed 5 µs and ingested 10 µs later, plus `cells`.
+fn build_log_row<'a>(
+    tenant: &'a str,
+    micros: i64,
+    body: &'a str,
+    severity: &'a str,
+    mut cells: Vec<(&'a str, Cell<'a>)>,
+) -> Row<'a> {
+    let mut row_cells = vec![
+        (COL_TIMESTAMP, Cell::Micros(micros)),
+        (COL_OBSERVED_TIMESTAMP, Cell::Micros(micros + 5)),
+        (COL_INGESTED_TIMESTAMP, Cell::Micros(micros + 10)),
+        (COL_BODY, Cell::Text(body)),
+        (COL_SEVERITY_TEXT, Cell::Text(severity)),
+    ];
+    row_cells.append(&mut cells);
+    Row {
+        tenant,
+        cells: row_cells,
+    }
+}
+
+/// A metrics row at `T0`: the required columns plus `cells`.
+fn build_metric_row<'a>(
+    tenant: &'a str,
+    name: &'a str,
+    metric_type: &'a str,
+    mut cells: Vec<(&'a str, Cell<'a>)>,
+) -> Row<'a> {
+    let mut row_cells = vec![
+        (COL_TIMESTAMP, Cell::Micros(T0)),
+        (COL_INGESTED_TIMESTAMP, Cell::Micros(T0)),
+        (COL_METRIC_NAME, Cell::Text(name)),
+        (COL_METRIC_TYPE, Cell::Text(metric_type)),
+    ];
+    row_cells.append(&mut cells);
+    Row {
+        tenant,
+        cells: row_cells,
+    }
+}
+
+/// Each ss4o logs field reads its source: aliases filter like their targets, a resource path to
+/// a promoted key (dotted or underscored) and a pattern over the resource attributes read the
+/// `service_name` column, attribute keys keep their dots. Tenant B's row, in the same commit,
+/// matches every query too. An undeclared field matches nothing and is absent from
+/// `_field_caps`, and an alias is not repeated in `_source`.
+#[tokio::test]
+async fn ss4o_logs_fields_resolve_to_their_sources_and_absent_fields_match_nothing() {
+    let (server, catalog) = TestServer::start().await;
+    commit_rows(
+        &catalog,
+        LOGS_TABLE,
+        &[
+            build_log_row(
+                TENANT_A,
+                T0,
+                "boom",
+                "ERROR",
+                vec![
+                    (COL_SERVICE_NAME, Cell::Text("checkout")),
+                    (COL_TRACE_ID, Cell::Bytes(&LOG_TRACE)),
+                    (COL_LOG_ATTRIBUTES, Cell::Map(&[("http.method", "GET")])),
+                ],
+            ),
+            build_log_row(TENANT_A, T0 + 1_000, "fine", "INFO", vec![]),
+            build_log_row(
+                TENANT_B,
+                T0,
+                "tenant b boom",
+                "ERROR",
+                vec![
+                    (COL_SERVICE_NAME, Cell::Text("checkout")),
+                    (COL_TRACE_ID, Cell::Bytes(&LOG_TRACE)),
+                    (COL_LOG_ATTRIBUTES, Cell::Map(&[("http.method", "GET")])),
+                ],
+            ),
+        ],
+    )
+    .await
+    .expect("commit logs");
+
+    for query in [
+        json!({"term": {"severity.text": "ERROR"}}),
+        json!({"term": {"serviceName": "checkout"}}),
+        json!({"term": {"resource.attributes.service.name": "checkout"}}),
+        json!({"term": {"resource.attributes.service_name": "checkout"}}),
+        json!({"query_string": {"query": "checkout", "fields": ["resource.attributes.*"]}}),
+        json!({"term": {"traceId": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"}}),
+        json!({"term": {"attributes.http.method": "GET"}}),
+        json!({"match": {"@message": "boom"}}),
+        json!({"range": {"time": {"lte": 1_760_000_000_000_u64, "format": "epoch_millis"}}}),
+        json!({"range": {"observerTime": {"lte": 1_760_000_000_000_u64, "format": "epoch_millis"}}}),
+    ] {
+        let (status, answer) = search_tenant_a_index(&server, SS4O_LOGS, query.clone())
+            .await
+            .expect("search request");
+
+        assert_eq!(status, StatusCode::OK, "{query}: {answer}");
+        assert_eq!(
+            read_sorted_source_texts(&answer, "body").expect("bodies"),
+            ["boom"],
+            "{query}"
+        );
+    }
+    for query in [
+        json!({"term": {"severity.number": 17}}),
+        json!({"exists": {"field": "schemaUrl"}}),
+        json!({"exists": {"field": "flags"}}),
+    ] {
+        let (status, answer) = search_tenant_a_index(&server, SS4O_LOGS, query.clone())
+            .await
+            .expect("search request");
+
+        assert_eq!(status, StatusCode::OK, "{query}: {answer}");
+        assert_eq!(answer["hits"]["total"]["value"], 0, "{query}");
+    }
+
+    let (_, answer) = search_tenant_a_index(&server, SS4O_LOGS, json!({"term": {"severity.text": "ERROR"}}))
+        .await
+        .expect("search request");
+    assert_eq!(answer["hits"]["total"]["value"], 1, "{answer}");
+    assert_eq!(
+        answer["hits"]["hits"][0]["_source"],
+        json!({
+            "@timestamp": "2025-10-09T08:53:20.000000Z",
+            "observedTimestamp": "2025-10-09T08:53:20.000005Z",
+            "traceId": "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+            "severity": {"text": "ERROR"},
+            "body": "boom",
+            "serviceName": "checkout",
+            "attributes": {"http.method": "GET"},
+            "resource": {"attributes": {}},
+            "instrumentationScope": {"attributes": {}}
+        })
+    );
+
+    let (status, answer) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        &format!("/{SS4O_LOGS}/_field_caps?fields=*"),
+        None,
+    )
+    .await
+    .expect("field caps");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let fields = answer["fields"].as_object().expect("fields");
+    for absent in [
+        "severity.number",
+        "schemaUrl",
+        "flags",
+        "droppedAttributesCount",
+        "event.name",
+    ] {
+        assert!(!fields.contains_key(absent), "{absent} is listed");
+    }
+    assert_eq!(
+        fields["body"],
+        json!({"text": {"type": "text", "searchable": true, "aggregatable": false}})
+    );
+    for date_field in ["@timestamp", "time", "observedTimestamp", "observerTime"] {
+        assert_eq!(fields[date_field]["date"]["type"], "date", "{date_field}");
+    }
+    server.shutdown().await;
+}
+
+/// The ss4o traces index reads the span fields of the Data Prepper profile with stored attribute
+/// keys unescaped, in `_source` and in event attributes too, plus `@timestamp` as an alias of
+/// `startTime`. Tenant B's span, in the same commit, matches every query below too: only the
+/// tenant scope keeps it out of tenant A's answers.
+#[tokio::test]
+async fn ss4o_traces_resolve_like_data_prepper_without_at_escaping() {
+    let (server, catalog) = TestServer::start().await;
+    let retry_event: &[(&str, Cell<'_>)] = &[
+        (COL_TIMESTAMP, Cell::Micros(T0 + 100_000)),
+        (COL_NAME, Cell::Text("retry")),
+        (COL_ATTRIBUTES, Cell::Map(&[("retry.count", "2")])),
+        (COL_DROPPED_ATTRIBUTES_COUNT, Cell::Int(0)),
+    ];
+    commit_rows(
+        &catalog,
+        SPANS_TABLE,
+        &[
+            build_span_row(
+                TENANT_A,
+                &TRACE_A,
+                &CHILD_SPAN,
+                T0,
+                50_000,
+                vec![
+                    (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
+                    (COL_NAME, Cell::Text("SELECT orders")),
+                    (COL_KIND, Cell::Int(3)),
+                    (COL_SPAN_ATTRIBUTES, Cell::Map(&[("db.system", "postgresql")])),
+                    (COL_EVENTS, Cell::Structs(&[retry_event])),
+                ],
+            ),
+            build_span_row(
+                TENANT_B,
+                &TRACE_A,
+                &TENANT_B_SPAN,
+                T0,
+                50_000,
+                vec![
+                    (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
+                    (COL_NAME, Cell::Text("tenant-b-select")),
+                    (COL_KIND, Cell::Int(3)),
+                    (COL_SPAN_ATTRIBUTES, Cell::Map(&[("db.system", "postgresql")])),
+                ],
+            ),
+        ],
+    )
+    .await
+    .expect("commit spans");
+
+    for query in [
+        json!({"term": {"span.attributes.db.system": "postgresql"}}),
+        json!({"term": {"kind": "SPAN_KIND_CLIENT"}}),
+        json!({"range": {"@timestamp": {"gte": 1_760_000_000_000_u64, "lte": 1_760_000_000_000_u64}}}),
+        json!({"range": {"durationInNanos": {"gte": 50_000_000}}}),
+    ] {
+        let (status, answer) = search_tenant_a_index(&server, SS4O_TRACES, query.clone())
+            .await
+            .expect("search request");
+
+        assert_eq!(status, StatusCode::OK, "{query}: {answer}");
+        assert_eq!(
+            read_sorted_span_ids(&answer).expect("span ids"),
+            [CHILD_SPAN_HEX],
+            "{query}"
+        );
+    }
+    let (_, answer) = search_tenant_a_index(
+        &server,
+        SS4O_TRACES,
+        json!({"term": {"span.attributes.db@system": "postgresql"}}),
+    )
+    .await
+    .expect("search request");
+    assert_eq!(
+        answer["hits"]["total"]["value"], 0,
+        "the ss4o profile reads no @ spelling"
+    );
+
+    let (_, answer) = search_tenant_a_index(&server, SS4O_TRACES, json!({"match_all": {}}))
+        .await
+        .expect("search request");
+    assert_eq!(
+        answer["hits"]["total"]["value"], 1,
+        "tenant A sees its one span: {answer}"
+    );
+    let source = &answer["hits"]["hits"][0]["_source"];
+    assert_eq!(source["span"], json!({"attributes": {"db.system": "postgresql"}}));
+    assert_eq!(
+        source["events"],
+        json!([{
+            "time": "2025-10-09T08:53:20.100000Z",
+            "name": "retry",
+            "attributes": {"retry.count": "2"},
+            "droppedAttributesCount": 0
+        }])
+    );
+    assert_eq!(source["kind"], "SPAN_KIND_CLIENT");
+    assert_eq!(source["startTime"], "2025-10-09T08:53:20.000000Z");
+    assert!(
+        source.get("@timestamp").is_none(),
+        "an alias is not repeated in _source"
+    );
+    assert!(source.get("traceGroup").is_none(), "{source}");
+
+    let (status, answer) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        &format!("/{SS4O_TRACES}/_field_caps?fields=*"),
+        None,
+    )
+    .await
+    .expect("field caps");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let fields = answer["fields"].as_object().expect("fields");
+    assert_eq!(fields["@timestamp"]["date"]["type"], "date");
+    assert!(fields.keys().all(|name| !name.starts_with("traceGroup")), "{fields:?}");
+    server.shutdown().await;
+}
+
+/// Tenant A: a gauge with an exemplar, a cumulative sum, a delta histogram, an exponential
+/// histogram, a summary. Tenant B, in the same commit: a cumulative gauge, a histogram and a
+/// summary named like tenant A's and shaped like them, so a leak duplicates a name in every
+/// selection of a gauge, a cumulative temporality, the histogram's kind, bucket and bound counts
+/// or the summary's kind and quantile count.
+async fn commit_metric_shapes(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteError> {
+    let exemplar: &[(&str, Cell<'_>)] = &[
+        (COL_TIMESTAMP, Cell::Micros(T0 + 7)),
+        (COL_TRACE_ID, Cell::Bytes(&TRACE_A)),
+        (COL_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
+        (COL_VALUE_DOUBLE, Cell::Double(3.5)),
+    ];
+    let median: &[(&str, Cell<'_>)] = &[
+        (QUANTILE_FIELD_QUANTILE, Cell::Double(0.5)),
+        (QUANTILE_FIELD_VALUE, Cell::Double(12.0)),
+    ];
+    let tail: &[(&str, Cell<'_>)] = &[
+        (QUANTILE_FIELD_QUANTILE, Cell::Double(0.99)),
+        (QUANTILE_FIELD_VALUE, Cell::Double(40.0)),
+    ];
+    commit_rows(
+        catalog,
+        METRICS_TABLE,
+        &[
+            build_metric_row(
+                TENANT_A,
+                "queue.depth",
+                "gauge",
+                vec![
+                    (COL_VALUE_INT, Cell::Long(4)),
+                    (COL_EXEMPLARS, Cell::Structs(&[exemplar])),
+                ],
+            ),
+            build_metric_row(
+                TENANT_A,
+                "requests",
+                "sum",
+                vec![
+                    (COL_VALUE_INT, Cell::Long(20)),
+                    (COL_AGGREGATION_TEMPORALITY, Cell::Text("CUMULATIVE")),
+                ],
+            ),
+            build_metric_row(
+                TENANT_A,
+                "latency",
+                "histogram",
+                vec![
+                    (COL_AGGREGATION_TEMPORALITY, Cell::Text("DELTA")),
+                    (COL_BUCKET_COUNTS, Cell::Longs(&[1, 2, 3])),
+                    (COL_EXPLICIT_BOUNDS, Cell::Doubles(&[0.5, 1.0])),
+                ],
+            ),
+            build_metric_row(
+                TENANT_A,
+                "payload",
+                "exponential_histogram",
+                vec![
+                    (COL_AGGREGATION_TEMPORALITY, Cell::Text("DELTA")),
+                    (COL_SCALE, Cell::Int(0)),
+                    (COL_POSITIVE_OFFSET, Cell::Int(-1)),
+                    (COL_POSITIVE_BUCKET_COUNTS, Cell::Longs(&[3, 5])),
+                    (COL_NEGATIVE_OFFSET, Cell::Int(0)),
+                    (COL_NEGATIVE_BUCKET_COUNTS, Cell::Longs(&[7])),
+                    (COL_BUCKET_COUNTS, Cell::Longs(&[])),
+                ],
+            ),
+            build_metric_row(
+                TENANT_A,
+                "rpc.duration",
+                "summary",
+                vec![(COL_QUANTILE_VALUES, Cell::Structs(&[median, tail]))],
+            ),
+            build_metric_row(
+                TENANT_B,
+                "queue.depth",
+                "gauge",
+                vec![
+                    (COL_VALUE_INT, Cell::Long(999)),
+                    (COL_AGGREGATION_TEMPORALITY, Cell::Text("CUMULATIVE")),
+                ],
+            ),
+            build_metric_row(
+                TENANT_B,
+                "latency",
+                "histogram",
+                vec![
+                    (COL_BUCKET_COUNTS, Cell::Longs(&[1, 2, 3])),
+                    (COL_EXPLICIT_BOUNDS, Cell::Doubles(&[0.5, 1.0])),
+                ],
+            ),
+            build_metric_row(
+                TENANT_B,
+                "rpc.duration",
+                "summary",
+                vec![(COL_QUANTILE_VALUES, Cell::Structs(&[median, tail]))],
+            ),
+        ],
+    )
+    .await
+}
+
+/// `kind` and `aggregationTemporality` render the upper-case names and filter back to the stored
+/// value: a term, a terms list and a range compare the names, `exists` holds where a name
+/// renders, and `COUNTER` and `AGGREGATION_TEMPORALITY_UNSPECIFIED` match nothing. Tenant B's
+/// gauge is cumulative and it also has a histogram and a summary, so a leak would change the
+/// gauge, cumulative, histogram and missing-kind rows.
+#[tokio::test]
+async fn ss4o_metrics_kind_and_temporality_render_upper_case_enums_and_filter_back() {
+    let (server, catalog) = TestServer::start().await;
+    commit_metric_shapes(&catalog).await.expect("commit metrics");
+
+    for (query, expected_names) in [
+        (json!({"term": {"kind": "GAUGE"}}), vec!["queue.depth"]),
+        (json!({"term": {"kind": "EXPONENTIAL_HISTOGRAM"}}), vec!["payload"]),
+        (json!({"term": {"kind": "COUNTER"}}), vec![]),
+        (
+            json!({"terms": {"kind": ["SUM", "HISTOGRAM"]}}),
+            vec!["latency", "requests"],
+        ),
+        // Names compare as keywords: `EXPONENTIAL_HISTOGRAM` and `GAUGE` sort below `HISTOGRAM`.
+        (
+            json!({"range": {"kind": {"gte": "HISTOGRAM"}}}),
+            vec!["latency", "requests"],
+        ),
+        (
+            json!({"term": {"aggregationTemporality": "AGGREGATION_TEMPORALITY_CUMULATIVE"}}),
+            vec!["requests"],
+        ),
+        (
+            json!({"term": {"aggregationTemporality": "AGGREGATION_TEMPORALITY_DELTA"}}),
+            vec!["latency", "payload"],
+        ),
+        (
+            json!({"term": {"aggregationTemporality": "AGGREGATION_TEMPORALITY_UNSPECIFIED"}}),
+            vec![],
+        ),
+        (
+            json!({"exists": {"field": "aggregationTemporality"}}),
+            vec!["latency", "payload", "requests"],
+        ),
+        (
+            json!({"bool": {"must_not": {"exists": {"field": "kind"}}}}),
+            vec!["rpc.duration"],
+        ),
+    ] {
+        let (status, answer) = search_tenant_a_index(&server, SS4O_METRICS, query.clone())
+            .await
+            .expect("search request");
+
+        assert_eq!(status, StatusCode::OK, "{query}: {answer}");
+        assert_eq!(
+            read_sorted_source_texts(&answer, "name").expect("names"),
+            expected_names,
+            "{query}"
+        );
+    }
+
+    let (_, answer) = search_tenant_a_index(&server, SS4O_METRICS, json!({"match_all": {}}))
+        .await
+        .expect("search request");
+    let find_source = |name: &str| {
+        answer["hits"]["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .map(|hit| &hit["_source"])
+            .find(|source| source["name"] == name)
+            .expect("a metric of that name")
+            .clone()
+    };
+    assert_eq!(find_source("queue.depth")["kind"], "GAUGE");
+    assert!(find_source("queue.depth").get("aggregationTemporality").is_none());
+    assert_eq!(
+        find_source("requests")["aggregationTemporality"],
+        "AGGREGATION_TEMPORALITY_CUMULATIVE"
+    );
+    assert_eq!(find_source("payload")["kind"], "EXPONENTIAL_HISTOGRAM");
+    assert!(find_source("rpc.duration").get("kind").is_none(), "summary has no kind");
+    server.shutdown().await;
+}
+
+/// The bucket, quantile and exemplar fields render from the arrays and the counts are their
+/// lengths, derived by hand: the exponential histogram has scale 0, so `base = 2`; positive
+/// offset `-1` gives `(2^-1, 2^0]` and `(2^0, 2^1]`, negative offset `0` gives `[-2^1, -2^0)`
+/// written as `min -2.0`, `max -1.0`; `T0 + 7 µs` renders `…20.000007Z`. A NULL list renders the
+/// field absent and an empty one `[]` with a count of `0`.
+#[tokio::test]
+async fn ss4o_metrics_bucket_quantile_and_exemplar_fields_render_and_their_counts_derive_from_the_arrays() {
+    let (server, catalog) = TestServer::start().await;
+    commit_metric_shapes(&catalog).await.expect("commit metrics");
+    let shape_fields = [
+        "bucketCountsList",
+        "explicitBoundsList",
+        "bucketCount",
+        "explicitBoundsCount",
+        "quantileValuesCount",
+        "positiveBuckets",
+        "negativeBuckets",
+        "quantiles",
+        "exemplar",
+    ];
+    let read_shape_fields = |answer: &Value| -> Value {
+        let source = &answer["hits"]["hits"][0]["_source"];
+        Value::Object(
+            shape_fields
+                .iter()
+                .filter_map(|name| source.get(*name).map(|value| ((*name).to_string(), value.clone())))
+                .collect(),
+        )
+    };
+
+    for (name, expected_fields) in [
+        (
+            "latency",
+            json!({"bucketCountsList": [1, 2, 3], "explicitBoundsList": [0.5, 1.0], "bucketCount": 3, "explicitBoundsCount": 2}),
+        ),
+        (
+            "payload",
+            json!({
+                "bucketCountsList": [],
+                "bucketCount": 0,
+                "positiveBuckets": [{"count": 3, "min": 0.5, "max": 1.0}, {"count": 5, "min": 1.0, "max": 2.0}],
+                "negativeBuckets": [{"count": 7, "min": -2.0, "max": -1.0}]
+            }),
+        ),
+        (
+            "rpc.duration",
+            json!({"quantileValuesCount": 2, "quantiles": [{"quantile": 0.5, "value": 12.0}, {"quantile": 0.99, "value": 40.0}]}),
+        ),
+        (
+            "queue.depth",
+            json!({"exemplar": [{
+                "time": "2025-10-09T08:53:20.000007Z",
+                "traceId": TRACE_A_HEX,
+                "spanId": ROOT_SPAN_HEX
+            }]}),
+        ),
+    ] {
+        let (status, answer) = search_tenant_a_index(&server, SS4O_METRICS, json!({"term": {"name": name}}))
+            .await
+            .expect("search request");
+
+        assert_eq!(status, StatusCode::OK, "{name}: {answer}");
+        assert_eq!(
+            answer["hits"]["total"]["value"], 1,
+            "{name}: tenant B's gauge is never returned"
+        );
+        assert_eq!(read_shape_fields(&answer), expected_fields, "{name}");
+    }
+
+    let (status, answer) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        &format!(
+            "/{SS4O_METRICS}/_field_caps?fields=positiveBuckets,negativeBuckets,quantiles,exemplar,bucketCount,\
+             explicitBoundsCount,quantileValuesCount,value,kind,aggregationTemporality"
+        ),
+        None,
+    )
+    .await
+    .expect("field caps");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    for object in ["positiveBuckets", "negativeBuckets", "quantiles", "exemplar"] {
+        assert_eq!(
+            answer["fields"][object],
+            json!({"object": {"type": "object", "searchable": false, "aggregatable": false}}),
+            "{object}"
+        );
+    }
+    for long in ["bucketCount", "explicitBoundsCount", "quantileValuesCount"] {
+        assert_eq!(
+            answer["fields"][long],
+            json!({"long": {"type": "long", "searchable": true, "aggregatable": true}}),
+            "{long}"
+        );
+    }
+    assert_eq!(
+        answer["fields"]["value"],
+        json!({"double": {"type": "double", "searchable": true, "aggregatable": true}})
+    );
+    for keyword in ["kind", "aggregationTemporality"] {
+        assert_eq!(
+            answer["fields"][keyword],
+            json!({"keyword": {"type": "keyword", "searchable": true, "aggregatable": true}}),
+            "{keyword}"
+        );
+    }
+    server.shutdown().await;
+}
+
+/// A list length lowers over the length per row: ranges, terms and `exists` select by it, a NULL
+/// list has no length and an empty one has `0`, and a fractional length matches nothing. Tenant
+/// B's histogram has three buckets and two bounds and its summary two quantiles, so a leak would
+/// add a second `latency` to every selection of `latency` and a second `rpc.duration` to the
+/// quantile count range.
+#[tokio::test]
+async fn a_range_on_an_array_length_field_selects_rows_by_length() {
+    let (server, catalog) = TestServer::start().await;
+    commit_metric_shapes(&catalog).await.expect("commit metrics");
+
+    for (query, expected_names) in [
+        (json!({"range": {"bucketCount": {"gte": 3}}}), vec!["latency"]),
+        (json!({"range": {"bucketCount": {"lt": 1}}}), vec!["payload"]),
+        (json!({"term": {"explicitBoundsCount": 2}}), vec!["latency"]),
+        (json!({"term": {"bucketCount": 0}}), vec!["payload"]),
+        (json!({"terms": {"bucketCount": [0, 3]}}), vec!["latency", "payload"]),
+        (json!({"term": {"bucketCount": 2.5}}), vec![]),
+        (json!({"exists": {"field": "bucketCount"}}), vec!["latency", "payload"]),
+        (
+            json!({"range": {"quantileValuesCount": {"gt": 1, "lte": 2}}}),
+            vec!["rpc.duration"],
+        ),
+    ] {
+        let (status, answer) = search_tenant_a_index(&server, SS4O_METRICS, query.clone())
+            .await
+            .expect("search request");
+
+        assert_eq!(status, StatusCode::OK, "{query}: {answer}");
+        assert_eq!(
+            read_sorted_source_texts(&answer, "name").expect("names"),
+            expected_names,
+            "{query}"
+        );
+    }
+    server.shutdown().await;
+}
+
+/// A term-level leaf on a bucket, quantile or exemplar field, or on a path below one, has no
+/// inverse and is refused naming the field as the request did; the refusal reads no row.
+#[tokio::test]
+async fn a_leaf_on_a_bucket_quantile_or_exemplar_field_is_a_400_naming_it() {
+    let (server, catalog) = TestServer::start().await;
+    commit_metric_shapes(&catalog).await.expect("commit metrics");
+
+    for (query, field) in [
+        (json!({"term": {"positiveBuckets.count": 3}}), "positiveBuckets.count"),
+        (json!({"exists": {"field": "quantiles"}}), "quantiles"),
+        (json!({"range": {"exemplar.time": {"gte": 0}}}), "exemplar.time"),
+        (json!({"term": {"negativeBuckets": 7}}), "negativeBuckets"),
+        (json!({"terms": {"quantiles.value": [12.0]}}), "quantiles.value"),
+        (json!({"prefix": {"exemplar.traceId": "0a"}}), "exemplar.traceId"),
+    ] {
+        let (status, answer) = search_tenant_a_index(&server, SS4O_METRICS, query.clone())
+            .await
+            .expect("search request");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {answer}");
+        assert_eq!(answer["error"]["type"], "illegal_argument_exception", "{query}");
+        assert_eq!(answer["error"]["field"], field, "{query}");
+    }
+    server.shutdown().await;
+}
+
+/// A literal that an ss4o metrics field cannot hold is the query-shard 400 whose root cause names
+/// the field as the request did, never the stored column behind it, and a term pattern on an
+/// enum name or a list length is the query-shard 400 of a term pattern on a typed field.
+#[tokio::test]
+async fn a_malformed_or_pattern_leaf_on_an_ss4o_metrics_field_is_a_query_shard_400() {
+    let (server, catalog) = TestServer::start().await;
+    commit_metric_shapes(&catalog).await.expect("commit metrics");
+
+    for (query, expected_field) in [
+        (json!({"term": {"bucketCount": "abc"}}), Some("bucketCount")),
+        (json!({"range": {"bucketCount": {"gte": "x"}}}), Some("bucketCount")),
+        (json!({"term": {"value": "abc"}}), Some("value")),
+        (json!({"range": {"value": {"lt": "x"}}}), Some("value")),
+        (json!({"prefix": {"kind": "GA"}}), None),
+        (json!({"wildcard": {"bucketCount": "1*"}}), None),
+    ] {
+        let (status, answer) = search_tenant_a_index(&server, SS4O_METRICS, query.clone())
+            .await
+            .expect("search request");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {answer}");
+        let cause = &answer["error"]["root_cause"][0];
+        assert_eq!(cause["type"], "query_shard_exception", "{query}");
+        assert_eq!(cause["index"], SS4O_METRICS, "{query}");
+        if let Some(expected_field) = expected_field {
+            assert_eq!(cause["field"], expected_field, "{query}");
+        }
+    }
+    server.shutdown().await;
+}
+
+/// Points named after their stored value: `int:<n>` holds `value_int = n`, `double:<x>` holds
+/// `value_double = x`; `histogram` holds neither. Tenant B's `int:1` would add a hit to every
+/// selection of tenant A's `int:1`.
+async fn commit_value_points(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteError> {
+    commit_rows(
+        catalog,
+        METRICS_TABLE,
+        &[
+            build_metric_row(TENANT_A, "int:-1", "gauge", vec![(COL_VALUE_INT, Cell::Long(-1))]),
+            build_metric_row(TENANT_A, "int:0", "gauge", vec![(COL_VALUE_INT, Cell::Long(0))]),
+            build_metric_row(TENANT_A, "int:1", "gauge", vec![(COL_VALUE_INT, Cell::Long(1))]),
+            build_metric_row(TENANT_A, "int:2", "gauge", vec![(COL_VALUE_INT, Cell::Long(2))]),
+            build_metric_row(
+                TENANT_A,
+                "double:-0.0",
+                "gauge",
+                vec![(COL_VALUE_DOUBLE, Cell::Double(-0.0))],
+            ),
+            build_metric_row(
+                TENANT_A,
+                "double:0.0",
+                "gauge",
+                vec![(COL_VALUE_DOUBLE, Cell::Double(0.0))],
+            ),
+            build_metric_row(
+                TENANT_A,
+                "double:1.5",
+                "gauge",
+                vec![(COL_VALUE_DOUBLE, Cell::Double(1.5))],
+            ),
+            build_metric_row(
+                TENANT_A,
+                "histogram",
+                "histogram",
+                vec![(COL_BUCKET_COUNTS, Cell::Longs(&[1]))],
+            ),
+            build_metric_row(TENANT_B, "int:1", "gauge", vec![(COL_VALUE_INT, Cell::Long(1))]),
+        ],
+    )
+    .await
+}
+
+/// `value` averages integer and double points together on the native `metrics` index and on the
+/// ss4o metrics index: `(10 + 20 + 0.5) / 3`, the histogram row has no value and tenant B's row
+/// is not read. `fields` and `docvalue_fields` render it on the native index from either value
+/// column, and not at all on the histogram row.
+#[tokio::test]
+async fn the_metrics_value_field_averages_integer_and_double_points() {
+    let (server, catalog) = TestServer::start().await;
+    commit_rows(
+        &catalog,
+        METRICS_TABLE,
+        &[
+            build_metric_row(TENANT_A, "a", "gauge", vec![(COL_VALUE_INT, Cell::Long(10))]),
+            build_metric_row(TENANT_A, "b", "sum", vec![(COL_VALUE_INT, Cell::Long(20))]),
+            build_metric_row(TENANT_A, "c", "gauge", vec![(COL_VALUE_DOUBLE, Cell::Double(0.5))]),
+            build_metric_row(TENANT_A, "d", "histogram", vec![(COL_BUCKET_COUNTS, Cell::Longs(&[4]))]),
+            build_metric_row(TENANT_B, "a", "gauge", vec![(COL_VALUE_INT, Cell::Long(1_000))]),
+        ],
+    )
+    .await
+    .expect("commit metrics");
+
+    for (index, double_field) in [("metrics", "value_double"), (SS4O_METRICS, "value@double")] {
+        let (status, answer) = send_request(
+            &server,
+            Method::POST,
+            TENANT_A,
+            &format!("/{index}/_search"),
+            Some(&json!({
+                "size": 0,
+                "aggs": {"points": {"avg": {"field": "value"}}, "doubles": {"avg": {"field": double_field}}}
+            })),
+        )
+        .await
+        .expect("search request");
+
+        assert_eq!(status, StatusCode::OK, "{index}: {answer}");
+        assert_eq!(
+            answer["aggregations"]["points"]["value"],
+            json!(30.5_f64 / 3.0),
+            "{index}"
+        );
+        assert_eq!(answer["aggregations"]["doubles"]["value"], json!(0.5), "{index}");
+    }
+
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/metrics/_search",
+        Some(&json!({"query": {"match_all": {}}, "docvalue_fields": ["value"], "fields": ["value"]})),
+    )
+    .await
+    .expect("search request");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let hits = answer["hits"]["hits"].as_array().expect("hits");
+    let mut names: Vec<&str> = hits
+        .iter()
+        .map(|hit| hit["_source"][COL_METRIC_NAME].as_str().expect("a metric name"))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["a", "b", "c", "d"], "tenant B's row is not returned");
+    let find_fields = |name: &str| {
+        hits.iter()
+            .find(|hit| hit["_source"][COL_METRIC_NAME] == name)
+            .map(|hit| hit["fields"].clone())
+            .expect("a hit of that name")
+    };
+    assert_eq!(find_fields("a")["value"], json!([10.0]));
+    assert_eq!(find_fields("b")["value"], json!([20.0]));
+    assert_eq!(find_fields("c")["value"], json!([0.5]));
+    assert!(find_fields("d").get("value").is_none(), "{answer}");
+
+    let (status, answer) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        "/metrics/_field_caps?fields=value",
+        None,
+    )
+    .await
+    .expect("field caps");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        answer["fields"]["value"],
+        json!({"double": {"type": "double", "searchable": true, "aggregatable": true}})
+    );
+    server.shutdown().await;
+}
+
+/// The `value` filter inverse, derived by hand: under IEEE totalOrder `-0.0 < +0.0`, so
+/// `lte -0.0` keeps the double `-0.0` and the integer `-1` but not the integer `0`, `gt -0.0`
+/// keeps the integer `0` and the double `+0.0`, and the term `-0.0` has no integer match;
+/// `(0.9, 1.1)` admits the integers `[⌈0.9⌉, ⌊1.1⌋] = [1, 1]`; `(1, 2)` admits no integer.
+#[tokio::test]
+async fn the_metrics_value_inverse_uses_ceil_and_floor_integer_bounds_and_negative_zero_rules() {
+    let (server, catalog) = TestServer::start().await;
+    commit_value_points(&catalog).await.expect("commit points");
+
+    for (query, expected_names) in [
+        (json!({"term": {"value": 1}}), vec!["int:1"]),
+        (json!({"term": {"value": 1.5}}), vec!["double:1.5"]),
+        (json!({"term": {"value": 0}}), vec!["double:0.0", "int:0"]),
+        (json!({"term": {"value": -0.0}}), vec!["double:-0.0"]),
+        (json!({"terms": {"value": [2, 1.5]}}), vec!["double:1.5", "int:2"]),
+        (
+            json!({"range": {"value": {"lte": -0.0}}}),
+            vec!["double:-0.0", "int:-1"],
+        ),
+        (
+            json!({"range": {"value": {"gt": -0.0}}}),
+            vec!["double:0.0", "double:1.5", "int:0", "int:1", "int:2"],
+        ),
+        (
+            json!({"range": {"value": {"gte": 0.5, "lte": 1.5}}}),
+            vec!["double:1.5", "int:1"],
+        ),
+        (json!({"range": {"value": {"gt": 1, "lt": 2}}}), vec!["double:1.5"]),
+        (json!({"range": {"value": {"gt": 0.9, "lt": 1.1}}}), vec!["int:1"]),
+        (
+            json!({"exists": {"field": "value"}}),
+            vec![
+                "double:-0.0",
+                "double:0.0",
+                "double:1.5",
+                "int:-1",
+                "int:0",
+                "int:1",
+                "int:2",
+            ],
+        ),
+    ] {
+        let (status, answer) = search_tenant_a_index(&server, "metrics", query.clone())
+            .await
+            .expect("search request");
+
+        assert_eq!(status, StatusCode::OK, "{query}: {answer}");
+        assert_eq!(
+            read_sorted_source_texts(&answer, COL_METRIC_NAME).expect("names"),
+            expected_names,
+            "{query}"
+        );
+    }
+    server.shutdown().await;
+}
+
+/// `describe metrics` lists the derived `value`, typed double, right after `value_int`: it is a
+/// field of the index. A PPL field reference resolves stored columns only, so `fields value` is
+/// the field-not-found refusal naming it, never an empty column.
+#[tokio::test]
+async fn ppl_describe_lists_the_metrics_value_and_a_ppl_reference_to_it_is_field_not_found() {
+    let (server, catalog) = TestServer::start().await;
+    commit_value_points(&catalog).await.expect("commit points");
+
+    let describe_reply = server
+        .post_ppl(TENANT_A, "/_plugins/_ppl", &json!({"query": "describe metrics"}))
+        .await;
+    let fields_reply = server
+        .post_ppl(
+            TENANT_A,
+            "/_plugins/_ppl",
+            &json!({"query": "source=metrics | fields value"}),
+        )
+        .await;
+
+    assert_eq!(describe_reply.status, 200, "{}", describe_reply.text);
+    let body = describe_reply.parse_json_body();
+    let find_column = |name: &str| {
+        body["schema"]
+            .as_array()
+            .expect("schema")
+            .iter()
+            .position(|column| column["name"] == name)
+            .expect("a describe column of that name")
+    };
+    let (column_name, type_name) = (find_column("COLUMN_NAME"), find_column("TYPE_NAME"));
+    let rows = body["datarows"].as_array().expect("datarows");
+    let value_int_position = rows
+        .iter()
+        .position(|row| row[column_name] == COL_VALUE_INT)
+        .expect("value_int is listed");
+    assert_eq!(rows[value_int_position + 1][column_name], "value", "{body}");
+    assert_eq!(rows[value_int_position + 1][type_name], "double", "{body}");
+    assert_eq!(fields_reply.status, 400, "{}", fields_reply.text);
+    let fields_body = fields_reply.parse_json_body();
+    assert_eq!(fields_body["error"]["code"], "FIELD_NOT_FOUND", "{fields_body}");
+    assert_eq!(fields_body["error"]["context"]["field"], "value", "{fields_body}");
+    server.shutdown().await;
+}
+
+/// A full-text leaf treats a bucket, quantile or exemplar field like any `object` field and
+/// matches nothing there, while it matches an enum name as an exact keyword and a list length as
+/// a number. Tenant B's gauge would add a hit to the `GAUGE` match.
+#[tokio::test]
+async fn a_full_text_leaf_matches_nothing_on_a_render_only_field_and_reads_names_and_lengths() {
+    let (server, catalog) = TestServer::start().await;
+    commit_metric_shapes(&catalog).await.expect("commit metrics");
+
+    for (query, expected_names) in [
+        (json!({"match": {"quantiles": "12"}}), vec![]),
+        (json!({"match": {"positiveBuckets.count": "3"}}), vec![]),
+        (json!({"match": {"kind": "GAUGE"}}), vec!["queue.depth"]),
+        (json!({"match": {"bucketCount": "3"}}), vec!["latency"]),
+    ] {
+        let (status, answer) = search_tenant_a_index(&server, SS4O_METRICS, query.clone())
+            .await
+            .expect("search request");
+
+        assert_eq!(status, StatusCode::OK, "{query}: {answer}");
+        assert_eq!(
+            read_sorted_source_texts(&answer, "name").expect("names"),
+            expected_names,
+            "{query}"
+        );
     }
     server.shutdown().await;
 }
