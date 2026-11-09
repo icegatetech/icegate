@@ -36,10 +36,10 @@ const POD_C: &[(&str, &str)] = &[("host.name", "pod-c")];
 const POD_Z: &[(&str, &str)] = &[("host.name", "pod-z")];
 
 /// One `logs` row of the seed. Its timestamp, observed and ingested timestamps are all the window
-/// start plus `offset_secs`.
+/// start plus `offset_seconds`.
 struct LogLine {
     tenant: &'static str,
-    offset_secs: i64,
+    offset_seconds: i64,
     service: Option<&'static str>,
     /// The attribute column carrying `host.name`, and its entries.
     host: Option<(&'static str, &'static [(&'static str, &'static str)])>,
@@ -53,7 +53,7 @@ struct LogLine {
 static LOG_LINES: [LogLine; 11] = [
     LogLine {
         tenant: TENANT_A,
-        offset_secs: 5,
+        offset_seconds: 5,
         service: Some("checkout"),
         host: Some((COL_RESOURCE_ATTRIBUTES, POD_B)),
         severity: "INFO",
@@ -62,7 +62,7 @@ static LOG_LINES: [LogLine; 11] = [
     },
     LogLine {
         tenant: TENANT_A,
-        offset_secs: 10,
+        offset_seconds: 10,
         service: Some("checkout"),
         host: Some((COL_LOG_ATTRIBUTES, POD_A)),
         severity: "INFO",
@@ -71,7 +71,7 @@ static LOG_LINES: [LogLine; 11] = [
     },
     LogLine {
         tenant: TENANT_A,
-        offset_secs: 20,
+        offset_seconds: 20,
         service: Some("checkout"),
         host: Some((COL_RESOURCE_ATTRIBUTES, POD_B)),
         severity: "ERROR",
@@ -80,7 +80,7 @@ static LOG_LINES: [LogLine; 11] = [
     },
     LogLine {
         tenant: TENANT_A,
-        offset_secs: 20,
+        offset_seconds: 20,
         service: Some("checkout"),
         host: Some((COL_RESOURCE_ATTRIBUTES, POD_B)),
         severity: "INFO",
@@ -89,7 +89,7 @@ static LOG_LINES: [LogLine; 11] = [
     },
     LogLine {
         tenant: TENANT_A,
-        offset_secs: 20,
+        offset_seconds: 20,
         service: Some("billing"),
         host: None,
         severity: "WARN",
@@ -98,7 +98,7 @@ static LOG_LINES: [LogLine; 11] = [
     },
     LogLine {
         tenant: TENANT_A,
-        offset_secs: 30,
+        offset_seconds: 30,
         service: None,
         host: Some((COL_SCOPE_ATTRIBUTES, POD_C)),
         severity: "debug",
@@ -107,7 +107,7 @@ static LOG_LINES: [LogLine; 11] = [
     },
     LogLine {
         tenant: TENANT_A,
-        offset_secs: 40,
+        offset_seconds: 40,
         service: Some("checkout"),
         host: Some((COL_RESOURCE_ATTRIBUTES, POD_B)),
         severity: "INFO",
@@ -116,7 +116,7 @@ static LOG_LINES: [LogLine; 11] = [
     },
     LogLine {
         tenant: TENANT_A,
-        offset_secs: -1,
+        offset_seconds: -1,
         service: Some("checkout"),
         host: Some((COL_RESOURCE_ATTRIBUTES, POD_B)),
         severity: "INFO",
@@ -125,7 +125,7 @@ static LOG_LINES: [LogLine; 11] = [
     },
     LogLine {
         tenant: TENANT_B,
-        offset_secs: 20,
+        offset_seconds: 20,
         service: Some("checkout"),
         host: Some((COL_RESOURCE_ATTRIBUTES, POD_B)),
         severity: "ERROR",
@@ -134,7 +134,7 @@ static LOG_LINES: [LogLine; 11] = [
     },
     LogLine {
         tenant: TENANT_B,
-        offset_secs: 25,
+        offset_seconds: 25,
         service: Some("b-service"),
         host: Some((COL_RESOURCE_ATTRIBUTES, POD_Z)),
         severity: "INFO",
@@ -143,7 +143,7 @@ static LOG_LINES: [LogLine; 11] = [
     },
     LogLine {
         tenant: TENANT_B,
-        offset_secs: 45,
+        offset_seconds: 45,
         service: Some("checkout"),
         host: Some((COL_RESOURCE_ATTRIBUTES, POD_B)),
         severity: "INFO",
@@ -154,7 +154,7 @@ static LOG_LINES: [LogLine; 11] = [
 
 /// One seed line as a `logs` row.
 fn build_log_row(line: &'static LogLine) -> Row<'static> {
-    let timestamp_micros = WINDOW_START_MICROS + line.offset_secs * SECOND_MICROS;
+    let timestamp_micros = WINDOW_START_MICROS + line.offset_seconds * SECOND_MICROS;
     let mut cells = vec![
         (COL_TIMESTAMP, Cell::Micros(timestamp_micros)),
         (COL_OBSERVED_TIMESTAMP, Cell::Micros(timestamp_micros)),

@@ -12,7 +12,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
+use datafusion::arrow::array::{
+    ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, StringArray,
+    TimestampMicrosecondArray,
+};
 use iceberg::Catalog;
 use iceberg::spec::{NestedField, PrimitiveType, Type};
 use icegate_common::schema::{
@@ -504,4 +507,287 @@ fn build_operation_row(line: &OperationLine) -> Row<'_> {
 pub async fn commit_operation_lines(catalog: &Arc<dyn Catalog>, lines: &[OperationLine]) {
     let rows: Vec<Row<'_>> = lines.iter().map(build_operation_row).collect();
     commit_rows(catalog, OPERATIONS_TABLE, &rows).await.expect("operations rows");
+}
+
+/// A required 32-bit integer column.
+fn build_int_column(values: impl Iterator<Item = i32>) -> ArrayRef {
+    Arc::new(Int32Array::from_iter_values(values))
+}
+
+/// A required boolean column.
+fn build_bool_column(values: impl Iterator<Item = bool>) -> ArrayRef {
+    Arc::new(BooleanArray::from_iter(values.map(Some)))
+}
+
+/// A nullable fixed-width binary column of `N`-byte ids.
+fn build_fixed_id_column<const N: usize>(values: impl Iterator<Item = Option<[u8; N]>>) -> ArrayRef {
+    let width = i32::try_from(N).expect("an id width fits i32");
+    Arc::new(FixedSizeBinaryArray::try_from_sparse_iter_with_size(values, width).expect("ids of one width"))
+}
+
+/// A nullable double column.
+fn build_double_column(values: impl Iterator<Item = Option<f64>>) -> ArrayRef {
+    Arc::new(Float64Array::from_iter(values))
+}
+
+/// The canonical lowercase hyphenated uuid trust requires of a mark id, numbered so tests can
+/// order ids by number: `00000000-0000-4000-8000-<number as 12 hex digits>`.
+pub fn format_mark_id(mark_number: u64) -> String {
+    format!("00000000-0000-4000-8000-{mark_number:012x}")
+}
+
+/// One fingerprint at all four levels, for marks whose level-1 to level-3 keys a test never reads.
+pub fn repeat_fingerprint(fingerprint: &str) -> [String; 4] {
+    std::array::from_fn(|_| fingerprint.to_owned())
+}
+
+/// The scope columns of one mark.
+#[derive(Clone, Default)]
+pub struct MarkScope {
+    /// `service_name`.
+    pub service_name: Option<&'static str>,
+    /// `environment`.
+    pub environment: Option<&'static str>,
+    /// `agent_name`.
+    pub agent_name: Option<&'static str>,
+    /// `agent_version`.
+    pub agent_version: Option<&'static str>,
+    /// `workflow_name`.
+    pub workflow_name: Option<&'static str>,
+    /// `model`.
+    pub model: Option<&'static str>,
+    /// `provider`.
+    pub provider: Option<&'static str>,
+}
+
+/// One `marks` row with explicit values.
+#[derive(Clone)]
+pub struct MarkRow {
+    /// The tenant the row belongs to.
+    pub tenant: &'static str,
+    /// `mark_id`, in [`format_mark_id`] form.
+    pub mark_id: String,
+    /// `scan_id`: ranks a mark's rows after `scanned_at`.
+    pub scan_id: &'static str,
+    /// `attempt`: ranks a mark's rows after `scan_id`.
+    pub attempt: i32,
+    /// `scanned_at`, in microseconds.
+    pub scanned_at_micros: i64,
+    /// `occurred_at`, in microseconds.
+    pub occurred_at_micros: i64,
+    /// `retracted`.
+    pub is_retracted: bool,
+    /// `trace_id`.
+    pub trace_id: [u8; 16],
+    /// `root_span_id`.
+    pub root_span_id: Option<[u8; 8]>,
+    /// `rule_id`.
+    pub rule_id: &'static str,
+    /// `fp_version`.
+    pub fp_version: i32,
+    /// `fp_epoch`.
+    pub fp_epoch: i32,
+    /// `fingerprint`, `fingerprint_l1`, `fingerprint_l2`, `fingerprint_l3`.
+    pub fingerprints: [String; 4],
+    /// `localization_kind`.
+    pub localization_kind: &'static str,
+    /// `localization_key`.
+    pub localization_key: &'static str,
+    /// `anchor_name`.
+    pub anchor_name: Option<&'static str>,
+    /// `variant`.
+    pub variant: Option<&'static str>,
+    /// `evidence`.
+    pub evidence: Option<&'static str>,
+    /// The seven scope columns.
+    pub scope: MarkScope,
+    /// `severity`: `low`, `medium` or `high`.
+    pub severity: &'static str,
+    /// `impact_cost_usd` as decimal text.
+    pub impact_cost_usd: Option<&'static str>,
+    /// `impact_added_latency_micros`.
+    pub impact_added_latency_micros: Option<i64>,
+    /// `impact_input_tokens`.
+    pub impact_input_tokens: Option<i64>,
+    /// `impact_output_tokens`.
+    pub impact_output_tokens: Option<i64>,
+    /// `impact_cacheable_tokens`.
+    pub impact_cacheable_tokens: Option<i64>,
+    /// `run_quality_z`.
+    pub run_quality_z: Option<f64>,
+}
+
+impl MarkRow {
+    /// A live mark of rule `rule-a` (version 1, epoch 1) scanned when it occurred by `scan-1`,
+    /// attempt 1: localized `code` at `src/lib.rs:10`, anchor `anchor`, evidence `{}`, service
+    /// `svc`, severity `low`, no impact figures.
+    pub fn new(
+        tenant: &'static str,
+        mark_number: u64,
+        occurred_at_micros: i64,
+        trace_id: [u8; 16],
+        fingerprints: [String; 4],
+    ) -> Self {
+        Self {
+            tenant,
+            mark_id: format_mark_id(mark_number),
+            scan_id: "scan-1",
+            attempt: 1,
+            scanned_at_micros: occurred_at_micros,
+            occurred_at_micros,
+            is_retracted: false,
+            trace_id,
+            root_span_id: None,
+            rule_id: "rule-a",
+            fp_version: 1,
+            fp_epoch: 1,
+            fingerprints,
+            localization_kind: "code",
+            localization_key: "src/lib.rs:10",
+            anchor_name: Some("anchor"),
+            variant: None,
+            evidence: Some("{}"),
+            scope: MarkScope {
+                service_name: Some("svc"),
+                ..MarkScope::default()
+            },
+            severity: "low",
+            impact_cost_usd: None,
+            impact_added_latency_micros: None,
+            impact_input_tokens: None,
+            impact_output_tokens: None,
+            impact_cacheable_tokens: None,
+            run_quality_z: None,
+        }
+    }
+
+    /// The row a later scan writes to retract this mark at `scanned_at_micros`.
+    pub fn build_retraction(&self, scanned_at_micros: i64) -> Self {
+        Self {
+            scan_id: "scan-retract",
+            scanned_at_micros,
+            is_retracted: true,
+            ..self.clone()
+        }
+    }
+}
+
+/// Commit `rows` into `marks` as one snapshot: every tenant's rows in one batch.
+pub async fn commit_mark_rows(catalog: &Arc<dyn Catalog>, rows: &[MarkRow]) {
+    let columns: HashMap<&'static str, ArrayRef> = HashMap::from([
+        (
+            COL_TENANT_ID,
+            build_string_column(rows.iter().map(|row| Some(row.tenant))),
+        ),
+        (
+            "mark_id",
+            build_string_column(rows.iter().map(|row| Some(row.mark_id.as_str()))),
+        ),
+        ("scan_id", build_string_column(rows.iter().map(|row| Some(row.scan_id)))),
+        ("attempt", build_int_column(rows.iter().map(|row| row.attempt))),
+        (
+            "scanned_at",
+            build_timestamp_column(rows.iter().map(|row| row.scanned_at_micros)),
+        ),
+        (
+            "occurred_at",
+            build_timestamp_column(rows.iter().map(|row| row.occurred_at_micros)),
+        ),
+        ("retracted", build_bool_column(rows.iter().map(|row| row.is_retracted))),
+        (
+            "trace_id",
+            build_fixed_id_column(rows.iter().map(|row| Some(row.trace_id))),
+        ),
+        (
+            "root_span_id",
+            build_fixed_id_column(rows.iter().map(|row| row.root_span_id)),
+        ),
+        ("rule_id", build_string_column(rows.iter().map(|row| Some(row.rule_id)))),
+        ("fp_version", build_int_column(rows.iter().map(|row| row.fp_version))),
+        ("fp_epoch", build_int_column(rows.iter().map(|row| row.fp_epoch))),
+        (
+            "fingerprint",
+            build_string_column(rows.iter().map(|row| Some(row.fingerprints[0].as_str()))),
+        ),
+        (
+            "fingerprint_l1",
+            build_string_column(rows.iter().map(|row| Some(row.fingerprints[1].as_str()))),
+        ),
+        (
+            "fingerprint_l2",
+            build_string_column(rows.iter().map(|row| Some(row.fingerprints[2].as_str()))),
+        ),
+        (
+            "fingerprint_l3",
+            build_string_column(rows.iter().map(|row| Some(row.fingerprints[3].as_str()))),
+        ),
+        (
+            "localization_kind",
+            build_string_column(rows.iter().map(|row| Some(row.localization_kind))),
+        ),
+        (
+            "localization_key",
+            build_string_column(rows.iter().map(|row| Some(row.localization_key))),
+        ),
+        (
+            "anchor_name",
+            build_string_column(rows.iter().map(|row| row.anchor_name)),
+        ),
+        ("variant", build_string_column(rows.iter().map(|row| row.variant))),
+        ("evidence", build_string_column(rows.iter().map(|row| row.evidence))),
+        (
+            "service_name",
+            build_string_column(rows.iter().map(|row| row.scope.service_name)),
+        ),
+        (
+            "environment",
+            build_string_column(rows.iter().map(|row| row.scope.environment)),
+        ),
+        (
+            "agent_name",
+            build_string_column(rows.iter().map(|row| row.scope.agent_name)),
+        ),
+        (
+            "agent_version",
+            build_string_column(rows.iter().map(|row| row.scope.agent_version)),
+        ),
+        (
+            "workflow_name",
+            build_string_column(rows.iter().map(|row| row.scope.workflow_name)),
+        ),
+        ("model", build_string_column(rows.iter().map(|row| row.scope.model))),
+        (
+            "provider",
+            build_string_column(rows.iter().map(|row| row.scope.provider)),
+        ),
+        (
+            "severity",
+            build_string_column(rows.iter().map(|row| Some(row.severity))),
+        ),
+        (
+            "impact_cost_usd",
+            build_string_column(rows.iter().map(|row| row.impact_cost_usd)),
+        ),
+        (
+            "impact_added_latency_micros",
+            build_long_column(rows.iter().map(|row| row.impact_added_latency_micros)),
+        ),
+        (
+            "impact_input_tokens",
+            build_long_column(rows.iter().map(|row| row.impact_input_tokens)),
+        ),
+        (
+            "impact_output_tokens",
+            build_long_column(rows.iter().map(|row| row.impact_output_tokens)),
+        ),
+        (
+            "impact_cacheable_tokens",
+            build_long_column(rows.iter().map(|row| row.impact_cacheable_tokens)),
+        ),
+        (
+            "run_quality_z",
+            build_double_column(rows.iter().map(|row| row.run_quality_z)),
+        ),
+    ]);
+    commit_columns(catalog, MARKS_TABLE, columns, rows.len()).await;
 }
