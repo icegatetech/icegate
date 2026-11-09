@@ -66,6 +66,27 @@ fn assert_semantic_refusal(reply: &PplReply, expected_text: &str) {
     assert_semantic_refusal_naming(reply, &[expected_text]);
 }
 
+/// A listener configuration whose PPL row limit (100) is far below the rows the never-capped tests read
+/// inside a join side, a subsearch, a window or an append branch: the limit bounds only the final answer,
+/// so those tests answer in full only while no inner side is capped by it.
+fn build_row_limited_config() -> OpenSearchConfig {
+    OpenSearchConfig {
+        ppl: PplLimitsConfig {
+            max_result_rows: Some(100),
+        },
+        ..OpenSearchConfig::default()
+    }
+}
+
+/// Asserts that `query`, run alone as `tenant`, is refused for exceeding the row limit of
+/// [`build_row_limited_config`]: the proof that the limit is in force in a never-capped test.
+async fn assert_row_limit_refuses(server: &TestServer, tenant: &str, query: &str) {
+    let reply = refuse_ppl(server, tenant, query).await;
+    let error = &reply.parse_json_body()["error"];
+    assert_eq!(error["code"], "RESOURCE_LIMIT_EXCEEDED", "{query}: {error}");
+    assert_eq!(error["context"]["limit"], 100, "{query}: {error}");
+}
+
 /// Asserts that `reply` is the semantic refusal and that its reason mentions every one of `names`.
 fn assert_semantic_refusal_naming(reply: &PplReply, names: &[&str]) {
     let error = &reply.parse_json_body()["error"];
@@ -853,7 +874,7 @@ mod join {
 
     #[tokio::test]
     async fn a_join_side_over_ten_thousand_rows_is_never_capped() {
-        let (server, catalog) = TestServer::start().await;
+        let (server, catalog) = TestServer::start_with_config(build_row_limited_config()).await;
         commit_rows(
             &catalog,
             LOGS_TABLE,
@@ -878,6 +899,7 @@ mod join {
              | inner join left=l right=s on l.service_name = s.service_name \
              [ source=spans | fields name, service_name ] \
              | stats count() as n";
+        assert_row_limit_refuses(&server, TENANT_A, "source=spans | fields name").await;
         assert_eq!(run_ppl(&server, TENANT_A, query).await["datarows"], json!([[10_050]]));
         server.shutdown().await;
     }
@@ -980,7 +1002,7 @@ mod subsearch {
 
     #[tokio::test]
     async fn an_in_subsearch_matching_more_than_ten_thousand_rows_is_never_capped() {
-        let (server, catalog) = TestServer::start().await;
+        let (server, catalog) = TestServer::start_with_config(build_row_limited_config()).await;
         let trace_ids: Vec<[u8; 16]> = (0..10_053).map(build_indexed_trace_id).collect();
         let logs: Vec<Row<'_>> = trace_ids
             .iter()
@@ -1004,6 +1026,12 @@ mod subsearch {
 
         let query = "source=logs | where trace_id in [ source=spans | where name = 'match' | fields trace_id ] \
              | stats count() as n";
+        assert_row_limit_refuses(
+            &server,
+            TENANT_A,
+            "source=spans | where name = 'match' | fields trace_id",
+        )
+        .await;
         assert_eq!(run_ppl(&server, TENANT_A, query).await["datarows"], json!([[10_050]]));
         server.shutdown().await;
     }
@@ -1572,7 +1600,7 @@ mod window {
 
     #[tokio::test]
     async fn eventstats_over_more_than_ten_thousand_rows_is_never_capped() {
-        let (server, catalog) = TestServer::start().await;
+        let (server, catalog) = TestServer::start_with_config(build_row_limited_config()).await;
         let mut rows: Vec<Row<'_>> = (0..10_050)
             .map(|offset| {
                 build_log_row(
@@ -1593,6 +1621,12 @@ mod window {
 
         let query =
             "source=logs | eventstats count() as n by service_name | stats count() as rows, max(n) as group_size";
+        assert_row_limit_refuses(
+            &server,
+            TENANT_A,
+            "source=logs | eventstats count() as n by service_name",
+        )
+        .await;
         assert_eq!(
             run_ppl(&server, TENANT_A, query).await["datarows"],
             json!([[10_050, 10_050]])
@@ -1850,12 +1884,7 @@ mod append {
     #[tokio::test]
     async fn an_appended_branch_beyond_the_row_limit_is_never_capped() {
         const BRANCH_ROWS: i64 = 10_050;
-        let config = OpenSearchConfig {
-            ppl: PplLimitsConfig {
-                max_result_rows: Some(100),
-            },
-            ..OpenSearchConfig::default()
-        };
+        let config = build_row_limited_config();
         assert!(
             i64::try_from(config.search.max_result_window).expect("the window fits an i64") < BRANCH_ROWS,
             "the branch must exceed the default result window"
@@ -1867,10 +1896,7 @@ mod append {
         spans.extend((0..3).map(|offset| build_span_row(TENANT_B, NOON + offset, "checkout", "b-span")));
         commit_rows(&catalog, SPANS_TABLE, &spans).await.expect("commit spans");
 
-        let branch_reply = refuse_ppl(&server, TENANT_A, "source=spans | fields name").await;
-        let branch_error = &branch_reply.parse_json_body()["error"];
-        assert_eq!(branch_error["code"], "RESOURCE_LIMIT_EXCEEDED", "{branch_error}");
-        assert_eq!(branch_error["context"]["limit"], 100, "{branch_error}");
+        assert_row_limit_refuses(&server, TENANT_A, "source=spans | fields name").await;
 
         let query = "source=logs | fields body | append [ source=spans | fields name ] | stats count() as n";
         assert_eq!(
