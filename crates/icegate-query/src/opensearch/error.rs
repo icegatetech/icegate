@@ -399,15 +399,33 @@ impl OpenSearchError {
     /// grouped, one failed shard) whose root cause is the `query_shard_exception`; the entry of
     /// `failed_shards` carries `shard`, `index` and `reason`.
     pub(crate) fn query_shard(index: &str, reason: &str) -> Self {
-        let shard_cause = Self::new(
+        Self::search_phase_failure(
+            OpenSearchErrorKind::QueryShard,
+            Some(index),
+            &Self::build_query_shard_cause(index, reason),
+        )
+    }
+
+    /// The [`query_shard`](Self::query_shard) failure for a literal that the field `field` of
+    /// `index` cannot hold, `detail` saying why. `field` is the name the request used, never the
+    /// column behind it; the root cause and the failed shard's reason carry it beside `index` for
+    /// a client.
+    pub(crate) fn malformed_field_literal(field: &str, index: &str, detail: &str) -> Self {
+        let shard_cause = Self::build_query_shard_cause(index, &format!("failed to create query: [{field}] {detail}"))
+            .with_metadata("field", field);
+        Self::search_phase_failure(OpenSearchErrorKind::QueryShard, Some(index), &shard_cause)
+    }
+
+    /// The `query_shard_exception` a query-shard failure on `index` wraps as its root cause.
+    fn build_query_shard_cause(index: &str, reason: &str) -> Self {
+        Self::new(
             OpenSearchErrorKind::QueryShard,
             StatusCode::BAD_REQUEST,
             "query_shard_exception",
             reason,
         )
         .with_metadata("index", index)
-        .with_metadata("index_uuid", "_na_");
-        Self::search_phase_failure(OpenSearchErrorKind::QueryShard, Some(index), &shard_cause)
+        .with_metadata("index_uuid", "_na_")
     }
 
     /// `from + size` exceeds `search.max_result_window` (`400`, a search-phase failure whose root
@@ -559,6 +577,57 @@ impl OpenSearchError {
         ))
         .with_metadata("field", field)
         .with_metadata("index", index)
+    }
+
+    /// The index expression `expression` reaches the table `table` through the indices of several
+    /// `profiles` without naming each of them (`400`), so a wildcard would return one row more
+    /// than once. `index` (the expression), `table` and `profiles` (in the indices' name order)
+    /// are carried for a client.
+    pub(crate) fn table_reached_through_profiles(expression: &str, table: &str, profiles: &[&str]) -> Self {
+        Self::illegal_argument(format!(
+            "index expression [{expression}] reaches table [{table}] through the profiles [{}]; name each of its \
+             indices explicitly to read it more than once",
+            profiles.join(", ")
+        ))
+        .with_metadata("index", expression)
+        .with_metadata("table", table)
+        .with_metadata("profiles", json!(profiles))
+    }
+
+    /// A stored attribute key holding the character an escaping profile writes for `.` (`400`),
+    /// whose spelling would read back as a different key; `key` carries the stored key for a
+    /// client.
+    pub(crate) fn unescapable_attribute_key(key: &str) -> Self {
+        Self::illegal_argument(format!(
+            "stored attribute key [{key}] contains '@', which this index writes for '.'; read it through its native \
+             index"
+        ))
+        .with_metadata("key", key)
+    }
+
+    /// A `fields` or `docvalue_fields` pattern `field` on the index `index` of a non-native
+    /// profile, whose fields are named one by one (`400`); `field` and `index` are carried for a
+    /// client.
+    pub(crate) fn field_pattern_on_profile_index(field: &str, index: &str) -> Self {
+        Self::illegal_argument(format!(
+            "field pattern [{field}] is not supported on index [{index}]; name each field"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("index", index)
+    }
+
+    /// The `operation` (a sort or an aggregation) reads the field `field` of `index`, an encoded
+    /// id whose missing value renders `""`: a sort or a bucket over its stored bytes would place
+    /// that value apart from where `""` sorts and buckets (`400`). `field`, `index` and
+    /// `operation` are carried for a client.
+    pub(crate) fn unordered_missing_id(field: &str, index: &str, operation: &str) -> Self {
+        Self::illegal_argument(format!(
+            "[{operation}] on field [{field}] of index [{index}] is not supported: a missing id renders \"\", which the \
+             stored ids do not order or bucket"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("index", index)
+        .with_metadata("operation", operation)
     }
 
     /// The scroll `scroll_id` expired, or the snapshot object it reads is gone (`404`).
@@ -995,6 +1064,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_malformed_field_literal_carries_the_requested_field_on_its_query_shard_cause() {
+        let error =
+            OpenSearchError::malformed_field_literal("status.code", "otel-v1-apm-span", "cannot hold the value [x]");
+        assert_eq!(error.kind(), &OpenSearchErrorKind::QueryShard);
+
+        let (status, body) = render_envelope(error).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "search_phase_execution_exception");
+        let cause = &body["error"]["root_cause"][0];
+        assert_eq!(cause["type"], "query_shard_exception");
+        assert_eq!(cause["field"], "status.code");
+        assert_eq!(cause["index"], "otel-v1-apm-span");
+        assert_eq!(
+            body["error"]["failed_shards"],
+            json!([{"shard": 0, "index": "otel-v1-apm-span", "reason": cause.clone()}])
+        );
+    }
+
+    #[tokio::test]
     async fn too_many_buckets_is_a_search_phase_400_with_the_bucket_cause_in_root_cause() {
         let (status, body) = render_envelope(OpenSearchError::too_many_buckets(3, 4)).await;
 
@@ -1053,6 +1142,54 @@ mod tests {
             assert_eq!(cause["reason"], "[severity_text] cannot be aggregated");
             assert_eq!(cause["field"], "severity_text");
             assert_eq!(cause["indices_by_type"], expected_indices);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_table_reached_through_profiles_carries_the_expression_table_and_profiles_in_error_and_root_cause() {
+        let (status, body) = render_envelope(OpenSearchError::table_reached_through_profiles(
+            "sp*,otel*",
+            "spans",
+            &["data_prepper", "native"],
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        for cause in [&body["error"], &body["error"]["root_cause"][0]] {
+            assert_eq!(cause["type"], "illegal_argument_exception");
+            assert_eq!(cause["index"], "sp*,otel*");
+            assert_eq!(cause["table"], "spans");
+            assert_eq!(cause["profiles"], json!(["data_prepper", "native"]));
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_refusals_carry_their_key_field_index_and_operation_in_error_and_root_cause() {
+        let cases = [
+            (
+                OpenSearchError::unescapable_attribute_key("user@domain"),
+                json!({"key": "user@domain"}),
+            ),
+            (
+                OpenSearchError::field_pattern_on_profile_index("status.*", "otel-v1-apm-span"),
+                json!({"field": "status.*", "index": "otel-v1-apm-span"}),
+            ),
+            (
+                OpenSearchError::unordered_missing_id("parentSpanId", "otel-v1-apm-span", "sort"),
+                json!({"field": "parentSpanId", "index": "otel-v1-apm-span", "operation": "sort"}),
+            ),
+        ];
+        for (error, expected_metadata) in cases {
+            let (status, body) = render_envelope(error).await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{expected_metadata}");
+            for cause in [&body["error"], &body["error"]["root_cause"][0]] {
+                assert_eq!(cause["type"], "illegal_argument_exception", "{expected_metadata}");
+                for (key, value) in expected_metadata.as_object().expect("an object") {
+                    assert_eq!(&cause[key], value, "{key}");
+                }
+            }
         }
     }
 

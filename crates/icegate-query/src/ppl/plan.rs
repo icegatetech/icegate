@@ -337,10 +337,23 @@ async fn resolve_data_entries<'session>(
 }
 
 /// The columns of one index (see [`project_source_columns`]).
+///
+/// # Errors
+///
+/// A semantic 400 naming the index and its profile for an index served under a non-native
+/// profile: PPL reads stored columns, and a profile that renames, encodes or derives fields has
+/// no PPL projection.
 fn scan_entry(session: &TenantSession, entry: &IndexEntry) -> Result<LogicalPlanBuilder, PplError> {
-    // Every index is read through the native profile, which exposes the table's own columns; a
-    // profile that renames or derives fields needs its own projection here.
-    let Profile::Native = entry.profile();
+    let profile = entry.profile();
+    if profile != Profile::Native {
+        return Err(PplError::Semantic {
+            reason: format!(
+                "PPL reads native indices only; [{}] is served under the {} profile",
+                entry.name(),
+                profile.name()
+            ),
+        });
+    }
     project_source_columns(session.scan_index(entry)?)
 }
 
@@ -2451,7 +2464,15 @@ fn find_promoted_column(name: &str, scope: &ExpressionScope<'_>) -> Result<Optio
         .map(
             |entry| match source.session.resolve_field(entry, name).map(|field| field.value) {
                 Some(FieldValue::Column { column }) if column != name => Some(column),
-                Some(FieldValue::Column { .. } | FieldValue::MapKey { .. } | FieldValue::HexId { .. }) | None => None,
+                // A native index, the only one PPL reads, resolves no encoded or derived field.
+                Some(
+                    FieldValue::Column { .. }
+                    | FieldValue::MapKey { .. }
+                    | FieldValue::HexId { .. }
+                    | FieldValue::Encoded(_)
+                    | FieldValue::Derived(_),
+                )
+                | None => None,
             },
         )
         .collect();
@@ -2726,6 +2747,8 @@ const DESCRIBE_NULLABLE: i32 = 2;
 
 /// Plans `describe <index>`: one row per field of the index's field model, in field-model order
 /// (schema column order, each MAP column followed by its keys in byte order, keys never split).
+/// An index served under a non-native profile lists the profile's fields in the profile's
+/// declared order; it answers although it cannot be a PPL source, since `describe` reads no rows.
 ///
 /// The rows are no index's columns, so the pipeline carries no source binding and no order.
 ///

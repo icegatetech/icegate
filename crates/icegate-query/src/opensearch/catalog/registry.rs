@@ -1,8 +1,11 @@
 //! The data indices one tenant sees and how an index expression selects them, how it selects the
 //! tenant's system indices, and how a request that reads one kind of index is told which.
 
+use std::collections::BTreeMap;
+
 use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE};
 
+use super::data_prepper::DATA_PREPPER_SPAN_INDEX;
 use super::expression::{ExpressionPart, IndexExpression, Selection, has_wildcard};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::extract::ExpandWildcards;
@@ -52,7 +55,23 @@ pub(crate) fn read_index_options(
 pub(crate) enum Profile {
     /// Columns under their stored names.
     Native,
+    /// The Data Prepper span index: camel-case names, hex ids, enum names, nested `_source`.
+    DataPrepper,
 }
+
+impl Profile {
+    /// The profile's name in error reasons and refusals.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::DataPrepper => "data_prepper",
+        }
+    }
+}
+
+/// The indices a non-native profile serves: index name, the table it reads, its profile. Each is
+/// listed when its table is, and is wildcard-visible.
+const PROFILE_INDICES: [(&str, &str, Profile); 1] = [(DATA_PREPPER_SPAN_INDEX, SPANS_TABLE, Profile::DataPrepper)];
 
 /// Something an index expression selects by name: a data index, or a system index or alias name.
 trait SelectableIndex {
@@ -124,19 +143,30 @@ pub(crate) struct IndexSet {
 
 impl IndexSet {
     /// Build the set from the table names a tenant-scoped catalog lists. Telemetry tables are
-    /// wildcard-visible; every other table resolves only by its exact name. A dot-prefixed table
-    /// name is dropped: dot-prefixed names are system indices, never data.
+    /// wildcard-visible, and each one also yields the indices of the non-native profiles that read
+    /// it; every other table resolves only by its exact name. A dot-prefixed table name is
+    /// dropped: dot-prefixed names are system indices, never data.
     pub(crate) fn from_table_names(names: impl IntoIterator<Item = String>) -> Self {
-        let mut entries: Vec<IndexEntry> = names
-            .into_iter()
-            .filter(|name| !name.starts_with('.'))
-            .map(|name| IndexEntry {
+        let mut entries: Vec<IndexEntry> = Vec::new();
+        for name in names.into_iter().filter(|name| !name.starts_with('.')) {
+            entries.extend(
+                PROFILE_INDICES
+                    .iter()
+                    .filter(|(_, table, _)| *table == name)
+                    .map(|(index, _, profile)| IndexEntry {
+                        name: (*index).to_string(),
+                        table: name.clone(),
+                        profile: *profile,
+                        is_wildcard_visible: true,
+                    }),
+            );
+            entries.push(IndexEntry {
                 is_wildcard_visible: find_telemetry_table(&name).is_some(),
                 table: name.clone(),
                 profile: Profile::Native,
                 name,
-            })
-            .collect();
+            });
+        }
         entries.sort_by(|left_entry, right_entry| left_entry.name.cmp(&right_entry.name));
         entries.dedup_by(|left_entry, right_entry| left_entry.name == right_entry.name);
         Self { entries }
@@ -147,37 +177,105 @@ impl IndexSet {
         &self.entries
     }
 
-    /// The entries `expression` selects under `options`, in name order, each at most once.
+    /// The entries `expression` selects under `options`, in name order, each at most once, for
+    /// an endpoint that lists indices without reading their rows (`_resolve/index`,
+    /// `_cat/indices`).
     ///
     /// # Errors
     ///
     /// Returns `index_not_found_exception` for a missing concrete name unless
     /// `ignore_unavailable`, and for an empty result when `allow_no_indices` is false (naming the
     /// whole expression).
+    pub(crate) fn resolve_listing(
+        &self,
+        expression: &IndexExpression,
+        options: IndexOptions,
+    ) -> Result<Vec<&IndexEntry>, OpenSearchError> {
+        Ok(self
+            .select_entries(expression, options)?
+            .into_iter()
+            .map(|(entry, _)| entry)
+            .collect())
+    }
+
+    /// The entries `expression` selects under `options`, for an endpoint that reads rows or
+    /// fields. A table reached through several profiles is read once per index only when every
+    /// one of those indices was named explicitly, so a wildcard never returns a row twice.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::resolve_listing`], and
+    /// [`OpenSearchError::table_reached_through_profiles`] when a wildcard reaches one table
+    /// through several profiles.
     pub(crate) fn resolve(
         &self,
         expression: &IndexExpression,
         options: IndexOptions,
     ) -> Result<Vec<&IndexEntry>, OpenSearchError> {
-        let resolved_entries: Vec<&IndexEntry> = match &expression.selection {
+        let selected_entries = self.select_entries(expression, options)?;
+        check_table_uniqueness(expression, &selected_entries)?;
+        Ok(selected_entries.into_iter().map(|(entry, _)| entry).collect())
+    }
+
+    /// Each entry `expression` selects under `options`, in name order, with whether a concrete
+    /// name (not a wildcard) selected it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::resolve_listing`].
+    pub(super) fn select_entries(
+        &self,
+        expression: &IndexExpression,
+        options: IndexOptions,
+    ) -> Result<Vec<(&IndexEntry, bool)>, OpenSearchError> {
+        let selected_entries: Vec<(&IndexEntry, bool)> = match &expression.selection {
             Selection::AllVisible => self
                 .entries
                 .iter()
                 .filter(|entry| is_expanded_by_wildcard(*entry, "*", options.expand_wildcards))
+                .map(|entry| (entry, false))
                 .collect(),
             Selection::Parts(parts) => select_items_by_parts(&self.entries, parts, options)?.collect(),
         };
-        if resolved_entries.is_empty() && !options.allow_no_indices {
+        if selected_entries.is_empty() && !options.allow_no_indices {
             return Err(OpenSearchError::index_not_found(expression.text()));
         }
-        Ok(resolved_entries)
+        Ok(selected_entries)
     }
 }
 
+/// Refuse a selection that reaches one table through several indices unless a concrete name
+/// selected each of them.
+///
+/// # Errors
+///
+/// Returns [`OpenSearchError::table_reached_through_profiles`] naming the first such table.
+pub(super) fn check_table_uniqueness(
+    expression: &IndexExpression,
+    selected_entries: &[(&IndexEntry, bool)],
+) -> Result<(), OpenSearchError> {
+    let mut entries_by_table: BTreeMap<&str, Vec<(&IndexEntry, bool)>> = BTreeMap::new();
+    for (entry, is_named) in selected_entries {
+        entries_by_table.entry(entry.table()).or_default().push((entry, *is_named));
+    }
+    for (table, table_entries) in entries_by_table {
+        if table_entries.len() > 1 && !table_entries.iter().all(|(_, is_named)| *is_named) {
+            let profiles: Vec<&str> = table_entries.iter().map(|(entry, _)| entry.profile().name()).collect();
+            return Err(OpenSearchError::table_reached_through_profiles(
+                expression.text(),
+                table,
+                &profiles,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The items of `items` (sorted by name, each name once) that `parts` select under `options`, in
-/// name order. The parts apply left to right: a wildcard inclusion adds what it expands to (see
-/// [`is_expanded_by_wildcard`]), a concrete inclusion adds the item of that exact name, and an
-/// exclusion removes every item it matches.
+/// name order, each with whether a concrete name selected it. The parts apply left to right: a
+/// wildcard inclusion adds what it expands to (see [`is_expanded_by_wildcard`]), a concrete
+/// inclusion adds the item of that exact name and marks it named, and an exclusion removes every
+/// item it matches and forgets that a name selected it.
 ///
 /// # Errors
 ///
@@ -186,8 +284,9 @@ fn select_items_by_parts<'a, T: SelectableIndex>(
     items: &'a [T],
     parts: &[ExpressionPart],
     options: IndexOptions,
-) -> Result<impl Iterator<Item = &'a T>, OpenSearchError> {
+) -> Result<impl Iterator<Item = (&'a T, bool)>, OpenSearchError> {
     let mut selection_flags = vec![false; items.len()];
+    let mut naming_flags = vec![false; items.len()];
     for part in parts {
         match part {
             ExpressionPart::Include(pattern) if has_wildcard(pattern) => {
@@ -198,22 +297,29 @@ fn select_items_by_parts<'a, T: SelectableIndex>(
             // `items` is sorted by name, so a concrete name is one binary search.
             ExpressionPart::Include(concrete_name) => {
                 match items.binary_search_by(|item| item.index_name().cmp(concrete_name.as_str())) {
-                    Ok(position) => selection_flags[position] = true,
+                    Ok(position) => {
+                        selection_flags[position] = true;
+                        naming_flags[position] = true;
+                    }
                     Err(_) if options.ignore_unavailable => {}
                     Err(_) => return Err(OpenSearchError::index_not_found(concrete_name)),
                 }
             }
             ExpressionPart::Exclude(pattern) => {
-                for (is_item_selected, item) in selection_flags.iter_mut().zip(items) {
-                    *is_item_selected &= !matches_glob(pattern, item.index_name());
+                for ((is_item_selected, is_item_named), item) in
+                    selection_flags.iter_mut().zip(naming_flags.iter_mut()).zip(items)
+                {
+                    let is_excluded = matches_glob(pattern, item.index_name());
+                    *is_item_selected &= !is_excluded;
+                    *is_item_named &= !is_excluded;
                 }
             }
         }
     }
     Ok(items
         .iter()
-        .zip(selection_flags)
-        .filter_map(|(item, is_item_selected)| is_item_selected.then_some(item)))
+        .zip(selection_flags.into_iter().zip(naming_flags))
+        .filter_map(|(item, (is_item_selected, is_item_named))| is_item_selected.then_some((item, is_item_named))))
 }
 
 /// What an index expression resolves to on a request that reads one kind of index.
@@ -236,7 +342,7 @@ pub(super) fn select_system_names<'a>(
     parts: &[ExpressionPart],
     options: IndexOptions,
 ) -> Result<Vec<&'a str>, OpenSearchError> {
-    Ok(select_items_by_parts(names, parts, options)?.copied().collect())
+    Ok(select_items_by_parts(names, parts, options)?.map(|(name, _)| *name).collect())
 }
 
 /// Decide what `expression` targets from its resolved data and system sides: a request reads
@@ -274,6 +380,7 @@ fn is_expanded_by_wildcard<T: SelectableIndex>(item: &T, pattern: &str, expand_w
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
+    use serde_json::json;
 
     use super::*;
     use crate::opensearch::error::render_envelope;
@@ -306,7 +413,7 @@ mod tests {
 
     fn resolve_names(text: &str, options: IndexOptions) -> Vec<String> {
         build_index_set()
-            .resolve(&IndexExpression::parse(text).expect("a valid expression"), options)
+            .resolve_listing(&IndexExpression::parse(text).expect("a valid expression"), options)
             .expect("the expression resolves")
             .into_iter()
             .map(|entry| entry.name().to_string())
@@ -315,20 +422,72 @@ mod tests {
 
     #[test]
     fn star_selects_registry_indices_in_name_order_but_no_exact_name_table() {
-        let telemetry_names = ["events", "logs", "metrics", "operations", "spans"];
-        assert_eq!(resolve_names("*", build_search_options()), telemetry_names);
-        assert_eq!(resolve_names("_all", build_search_options()), telemetry_names);
-        assert_eq!(resolve_names("", build_search_options()), telemetry_names);
+        let visible_names = ["events", "logs", "metrics", "operations", "otel-v1-apm-span", "spans"];
+        assert_eq!(resolve_names("*", build_search_options()), visible_names);
+        assert_eq!(resolve_names("_all", build_search_options()), visible_names);
+        assert_eq!(resolve_names("", build_search_options()), visible_names);
     }
 
     #[test]
     fn exclusions_and_single_character_wildcards_apply_in_order() {
         assert_eq!(
             resolve_names("*,-s*", build_search_options()),
-            ["events", "logs", "metrics", "operations"]
+            ["events", "logs", "metrics", "operations", "otel-v1-apm-span"]
         );
         assert_eq!(resolve_names("l?gs", build_search_options()), ["logs"]);
         assert_eq!(resolve_names("*,-*,logs", build_search_options()), ["logs"]);
+    }
+
+    /// A table reached through two profiles is read twice only when each of its indices is
+    /// named: a wildcard reaching `spans` and `otel-v1-apm-span` is refused naming the
+    /// expression, the table and both profiles, while naming both, or excluding one, resolves.
+    #[tokio::test]
+    async fn a_table_reached_through_two_profiles_needs_every_index_named() {
+        let index_set = build_index_set();
+        let resolve_entry_names = |text: &str| {
+            index_set
+                .resolve(
+                    &IndexExpression::parse(text).expect("a valid expression"),
+                    build_search_options(),
+                )
+                .map(|entries| entries.into_iter().map(|entry| entry.name().to_string()).collect::<Vec<_>>())
+        };
+
+        for text in ["*", "_all", "", "sp*,otel*", "spans,otel*", "otel*,s*", "*,-logs"] {
+            let (status, body) = render_envelope(resolve_entry_names(text).expect_err(text)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{text:?}");
+            for cause in [&body["error"], &body["error"]["root_cause"][0]] {
+                assert_eq!(cause["type"], "illegal_argument_exception", "{text:?}");
+                assert_eq!(cause["index"], text, "{text:?}");
+                assert_eq!(cause["table"], "spans", "{text:?}");
+                assert_eq!(cause["profiles"], json!(["data_prepper", "native"]), "{text:?}");
+            }
+        }
+        assert_eq!(
+            resolve_entry_names("spans,otel-v1-apm-span").expect("both named"),
+            ["otel-v1-apm-span", "spans"]
+        );
+        assert_eq!(
+            resolve_entry_names("*,-s*").expect("one profile of each table left"),
+            ["events", "logs", "metrics", "operations", "otel-v1-apm-span"]
+        );
+        assert_eq!(
+            resolve_entry_names("*,-otel*").expect("one profile of each table left"),
+            ["events", "logs", "metrics", "operations", "spans"]
+        );
+        assert_eq!(
+            resolve_entry_names("logs,spans").expect("one profile each"),
+            ["logs", "spans"]
+        );
+        assert_eq!(
+            resolve_entry_names("otel-v1-apm-span").expect("one profile"),
+            ["otel-v1-apm-span"]
+        );
+        // A name an exclusion removed and a wildcard added back is no longer named.
+        let (status, body) =
+            render_envelope(resolve_entry_names("x*,spans,otel-v1-apm-span,-sp*,s*").expect_err("unnamed")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["table"], "spans");
     }
 
     #[test]

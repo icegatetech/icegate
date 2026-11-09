@@ -19,11 +19,11 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{
     ArrayRef, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, ListArray,
-    ListBuilder, MapBuilder, MapFieldNames, StringArray, StringBuilder, TimestampMicrosecondArray, new_empty_array,
-    new_null_array,
+    ListBuilder, MapBuilder, MapFieldNames, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray,
+    new_empty_array, new_null_array,
 };
 use datafusion::arrow::buffer::OffsetBuffer;
-use datafusion::arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use iceberg::spec::{DataFile, PartitionSpec, Schema, SortOrder};
 use iceberg::table::Table;
@@ -141,7 +141,9 @@ pub async fn create_production_tables(catalog: &Arc<dyn Catalog>) -> Result<(), 
     Ok(())
 }
 
-/// One cell of a [`Row`], named by the column it fills.
+/// One cell of a [`Row`], named by the column it fills. Every variant holds a shared reference or
+/// a scalar, so a cell copies.
+#[derive(Clone, Copy)]
 pub enum Cell<'a> {
     /// A string.
     Text(&'a str),
@@ -165,6 +167,9 @@ pub enum Cell<'a> {
     /// The value of an `Int32` column. It holds an `i64` so a literal of any width can be
     /// written; the column builder checks that it fits.
     Int(i64),
+    /// The elements of a list of structs, each element given by its cells, which fill the
+    /// struct's members by name like a [`Row`]'s cells fill a table's columns.
+    Structs(&'a [&'a [(&'a str, Self)]]),
 }
 
 /// One table row with explicit values: its tenant and the cells it sets. Every other column is
@@ -371,23 +376,74 @@ fn build_rows_column(field: &Field, rows: &[Row<'_>]) -> Result<ArrayRef, RowWri
             }
             Arc::new(builder.finish())
         }
-        DataType::List(item) => {
-            assert_no_cells(rows, name);
-            let offsets = OffsetBuffer::new(vec![0_i32; rows.len() + 1].into());
-            let nulls = (!is_required).then(|| vec![false; rows.len()].into());
-            Arc::new(ListArray::new(
-                Arc::clone(item),
-                offsets,
-                new_empty_array(item.data_type()),
-                nulls,
-            ))
-        }
+        DataType::List(item) => build_list_column(name, item, rows, is_required)?,
         other => {
             assert_no_cells(rows, name);
             new_null_array(other, rows.len())
         }
     };
     Ok(column)
+}
+
+/// A list column: `Structs` cells give each row's elements; a row without a cell is NULL when the
+/// column is nullable and empty otherwise. A struct element's cells fill the struct's members by
+/// name, recursively, with the defaults of [`build_rows_column`]. A list of any other element type
+/// takes no cells. Panics on a cell of another kind.
+///
+/// # Errors
+///
+/// Fails when the elements overflow the list's `i32` offsets, or Arrow refuses a member, the
+/// struct elements or the list.
+fn build_list_column(
+    name: &str,
+    item: &FieldRef,
+    rows: &[Row<'_>],
+    is_required: bool,
+) -> Result<ArrayRef, RowWriteError> {
+    let mut offsets: Vec<i32> = Vec::with_capacity(rows.len() + 1);
+    let mut end_offset = 0_i32;
+    offsets.push(end_offset);
+    let mut validity: Vec<bool> = Vec::with_capacity(rows.len());
+    // The struct elements borrow from `rows` only, so they live as long as the slice.
+    let mut elements: Vec<Row<'_>> = Vec::new();
+    for row in rows {
+        let cell = find_row_cell(row, name).copied();
+        let element_count = match cell {
+            Some(Cell::Structs(values)) => {
+                elements.extend(values.iter().map(|cells| Row {
+                    tenant: row.tenant,
+                    cells: cells.to_vec(),
+                }));
+                values.len()
+            }
+            None => 0,
+            Some(_) => panic!("`{name}` takes Structs"),
+        };
+        validity.push(cell.is_some() || is_required);
+        end_offset = end_offset
+            .checked_add(i32::try_from(element_count)?)
+            .ok_or("list offsets overflow i32")?;
+        offsets.push(end_offset);
+    }
+    let values: ArrayRef = match item.data_type() {
+        DataType::Struct(members) => {
+            let member_columns = members
+                .iter()
+                .map(|member| build_rows_column(member, &elements))
+                .collect::<Result<Vec<ArrayRef>, RowWriteError>>()?;
+            Arc::new(StructArray::try_new(members.clone(), member_columns, None)?)
+        }
+        other => {
+            assert_no_cells(rows, name);
+            new_empty_array(other)
+        }
+    };
+    Ok(Arc::new(ListArray::try_new(
+        Arc::clone(item),
+        OffsetBuffer::new(offsets.into()),
+        values,
+        Some(validity.into()),
+    )?))
 }
 
 /// The production writer settings of `table_name`: its bloom-filter columns and column

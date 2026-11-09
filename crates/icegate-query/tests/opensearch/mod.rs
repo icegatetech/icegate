@@ -17,6 +17,7 @@ mod ppl_clients;
 mod ppl_endpoints;
 mod ppl_formats;
 mod ppl_trust_delta;
+mod profiles;
 mod requests;
 mod rustfs_conditional;
 mod saved_objects;

@@ -533,11 +533,13 @@ mod tests {
     }
 
     /// An index `uuid` is stable for one tenant and one index, and no two tenants or indices share
-    /// one, so a client keying state by it never mixes two tenants' indices.
+    /// one, so a client keying state by it never mixes two tenants' indices; two indices over one
+    /// table (`spans` and its span profile index) are two indices.
     #[test]
     fn index_uuids_differ_between_tenants_and_between_indices() {
         let index_set = IndexSet::from_table_names(["logs".to_string(), "spans".to_string()]);
-        let [logs_entry, spans_entry] = <&[IndexEntry; 2]>::try_from(index_set.entries()).expect("logs and spans");
+        let [logs_entry, span_profile_entry, spans_entry] =
+            <&[IndexEntry; 3]>::try_from(index_set.entries()).expect("logs, otel-v1-apm-span and spans");
         let tenant_a = build_tenant("tenant-a");
         let tenant_b = build_tenant("tenant-b");
         let render_uuid = |entry: &IndexEntry, tenant: &TenantId| {
@@ -560,6 +562,11 @@ mod tests {
         assert_eq!(tenant_a_logs_uuid, render_uuid(logs_entry, &tenant_a));
         assert_ne!(tenant_a_logs_uuid, render_uuid(logs_entry, &tenant_b));
         assert_ne!(tenant_a_logs_uuid, render_uuid(spans_entry, &tenant_a));
+        assert_eq!(span_profile_entry.name(), "otel-v1-apm-span");
+        assert_ne!(
+            render_uuid(span_profile_entry, &tenant_a),
+            render_uuid(spans_entry, &tenant_a)
+        );
     }
 
     /// `format` is matched case-insensitively, so its spelling never changes the answer; a value

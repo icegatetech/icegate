@@ -7,7 +7,8 @@ use datafusion::logical_expr::Expr;
 use datafusion::prelude::ident;
 use icegate_common::schema::{COL_RESOURCE_ATTRIBUTES, promoted_resource_keys};
 
-use super::{IndexEntry, TenantSession};
+use super::encoding::{DerivedField, EncodedField, expand_profile_pattern};
+use super::{IndexEntry, TenantSession, find_profile_table};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::glob::matches_glob;
 
@@ -122,6 +123,10 @@ pub(crate) enum FieldValue {
         /// The column's width in bytes.
         width: i32,
     },
+    /// A stored value under a reversible conversion; filters lower through its inverse.
+    Encoded(EncodedField),
+    /// A per-row expression over stored columns.
+    Derived(DerivedField),
 }
 
 impl FieldValue {
@@ -134,7 +139,28 @@ impl FieldValue {
         match self {
             Self::Column { column } | Self::HexId { column, .. } => ident(column),
             Self::MapKey { column, key } => get_field(ident(column), key.as_str()),
+            Self::Encoded(encoded_field) => encoded_field.build_read_expr(),
+            Self::Derived(derived_field) => derived_field.build_read_expr(),
         }
+    }
+}
+
+impl ResolvedField {
+    /// The field as a filter or a sort reads it. An RFC 3339 time reads as its stored date column
+    /// (date math, epoch-millisecond bounds and formats apply unchanged) and an escaped attribute
+    /// key as its stored MAP key; every other value is unchanged.
+    pub(crate) fn into_lowering_view(self) -> Self {
+        let value = match self.value {
+            FieldValue::Encoded(EncodedField::Rfc3339Time { column }) => FieldValue::Column {
+                column: column.to_string(),
+            },
+            FieldValue::Encoded(EncodedField::EscapedMapKey { column, key }) => FieldValue::MapKey {
+                column: column.to_string(),
+                key,
+            },
+            other_value => other_value,
+        };
+        Self { value, ..self }
     }
 }
 
@@ -168,14 +194,16 @@ impl TenantSession {
     /// every key path it covers (`*`, `log_attributes.*`, `log_*`); and the column
     /// of each promoted resource key whose attribute path it matches, so
     /// `resource_attributes.*` reaches `service_name` where ingest moved that key
-    /// out of the map.
+    /// out of the map. On an index of a non-native profile the pattern selects among
+    /// the profile's fields instead, under the same MAP rule (see
+    /// `expand_profile_pattern`).
     ///
     /// # Errors
     ///
     /// `illegal_argument` (400) when the pattern matches some but not every key
     /// path of a MAP column: which keys exist is not known without enumerating
     /// them, and a silently partial selection would return wrong rows. Any error of
-    /// [`TenantSession::scan_index`].
+    /// [`TenantSession::scan_index`] and [`TenantSession::table_schema`].
     pub(crate) fn expand_field_pattern(
         &self,
         entry: &IndexEntry,
@@ -183,6 +211,9 @@ impl TenantSession {
     ) -> Result<Vec<SelectedField>, OpenSearchError> {
         if !pattern.contains(['*', '?']) {
             return Ok(self.select_named_field(entry, pattern));
+        }
+        if let Some(table) = find_profile_table(entry) {
+            return expand_profile_pattern(table, &*self.table_schema(entry)?, pattern);
         }
         let scan = self.scan_index(entry)?;
         let mut selected_fields = Vec::new();
@@ -229,7 +260,7 @@ impl TenantSession {
 
 /// Whether `pattern` matches every key path `<column>.<key>`: it ends with `*`
 /// and matches `<column>.` itself, so its final `*` absorbs any key.
-fn covers_every_key(pattern: &str, column: &str) -> bool {
+pub(super) fn covers_every_key(pattern: &str, column: &str) -> bool {
     pattern.ends_with('*') && matches_glob(pattern, &format!("{column}."))
 }
 
@@ -237,7 +268,7 @@ fn covers_every_key(pattern: &str, column: &str) -> bool {
 /// run, `?` one character). After `prefix` is consumed the pattern can still
 /// match exactly when some pattern position is reachable, because any remaining
 /// glob suffix matches some text.
-fn glob_matches_some_extension(pattern: &str, prefix: &str) -> bool {
+pub(super) fn glob_matches_some_extension(pattern: &str, prefix: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let mut reachable_positions = vec![false; pattern.len() + 1];
     reachable_positions[0] = true;

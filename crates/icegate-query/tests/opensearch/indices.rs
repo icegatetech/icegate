@@ -33,6 +33,7 @@ async fn resolve_index_lists_the_telemetry_indices_sorted_and_open() {
                 build_open_index("logs"),
                 build_open_index("metrics"),
                 build_open_index("operations"),
+                build_open_index("otel-v1-apm-span"),
                 build_open_index("spans")
             ],
             "aliases": [],

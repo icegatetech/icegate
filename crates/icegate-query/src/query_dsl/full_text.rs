@@ -331,6 +331,16 @@ pub(crate) enum SearchKind {
         /// Bytes of the id.
         width: i32,
     },
+    /// A fixed-width binary id written as hex, whose missing id renders `""`: an empty value
+    /// matches the rows without one.
+    HexIdOrEmpty {
+        /// Bytes of the id.
+        width: i32,
+    },
+    /// A keyword shown under a reversible conversion of its stored value (an enum name, NULL as
+    /// `""`): matched as one exact value, and never by a pattern, whose inverse no conversion
+    /// declares.
+    EncodedKeyword,
     /// A 32-bit integer.
     Integer,
     /// A 64-bit integer.
@@ -660,15 +670,22 @@ impl LeafContext<'_> {
                     .map(|token| build_term_query(name, Value::String(token.text)))
                     .collect(),
             )),
-            SearchKind::Keyword => Ok(Some(build_term_query(name, Value::String(text.to_owned())))),
+            SearchKind::Keyword | SearchKind::EncodedKeyword => {
+                Ok(Some(build_term_query(name, Value::String(text.to_owned()))))
+            }
+            SearchKind::HexIdOrEmpty { .. } if text.is_empty() => {
+                Ok(Some(build_term_query(name, Value::String(String::new()))))
+            }
             // A `term` leaf carries the value as the request wrote it, and its lowering
             // decodes it for the column; this decode only chooses that leaf or a refusal.
-            SearchKind::HexId { width } => match decode_fixed_binary_literal(text, &DataType::FixedSizeBinary(width)) {
-                Ok(_) => Ok(Some(build_term_query(name, Value::String(text.to_owned())))),
-                Err(error) => {
-                    self.refuse_malformed_value(&format!("[{text}] is not a {width}-byte hex id for [{name}]: {error}"))
+            SearchKind::HexId { width } | SearchKind::HexIdOrEmpty { width } => {
+                match decode_fixed_binary_literal(text, &DataType::FixedSizeBinary(width)) {
+                    Ok(_) => Ok(Some(build_term_query(name, Value::String(text.to_owned())))),
+                    Err(error) => self.refuse_malformed_value(&format!(
+                        "[{text}] is not a {width}-byte hex id for [{name}]: {error}"
+                    )),
                 }
-            },
+            }
             SearchKind::Integer => self.build_numeric_term_query(name, text, FieldType::Integer),
             SearchKind::Long => self.build_numeric_term_query(name, text, FieldType::Long),
             SearchKind::Double => self.build_numeric_term_query(name, text, FieldType::Double),
@@ -766,8 +783,8 @@ impl LeafContext<'_> {
             let Some(bound) = bound else { continue };
             let value = match kind {
                 SearchKind::Text => Some(Value::String(normalize_standard(&bound.text))),
-                SearchKind::Keyword => Some(Value::String(bound.text.clone())),
-                SearchKind::HexId { width } => {
+                SearchKind::Keyword | SearchKind::EncodedKeyword => Some(Value::String(bound.text.clone())),
+                SearchKind::HexId { width } | SearchKind::HexIdOrEmpty { width } => {
                     decode_fixed_binary_literal(&bound.text, &DataType::FixedSizeBinary(width))
                         .ok()
                         .map(|_| Value::String(bound.text.clone()))

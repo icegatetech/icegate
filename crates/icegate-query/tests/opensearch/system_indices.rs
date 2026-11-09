@@ -704,12 +704,20 @@ async fn resolve_and_cat_indices_list_a_system_index_only_when_hidden_indices_ar
     };
     assert_eq!(
         list_index_names(&open_resolution),
-        ["events", "logs", "metrics", "operations", "spans"]
+        ["events", "logs", "metrics", "operations", "otel-v1-apm-span", "spans"]
     );
     assert_eq!(open_resolution["aliases"], json!([]));
     assert_eq!(
         list_index_names(&hidden_resolution),
-        [".kibana_1", "events", "logs", "metrics", "operations", "spans"]
+        [
+            ".kibana_1",
+            "events",
+            "logs",
+            "metrics",
+            "operations",
+            "otel-v1-apm-span",
+            "spans"
+        ]
     );
     assert_eq!(
         hidden_resolution["indices"][0],
@@ -851,6 +859,31 @@ async fn mapping_of_a_system_index_is_its_stored_mapping() {
         response.text().await.expect("body"),
         r#"{".kibana_1":{"mappings":{"dynamic":"strict","properties":{"type":{"type":"keyword"},"updated_at":{"type":"date"},"migrationVersion":{"dynamic":"true","type":"object"}},"_meta":{"migrationMappingPropertyHashes":{"type":"2f4316de49999235636386fe51dc06c1","updated_at":"00da57df13e94e9d98437d13ace4bfe0"}}}}}"#
     );
+    server.shutdown().await;
+}
+
+/// An expression naming a missing data index and a missing system index is a 404 naming the data
+/// index, on a reading endpoint (`_field_caps`, `_search`) as on a listing one (`_cat/indices`):
+/// every endpoint resolves the data side first.
+#[tokio::test]
+async fn a_missing_data_and_system_name_is_a_404_naming_the_data_index_on_every_endpoint() {
+    let (server, _catalog) = TestServer::start().await;
+    put_index(&server, TENANT_A, ".kibana_1", KIBANA_INDEX_BODY).await;
+
+    for path in [
+        "/missing-data,.missing-system/_field_caps?fields=*",
+        "/missing-data,.missing-system/_search",
+        "/_cat/indices/missing-data,.missing-system?format=json",
+    ] {
+        let response = send_bodiless_request(&server, Method::GET, TENANT_A, path)
+            .await
+            .expect("request");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        let body = read_json(response).await;
+        assert_eq!(body["error"]["type"], "index_not_found_exception", "{path}: {body}");
+        assert_eq!(body["error"]["index"], "missing-data", "{path}: {body}");
+    }
     server.shutdown().await;
 }
 

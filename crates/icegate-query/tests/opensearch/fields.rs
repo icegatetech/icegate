@@ -20,9 +20,6 @@ const TENANT_B: &str = "tenant-b";
 /// keys.
 const FIXED_TIMESTAMP_MICROS: i64 = 1_760_000_000_000_000;
 
-/// The wildcard-visible data indices of the harness, in name order: every telemetry table.
-const TELEMETRY_INDICES: [&str; 5] = ["events", "logs", "metrics", "operations", "spans"];
-
 const fn build_log_row<'a>(
     tenant_id: &'a str,
     resource_attributes: &'a [(&'a str, &'a str)],
@@ -373,39 +370,31 @@ async fn field_caps_reports_exactly_the_id_index_and_source_metadata_fields() {
     server.shutdown().await;
 }
 
-/// Without an index in the path, `_field_caps` (by GET and by POST) and `_mapping` cover every
-/// wildcard-visible index, and no exact-name table.
+/// Without an index in the path, `_field_caps` (by GET and by POST) and `_mapping` select every
+/// wildcard-visible index, `spans` and `otel-v1-apm-span` among them: one table reached through
+/// two profiles without naming either index, which each endpoint refuses, naming the table and
+/// its profiles.
 #[tokio::test]
-async fn field_caps_and_mapping_without_an_index_cover_every_wildcard_visible_index() {
+async fn field_caps_and_mapping_without_an_index_refuse_a_table_reached_through_two_profiles() {
     let (server, _catalog) = TestServer::start().await;
-    let expected_capabilities = json!({
-        "indices": TELEMETRY_INDICES,
-        "fields": {"_id": {"_id": {"type": "_id", "searchable": true, "aggregatable": false}}}
-    });
 
-    let (status_by_get, capabilities_by_get) =
-        send_request(&server, Method::GET, TENANT_A, "/_field_caps?fields=_id", None)
+    for (method, path) in [
+        (Method::GET, "/_field_caps?fields=_id"),
+        (Method::POST, "/_field_caps?fields=_id"),
+        (Method::GET, "/_mapping"),
+    ] {
+        let (status, body) = send_request(&server, method.clone(), TENANT_A, path, None)
             .await
             .expect("a JSON answer");
-    let (status_by_post, capabilities_by_post) =
-        send_request(&server, Method::POST, TENANT_A, "/_field_caps?fields=_id", None)
-            .await
-            .expect("a JSON answer");
-    let (mapping_status, mappings) = send_request(&server, Method::GET, TENANT_A, "/_mapping", None)
-        .await
-        .expect("a JSON answer");
 
-    assert_eq!((status_by_get, status_by_post, mapping_status), (200, 200, 200));
-    assert_eq!(capabilities_by_get, expected_capabilities);
-    assert_eq!(capabilities_by_post, expected_capabilities);
-    let mut mapped_indices: Vec<&str> = mappings
-        .as_object()
-        .expect("an object of indices")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    mapped_indices.sort_unstable();
-    assert_eq!(mapped_indices, TELEMETRY_INDICES);
+        assert_eq!(status, 400, "{method} {path}: {body}");
+        assert_eq!(body["error"]["type"], "illegal_argument_exception", "{method} {path}");
+        assert_eq!(body["error"]["table"], "spans", "{method} {path}");
+        let profiles = body["error"]["profiles"].as_array().expect("the profiles");
+        for profile in ["native", "data_prepper"] {
+            assert!(profiles.contains(&json!(profile)), "{method} {path}: {profiles:?}");
+        }
+    }
     server.shutdown().await;
 }
 
@@ -443,8 +432,8 @@ async fn an_unknown_parameter_is_a_400_on_every_field_route_and_an_ignored_one_i
     let cases = [
         (
             Method::GET,
-            "/_field_caps?fields=_id".to_string(),
-            "/_field_caps?fields=_id&unknown_knob=1".to_string(),
+            "/logs/_field_caps?fields=_id".to_string(),
+            "/logs/_field_caps?fields=_id&unknown_knob=1".to_string(),
         ),
         (
             Method::POST,
@@ -453,8 +442,8 @@ async fn an_unknown_parameter_is_a_400_on_every_field_route_and_an_ignored_one_i
         ),
         (
             Method::GET,
-            "/_mapping?local=true".to_string(),
-            "/_mapping?unknown_knob=1".to_string(),
+            "/logs/_mapping?local=true".to_string(),
+            "/logs/_mapping?unknown_knob=1".to_string(),
         ),
         (
             Method::GET,

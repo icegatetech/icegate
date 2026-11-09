@@ -14,6 +14,7 @@ use serde_json::{Map, Number, Value, json};
 
 use super::doc_id::MICROS_PER_DAY;
 use super::request::{SearchRequest, SortClause, SourceFilter, TrackTotalHits};
+use crate::opensearch::catalog::{ProfileTable, render_profile_document};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::glob::matches_glob;
 
@@ -31,6 +32,22 @@ pub(crate) struct SearchHit<'a> {
     pub(crate) sort_values: Option<Vec<Value>>,
     /// The hit's `fields`; `None` when the request asks for none.
     pub(crate) field_values: Option<Map<String, Value>>,
+    /// The field table of the hit's index when it serves a non-native profile: `_source` then
+    /// renders the profile's document instead of the stored columns.
+    pub(crate) profile_table: Option<&'static ProfileTable>,
+}
+
+/// The `_source` of `hit` under `filter`: the stored columns for a native index, the profile's
+/// nested document otherwise.
+///
+/// # Errors
+///
+/// The renderer's errors (see [`render_source`] and `render_profile_document`).
+pub(crate) fn render_profile_source(hit: &SearchHit<'_>, filter: &SourceFilter) -> Result<Value, OpenSearchError> {
+    hit.profile_table.map_or_else(
+        || render_source(hit.batch, hit.row, filter),
+        |table| render_profile_document(table, hit.batch, hit.row, filter),
+    )
 }
 
 /// The `_search` response, with its keys in this fixed order: `took`, `timed_out`,
@@ -110,10 +127,7 @@ fn render_hit(hit: &SearchHit<'_>, score: &Value, request: &SearchRequest) -> Re
     }
     object.insert("_score".to_string(), score.clone());
     if !matches!(request.source, SourceFilter::Nothing) {
-        object.insert(
-            "_source".to_string(),
-            render_source(hit.batch, hit.row, &request.source)?,
-        );
+        object.insert("_source".to_string(), render_profile_source(hit, &request.source)?);
     }
     if let Some(field_values) = hit.field_values.as_ref().filter(|values| !values.is_empty()) {
         object.insert("fields".to_string(), Value::Object(field_values.clone()));

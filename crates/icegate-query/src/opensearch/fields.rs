@@ -5,8 +5,8 @@
 //! from the mapping it was created with: `_field_caps` derives them from it, `_mapping` answers it
 //! as stored, and `_mapping/field` is not served for it.
 
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 
 use axum::Json;
 use axum::extract::{Extension, State};
@@ -326,10 +326,10 @@ pub(crate) async fn describe_mappings(
                     .await?
                     .into_iter()
                     .map(|(index, fields)| {
-                        let properties = Value::Object(render_properties(&fields));
-                        (index, build_object("mappings", build_object("properties", properties)))
+                        let properties = Value::Object(render_properties(&fields)?);
+                        Ok((index, build_object("mappings", build_object("properties", properties))))
                     })
-                    .collect();
+                    .collect::<Result<_, OpenSearchError>>()?;
             Ok(Json(Value::Object(body)).into_response())
         }
         IndexTarget::System(indices) => {
@@ -356,33 +356,84 @@ pub(crate) async fn describe_mappings(
     }
 }
 
-/// Mapping properties in the order of `fields`, which is the schema column order: IceGate's
-/// contract, kept on the wire because icegate-query enables `serde_json`'s `preserve_order`. A
-/// field with a parent nests under its parent's `properties` by its stored key, so a key with
-/// dots stays one property.
-fn render_properties(fields: &[IndexField]) -> Map<String, Value> {
-    let mut properties = Map::new();
-    for field in fields {
-        let mapping = json!({"type": field.field_type.name()});
-        match &field.parent {
-            Some(parent) => {
-                // The MAP column precedes its keys in schema order, so the lookup hits for every key;
-                // only a key listed without its column pays for an owned copy of the parent's name.
-                let leaf_name = read_leaf_name(field);
-                if let Some(parent_mapping) = properties.get_mut(parent.as_str()) {
-                    parent_mapping["properties"][leaf_name] = mapping;
-                } else {
-                    let mut parent_mapping = json!({"type": "object"});
-                    parent_mapping["properties"][leaf_name] = mapping;
-                    properties.insert(parent.clone(), parent_mapping);
-                }
-            }
-            None => {
-                properties.entry(field.name.clone()).or_insert(mapping);
-            }
-        }
+/// Insert the mapping of type `field_type` at the key path `keys` below `properties`, each
+/// missing ancestor as an `object`. A mapping gains `properties` only when a child is inserted
+/// below it, so a leaf or an empty object carries its type alone. `properties` is a
+/// `serde_json::Map`, whose `preserve_order` backing finds a key in constant time and keeps the
+/// first-insertion order.
+///
+/// # Errors
+///
+/// Returns `500` when a mapping on the path, or its `properties`, is no JSON object: every node
+/// this function builds is one, so the tree was not built here alone.
+fn insert_mapping(
+    properties: &mut Map<String, Value>,
+    keys: &[&str],
+    field_type: &'static str,
+) -> Result<(), OpenSearchError> {
+    let Some((key, descendant_keys)) = keys.split_first() else {
+        return Ok(());
+    };
+    if !properties.contains_key(*key) {
+        properties.insert((*key).to_string(), json!({"type": FieldType::Object.name()}));
     }
-    properties
+    let Some(Value::Object(mapping)) = properties.get_mut(*key) else {
+        return Err(report_malformed_mapping(key));
+    };
+    if descendant_keys.is_empty() {
+        mapping.insert("type".to_string(), Value::from(field_type));
+        return Ok(());
+    }
+    let Value::Object(child_properties) = mapping.entry("properties").or_insert_with(|| Value::Object(Map::new()))
+    else {
+        return Err(report_malformed_mapping(key));
+    };
+    insert_mapping(child_properties, descendant_keys, field_type)
+}
+
+/// The `500` for a mapping tree whose node `key`, or its `properties`, is no JSON object.
+fn report_malformed_mapping(key: &str) -> OpenSearchError {
+    OpenSearchError::internal(format!("the mapping of [{key}] or its properties is no object"))
+}
+
+/// Mapping properties in the order of `fields`: the schema column order for a native index and
+/// the profile's declared order otherwise, IceGate's contract, kept on the wire because
+/// icegate-query enables `serde_json`'s `preserve_order`. A field nests under its parent chain;
+/// below each parent it is keyed by the rest of its name, so a stored key with dots stays one
+/// property.
+///
+/// # Errors
+///
+/// As [`insert_mapping`].
+fn render_properties(fields: &[IndexField]) -> Result<Map<String, Value>, OpenSearchError> {
+    let parents: HashMap<&str, &str> = fields
+        .iter()
+        .filter_map(|field| field.parent.as_deref().map(|parent| (field.name.as_str(), parent)))
+        .collect();
+    let mut properties = Map::new();
+    let mut chain: Vec<&str> = Vec::new();
+    let mut keys: Vec<&str> = Vec::new();
+    for field in fields {
+        chain.clear();
+        chain.push(field.name.as_str());
+        while let Some(parent) = chain.last().and_then(|name| parents.get(name)) {
+            chain.push(*parent);
+        }
+        chain.reverse();
+        keys.clear();
+        let mut parent_name: Option<&str> = None;
+        for &name in &chain {
+            keys.push(
+                parent_name
+                    .and_then(|parent| name.strip_prefix(parent))
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    .unwrap_or(name),
+            );
+            parent_name = Some(name);
+        }
+        insert_mapping(&mut properties, &keys, field.field_type.name())?;
+    }
+    Ok(properties)
 }
 
 /// The name of `field` under its parent: the whole stored key of a MAP key, dots included; the
@@ -503,7 +554,7 @@ mod tests {
     use crate::infra::metrics::test_support::{build_meter_provider, find_counter_total};
     use crate::opensearch::catalog::{CatalogSettings, IndexCatalog};
     use crate::opensearch::config::{EmulatedVersion, OpenSearchConfig};
-    use crate::opensearch::error::render_envelope;
+    use crate::opensearch::error::{OpenSearchErrorKind, render_envelope};
     use crate::opensearch::node::NodeIdentity;
     use crate::test_support::{
         LogAttributesRow, LogsWarehouse, build_in_memory_system_index_store, build_logs_warehouse,
@@ -745,8 +796,8 @@ mod tests {
             ],
         )];
 
-        let properties = render_properties(&fields_by_index[0].1);
-        let properties_without_column = render_properties(&fields_by_index[0].1[1..]);
+        let properties = render_properties(&fields_by_index[0].1).expect("a mapping tree");
+        let properties_without_column = render_properties(&fields_by_index[0].1[1..]).expect("a mapping tree");
         let field_mappings =
             render_field_mappings(&fields_by_index, &[method_field.as_str()], "logs").expect("one type");
 
@@ -761,6 +812,27 @@ mod tests {
                 "mapping": {"http.method": {"type": "keyword"}}
             }}}})
         );
+    }
+
+    /// A mapping tree whose node on the path, or that node's `properties`, is no object is a 500,
+    /// never a mapping silently left out.
+    #[test]
+    fn a_mapping_node_that_is_no_object_is_a_500() {
+        let mut leaf_as_text = Map::new();
+        leaf_as_text.insert("status".to_string(), json!("keyword"));
+        let mut properties_as_number = Map::new();
+        properties_as_number.insert("status".to_string(), json!({"type": "object", "properties": 1}));
+
+        let refusals = [
+            insert_mapping(&mut leaf_as_text, &["status", "code"], "integer").expect_err("node is text"),
+            insert_mapping(&mut properties_as_number, &["status", "code"], "integer")
+                .expect_err("properties is a number"),
+        ];
+
+        for refusal in refusals {
+            assert_eq!(refusal.kind(), &OpenSearchErrorKind::Internal);
+            assert_eq!(refusal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
 
     /// A MAP key's field name is `<column>.<key>`, so only a pattern holding a wildcard or a dot

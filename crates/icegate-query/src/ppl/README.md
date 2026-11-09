@@ -68,7 +68,11 @@ states the exact rules.
 index list is an index expression: comma-separated names, `*` wildcards and `-` exclusions,
 resolved like the `_search` path with `ignore_unavailable=false`, `allow_no_indices=false` and
 open, non-hidden indices. A name that matches nothing is a 404 `INDEX_NOT_FOUND`; names are
-case-sensitive. A source on system indices is a 400. `describe <index>` is a source of its own:
+case-sensitive. A source on system indices is a 400, and so is a source on an index served under
+a non-native profile (`otel-v1-apm-span`): PPL reads stored columns, and such a profile renames,
+encodes and derives fields. A wildcard that reaches one table through two indices without naming
+each (`*` reaches `spans` and `otel-v1-apm-span`) is a 400 as on `_search`, so no row is read
+twice. `describe <index>` lists an index's fields and reads no rows, so its rules differ:
 see [`describe`](#describe). `source=[ <subsearch> ] [as t]` reads a subsearch's output: see
 [Subsearches](#subsearches).
 
@@ -298,7 +302,9 @@ it is typed `int`.
 
 One row per field of the index's field model, in the order `_mapping` lists them: schema column order,
 each MAP column followed by its keys in byte order. A key containing dots is one row
-(`log_attributes.http.method`). Per row: `TABLE_CAT` is `opensearch.cluster_name`; `TABLE_NAME` is the
+(`log_attributes.http.method`). An index served under a non-native profile (`otel-v1-apm-span`) lists
+the profile's fields in the profile's declared order. `describe` reads no rows, so it answers for such
+an index although the index cannot be a PPL source (see [Sources](#sources)). Per row: `TABLE_CAT` is `opensearch.cluster_name`; `TABLE_NAME` is the
 index as written; `COLUMN_NAME` the field name; `TYPE_NAME` is `string` for `text` and `keyword`,
 `timestamp` for `date`, `int`, `bigint`, `double`, `boolean`, and `struct` for objects; `NUM_PREC_RADIX`
 10; `NULLABLE` 2; `ORDINAL_POSITION` the 0-based row number; `IS_NULLABLE` and `IS_GENERATEDCOLUMN`

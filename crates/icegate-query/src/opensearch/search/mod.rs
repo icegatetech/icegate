@@ -17,7 +17,7 @@ use axum::response::Response;
 use serde_json::Value;
 
 use self::execute::{check_result_window, search_data_indices};
-pub(super) use self::hits::read_timestamp_micros;
+pub(super) use self::hits::{read_timestamp_micros, render_array_value, render_iso_micros};
 pub(crate) use self::msearch::{run_multi_search, run_multi_search_on_index};
 use self::request::{SearchParameters, parse_search_request, parse_search_value};
 use super::catalog::{IndexExpression, IndexTarget, read_index_options};

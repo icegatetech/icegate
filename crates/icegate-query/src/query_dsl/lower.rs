@@ -19,7 +19,9 @@ use serde_json::Value;
 
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::opensearch::catalog::{
-    FieldType, FieldValue, IndexEntry, ResolvedField, SelectedField, TenantSession, native_column_type,
+    EncodedField, FieldType, FieldValue, IndexEntry, ResolvedField, SelectedField, TenantSession, find_profile_table,
+    lower_derived_exists, lower_derived_range, lower_derived_term, lower_encoded_exists, lower_encoded_range,
+    lower_encoded_term, native_column_type,
 };
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::{
@@ -139,10 +141,21 @@ fn build_search_field(selected_field: SelectedField) -> Option<SearchField> {
 }
 
 /// How a resolved field matches full-text input; an object field (a MAP column
-/// named whole) matches nothing.
+/// named whole) matches nothing. An encoded hex id matches as one (its `""` as a
+/// missing id), an escaped attribute key as the keyword of its stored MAP key, and
+/// any other encoded keyword as an exact value that no pattern reaches.
 const fn read_search_kind(field: &ResolvedField) -> Option<SearchKind> {
-    if let FieldValue::HexId { width, .. } = &field.value {
-        return Some(SearchKind::HexId { width: *width });
+    match (&field.value, field.field_type) {
+        (FieldValue::HexId { width, .. }, _) => return Some(SearchKind::HexId { width: *width }),
+        (FieldValue::Encoded(EncodedField::HexIdOrEmpty { width, .. }), _) => {
+            return Some(SearchKind::HexIdOrEmpty { width: *width });
+        }
+        (FieldValue::Encoded(EncodedField::EscapedMapKey { .. }), _) => {}
+        (FieldValue::Encoded(_), FieldType::Keyword) => return Some(SearchKind::EncodedKeyword),
+        (
+            FieldValue::Column { .. } | FieldValue::MapKey { .. } | FieldValue::Encoded(_) | FieldValue::Derived(_),
+            _,
+        ) => {}
     }
     match field.field_type {
         FieldType::Text => Some(SearchKind::Text),
@@ -398,18 +411,24 @@ fn require_should_matches(should_clauses: Vec<Expr>, minimum_should_count: u32) 
     Ok(matched_count.map_or_else(|| lit(false), |sum| sum.gt_eq(lit(i64::from(minimum_should_count)))))
 }
 
-/// Resolve the field `name` a query leaf reads in `scope.entry`.
+/// Resolve the field `name` a query leaf reads in `scope.entry`, as a filter reads it (see
+/// [`ResolvedField::into_lowering_view`]).
 ///
-/// `None` means the index has no field of that name, and the leaf matches nothing there. A
-/// column the index has but no `OpenSearch` type represents is the 500 of
-/// [`native_column_type`] instead, so a leaf on it never answers as if the column were absent.
+/// `None` means the index has no field of that name, and the leaf matches nothing there. On a
+/// native index, a column the index has but no `OpenSearch` type represents is the 500 of
+/// [`native_column_type`] instead, so a leaf on it never answers as if the column were absent. A
+/// profile index's fields are exactly its profile's table, so a stored column the profile does
+/// not expose is no field there and matches nothing.
 ///
 /// # Errors
 ///
 /// Returns that 500, and the error the index's table failed to open with.
-fn resolve_leaf_field(scope: &LoweringScope<'_>, name: &str) -> Result<Option<ResolvedField>, OpenSearchError> {
+fn resolve_lowering_field(scope: &LoweringScope<'_>, name: &str) -> Result<Option<ResolvedField>, OpenSearchError> {
     if let Some(field) = scope.session.resolve_field(scope.entry, name) {
-        return Ok(Some(field));
+        return Ok(Some(field.into_lowering_view()));
+    }
+    if find_profile_table(scope.entry).is_some() {
+        return Ok(None);
     }
     // `resolve_field` resolves every column whose Arrow type an `OpenSearch` type represents, so
     // a column it leaves unresolved is one no type represents.
@@ -423,7 +442,11 @@ fn resolve_leaf_field(scope: &LoweringScope<'_>, name: &str) -> Result<Option<Re
 
 /// The text a `term`, `terms` or range value denotes: a string as is, a number or a boolean
 /// in its JSON spelling.
-fn render_literal_text(value: &Value, field: &str) -> Result<String, OpenSearchError> {
+///
+/// # Errors
+///
+/// Returns `parsing_exception` naming `field` for a null, an array or an object.
+pub(crate) fn render_literal_text(value: &Value, field: &str) -> Result<String, OpenSearchError> {
     match value {
         Value::String(text) => Ok(text.clone()),
         Value::Number(number) => Ok(number.to_string()),
@@ -454,6 +477,85 @@ fn decode_hex_literal(
         })
 }
 
+/// One leaf on a resolved field, as the profile lowering receives it.
+enum ProfileLeaf<'q> {
+    /// `term` with this value.
+    Term(&'q Value),
+    /// `terms` with these values.
+    Terms(&'q [Value]),
+    /// `range` with these bounds.
+    Range {
+        /// The lower bound.
+        lower: Option<&'q RangeBound>,
+        /// The upper bound.
+        upper: Option<&'q RangeBound>,
+    },
+    /// `exists`.
+    Exists,
+    /// A term pattern leaf (`prefix`, `wildcard`, `regexp`), by its name.
+    Pattern(&'static str),
+}
+
+/// Lower a leaf on an encoded or derived field through the field's inverse; `None` for a stored
+/// column, a MAP key or a hex id, which the native leaf lowering handles.
+///
+/// # Errors
+///
+/// A term pattern on an encoded or derived field is the query-shard 400 of a term pattern on a
+/// typed field; otherwise the errors of the field's lowering. Each refusal names the field as the
+/// request did (`field.name`), never the column behind it.
+fn lower_profile_leaf(
+    field: &ResolvedField,
+    leaf: ProfileLeaf<'_>,
+    scope: &LoweringScope<'_>,
+) -> Result<Option<Expr>, OpenSearchError> {
+    let index = scope.entry.name();
+    let lowered_predicate = match (&field.value, leaf) {
+        (FieldValue::Column { .. } | FieldValue::MapKey { .. } | FieldValue::HexId { .. }, _) => return Ok(None),
+        (FieldValue::Encoded(_) | FieldValue::Derived(_), ProfileLeaf::Pattern(leaf_name)) => {
+            return Err(refuse_term_pattern(field, leaf_name, scope));
+        }
+        (FieldValue::Encoded(encoded_field), ProfileLeaf::Term(value)) => {
+            lower_encoded_term(encoded_field, &field.name, value, index)?
+        }
+        (FieldValue::Encoded(encoded_field), ProfileLeaf::Terms(values)) => values
+            .iter()
+            .map(|value| lower_encoded_term(encoded_field, &field.name, value, index))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .reduce(Expr::or)
+            .unwrap_or_else(|| lit(false)),
+        (FieldValue::Encoded(encoded_field), ProfileLeaf::Range { lower, upper }) => {
+            lower_encoded_range(encoded_field, &field.name, lower, upper, index)?
+        }
+        (FieldValue::Encoded(encoded_field), ProfileLeaf::Exists) => lower_encoded_exists(encoded_field)?,
+        (FieldValue::Derived(derived_field), ProfileLeaf::Term(value)) => {
+            lower_derived_term(*derived_field, value, index)?
+        }
+        (FieldValue::Derived(derived_field), ProfileLeaf::Terms(values)) => values
+            .iter()
+            .map(|value| lower_derived_term(*derived_field, value, index))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .reduce(Expr::or)
+            .unwrap_or_else(|| lit(false)),
+        (FieldValue::Derived(derived_field), ProfileLeaf::Range { lower, upper }) => {
+            lower_derived_range(*derived_field, lower, upper, index)?
+        }
+        (FieldValue::Derived(derived_field), ProfileLeaf::Exists) => lower_derived_exists(*derived_field),
+    };
+    Ok(Some(lowered_predicate))
+}
+
+/// The `500` for a profile field that reached a native leaf lowering past
+/// [`lower_profile_leaf`].
+fn report_unlowered_profile_field(field: &ResolvedField) -> OpenSearchError {
+    OpenSearchError::internal(format!(
+        "field [{}] has a profile encoding the native lowering cannot read",
+        field.name
+    ))
+}
+
 /// The final query-shard 400 for a term pattern (`prefix`, `wildcard`, `regexp`) on a field that
 /// only matches whole parsed values.
 fn refuse_term_pattern(field: &ResolvedField, leaf: &str, scope: &LoweringScope<'_>) -> OpenSearchError {
@@ -464,6 +566,8 @@ fn refuse_term_pattern(field: &ResolvedField, leaf: &str, scope: &LoweringScope<
             field.name,
             match field.value {
                 FieldValue::HexId { .. } => "binary id",
+                FieldValue::Encoded(_) => "encoded",
+                FieldValue::Derived(_) => "derived",
                 FieldValue::Column { .. } | FieldValue::MapKey { .. } => field.field_type.name(),
             }
         ),
@@ -474,12 +578,26 @@ fn refuse_term_pattern(field: &ResolvedField, leaf: &str, scope: &LoweringScope<
 /// covers, or one token of a text field equal to the unanalyzed term; a name the index lacks,
 /// or an `object`, matches nothing.
 fn lower_term(query: &TermQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
-    let Some(field) = resolve_leaf_field(scope, &query.field)? else {
+    let Some(field) = resolve_lowering_field(scope, &query.field)? else {
         return Ok(lit(false));
     };
+    // A case-insensitive term compares the rendered keyword; a hex id decodes in either case, so
+    // its inverse stays exact.
+    if query.case_insensitive
+        && field.field_type == FieldType::Keyword
+        && let FieldValue::Encoded(encoded_field) = &field.value
+        && !matches!(encoded_field, EncodedField::HexIdOrEmpty { .. })
+    {
+        let text = render_literal_text(&query.value, &query.field)?;
+        return Ok(lower(field.value.build_read_expr()).eq(lower(lit(text))));
+    }
+    if let Some(lowered_predicate) = lower_profile_leaf(&field, ProfileLeaf::Term(&query.value), scope)? {
+        return Ok(lowered_predicate);
+    }
     let text = render_literal_text(&query.value, &query.field)?;
     let read_expr = field.value.build_read_expr();
     match (field.field_type, &field.value) {
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => Err(report_unlowered_profile_field(&field)),
         (FieldType::Keyword, FieldValue::HexId { width, .. }) => {
             Ok(read_expr.eq(decode_hex_literal(&text, *width, &field, scope)?))
         }
@@ -507,9 +625,12 @@ fn lower_term(query: &TermQuery, scope: &LoweringScope<'_>) -> Result<Expr, Open
 /// leaf answers, so a malformed one is the 400 wherever it stands; a list of no matchable value
 /// matches nothing.
 fn lower_terms(query: &TermsQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
-    let Some(field) = resolve_leaf_field(scope, &query.field)? else {
+    let Some(field) = resolve_lowering_field(scope, &query.field)? else {
         return Ok(lit(false));
     };
+    if let Some(lowered_predicate) = lower_profile_leaf(&field, ProfileLeaf::Terms(&query.values), scope)? {
+        return Ok(lowered_predicate);
+    }
     if query.values.is_empty() {
         return Ok(lit(false));
     }
@@ -520,6 +641,7 @@ fn lower_terms(query: &TermsQuery, scope: &LoweringScope<'_>) -> Result<Expr, Op
         .collect::<Result<Vec<_>, _>>()?;
     let read_expr = field.value.build_read_expr();
     match (field.field_type, &field.value) {
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => Err(report_unlowered_profile_field(&field)),
         (FieldType::Keyword, FieldValue::HexId { width, .. }) => {
             let literals = texts
                 .iter()
@@ -573,37 +695,27 @@ fn conjoin_bounds(read_expr: Expr, bounds: Vec<Expr>) -> Expr {
 /// boolean bounds by their typed rules, date bounds as typed timestamps of the column's unit, and
 /// text bounds with each token of the field.
 fn lower_range(query: &RangeQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
-    let Some(field) = resolve_leaf_field(scope, &query.field)? else {
+    let Some(field) = resolve_lowering_field(scope, &query.field)? else {
         return Ok(lit(false));
     };
+    if let Some(lowered_predicate) = lower_profile_leaf(
+        &field,
+        ProfileLeaf::Range {
+            lower: query.lower.as_ref(),
+            upper: query.upper.as_ref(),
+        },
+        scope,
+    )? {
+        return Ok(lowered_predicate);
+    }
     let read_expr = field.value.build_read_expr();
     match (field.field_type, &field.value) {
-        (FieldType::Keyword, value) => {
-            let build_bound_literal = |bound: &RangeBound| -> Result<Expr, OpenSearchError> {
-                let text = render_literal_text(&bound.value, &query.field)?;
-                match value {
-                    FieldValue::HexId { width, .. } => decode_hex_literal(&text, *width, &field, scope),
-                    FieldValue::Column { .. } | FieldValue::MapKey { .. } => Ok(lit(text)),
-                }
-            };
-            let mut bounds = Vec::with_capacity(2);
-            if let Some(bound) = &query.lower {
-                let literal = build_bound_literal(bound)?;
-                bounds.push(if bound.is_inclusive {
-                    read_expr.clone().gt_eq(literal)
-                } else {
-                    read_expr.clone().gt(literal)
-                });
-            }
-            if let Some(bound) = &query.upper {
-                let literal = build_bound_literal(bound)?;
-                bounds.push(if bound.is_inclusive {
-                    read_expr.clone().lt_eq(literal)
-                } else {
-                    read_expr.clone().lt(literal)
-                });
-            }
-            Ok(conjoin_bounds(read_expr, bounds))
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => Err(report_unlowered_profile_field(&field)),
+        (FieldType::Keyword, FieldValue::HexId { width, .. }) => lower_keyword_range(query, read_expr, |text| {
+            decode_hex_literal(&text, *width, &field, scope)
+        }),
+        (FieldType::Keyword, FieldValue::Column { .. } | FieldValue::MapKey { .. }) => {
+            lower_keyword_range(query, read_expr, |text| Ok(lit(text)))
         }
         (FieldType::Date, FieldValue::Column { .. } | FieldValue::HexId { .. }) => {
             lower_date_range(query, read_expr, &field, scope)
@@ -614,6 +726,31 @@ fn lower_range(query: &RangeQuery, scope: &LoweringScope<'_>) -> Result<Expr, Op
         (FieldType::Object | FieldType::Date, _) => Ok(lit(false)),
         (FieldType::Text, _) => lower_text_range(read_expr, query),
     }
+}
+
+/// A `range` on a keyword field: `read_expr` compared with each present bound, whose text
+/// `build_literal` turns into the literal the field compares with.
+///
+/// # Errors
+///
+/// Returns `parsing_exception` for a bound that is no string, number or boolean, and the error
+/// of `build_literal`.
+fn lower_keyword_range(
+    query: &RangeQuery,
+    read_expr: Expr,
+    build_literal: impl Fn(String) -> Result<Expr, OpenSearchError>,
+) -> Result<Expr, OpenSearchError> {
+    let mut bounds = Vec::with_capacity(2);
+    for (is_lower, bound) in list_present_bounds(query) {
+        let literal = build_literal(render_literal_text(&bound.value, &query.field)?)?;
+        bounds.push(match classify_bound_side(is_lower, bound) {
+            BoundSide::LowerInclusive => read_expr.clone().gt_eq(literal),
+            BoundSide::LowerExclusive => read_expr.clone().gt(literal),
+            BoundSide::UpperInclusive => read_expr.clone().lt_eq(literal),
+            BoundSide::UpperExclusive => read_expr.clone().lt(literal),
+        });
+    }
+    Ok(conjoin_bounds(read_expr, bounds))
 }
 
 /// The side a range bound is on.
@@ -1014,11 +1151,15 @@ fn lower_ids(query: &IdsQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSe
 ///
 /// Returns the error the index's table failed to open with.
 fn lower_exists(query: &ExistsQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
-    let Some(field) = resolve_leaf_field(scope, &query.field)? else {
+    let Some(field) = resolve_lowering_field(scope, &query.field)? else {
         return Ok(lit(false));
     };
+    if let Some(lowered_predicate) = lower_profile_leaf(&field, ProfileLeaf::Exists, scope)? {
+        return Ok(lowered_predicate);
+    }
     let read_expr = field.value.build_read_expr();
     Ok(match (field.field_type, &field.value) {
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => return Err(report_unlowered_profile_field(&field)),
         (FieldType::Object, FieldValue::Column { column }) => {
             if matches!(
                 scope.session.column_data_type(scope.entry, column)?,
@@ -1046,10 +1187,14 @@ fn lower_exists(query: &ExistsQuery, scope: &LoweringScope<'_>) -> Result<Expr, 
 /// A `prefix` on a keyword value or on one token of a text field; the final query-shard 400 on
 /// an id, numeric, date or boolean field.
 fn lower_prefix(query: &PrefixQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
-    let Some(field) = resolve_leaf_field(scope, &query.field)? else {
+    let Some(field) = resolve_lowering_field(scope, &query.field)? else {
         return Ok(lit(false));
     };
+    if let Some(lowered_predicate) = lower_profile_leaf(&field, ProfileLeaf::Pattern("prefix"), scope)? {
+        return Ok(lowered_predicate);
+    }
     match (field.field_type, &field.value) {
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => Err(report_unlowered_profile_field(&field)),
         (FieldType::Keyword, FieldValue::Column { .. } | FieldValue::MapKey { .. }) => {
             let read_expr = field.value.build_read_expr();
             Ok(if query.case_insensitive {
@@ -1070,10 +1215,14 @@ fn lower_prefix(query: &PrefixQuery, scope: &LoweringScope<'_>) -> Result<Expr, 
 /// A `wildcard` over a whole keyword value or one token of a text field; the final query-shard
 /// 400 on an id, numeric, date or boolean field.
 fn lower_wildcard(query: &WildcardQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
-    let Some(field) = resolve_leaf_field(scope, &query.field)? else {
+    let Some(field) = resolve_lowering_field(scope, &query.field)? else {
         return Ok(lit(false));
     };
+    if let Some(lowered_predicate) = lower_profile_leaf(&field, ProfileLeaf::Pattern("wildcard"), scope)? {
+        return Ok(lowered_predicate);
+    }
     match (field.field_type, &field.value) {
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => Err(report_unlowered_profile_field(&field)),
         (FieldType::Keyword, FieldValue::Column { .. } | FieldValue::MapKey { .. }) => Ok(Expr::Like(Like::new(
             false,
             Box::new(field.value.build_read_expr()),
@@ -1100,10 +1249,14 @@ fn lower_regexp(query: &RegexpQuery, scope: &LoweringScope<'_>) -> Result<Expr, 
         query.flags,
         query.case_insensitive,
     )?);
-    let Some(field) = resolve_leaf_field(scope, &query.field)? else {
+    let Some(field) = resolve_lowering_field(scope, &query.field)? else {
         return Ok(lit(false));
     };
+    if let Some(lowered_predicate) = lower_profile_leaf(&field, ProfileLeaf::Pattern("regexp"), scope)? {
+        return Ok(lowered_predicate);
+    }
     match (field.field_type, &field.value) {
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => Err(report_unlowered_profile_field(&field)),
         (FieldType::Keyword, FieldValue::Column { .. } | FieldValue::MapKey { .. }) => {
             Ok(build_keyword_regex_match_udf(pattern).call(vec![field.value.build_read_expr()]))
         }
@@ -2740,5 +2893,29 @@ mod tests {
         .expect("search");
         assert_eq!(instant_matches, build_name_set(&["a-same-day", "a-last-microsecond"]));
         assert_query_shard_400(&fixture, LOGS_TABLE, json!({"term": {"timestamp": "yesterday"}})).await;
+    }
+
+    /// A profile index's fields are exactly its profile's table: a stored column the span profile
+    /// does not expose names no field there, so a leaf on it matches nothing rather than reading
+    /// the column or answering the 500 of a column no field type represents.
+    #[tokio::test]
+    async fn a_leaf_on_a_stored_column_the_span_profile_does_not_expose_matches_nothing() {
+        let fixture = SearchFixture::new().await;
+        let session = fixture.open_session(TENANT_A).await;
+        let entry = find_index_entry(&session, "otel-v1-apm-span");
+        let scope = LoweringScope {
+            session: &session,
+            entry,
+            now: build_request_instant(),
+        };
+
+        for query in [
+            json!({"term": {COL_TRACE_ID: "0123456789abcdeffedcba9876543210"}}),
+            json!({"exists": {"field": COL_SPAN_ID}}),
+        ] {
+            let lowered_predicate = lower_query(&parse_query(&query).expect("a valid query"), &scope).expect("lowered");
+
+            assert_eq!(lowered_predicate, lit(false), "{query}");
+        }
     }
 }

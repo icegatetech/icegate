@@ -48,7 +48,10 @@ use super::request::{DocValueField, SearchRequest, SortClause, SortOrder, TrackT
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::error::QueryError;
 use crate::opensearch::SearchLimitsConfig;
-use crate::opensearch::catalog::{FieldType, FieldValue, IndexEntry, ResolvedField, TenantSession, native_column_type};
+use crate::opensearch::catalog::{
+    EncodedField, FieldType, FieldValue, IndexEntry, ProfileTable, ResolvedField, TenantSession, find_profile_table,
+    native_column_type, render_profile_field,
+};
 use crate::opensearch::context::RequestContext;
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::glob::matches_glob;
@@ -218,14 +221,15 @@ fn build_search_hit(
     session: &TenantSession,
     candidate: Candidate<'_>,
     sort: &SortPlan,
-    field_requests: &[&DocValueField],
+    field_requests: &FieldRequestPlan<'_>,
 ) -> Result<PageHit, OpenSearchError> {
     Ok(PageHit {
         sort_values: (!sort.keys.is_empty()).then(|| render_sort_values(&candidate)).transpose()?,
-        field_values: (!field_requests.is_empty())
+        field_values: (!field_requests.requests.is_empty())
             .then(|| render_field_values(session, &candidate, field_requests))
             .transpose()?,
         index_name: candidate.entry.name().to_string(),
+        profile_table: find_profile_table(candidate.entry),
         batch: candidate.batch,
         row: candidate.row,
         document_id: candidate.document_id,
@@ -297,6 +301,8 @@ pub(super) fn render_index_rows_as_hits(
 struct PageHit {
     /// The name of the index the row was read from.
     index_name: String,
+    /// The field table of that index when it serves a non-native profile.
+    profile_table: Option<&'static ProfileTable>,
     /// The table columns of the batch holding the row.
     batch: Arc<RecordBatch>,
     /// The row within `batch`.
@@ -320,6 +326,7 @@ impl PageHit {
             document_id: &self.document_id,
             sort_values: self.sort_values.take(),
             field_values: self.field_values.take(),
+            profile_table: self.profile_table,
         }
     }
 }
@@ -564,8 +571,16 @@ fn decide_field_kind(field: &ResolvedField, entry: &IndexEntry) -> Result<SortKe
     match (field.field_type, &field.value) {
         (FieldType::Date | FieldType::Integer | FieldType::Long | FieldType::Boolean, _) => Ok(SortKeyKind::Long),
         (FieldType::Double, _) => Ok(SortKeyKind::Double),
-        (FieldType::Keyword, FieldValue::HexId { width, .. }) => Ok(SortKeyKind::Hex(*width)),
-        (FieldType::Keyword, FieldValue::Column { .. } | FieldValue::MapKey { .. }) => Ok(SortKeyKind::Text),
+        // An encoded hex id sorts as the bytes it renders in hex, every other encoded or derived
+        // keyword as its rendered text, which `build_read_expr` reads.
+        (
+            FieldType::Keyword,
+            FieldValue::HexId { width, .. } | FieldValue::Encoded(EncodedField::HexIdOrEmpty { width, .. }),
+        ) => Ok(SortKeyKind::Hex(*width)),
+        (
+            FieldType::Keyword,
+            FieldValue::Column { .. } | FieldValue::MapKey { .. } | FieldValue::Encoded(_) | FieldValue::Derived(_),
+        ) => Ok(SortKeyKind::Text),
         (FieldType::Text | FieldType::Object, _) => Err(OpenSearchError::query_shard(
             entry.name(),
             &format!(
@@ -583,11 +598,11 @@ fn has_same_sort_type(left: &ResolvedField, right: &ResolvedField) -> bool {
     left.field_type == right.field_type && find_hex_width(left) == find_hex_width(right)
 }
 
-/// The width of a hex-id field; `None` for any other field.
+/// The width of a hex-id field, stored or encoded; `None` for any other field.
 const fn find_hex_width(field: &ResolvedField) -> Option<i32> {
     match field.value {
-        FieldValue::HexId { width, .. } => Some(width),
-        FieldValue::Column { .. } | FieldValue::MapKey { .. } => None,
+        FieldValue::HexId { width, .. } | FieldValue::Encoded(EncodedField::HexIdOrEmpty { width, .. }) => Some(width),
+        FieldValue::Column { .. } | FieldValue::MapKey { .. } | FieldValue::Encoded(_) | FieldValue::Derived(_) => None,
     }
 }
 
@@ -750,8 +765,10 @@ fn build_doc_hash_expr(session: &TenantSession, entry: &IndexEntry) -> Result<Ex
 /// Returns the query-shard 400 for an index lacking the field without `unmapped_type`, or
 /// resolving it to a text or object field; `illegal_argument_exception` from
 /// [`OpenSearchError::sort_field_conflict`] for a field with different sort types across indices,
-/// and from [`classify_unmapped_type`] for an `unmapped_type` it refuses, whether or not an index
-/// lacks the field; and `500` when a sort expression cannot be built.
+/// from [`OpenSearchError::unordered_missing_id`] for an encoded id whose stored column admits
+/// NULL, and from [`classify_unmapped_type`] for an `unmapped_type` it refuses, whether or not an
+/// index lacks the field; the error an index's table failed to open with; and `500` when a sort
+/// expression cannot be built.
 fn plan_field_sort(
     session: &TenantSession,
     entries: &[&IndexEntry],
@@ -759,12 +776,19 @@ fn plan_field_sort(
     unmapped_type: Option<&str>,
 ) -> Result<(SortKeyKind, Vec<Expr>), OpenSearchError> {
     let unmapped_kind = unmapped_type.map(classify_unmapped_type).transpose()?;
-    let resolutions: Vec<Option<ResolvedField>> =
-        entries.iter().map(|entry| session.resolve_field(entry, field)).collect();
+    // A field sorts the way a filter reads it: a profile time as its stored date column (its sort
+    // value in epoch milliseconds), an escaped attribute key as its stored MAP key.
+    let resolutions: Vec<Option<ResolvedField>> = entries
+        .iter()
+        .map(|entry| session.resolve_field(entry, field).map(ResolvedField::into_lowering_view))
+        .collect();
     let mut first_resolution: Option<(SortKeyKind, &ResolvedField, &str)> = None;
     for (entry, resolution) in entries.iter().zip(&resolutions) {
         match resolution {
             Some(resolved_field) => {
+                if session.is_nullable_encoded_id(entry, resolved_field)? {
+                    return Err(OpenSearchError::unordered_missing_id(field, entry.name(), "sort"));
+                }
                 let kind = decide_field_kind(resolved_field, entry)?;
                 match first_resolution {
                     Some((_, first_field, first_index)) if !has_same_sort_type(first_field, resolved_field) => {
@@ -1633,28 +1657,64 @@ fn refuse_unserved_request_keys(request: &SearchRequest) -> Result<(), OpenSearc
     Ok(())
 }
 
+/// How `fields` reads one requested name in the hits of an index of a non-native profile,
+/// decided once per search from the name's resolution there.
+#[derive(Debug, Clone, Copy)]
+enum ProfileFieldRead {
+    /// The name is no leaf of the profile: the hits carry no value for it.
+    Absent,
+    /// A profile time, read from its stored date column so a requested date format applies as on
+    /// a native date column.
+    Time(&'static str),
+    /// Any other leaf, rendered as the index's profile table shows it.
+    Rendered(&'static ProfileTable),
+}
+
+/// The `docvalue_fields` then the `fields` of a request, with how each reads every index of a
+/// non-native profile.
+struct FieldRequestPlan<'r> {
+    /// The requested names and patterns, `docvalue_fields` first.
+    requests: Vec<&'r DocValueField>,
+    /// Per request, per index position in the search: how the request reads that index; `None`
+    /// for a native index, whose hits resolve the name themselves.
+    profile_reads: Vec<Vec<Option<ProfileFieldRead>>>,
+}
+
 /// The `docvalue_fields` then the `fields` of a request, checked against every index: a
 /// concrete name or a pattern-matched column typed differently across the indices is a 400
-/// naming the field and the indices of each type, and a format on a concrete non-date field is a
-/// 400.
+/// naming the field and the indices of each type, a format on a concrete non-date field is a
+/// 400, and so is a pattern on an index of a non-native profile, whose fields are named one by
+/// one. Each concrete name is resolved once per index of a non-native profile here; its hits
+/// read that outcome instead of resolving the name again.
 ///
 /// # Errors
 ///
 /// Returns [`OpenSearchError::field_projection_conflict`] for a name typed differently across
 /// `entries`, `illegal_argument_exception` for a format on a concrete field that is no date,
-/// the error an index's table failed to open with, and `500` for a column a pattern matches whose
-/// type no `OpenSearch` type represents.
+/// [`OpenSearchError::field_pattern_on_profile_index`] for a pattern on an index of a non-native
+/// profile, the error an index's table failed to open with, and `500` for a column a pattern
+/// matches whose type no `OpenSearch` type represents.
 fn plan_field_requests<'r>(
     session: &TenantSession,
     entries: &[&IndexEntry],
     request: &'r SearchRequest,
-) -> Result<Vec<&'r DocValueField>, OpenSearchError> {
+) -> Result<FieldRequestPlan<'r>, OpenSearchError> {
     let requests: Vec<&DocValueField> = request.docvalue_fields.iter().chain(&request.fields).collect();
+    let mut profile_reads = Vec::with_capacity(requests.len());
     for field_request in &requests {
         // The type each index gives every name the request reaches, by name.
         let mut types: BTreeMap<String, BTreeMap<&'static str, Vec<&str>>> = BTreeMap::new();
+        let mut entry_reads: Vec<Option<ProfileFieldRead>> = Vec::with_capacity(entries.len());
         for entry in entries {
+            let profile_table = find_profile_table(entry);
             if field_request.is_pattern() {
+                if profile_table.is_some() {
+                    return Err(OpenSearchError::field_pattern_on_profile_index(
+                        &field_request.field,
+                        entry.name(),
+                    ));
+                }
+                entry_reads.push(None);
                 let schema = session.table_schema(entry)?;
                 for field in schema.fields() {
                     if !matches_glob(&field_request.field, field.name()) {
@@ -1670,7 +1730,11 @@ fn plan_field_requests<'r>(
                             .push(entry.name());
                     }
                 }
-            } else if let Some(resolved_field) = session.resolve_field(entry, &field_request.field) {
+                continue;
+            }
+            let resolution = session.resolve_field(entry, &field_request.field);
+            entry_reads.push(profile_table.map(|table| decide_profile_field_read(table, resolution.as_ref())));
+            if let Some(resolved_field) = resolution {
                 if field_request.format.is_some() && resolved_field.field_type != FieldType::Date {
                     return Err(OpenSearchError::illegal_argument(format!(
                         "field [{}] of type [{}] in index [{}] does not support formats",
@@ -1690,29 +1754,64 @@ fn plan_field_requests<'r>(
         if let Some((name, indices_by_type)) = types.iter().find(|(_, indices_by_type)| indices_by_type.len() > 1) {
             return Err(OpenSearchError::field_projection_conflict(name, indices_by_type));
         }
+        profile_reads.push(entry_reads);
     }
-    Ok(requests)
+    Ok(FieldRequestPlan {
+        requests,
+        profile_reads,
+    })
+}
+
+/// How the hits of an index served by `table` read a requested name that resolved to
+/// `resolution` there.
+const fn decide_profile_field_read(
+    table: &'static ProfileTable,
+    resolution: Option<&ResolvedField>,
+) -> ProfileFieldRead {
+    match resolution {
+        None => ProfileFieldRead::Absent,
+        Some(ResolvedField {
+            value: FieldValue::Encoded(EncodedField::Rfc3339Time { column }),
+            ..
+        }) => ProfileFieldRead::Time(column),
+        Some(_) => ProfileFieldRead::Rendered(table),
+    }
 }
 
 /// The `fields` of one hit: each requested name or pattern resolved against the hit's own index,
 /// each value a one-element array, a missing value no key; a later request for the same name
-/// replaces the earlier one.
+/// replaces the earlier one. A name on an index of a non-native profile reads as `plan` decided
+/// for that index.
 ///
 /// # Errors
 ///
-/// Returns `500` for a value [`render_field_value`] or [`render_array_value`] cannot render, a
-/// column of a type no `OpenSearch` type represents, a MAP column that is not a MAP of `Utf8`
-/// keys, and a resolved column the hit's batch does not hold: the batch holds every column of
-/// the index's table, so a missing one is a broken invariant, not a missing value.
+/// Returns `500` for a value [`render_field_value`], [`render_array_value`] or
+/// [`render_profile_field`] cannot render, a column of a type no `OpenSearch` type represents, a
+/// MAP column that is not a MAP of `Utf8` keys, a resolved column the hit's batch does not hold
+/// (the batch holds every column of the index's table, so a missing one is a broken invariant,
+/// not a missing value), and a plan without the hit's index; and the 400 of
+/// [`render_profile_field`] for a stored attribute key its profile cannot spell.
 fn render_field_values(
     session: &TenantSession,
     candidate: &Candidate<'_>,
-    requests: &[&DocValueField],
+    plan: &FieldRequestPlan<'_>,
 ) -> Result<Map<String, Value>, OpenSearchError> {
     let batch = candidate.batch.as_ref();
     let row = candidate.row;
     let mut values = Map::new();
-    for field_request in requests {
+    for (field_request, entry_reads) in plan.requests.iter().zip(&plan.profile_reads) {
+        let profile_read = entry_reads.get(candidate.position).ok_or_else(|| {
+            OpenSearchError::internal(format!(
+                "the `fields` plan has no index at position {}",
+                candidate.position
+            ))
+        })?;
+        if let Some(profile_read) = profile_read {
+            if let Some(value) = render_profile_field_value(candidate, *profile_read, field_request)? {
+                values.insert(field_request.field.clone(), json!([value]));
+            }
+            continue;
+        }
         if field_request.is_pattern() {
             render_pattern_field_values(batch, row, field_request, &mut values)?;
             continue;
@@ -1744,12 +1843,44 @@ fn render_field_values(
                     .map(|entry| render_array_value(map_values.as_ref(), entry))
                     .transpose()?
             }
+            // A native index resolves no encoded or derived field.
+            FieldValue::Encoded(_) | FieldValue::Derived(_) => None,
         };
         if let Some(value) = value {
             values.insert(field_request.field.clone(), json!([value]));
         }
     }
     Ok(values)
+}
+
+/// The `fields` value `field_request` reads from `candidate`'s row, on an index of a non-native
+/// profile, as `profile_read` decided; `None` when the row has no value or the name is no leaf of
+/// the profile. A profile time keeps the requested date format, like a native date column; every
+/// other field renders as the profile shows it.
+///
+/// # Errors
+///
+/// Returns the errors of [`render_field_value`] and [`render_profile_field`], and `500` for a
+/// resolved column the hit's batch does not hold.
+fn render_profile_field_value(
+    candidate: &Candidate<'_>,
+    profile_read: ProfileFieldRead,
+    field_request: &DocValueField,
+) -> Result<Option<Value>, OpenSearchError> {
+    let batch = candidate.batch.as_ref();
+    let row = candidate.row;
+    match profile_read {
+        ProfileFieldRead::Absent => Ok(None),
+        ProfileFieldRead::Time(column) => {
+            let array = read_resolved_column(batch, column)?;
+            (!array.is_null(row))
+                .then(|| render_field_value(array.as_ref(), row, field_request.format))
+                .transpose()
+        }
+        ProfileFieldRead::Rendered(table) => {
+            Ok(Some(render_profile_field(table, batch, row, &field_request.field)?).filter(|value| !value.is_null()))
+        }
+    }
 }
 
 /// The column `column` of a hit's `batch`, which a field of the hit's index resolved to.

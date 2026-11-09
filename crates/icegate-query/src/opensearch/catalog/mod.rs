@@ -6,6 +6,8 @@
 //! footprint count (see [`TenantSession::count_footprint`]), except in a global table, which it
 //! counts whole.
 
+mod data_prepper;
+mod encoding;
 mod expression;
 mod field;
 mod map_key_cache;
@@ -35,6 +37,12 @@ use icegate_common::schema::{
 use icegate_common::{ICEGATE_NAMESPACE, TenantId, icegate_table_ident};
 use tokio::sync::OnceCell;
 
+use self::data_prepper::DATA_PREPPER_TABLE;
+pub(crate) use self::encoding::{
+    EncodedField, ProfileTable, lower_derived_exists, lower_derived_range, lower_derived_term, lower_encoded_exists,
+    lower_encoded_range, lower_encoded_term, render_profile_document, render_profile_field,
+};
+use self::encoding::{is_nullable_encoded_id, list_profile_fields, resolve_profile_field};
 use self::expression::ExpressionPart;
 pub(crate) use self::expression::IndexExpression;
 pub(crate) use self::field::{FieldType, FieldValue, IndexField, ResolvedField, SelectedField};
@@ -42,7 +50,7 @@ use self::map_key_cache::{MapKeyCache, MapKeys, MapKeysVersion};
 pub(crate) use self::native::native_column_type;
 use self::native::{list_native_fields, resolve_native_field};
 pub(crate) use self::registry::{IndexEntry, IndexOptions, IndexSet, IndexTarget, Profile, read_index_options};
-use self::registry::{choose_index_target, find_telemetry_table, select_system_names};
+use self::registry::{check_table_uniqueness, choose_index_target, find_telemetry_table, select_system_names};
 use super::error::OpenSearchError;
 use super::system_index::{CurrentSnapshot, SystemIndexStore, SystemSnapshot};
 use crate::engine::QueryEngine;
@@ -183,6 +191,15 @@ impl IndexCatalog {
     }
 }
 
+/// The field table of a non-native profile index; `None` for a native index, whose fields are
+/// its columns.
+pub(crate) const fn find_profile_table(entry: &IndexEntry) -> Option<&'static ProfileTable> {
+    match entry.profile() {
+        Profile::Native => None,
+        Profile::DataPrepper => Some(&DATA_PREPPER_TABLE),
+    }
+}
+
 /// Open the table of every data index in `indices` through the tenant-scoped `namespace`.
 async fn open_index_tables(
     namespace: &dyn SchemaProvider,
@@ -303,16 +320,35 @@ impl TenantSession {
         }
     }
 
-    /// Resolve the field `name` of `entry`.
+    /// Resolve the field `name` of `entry`: a column of a native index, a field of the profile's
+    /// table otherwise (see [`find_profile_table`]).
     ///
     /// `None` means the name names nothing in this index: a query leaf on it matches nothing.
     /// An index whose table failed to open also resolves nothing; its scan reports the failure,
     /// and every search scans before it lowers.
     pub(crate) fn resolve_field(&self, entry: &IndexEntry, name: &str) -> Option<ResolvedField> {
-        let provider = self.open_table(entry).ok()?;
-        match entry.profile() {
-            Profile::Native => resolve_native_field(&provider.schema(), entry.table(), name),
+        let schema = self.open_table(entry).ok()?.schema();
+        find_profile_table(entry).map_or_else(
+            || resolve_native_field(&schema, entry.table(), name),
+            |table| resolve_profile_field(table, &schema, name),
+        )
+    }
+
+    /// Whether `field`, resolved in `entry`, is an encoded id whose stored column admits NULL
+    /// (see [`is_nullable_encoded_id`]): a sort or an aggregation refuses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error the table failed to open with.
+    pub(crate) fn is_nullable_encoded_id(
+        &self,
+        entry: &IndexEntry,
+        field: &ResolvedField,
+    ) -> Result<bool, OpenSearchError> {
+        if !matches!(field.value, FieldValue::Encoded(EncodedField::HexIdOrEmpty { .. })) {
+            return Ok(false);
         }
+        Ok(is_nullable_encoded_id(self.table_schema(entry)?.as_ref(), &field.value))
     }
 
     /// The Arrow type of `column` in `entry`'s tenant-scoped table, `None` when it has no such
@@ -399,34 +435,52 @@ impl TenantSession {
 
     /// Resolve `expression` for a request that reads one kind of index: data indices, or system
     /// indices (aliases resolved). The system snapshot is read only when a part names a system
-    /// index or `expand_wildcards` includes hidden.
+    /// index or `expand_wildcards` includes hidden. The data side resolves before the system side,
+    /// as in [`Self::list_targets`], so a missing name on both sides is reported by its data name on
+    /// every endpoint.
     ///
     /// # Errors
     ///
     /// Returns `illegal_argument_exception` naming the system indices when the expression selects
-    /// data and system indices together; `index_not_found_exception` per `options`; the store's
-    /// read error.
+    /// data and system indices together; [`OpenSearchError::table_reached_through_profiles`] when
+    /// it selects data indices only and reaches one table through several profiles without naming
+    /// each index (see [`IndexSet::resolve`]); `index_not_found_exception` per `options`; the
+    /// store's read error.
     pub(crate) async fn resolve_target(
         &self,
         expression: &IndexExpression,
         options: IndexOptions,
     ) -> Result<IndexTarget<'_>, OpenSearchError> {
-        let listing = self
-            .list_targets(
-                expression,
-                IndexOptions {
-                    allow_no_indices: true,
-                    ..options
-                },
-            )
-            .await?;
-        let system_indices = self.resolve_listed_system_indices(listing.system_listing).await?;
-        choose_index_target(
-            expression,
-            listing.data_entries,
-            system_indices,
-            options.allow_no_indices,
-        )
+        let partition = expression.partition_system_parts(options.expand_wildcards.is_hidden);
+        // Each side may come out empty: only both together decide whether nothing was named.
+        let side_options = IndexOptions {
+            allow_no_indices: true,
+            ..options
+        };
+        if partition.system_parts.is_empty() {
+            // No part names a system index, so a target is data indices, whose rows are read:
+            // each table reached once.
+            let data_entries = match &partition.data_expression {
+                Some(data_expression) => self.indices.resolve(data_expression, side_options)?,
+                None => Vec::new(),
+            };
+            return choose_index_target(expression, data_entries, Vec::new(), options.allow_no_indices);
+        }
+        let selected_data_entries = match &partition.data_expression {
+            Some(data_expression) => self.indices.select_entries(data_expression, side_options)?,
+            None => Vec::new(),
+        };
+        let system_listing = self.select_system_targets(&partition.system_parts, side_options).await?;
+        let system_indices = self.resolve_listed_system_indices(system_listing).await?;
+        // Only a target of data indices reads their rows, so only it needs each table reached
+        // once; an expression that also names system indices keeps the mix's own 400.
+        if let Some(data_expression) = &partition.data_expression
+            && system_indices.is_empty()
+        {
+            check_table_uniqueness(data_expression, &selected_data_entries)?;
+        }
+        let data_entries = selected_data_entries.into_iter().map(|(entry, _)| entry).collect();
+        choose_index_target(expression, data_entries, system_indices, options.allow_no_indices)
     }
 
     /// The concrete system indices `system_listing` names, in name order, each once: its indices
@@ -448,7 +502,9 @@ impl TenantSession {
     }
 
     /// List what `expression` names on both sides, for the endpoints that show data and system
-    /// indices together. The system snapshot is read as for [`Self::resolve_target`].
+    /// indices together. A table reached through several profiles is listed once per index, with
+    /// no uniqueness check (see [`IndexSet::resolve_listing`]). The system snapshot is read as for
+    /// [`Self::resolve_target`].
     ///
     /// # Errors
     ///
@@ -465,7 +521,7 @@ impl TenantSession {
             ..options
         };
         let data_entries = match &partition.data_expression {
-            Some(data_expression) => self.indices.resolve(data_expression, side_options)?,
+            Some(data_expression) => self.indices.resolve_listing(data_expression, side_options)?,
             None => Vec::new(),
         };
         let system_listing = if partition.system_parts.is_empty() {
@@ -503,7 +559,8 @@ impl TenantSession {
         })
     }
 
-    /// The fields of `entry`, in schema column order.
+    /// The fields of `entry`, in schema column order, or in its profile's declared order for an
+    /// index of a non-native profile.
     ///
     /// With [`FieldListing::WithMapKeys`], a telemetry table's MAP columns list the tenant's keys
     /// in committed Iceberg data within the discovery window that ends at the end of the minute
@@ -538,9 +595,10 @@ impl TenantSession {
         };
         let empty_map_keys = MapKeys::new();
         let map_keys = listed_map_keys.as_deref().unwrap_or(&empty_map_keys);
-        match entry.profile() {
-            Profile::Native => list_native_fields(&arrow_schema, map_keys),
-        }
+        find_profile_table(entry).map_or_else(
+            || list_native_fields(&arrow_schema, map_keys),
+            |table| list_profile_fields(table, &arrow_schema, map_keys),
+        )
     }
 
     /// The tenant's committed footprint in `entry`'s table; `None` for a view, which has no

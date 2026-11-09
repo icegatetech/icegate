@@ -2279,23 +2279,19 @@ async fn search_without_an_index_in_the_path_reaches_the_handler_on_get_and_post
 }
 
 /// The test catalog holds data tables and no system index, so the empty expression selects every
-/// wildcard-visible data index, each empty: the data path answers no hits.
+/// wildcard-visible data index, `spans` and `otel-v1-apm-span` among them: one table reached
+/// through two profiles without naming either index, which a search refuses rather than read
+/// its rows twice.
 #[tokio::test]
-async fn a_valid_search_without_an_index_in_the_path_searches_the_data_indices() -> TestResult {
+async fn a_search_without_an_index_in_the_path_refuses_a_table_reached_through_two_profiles() -> TestResult {
     let (server, _catalog) = TestServer::start().await;
 
     let (status, answer) = send_request(&server, Method::POST, TENANT_A, "/_search", Some(&json!({}))).await?;
 
-    assert_eq!(status, StatusCode::OK, "{answer}");
-    assert_eq!(answer["timed_out"], false);
-    assert_eq!(
-        answer["_shards"],
-        json!({"total": 1, "successful": 1, "skipped": 0, "failed": 0})
-    );
-    assert_eq!(
-        answer["hits"],
-        json!({"total": {"value": 0, "relation": "eq"}, "max_score": null, "hits": []})
-    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(answer["error"]["index"], "");
+    assert_eq!(answer["error"]["table"], "spans");
     server.shutdown().await;
     Ok(())
 }

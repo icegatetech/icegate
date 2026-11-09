@@ -62,7 +62,7 @@ use super::pipeline::{apply_pipelines, validate_pipelines};
 use super::render::render_aggregations;
 use super::terms::{TermsOrder, TermsSpec, build_filter_predicate, build_key_literal};
 use super::top_hits::{TopHitsResults, TopHitsSpec, collect_top_hits};
-use crate::opensearch::catalog::{FieldType, FieldValue, IndexEntry, ResolvedField, TenantSession};
+use crate::opensearch::catalog::{EncodedField, FieldType, FieldValue, IndexEntry, ResolvedField, TenantSession};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::MICROS_PER_MILLISECOND;
 use crate::opensearch::search::execute::convert_plan_error;
@@ -1261,7 +1261,9 @@ pub(crate) fn plan_aggregation_rows(
 }
 
 /// The distinct fields the aggregations of `tree` read, each checked against every aggregation
-/// that reads it; `filter` and `filters` read none.
+/// that reads it; `filter` and `filters` read none. An encoded id whose stored column admits NULL
+/// is refused with [`OpenSearchError::unordered_missing_id`]: its missing value renders `""`,
+/// which no bucket or count over the stored bytes reads.
 fn resolve_aggregation_fields(
     session: &TenantSession,
     entries: &[&IndexEntry],
@@ -1275,6 +1277,13 @@ fn resolve_aggregation_fields(
         let resolved: Vec<Option<ResolvedField>> =
             entries.iter().map(|entry| session.resolve_field(entry, name)).collect();
         check_field_for_aggregation(aggregation, name, entries, &resolved)?;
+        for (entry, field) in entries.iter().zip(&resolved) {
+            if let Some(field) = field
+                && session.is_nullable_encoded_id(entry, field)?
+            {
+                return Err(OpenSearchError::unordered_missing_id(name, entry.name(), "aggregation"));
+            }
+        }
         if fields.iter().all(|field| field.name != name)
             && let Some(data_type) = choose_row_data_type(aggregation, &resolved)
         {
@@ -1463,7 +1472,11 @@ fn choose_row_data_type(aggregation: &NamedAggregation, resolved: &[Option<Resol
 /// aggregation reads.
 const fn map_field_data_type(field: &ResolvedField) -> Option<DataType> {
     match (&field.value, field.field_type) {
-        (FieldValue::HexId { width, .. }, _) => Some(DataType::FixedSizeBinary(*width)),
+        // An encoded hex id is read as its stored bytes, which bucket keys render in hex: no cast
+        // turns fixed-size binary into text.
+        (FieldValue::HexId { width, .. } | FieldValue::Encoded(EncodedField::HexIdOrEmpty { width, .. }), _) => {
+            Some(DataType::FixedSizeBinary(*width))
+        }
         (_, FieldType::Keyword) => Some(DataType::Utf8),
         (_, FieldType::Date) => Some(DataType::Timestamp(TimeUnit::Microsecond, None)),
         (_, FieldType::Integer) => Some(DataType::Int32),

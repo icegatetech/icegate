@@ -21,6 +21,7 @@
 //! - `ppl_endpoints`: cluster settings, `SHOW TABLES`, the PPL grammar bundle and the plugin stubs
 //! - `ppl_formats`: the `viz`, `csv` and `raw` formats, `_explain`, and the scan pushdowns it shows
 //! - `ppl_trust_delta`: PPL `join` beyond the core commands
+//! - `profiles`: the Data Prepper span profile over real HTTP
 //! - `requests`: JSON and NDJSON request helpers shared by the system-index and data-index modules
 //! - `rustfs_conditional`: the object-store guarantees the system-index store builds on
 //! - `saved_objects`: system-index document endpoints
