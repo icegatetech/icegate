@@ -81,8 +81,8 @@ impl Renderer<'_, '_> {
         match node {
             LayoutNode::Metric(metric) => {
                 let slot = &self.layout.metrics[metric];
-                let is_date = self.inputs.metric_inputs[metric].is_date;
-                let value = render_metric(slot, is_date, &|statistic| {
+                let is_rendered_as_date = self.inputs.metric_inputs[metric].is_rendered_as_date;
+                let value = render_metric(slot, is_rendered_as_date, &|statistic| {
                     self.reader.read_statistic(metric, statistic, row, bucket_path)
                 })?;
                 Ok((slot.name.to_string(), value))

@@ -716,8 +716,9 @@ pub(super) fn read_value_script(name: &str, value: &Value) -> Result<MetricScrip
 ///
 /// `400 parsing_exception` for a missing `field` without a trace-list script; beside a trace-list
 /// script, `400 illegal_argument_exception` for a `missing` (`aggregation` and `key` metadata)
-/// and for a `field` other than the root field the script reads (`aggregation` and `field`
-/// metadata).
+/// and for a `field` (`aggregation` and `field` metadata): beside the latency script one other
+/// than the root duration it reads, beside the last-updated script any, since a named field
+/// would give its answer the field's date format.
 pub(super) fn resolve_metric_spec(
     kind_name: &str,
     name: &str,
@@ -730,6 +731,13 @@ pub(super) fn resolve_metric_spec(
             (script, CrossRowField::DurationInNanos.client_name(), None)
         }
         Some(script @ MetricScript::TraceLastUpdated) => {
+            if let Some(named_field) = &field {
+                return Err(OpenSearchError::trace_script_with_field(
+                    name,
+                    script.describe_script(),
+                    named_field,
+                ));
+            }
             (script, CrossRowField::EndTime.client_name(), Some(SPAN_END_TIME_FIELD))
         }
         Some(MetricScript::Arithmetic(_)) | None => {
@@ -1897,13 +1905,17 @@ mod tests {
             ["traceGroupFields.endTime", "endTime"]
         );
 
-        let error = assert_refusal(
-            json!({"last_updated": {"max": {"field": "endTime", "script": script}}}),
-            "illegal_argument_exception",
-        )
-        .await;
-        assert_eq!(error["aggregation"], "last_updated", "{error}");
-        assert_eq!(error["field"], "endTime", "{error}");
+        // Any field is refused, the root end time the script reads included: a named field would
+        // give the answer the field's date format.
+        for named_field in ["endTime", "traceGroupFields.endTime"] {
+            let error = assert_refusal(
+                json!({"last_updated": {"max": {"field": named_field, "script": script}}}),
+                "illegal_argument_exception",
+            )
+            .await;
+            assert_eq!(error["aggregation"], "last_updated", "{error}");
+            assert_eq!(error["field"], named_field, "{error}");
+        }
         let error = assert_refusal(
             json!({"last_updated": {"max": {"missing": 0, "script": script}}}),
             "illegal_argument_exception",

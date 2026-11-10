@@ -319,6 +319,19 @@ impl OpenSearchError {
     }
 
     /// The error rejecting a metric aggregation running the trace-list `script` (the name a
+    /// refusal gives it), which takes no `field`, that names `field` (`400`,
+    /// `illegal_argument_exception`): a field beside the script would give its answer the
+    /// field's date format, which the script alone renders without. `aggregation` carries the
+    /// request's name for it and `field` the field it named.
+    pub(crate) fn trace_script_with_field(aggregation: &str, script: &str, field: &str) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!("the {script} script of [{aggregation}] reads its own fields and takes no field, got [{field}]"),
+        )
+        .with_metadata("field", field)
+    }
+
+    /// The error rejecting a metric aggregation running the trace-list `script` (the name a
     /// refusal gives it) that also names a `missing` (`400`, `illegal_argument_exception`): the
     /// script itself decides what a span without a root answers, and a `missing` would replace
     /// that answer. `aggregation` carries the request's name for it and `key` is `missing`.

@@ -346,8 +346,10 @@ pub(super) struct MetricInput {
     /// The per-row value: a `Float64` (a date in epoch milliseconds) for every metric but
     /// `value_count` and `cardinality`, which read the field's own value.
     pub(super) value: Expr,
-    /// Whether the field is a date, so an extreme also renders as a string.
-    pub(super) is_date: bool,
+    /// Whether an extreme also renders as a date string: the field is a date and no value script
+    /// computed the value. A script's answer, a date included, renders raw (no
+    /// `value_as_string`), as `OpenSearch`'s numeric values source of a script-only metric does.
+    pub(super) is_rendered_as_date: bool,
 }
 
 /// The aggregate expression computing `statistic` over `value`.
@@ -378,7 +380,8 @@ pub(super) fn plan_statistic(statistic: Statistic, value: Expr) -> Result<Expr, 
 /// searched index maps as a NULL column; `plan_aggregation_rows` has already refused a mapped
 /// field the metric cannot read. Every column but a date is therefore read as a double, the NULL
 /// column included. A date is read as epoch milliseconds and renders as a date; only the
-/// last-updated script, whose answer is a date itself, runs over one.
+/// last-updated script, whose answer is a date itself, runs over one, and its answer renders as
+/// a plain number ([`MetricInput::is_rendered_as_date`]).
 ///
 /// # Errors
 ///
@@ -408,7 +411,7 @@ pub(super) fn plan_metric_input(
     if matches!(kind, MetricKind::ValueCount | MetricKind::Cardinality) {
         return Ok(MetricInput {
             value: field.expr,
-            is_date: false,
+            is_rendered_as_date: false,
         });
     }
     let is_date = matches!(field.data_type, DataType::Timestamp(TimeUnit::Microsecond, _));
@@ -433,7 +436,10 @@ pub(super) fn plan_metric_input(
         }
         Some(script) => script.lower_value_script(value),
     };
-    Ok(MetricInput { value, is_date })
+    Ok(MetricInput {
+        value,
+        is_rendered_as_date: is_date && spec.value_script.is_none(),
+    })
 }
 
 /// Epoch milliseconds of a `Timestamp(µs)`, floored, as a `Float64`.
@@ -514,8 +520,8 @@ pub(super) fn resolve_order_statistic(kind: MetricKind, path: &MetricPath) -> Re
 ///
 /// A single-value metric renders `value`: `null` when the bucket has no value, 0 for an empty
 /// `sum`, `value_count` and `cardinality`. `stats` renders `count`, `min`, `max`, `avg` and
-/// `sum` (an empty sum is 0). An extreme of a date field also renders `<key>_as_string` at
-/// millisecond precision. `percentiles` and `percentile_ranks` render `values` keyed by percent
+/// `sum` (an empty sum is 0). With `is_date` ([`MetricInput::is_rendered_as_date`]) an extreme
+/// also renders `<key>_as_string` at millisecond precision. `percentiles` and `percentile_ranks` render `values` keyed by percent
 /// or value, or as an array when not keyed. `extended_stats` renders as [`render_extended_stats`]
 /// states. A `max` over the trace-list latency script ending in a default renders 0, never
 /// `null`, for a bucket without a value; the form without a default renders `null` there.
