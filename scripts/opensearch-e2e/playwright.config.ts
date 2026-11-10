@@ -1,5 +1,5 @@
 import { defineConfig, devices } from '@playwright/test';
-import { OSD_URL } from './stand';
+import { GRAFANA_URL, OSD_URL } from './stand';
 
 /**
  * One shared Compose stand, so cases run one at a time in file order in one worker. No case is
@@ -25,6 +25,12 @@ export default defineConfig({
       name: 'osd',
       testMatch: 'osd.spec.ts',
       use: { baseURL: OSD_URL, testIdAttribute: 'data-test-subj' },
+    },
+    {
+      // The Grafana project keeps Playwright's default test-id attribute, `data-testid`.
+      name: 'grafana',
+      testMatch: 'grafana.spec.ts',
+      use: { baseURL: GRAFANA_URL },
     },
   ],
 });

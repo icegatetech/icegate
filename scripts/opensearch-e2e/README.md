@@ -10,6 +10,15 @@ identifier: renaming one means updating every citation (`grep -rn '<old name>'`)
 The integration tests in `crates/icegate-query/tests/opensearch/` pin IceGate's own contract with
 client-shaped requests; they make no claim about a client.
 
+| Project | File | Client |
+|---|---|---|
+| `osd` | `osd.spec.ts` | OpenSearch Dashboards: boot and migration, saved objects, index patterns, Discover, a dashboard, Query Workbench, Discover PPL, Observability Logs, the tenant header |
+| `grafana` | `grafana.spec.ts` | Grafana with the OpenSearch datasource plugin, through the stand's three OpenSearch datasources: health, Lucene and PPL logs, variables, ad-hoc filters, the metrics editor, traces, trace-to-logs |
+
+The Grafana cases create their dashboards through Grafana's HTTP API in `beforeAll`, each
+named `e2e-<purpose>`, and run Explore queries from URLs, so every query reaches IceGate through
+the plugin.
+
 ## Running the suite
 
 Docker is required, with a Compose that reads the `!reset` tag
@@ -21,7 +30,7 @@ npm --prefix scripts/opensearch-e2e ci
 npx --prefix scripts/opensearch-e2e playwright install chromium
 PROFILE=debug docker compose -f config/docker/docker-compose.yml -f config/docker/docker-compose.e2e.yml up -d --build
 scripts/opensearch-e2e/seed.sh
-cd scripts/opensearch-e2e && npx playwright test --project=osd
+cd scripts/opensearch-e2e && npx playwright test --project=osd --project=grafana
 ```
 
 `npx playwright test --list` prints every case. A failed case keeps its trace in

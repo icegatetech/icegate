@@ -81,6 +81,11 @@ jobs:
         working-directory: scripts/opensearch-e2e
         run: npx playwright test --project=osd
 
+      - name: Grafana cases
+        if: ${{ !cancelled() && steps.seed.outcome == 'success' }}
+        working-directory: scripts/opensearch-e2e
+        run: npx playwright test --project=grafana
+
       - name: Collect the stand's logs
         if: failure()
         run: $COMPOSE logs --no-color --timestamps > stand.log

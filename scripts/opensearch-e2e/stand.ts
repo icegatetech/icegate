@@ -9,7 +9,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { expect, type APIRequestContext } from '@playwright/test';
+import { expect, type APIRequestContext, type Locator, type Page } from '@playwright/test';
 
 /** The repository root; the Compose files and the stand's config documents are read from it. */
 export const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -225,6 +225,22 @@ export async function waitForOsdAvailable(request: APIRequestContext, timeoutMs:
   return version;
 }
 
+/**
+ * Waits, at most `timeoutMs`, until Grafana's `/api/health` answers 200. It polls as
+ * `waitForOsdAvailable` does, so a timeout reports the last request error or status.
+ */
+export async function waitForGrafanaHealthy(request: APIRequestContext, timeoutMs: number): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        const response = await request.get(`${GRAFANA_URL}/api/health`).catch((error: Error) => error);
+        return response instanceof Error ? `unreachable: ${response.message}` : `status ${response.status()}`;
+      },
+      { message: 'Grafana healthy', timeout: timeoutMs, intervals: [2_000] }
+    )
+    .toBe('status 200');
+}
+
 /** Writes advanced settings through OSD's own settings API; `null` resets a setting. */
 export async function setOsdSettings(request: APIRequestContext, changes: Record<string, unknown>): Promise<void> {
   const response = await request.post(`${OSD_URL}/api/opensearch-dashboards/settings`, {
@@ -232,4 +248,67 @@ export async function setOsdSettings(request: APIRequestContext, changes: Record
     data: { changes },
   });
   expect(response.status(), await response.text()).toBe(200);
+}
+
+/** The plugin id of Grafana's OpenSearch datasource, as provisioned datasources name their type. */
+export const GRAFANA_PLUGIN_ID = 'grafana-opensearch-datasource';
+
+/**
+ * Basic credentials the suite sends on Grafana API calls that create dashboards or read an
+ * admin endpoint, rather than relying on the anonymous session. The stand's Grafana service sets
+ * no administrator credential; the Grafana `beforeAll` fails at its first dashboard if these are
+ * not accepted.
+ */
+export const GRAFANA_ADMIN_HEADERS = { authorization: `Basic ${Buffer.from('admin:admin').toString('base64')}` };
+
+/** An Explore URL that runs one query of the datasource over `range` as the page loads. */
+export function exploreUrl(
+  datasourceUid: string,
+  query: Record<string, unknown>,
+  range: { from: string; to: string }
+): string {
+  const panes = JSON.stringify({
+    e2e: {
+      datasource: datasourceUid,
+      queries: [{ refId: 'A', datasource: { type: GRAFANA_PLUGIN_ID, uid: datasourceUid }, ...query }],
+      range,
+    },
+  });
+  return `/explore?orgId=1&schemaVersion=1&panes=${encodeURIComponent(panes)}`;
+}
+
+/** A Lucene metric query: a count per date-histogram bucket of the datasource's time field. */
+export function luceneMetricQuery(): Record<string, unknown> {
+  return {
+    queryType: 'lucene',
+    luceneQueryType: 'Metric',
+    query: '*',
+    metrics: [{ id: '1', type: 'count' }],
+    bucketAggs: [{ id: '2', type: 'date_histogram', settings: { interval: 'auto' } }],
+  };
+}
+
+/**
+ * The metric aggregations the cases expect the metrics editor to offer in place of the first
+ * `Count` (`grafana metrics editor on the spans datasource offers the metric aggregations`).
+ */
+export const METRIC_AGGREGATION_LABELS = [
+  'Average',
+  'Sum',
+  'Max',
+  'Min',
+  'Extended Stats',
+  'Percentiles',
+  'Unique Count',
+] as const;
+
+/** The first query editor row of an Explore pane or a panel editor. */
+export function queryEditorRow(page: Page): Locator {
+  return page.locator('[data-testid="data-testid Query editor row"], [aria-label="Query editor row"]').first();
+}
+
+/** Opens the metric type picker of the first metric row in an Explore Lucene metric query. */
+export async function openMetricTypeOptions(page: Page): Promise<void> {
+  await expect(page.getByTestId('query-type-select')).toBeVisible();
+  await queryEditorRow(page).getByText('Count', { exact: true }).first().click();
 }
