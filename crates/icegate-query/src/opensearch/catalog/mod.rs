@@ -655,8 +655,8 @@ impl TenantSession {
     ///
     /// # Errors
     ///
-    /// Returns `illegal_argument_exception` naming the system indices when the expression selects
-    /// data and system indices together; [`OpenSearchError::table_reached_through_profiles`] when
+    /// Returns [`OpenSearchError::mixed_index_target`] when the expression selects data and system
+    /// indices together; [`OpenSearchError::table_reached_through_profiles`] when
     /// it selects data indices only and reaches one table through several profiles without naming
     /// each index (see [`IndexSet::resolve`]); `index_not_found_exception` per `options`; the
     /// store's read error.

@@ -330,9 +330,12 @@ async fn get_of_a_data_index_document_is_refused_400() -> TestResult {
     let (server, _catalog) = TestServer::start().await;
 
     let (status, body) = send_request(&server, Method::GET, TENANT_A, "/logs/_doc/1", None).await?;
+    // The same route answers a system index (absent here), so the refusal is the data index's own.
+    let (system_status, system_body) = send_request(&server, Method::GET, TENANT_A, "/.kibana/_doc/1", None).await?;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["type"], "illegal_argument_exception");
+    assert_eq!(system_status, StatusCode::NOT_FOUND, "{system_body}");
     server.shutdown().await;
     Ok(())
 }
@@ -386,6 +389,9 @@ async fn an_op_type_the_endpoint_does_not_take_is_refused_400() -> TestResult {
     }
     let (status, _) = send_request(&server, Method::GET, TENANT_A, "/.kibana/_doc/x", None).await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // Without `op_type` the same route creates the document, so the refusal is the op type's own.
+    let (status, body) = send_request(&server, Method::PUT, TENANT_A, "/.kibana/_create/x", Some(&source)).await?;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
     server.shutdown().await;
     Ok(())
 }
@@ -1308,10 +1314,29 @@ async fn an_unknown_parameter_on_bulk_or_mget_is_refused() -> TestResult {
     )
     .await?;
 
+    // Without `routing` the same requests are answered, so the refusal is the parameter's own.
+    let (bulk_control_status, bulk_control_answer) = send_ndjson(
+        &server,
+        TENANT_A,
+        "/_bulk",
+        "{\"delete\":{\"_index\":\".kibana\",\"_id\":\"a\"}}\n".to_string(),
+    )
+    .await?;
+    let (mget_control_status, mget_control_answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/_mget",
+        Some(&json!({"docs": [{"_index": ".kibana", "_id": "a"}]})),
+    )
+    .await?;
+
     assert_eq!(bulk_status, StatusCode::BAD_REQUEST);
     assert_eq!(bulk_answer["error"]["type"], "illegal_argument_exception");
     assert_eq!(mget_status, StatusCode::BAD_REQUEST);
     assert_eq!(mget_answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(bulk_control_status, StatusCode::OK, "{bulk_control_answer}");
+    assert_eq!(mget_control_status, StatusCode::OK, "{mget_control_answer}");
     server.shutdown().await;
     Ok(())
 }
@@ -1537,15 +1562,11 @@ async fn start_server_with_answer_bound(max_answer_bytes: usize) -> Result<TestS
     Ok(server)
 }
 
-/// Assert `error`, an `error` object of the envelope or of an item, is the answer bound's refusal.
-fn assert_answer_bound_refusal(error: &Value) {
+/// Assert `error`, an `error` object of the envelope or of an item, is the refusal of the answer
+/// bound `max_answer_bytes`, which it carries under `limit`.
+fn assert_answer_bound_refusal(error: &Value, max_answer_bytes: usize) {
     assert_eq!(error["type"], "illegal_argument_exception", "{error}");
-    assert!(
-        error["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("opensearch.system_indices.max_answer_bytes")),
-        "{error}"
-    );
+    assert_eq!(error["limit"], max_answer_bytes, "{error}");
 }
 
 /// Three entries of 2,135 bytes, two commas and the 11 bytes of `{"docs":[` and `]}`.
@@ -1584,7 +1605,7 @@ async fn an_mget_answer_at_or_just_below_max_answer_bytes_answers_every_entry_in
 
 /// One byte above the bound, the answer is the error envelope and holds no part of `docs`.
 #[tokio::test]
-async fn an_mget_answer_just_above_max_answer_bytes_is_refused_naming_the_setting() -> TestResult {
+async fn an_mget_answer_just_above_max_answer_bytes_is_refused_carrying_the_limit() -> TestResult {
     let server = start_server_with_answer_bound(THREE_ENTRY_ANSWER_BYTES - 1).await?;
 
     let (status, answer) = send_request(
@@ -1598,7 +1619,7 @@ async fn an_mget_answer_just_above_max_answer_bytes_is_refused_naming_the_settin
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(answer["status"], 400);
-    assert_answer_bound_refusal(&answer["error"]);
+    assert_answer_bound_refusal(&answer["error"], THREE_ENTRY_ANSWER_BYTES - 1);
     assert!(answer.get("docs").is_none(), "{answer}");
     server.shutdown().await;
     Ok(())
@@ -1629,7 +1650,7 @@ async fn an_mget_of_only_unknown_ids_past_max_answer_bytes_is_refused_and_below_
     .await?;
 
     assert_eq!(over_status, StatusCode::BAD_REQUEST);
-    assert_answer_bound_refusal(&over_answer["error"]);
+    assert_answer_bound_refusal(&over_answer["error"], 6000);
     assert_eq!(under_status, StatusCode::OK);
     assert_eq!(
         under_answer["docs"],
@@ -1718,7 +1739,7 @@ async fn update_items_past_max_answer_bytes_fail_alone_and_the_kept_items_answer
     assert_eq!(items[2], build_kept_item("config:a", 4, '3'));
     assert_eq!(items[3]["update"]["status"], 400);
     assert_eq!(items[3]["update"]["_id"], "config:a");
-    assert_answer_bound_refusal(&items[3]["update"]["error"]);
+    assert_answer_bound_refusal(&items[3]["update"]["error"], 6000);
     assert_eq!(items[4]["index"]["_seq_no"], 5);
     assert_eq!(items[4]["index"]["status"], 201);
     assert_eq!(items[5]["delete"]["_seq_no"], 6);
@@ -1930,6 +1951,9 @@ async fn count_with_a_malformed_body_or_parameter_is_refused() -> TestResult {
     .await?;
     let (unknown_status, unknown_answer) =
         send_request(&server, Method::GET, TENANT_A, "/.kibana/_count?unknown=1", None).await?;
+    // The same route counts without the parameters, so each refusal is its parameter's own.
+    let (control_status, control_answer) =
+        send_request(&server, Method::GET, TENANT_A, "/.kibana/_count", None).await?;
 
     assert_eq!(malformed_status, StatusCode::BAD_REQUEST);
     assert_eq!(malformed_answer["error"]["type"], "parsing_exception");
@@ -1939,6 +1963,7 @@ async fn count_with_a_malformed_body_or_parameter_is_refused() -> TestResult {
     assert_eq!(wildcards_answer["error"]["type"], "illegal_argument_exception");
     assert_eq!(unknown_status, StatusCode::BAD_REQUEST);
     assert_eq!(unknown_answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(control_status, StatusCode::OK, "{control_answer}");
     server.shutdown().await;
     Ok(())
 }
@@ -1975,9 +2000,16 @@ async fn count_with_a_date_bound_past_the_representable_range_is_a_400() -> Test
     let body = json!({"query": {"range": {"updated_at": {"gte": "8210266876000000||/d", "time_zone": "+18:00"}}}});
 
     let (status, answer) = send_request(&server, Method::POST, TENANT_A, "/.kibana/_count", Some(&body)).await?;
+    // An instant whose local time stays in range rounds in the same zone, so the refusal is the
+    // range's own.
+    let in_range_body =
+        json!({"query": {"range": {"updated_at": {"gte": "1760000000000||/d", "time_zone": "+18:00"}}}});
+    let (in_range_status, in_range_answer) =
+        send_request(&server, Method::POST, TENANT_A, "/.kibana/_count", Some(&in_range_body)).await?;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(in_range_status, StatusCode::OK, "{in_range_answer}");
     server.shutdown().await;
     Ok(())
 }
@@ -2132,8 +2164,15 @@ async fn count_on_a_data_index_is_a_400() -> TestResult {
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(answer["error"]["index"], "logs", "{answer}");
     assert_eq!(mixed_status, StatusCode::BAD_REQUEST);
     assert_eq!(mixed_answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(mixed_answer["error"]["index"], ".kibana_1,logs", "{mixed_answer}");
+    assert_eq!(
+        mixed_answer["error"]["system_indices"],
+        json!([".kibana_1"]),
+        "{mixed_answer}"
+    );
     server.shutdown().await;
     Ok(())
 }
@@ -2422,6 +2461,16 @@ async fn aggregations_on_a_system_index_are_a_400() -> TestResult {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(answer["error"]["type"], "illegal_argument_exception", "{body}");
     }
+    // Without aggregations the same search is answered, so the refusal is theirs.
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search",
+        Some(&json!({"size": 0})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{answer}");
     server.shutdown().await;
     Ok(())
 }
@@ -2442,6 +2491,8 @@ async fn a_search_mixing_system_and_data_indices_is_a_400() -> TestResult {
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
     assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(answer["error"]["index"], ".kibana_1,logs", "{answer}");
+    assert_eq!(answer["error"]["system_indices"], json!([".kibana_1"]), "{answer}");
     server.shutdown().await;
     Ok(())
 }
@@ -2469,7 +2520,7 @@ async fn a_search_answer_carried_past_max_answer_bytes_by_its_sort_values_is_ref
     assert_eq!(fitting_status, StatusCode::OK, "{fitting_answer}");
     assert_eq!(fitting_answer["hits"]["total"], json!({"value": 2, "relation": "eq"}));
     assert_eq!(refused_status, StatusCode::BAD_REQUEST);
-    assert_answer_bound_refusal(&refused_answer["error"]);
+    assert_answer_bound_refusal(&refused_answer["error"], 6000);
     server.shutdown().await;
     Ok(())
 }
@@ -2505,11 +2556,6 @@ async fn a_sort_reading_one_source_field_twice_is_refused() -> TestResult {
 
         assert_eq!(status, StatusCode::BAD_REQUEST, "{sort}");
         assert_eq!(answer["error"]["type"], "illegal_argument_exception", "{sort}");
-        assert_eq!(
-            answer["error"]["reason"],
-            format!("the sort reads the field [{field}] of index [.kibana_1] more than once"),
-            "{sort}"
-        );
         assert_eq!(answer["error"]["field"], field, "{sort}");
         assert_eq!(answer["error"]["index"], ".kibana_1", "{sort}");
     }
@@ -3129,10 +3175,15 @@ async fn a_scroll_clearance_without_an_id_or_with_an_unknown_parameter_is_a_400(
     )
     .await?;
 
+    // A clearance of every scroll, without the parameter, is answered by the same routes.
+    let (all_status, all_answer) =
+        send_request(&server, Method::DELETE, TENANT_A, "/_search/scroll/_all", None).await?;
+
     assert_eq!(no_id_status, StatusCode::BAD_REQUEST);
     assert_eq!(no_id_refusal["error"]["type"], "illegal_argument_exception");
     assert_eq!(parameter_status, StatusCode::BAD_REQUEST);
     assert_eq!(parameter_refusal["error"]["type"], "illegal_argument_exception");
+    assert_eq!(all_status, StatusCode::OK, "{all_answer}");
     server.shutdown().await;
     Ok(())
 }
@@ -3151,9 +3202,19 @@ async fn a_scroll_with_a_sort_is_a_400() -> TestResult {
         Some(&json!({"size": 2, "sort": [{"config.buildNum": "asc"}]})),
     )
     .await?;
+    // Without the sort the same scroll opens, so the refusal is the sort's own.
+    let (unsorted_status, unsorted_body) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/.kibana/_search?scroll=1m",
+        Some(&json!({"size": 2})),
+    )
+    .await?;
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["type"], "illegal_argument_exception");
+    assert_eq!(unsorted_status, StatusCode::OK, "{unsorted_body}");
     server.shutdown().await;
     Ok(())
 }
@@ -3362,9 +3423,9 @@ async fn a_scroll_page_past_max_answer_bytes_is_refused_when_opened_and_when_con
 
     assert_eq!(read_hit_ids(&first_page)?, ["config:0"]);
     assert_eq!(opening_status, StatusCode::BAD_REQUEST, "{opening_refusal}");
-    assert_answer_bound_refusal(&opening_refusal["error"]);
+    assert_answer_bound_refusal(&opening_refusal["error"], 6000);
     assert_eq!(continuation_status, StatusCode::BAD_REQUEST, "{continuation_refusal}");
-    assert_answer_bound_refusal(&continuation_refusal["error"]);
+    assert_answer_bound_refusal(&continuation_refusal["error"], 6000);
     server.shutdown().await;
     Ok(())
 }

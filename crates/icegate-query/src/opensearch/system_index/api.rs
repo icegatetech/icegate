@@ -393,7 +393,5 @@ fn refuse_data_index_metadata(index: &str) -> Result<(), OpenSearchError> {
     if index.starts_with('.') {
         return Ok(());
     }
-    Err(OpenSearchError::illegal_argument(format!(
-        "[{index}] is a data index: index-level metadata endpoints serve system indices only"
-    )))
+    Err(OpenSearchError::data_index_without_metadata(index))
 }

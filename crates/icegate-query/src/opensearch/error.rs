@@ -578,6 +578,12 @@ impl OpenSearchError {
         )
     }
 
+    /// 404 `status_exception` for the ML config `id`, which IceGate never holds; `id` carries it
+    /// for a client.
+    pub(crate) fn ml_config_not_found(id: &str) -> Self {
+        Self::status_not_found(format!("no ML config [{id}]")).with_metadata("id", id)
+    }
+
     /// An aggregation over `field`, which the searched indices give more than one type, mapped or
     /// stored (`400`, `aggregation_execution_exception`). `field` and `indices_by_type` (each type
     /// name mapped to the array of indices giving the field that type) are carried for a client.
@@ -650,6 +656,50 @@ impl OpenSearchError {
     pub(crate) fn unsupported_header_key(key: &str) -> Self {
         Self::illegal_argument(format!("key [{key}] is not supported in the metadata section"))
             .with_metadata("key", key)
+    }
+
+    /// The index expression `expression` selects the system indices `system_indices` beside data
+    /// indices (`400`), and one request reads one or the other: `index` carries the expression
+    /// and `system_indices` the system side, so a client knows which side to drop.
+    pub(crate) fn mixed_index_target(expression: &str, system_indices: &[String]) -> Self {
+        Self::illegal_argument(format!(
+            "[{expression}] mixes the system indices [{}] with data indices; one request reads one or the other",
+            system_indices.join(",")
+        ))
+        .with_metadata("index", expression)
+        .with_metadata("system_indices", json!(system_indices))
+    }
+
+    /// An index-level metadata request names the data index `index` (`400`), which `index`
+    /// carries for a client: only system indices have index-level metadata.
+    pub(crate) fn data_index_without_metadata(index: &str) -> Self {
+        Self::illegal_argument(format!(
+            "[{index}] is a data index: index-level metadata endpoints serve system indices only"
+        ))
+        .with_metadata("index", index)
+    }
+
+    /// The system-index field `field` is mapped with the type `field_type`, which no query reads
+    /// (`400`); `field` and `field_type` carry them for a client.
+    pub(crate) fn unqueryable_system_field(field: &str, field_type: &str) -> Self {
+        Self::illegal_argument(format!(
+            "the field [{field}] of type [{field_type}] cannot be queried on a system index"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("field_type", field_type)
+    }
+
+    /// The query leaf `leaf` holds the key `key`, which it does not read (`400`,
+    /// `parsing_exception`), and `key` carries it for a client. It is refused rather than
+    /// ignored, because ignoring it would run a different query.
+    pub(crate) fn unknown_query_key(leaf: &str, key: &str) -> Self {
+        Self::parsing(format!("[{leaf}] query does not support [{key}]")).with_metadata("key", key)
+    }
+
+    /// A query object holds the keys `keys` where it takes exactly one of them (`400`,
+    /// `parsing_exception`), and `keys` carries them, in request order, for a client.
+    pub(crate) fn conflicting_query_keys(reason: impl Into<String>, keys: &[&str]) -> Self {
+        Self::parsing(reason).with_metadata("keys", json!(keys))
     }
 
     /// The document `id` of `index` holds a value of the sort field `field` that does not read as

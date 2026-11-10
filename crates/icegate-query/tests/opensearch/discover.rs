@@ -279,14 +279,8 @@ async fn a_star_search_with_hidden_indices_is_a_400_naming_the_system_indices() 
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
     assert_eq!(answer["error"]["type"], "illegal_argument_exception");
-    // The refusal carries no structured key for the system indices; the reason naming them is
-    // what tells the caller which side to drop.
-    assert!(
-        answer["error"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains(".kibana")),
-        "the reason names the system index: {}",
-        answer["error"]["reason"]
-    );
+    // `system_indices` tells the caller which side to drop.
+    assert_eq!(answer["error"]["index"], "*", "{answer}");
+    assert_eq!(answer["error"]["system_indices"], json!([".kibana"]), "{answer}");
     server.shutdown().await;
 }

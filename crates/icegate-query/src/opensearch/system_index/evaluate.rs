@@ -114,7 +114,7 @@ impl FieldKind {
     ///
     /// # Errors
     ///
-    /// `illegal_argument_exception` naming `field` and its type for any other type.
+    /// [`OpenSearchError::unqueryable_system_field`] for any other type.
     pub(crate) fn from_mapping_type(type_name: &str, field: &str) -> Result<Self, OpenSearchError> {
         match type_name {
             "keyword" => Ok(Self::Keyword),
@@ -125,9 +125,7 @@ impl FieldKind {
             "boolean" => Ok(Self::Boolean),
             "object" => Ok(Self::Object),
             "nested" => Ok(Self::Nested),
-            other => Err(OpenSearchError::illegal_argument(format!(
-                "the field [{field}] of type [{other}] cannot be queried on a system index"
-            ))),
+            other => Err(OpenSearchError::unqueryable_system_field(field, other)),
         }
     }
 }
@@ -2399,8 +2397,8 @@ mod tests {
             render_envelope(FieldKind::from_mapping_type("geo_point", "location").expect_err("refused")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "illegal_argument_exception");
-        let reason = body["error"]["reason"].as_str().expect("reason");
-        assert!(reason.contains("location") && reason.contains("geo_point"), "{reason}");
+        assert_eq!(body["error"]["field"], "location", "{body}");
+        assert_eq!(body["error"]["field_type"], "geo_point", "{body}");
     }
 
     #[test]

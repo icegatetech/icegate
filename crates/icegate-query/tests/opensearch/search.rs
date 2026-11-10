@@ -21,6 +21,10 @@ use icegate_common::{
     LOGS_TABLE, MemoryPressureConfig, MemoryPressureSampler, OPERATIONS_TABLE, SPANS_TABLE, UsageReader,
 };
 use icegate_query::opensearch::{OpenSearchConfig, SearchLimitsConfig, SystemIndicesConfig};
+use icegate_queue::SegmentId;
+use object_store::ObjectStoreExt as _;
+use parquet::basic::Encoding;
+use parquet::file::reader::{FileReader as _, SerializedFileReader};
 use reqwest::Method;
 use serde_json::{Map, Value, json};
 
@@ -40,6 +44,8 @@ const TRACE_ID: [u8; 16] = [
     0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
 ];
 const SPAN_ID: [u8; 8] = [0xaa, 0xbb, 0xcc, 0xdd, 0x00, 0x11, 0x22, 0x33];
+/// A trace id no other constant shares.
+const OTHER_TRACE_ID: [u8; 16] = [0x22; 16];
 
 /// Send `body` to `path` as `tenant` and read the status and the JSON answer.
 async fn post_json(server: &TestServer, tenant: Option<&str>, path: &str, body: &Value) -> (u16, Value) {
@@ -514,9 +520,12 @@ async fn seq_no_primary_term_on_a_data_index_is_a_400() {
         &json!({"seq_no_primary_term": true}),
     )
     .await;
+    // Without the key the same search is answered, so the refusal is the key's own.
+    let (control_status, control_answer) = post_json(&server, Some(TENANT_A), "/logs/_search", &json!({})).await;
 
     assert_eq!(status, 400, "{answer}");
     assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    assert_eq!(control_status, 200, "{control_answer}");
     server.shutdown().await;
 }
 
@@ -607,10 +616,13 @@ async fn middleware_refusals_on_the_search_route_answer_in_the_envelope() {
         "{too_large_answer}"
     );
 
-    // No tenant under the multi policy: refused in the 400 envelope.
+    // No tenant under the multi policy: refused in the 400 envelope. The same request with a
+    // tenant is answered, so the refusal is the missing tenant's own.
     let (status, refused_answer) = post_json(&limited_server, None, "/logs/_search", &body).await;
     assert_eq!(status, 400, "{refused_answer}");
     assert_eq!(refused_answer["error"]["type"], "illegal_argument_exception");
+    let (tenant_status, tenant_answer) = post_json(&limited_server, Some(TENANT_A), "/logs/_search", &body).await;
+    assert_eq!(tenant_status, 200, "{tenant_answer}");
     limited_server.shutdown().await;
 }
 
@@ -673,6 +685,82 @@ async fn search_never_returns_another_tenants_rows_from_one_wal_segment_or_one_p
         "tenant B's rows never match for tenant A: {probe_answer}"
     );
     assert_eq!(probe_answer["hits"]["hits"], json!([]));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_trace_id_term_reads_a_bloom_filtered_delta_encoded_wal_segment_and_never_another_tenants_row() {
+    let (server, catalog) = TestServer::start().await;
+    let with_trace_id = |mut row: Row<'static>, trace_id: &'static [u8; 16]| {
+        row.cells.push((COL_TRACE_ID, Cell::Bytes(trace_id)));
+        row.cells.push((COL_SPAN_ID, Cell::Bytes(&SPAN_ID)));
+        row
+    };
+    // The `logs` table has no commit, so its WAL is read from offset 0. Tenant B's row shares
+    // tenant A's trace id, so a lookup that ignored the tenant would return it.
+    write_wal_segment(
+        &server.wal_store,
+        &catalog,
+        LOGS_TABLE,
+        0,
+        &[
+            with_trace_id(build_log_row(TENANT_A, T0, "a-match", "INFO"), &TRACE_ID),
+            with_trace_id(build_log_row(TENANT_B, T0 + 1, "b-match", "INFO"), &TRACE_ID),
+            with_trace_id(build_log_row(TENANT_A, T0 + 2, "a-other", "INFO"), &OTHER_TRACE_ID),
+        ],
+    )
+    .await
+    .expect("segment");
+
+    // The segment carries what the queue writes: format version 2, page indexes, the
+    // DELTA_BYTE_ARRAY id columns without a dictionary, and a bloom filter on both ids.
+    let segment = SegmentId {
+        topic: LOGS_TABLE.to_string(),
+        offset: 0,
+    };
+    let segment_bytes = server
+        .wal_store
+        .get(&segment.to_relative_path())
+        .await
+        .expect("segment exists")
+        .bytes()
+        .await
+        .expect("segment bytes");
+    let reader = SerializedFileReader::new(segment_bytes).expect("segment is Parquet");
+    let metadata = reader.metadata();
+    assert_eq!(metadata.file_metadata().version(), 2);
+    assert_eq!(metadata.num_row_groups(), 1);
+    let row_group = metadata.row_group(0);
+    for id_column in [COL_TRACE_ID, COL_SPAN_ID] {
+        let column = row_group
+            .columns()
+            .iter()
+            .find(|column| column.column_path().string() == id_column)
+            .expect("id column");
+        assert!(column.bloom_filter_offset().is_some(), "{id_column} has a bloom filter");
+        assert!(column.column_index_offset().is_some(), "{id_column} has a page index");
+        assert!(
+            column.encodings().any(|encoding| encoding == Encoding::DELTA_BYTE_ARRAY),
+            "{id_column} is DELTA_BYTE_ARRAY"
+        );
+        assert!(
+            !column
+                .encodings()
+                .any(|encoding| matches!(encoding, Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY)),
+            "{id_column} has no dictionary"
+        );
+    }
+
+    let lookup = json!({"query": {"term": {"trace_id": "0123456789abcdeffedcba9876543210"}}});
+    for (tenant, expected_bodies) in [(TENANT_A, vec!["a-match"]), (TENANT_B, vec!["b-match"])] {
+        let (status, answer) = post_json(&server, Some(tenant), "/logs/_search", &lookup).await;
+        assert_eq!(status, 200, "{answer}");
+        assert_eq!(
+            read_sorted_source_texts(&answer, COL_BODY).expect("sorted source texts"),
+            expected_bodies,
+            "{tenant}: {answer}"
+        );
+    }
     server.shutdown().await;
 }
 
@@ -1949,6 +2037,9 @@ async fn a_search_after_value_that_fits_no_sort_key_is_a_400() {
         .await;
         assert_eq!(status, 400, "{case}: {refused_answer}");
         assert_eq!(refused_answer["error"]["type"], "illegal_argument_exception", "{case}");
+        // The same sort without the anchor is answered, so the refusal is the anchor's own.
+        let (sorted_status, sorted_answer) = post_json(&server, Some(TENANT_A), path, &json!({"sort": sort})).await;
+        assert_eq!(sorted_status, 200, "{case}: {sorted_answer}");
     }
     server.shutdown().await;
 }
@@ -3240,6 +3331,15 @@ async fn a_pattern_selecting_some_keys_of_a_map_column_is_a_400() {
     .await;
     assert_eq!(status, 400, "{answer}");
     assert_eq!(answer["error"]["type"], "illegal_argument_exception");
+    // A pattern over a column is answered, so the refusal is the partial map pattern's own.
+    let (control_status, control_answer) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({"query": {"multi_match": {"query": "GET", "fields": ["bod*"]}}}),
+    )
+    .await;
+    assert_eq!(control_status, 200, "{control_answer}");
     server.shutdown().await;
 }
 

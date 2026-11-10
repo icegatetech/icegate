@@ -56,8 +56,9 @@ enum LikeToken {
 ///
 /// # Errors
 ///
-/// `illegal_argument_exception` for a body that is not JSON or lacks a string `query` and, with the
-/// reason [`SQL_REFUSAL`], for any other statement.
+/// `illegal_argument_exception` for a body that is not JSON; with `key` `query`, for a body that
+/// lacks a string `query` (its `value` under `value`, when it has one) and, with the reason
+/// [`SQL_REFUSAL`] and the statement under `value`, for any other statement.
 pub(crate) async fn show_tables(
     State(state): State<OpenSearchState>,
     context: RequestContext,
@@ -67,11 +68,14 @@ pub(crate) async fn show_tables(
     let request: Value = serde_json::from_slice(&body)
         .map_err(|error| OpenSearchError::illegal_argument(format!("request body is not valid JSON: {error}")))?;
     let Some(Value::String(statement)) = request.get("query") else {
-        return Err(OpenSearchError::illegal_argument(
+        return Err(OpenSearchError::invalid_request_key(
+            "query",
+            request.get("query"),
             "request body must carry a string [query]",
         ));
     };
-    let pattern = parse_show_tables_like(statement).ok_or_else(|| OpenSearchError::illegal_argument(SQL_REFUSAL))?;
+    let pattern = parse_show_tables_like(statement)
+        .ok_or_else(|| OpenSearchError::invalid_request_key("query", request.get("query"), SQL_REFUSAL))?;
     let session = state.catalog.open_session(&context.tenant).await?;
     // The index set lists its entries in name order, and filtering keeps that order.
     let rows: Vec<Value> = session

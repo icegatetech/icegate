@@ -61,11 +61,6 @@ fn assert_semantic_error(error: &Value) {
     assert_eq!(error["code"], "SEMANTIC_ERROR", "{error}");
 }
 
-/// Asserts that `reply` is the semantic refusal and that its reason mentions `expected_text`.
-fn assert_semantic_refusal(reply: &PplReply, expected_text: &str) {
-    assert_semantic_refusal_naming(reply, &[expected_text]);
-}
-
 /// A listener configuration whose PPL row limit (100) is far below the rows the never-capped tests read
 /// inside a join side, a subsearch, a window or an append branch: the limit bounds only the final answer,
 /// so those tests answer in full only while no inner side is capped by it.
@@ -87,14 +82,12 @@ async fn assert_row_limit_refuses(server: &TestServer, tenant: &str, query: &str
     assert_eq!(error["context"]["limit"], 100, "{query}: {error}");
 }
 
-/// Asserts that `reply` is the semantic refusal and that its reason mentions every one of `names`.
-fn assert_semantic_refusal_naming(reply: &PplReply, names: &[&str]) {
+/// Asserts that `reply` is the semantic refusal whose `context` names `name`, what the refusal is
+/// about. Its reason is IceGate's own wording and is not read.
+fn assert_semantic_refusal_naming(reply: &PplReply, name: &str) {
     let error = &reply.parse_json_body()["error"];
     assert_semantic_error(error);
-    let reason = error["reason"].as_str().unwrap_or_default();
-    for name in names {
-        assert!(reason.contains(name), "no `{name}` in {}", reply.text);
-    }
+    assert_eq!(error["context"], json!({ "name": name }), "{}", reply.text);
 }
 
 /// The lines of `plan` that mention `operator`.
@@ -528,15 +521,7 @@ mod join {
             ),
         )
         .await;
-        let reused_alias_error = &reused_alias_reply.parse_json_body()["error"];
-        assert_semantic_error(reused_alias_error);
-        assert!(
-            reused_alias_error["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("two columns `s.service_name`") && reason.contains("right=")),
-            "{}",
-            reused_alias_reply.text
-        );
+        assert_semantic_refusal_naming(&reused_alias_reply, "s.service_name");
         let chained_answer = run_ppl(
             &server,
             TENANT_A,
@@ -586,13 +571,7 @@ mod join {
             "source=logs | left join max=1 left=l right=s on l.service_name = s.service_name [ source=spans ]",
         )
         .await;
-        let capped_error = &capped_reply.parse_json_body()["error"];
-        assert_semantic_error(capped_error);
-        assert!(
-            capped_error["reason"].as_str().is_some_and(|reason| reason.contains("max=1")),
-            "{}",
-            capped_reply.text
-        );
+        assert_semantic_refusal_naming(&capped_reply, "max");
         server.shutdown().await;
     }
 
@@ -836,15 +815,7 @@ mod join {
             &format!("source=logs | inner join right=k on body = k.x [ source={SYSTEM_INDEX} ]"),
         )
         .await;
-        let system_error = &system_side.parse_json_body()["error"];
-        assert_semantic_error(system_error);
-        assert!(
-            system_error["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains(SYSTEM_INDEX)),
-            "{}",
-            system_side.text
-        );
+        assert_semantic_refusal_naming(&system_side, SYSTEM_INDEX);
         server.shutdown().await;
     }
 
@@ -1107,7 +1078,7 @@ mod subsearch {
     async fn an_alias_on_an_index_source_is_a_semantic_400() {
         let (server, _catalog) = TestServer::start().await;
         let reply = refuse_ppl(&server, TENANT_A, "source=logs as l | fields body").await;
-        assert_semantic_refusal(&reply, "left=<alias>");
+        assert_semantic_refusal_naming(&reply, "l");
         server.shutdown().await;
     }
 
@@ -1227,14 +1198,14 @@ mod subsearch {
             "source=logs | where body = 'x' or service_name in [ source=spans | fields service_name ]",
         )
         .await;
-        assert_semantic_refusal(&nested_reply, "top-level");
+        assert_semantic_refusal_naming(&nested_reply, "in");
         let two_column_reply = refuse_ppl(
             &server,
             TENANT_A,
             "source=logs | where service_name in [ source=spans | fields name, service_name ]",
         )
         .await;
-        assert_semantic_refusal(&two_column_reply, "one column");
+        assert_semantic_refusal_naming(&two_column_reply, "in");
 
         // A subsearch over a system index is refused like a system-index source, naming the index.
         create_system_index(&server, TENANT_A).await.expect("create the system index");
@@ -1243,7 +1214,7 @@ mod subsearch {
             format!("source=[ source={SYSTEM_INDEX} ]"),
         ] {
             let system_reply = refuse_ppl(&server, TENANT_A, &query).await;
-            assert_semantic_refusal(&system_reply, SYSTEM_INDEX);
+            assert_semantic_refusal_naming(&system_reply, SYSTEM_INDEX);
         }
         server.shutdown().await;
     }
@@ -1406,11 +1377,11 @@ mod window {
                 &format!("source=logs | {command} count() as n, max(timestamp) as n"),
             )
             .await;
-            assert_semantic_refusal(&twice_reply, &format!("{command} names the column `n` twice"));
+            assert_semantic_refusal_naming(&twice_reply, "n");
 
             let distinct_reply =
                 refuse_ppl(&server, TENANT_A, &format!("source=logs | {command} dc(service_name)")).await;
-            assert_semantic_refusal(&distinct_reply, "`dc`");
+            assert_semantic_refusal_naming(&distinct_reply, "dc");
 
             // An aggregate that replaces the column a promoted attribute reads leaves that attribute unreadable.
             let replaced_reply = refuse_ppl(
@@ -1421,11 +1392,7 @@ mod window {
                 ),
             )
             .await;
-            assert_semantic_refusal(
-                &replaced_reply,
-                "field [resource_attributes.service.name] reads the column [service_name], which an earlier command \
-                 removed, renamed or replaced",
-            );
+            assert_semantic_refusal_naming(&replaced_reply, "resource_attributes.service.name");
         }
         server.shutdown().await;
     }
@@ -1471,10 +1438,7 @@ mod window {
             "source=logs | eventstats count() by span(timestamp, 1h)",
         )
         .await;
-        assert_semantic_refusal(
-            &span_reply,
-            "eventstats groups by fields; `by span(…)` is not supported",
-        );
+        assert_semantic_refusal_naming(&span_reply, "span");
         server.shutdown().await;
     }
 
@@ -1766,8 +1730,7 @@ mod append {
             "source=logs | fields body | append [ source=spans | eval body = 1 | fields body ]",
         )
         .await;
-        // The contract names the column and both types; the wording around them is not part of it.
-        assert_semantic_refusal_naming(&conflict_reply, &["body", "string", "bigint"]);
+        assert_semantic_refusal_naming(&conflict_reply, "body");
         server.shutdown().await;
     }
 
@@ -1873,7 +1836,7 @@ mod append {
             &format!("source=logs | append [ source={SYSTEM_INDEX} ]"),
         )
         .await;
-        assert_semantic_refusal(&system_reply, SYSTEM_INDEX);
+        assert_semantic_refusal_naming(&system_reply, SYSTEM_INDEX);
         server.shutdown().await;
     }
 
@@ -2195,8 +2158,8 @@ mod hex_ids {
         server.shutdown().await;
     }
 
-    /// A bound that is no id literal is refused as in a comparison: invalid hex names the column and the
-    /// literal, a value of another type names the id field and both PPL types.
+    /// A bound that is no id literal is refused as in a comparison: invalid hex names the literal, a value of
+    /// another type names the id field.
     #[tokio::test]
     async fn between_on_an_id_with_an_invalid_or_mistyped_bound_is_a_400() {
         // Reads no rows: the refusal comes while planning, so no other tenant's row could change it.
@@ -2207,9 +2170,9 @@ mod hex_ids {
             &format!("source=spans | where trace_id between '{HEX_01}' and 'zz'"),
         )
         .await;
-        assert_semantic_refusal_naming(&invalid_reply, &[COL_TRACE_ID, "'zz'", "not an even-length hex string"]);
+        assert_semantic_refusal_naming(&invalid_reply, "zz");
         let mistyped_reply = refuse_ppl(&server, TENANT_A, "source=spans | where span_id between 1 and 2").await;
-        assert_semantic_refusal_naming(&mistyped_reply, &[COL_SPAN_ID, "string", "bigint"]);
+        assert_semantic_refusal_naming(&mistyped_reply, COL_SPAN_ID);
         server.shutdown().await;
     }
 
@@ -2217,62 +2180,39 @@ mod hex_ids {
     async fn invalid_hex_or_a_wrong_length_is_a_400() {
         // Reads no rows: the refusal comes while planning, so no other tenant's row could change it.
         let (server, _catalog) = TestServer::start().await;
-        let quoted_hex_7f = format!("'{HEX_7F}'");
-        for (condition, fragments) in [
+        // Each refusal names the literal it refuses: not hex, or another number of bytes than the id.
+        for (condition, literal) in [
             (
                 "trace_id = 'zz000000000000000000000000000000'".to_string(),
-                [
-                    COL_TRACE_ID,
-                    "'zz000000000000000000000000000000'",
-                    "not an even-length hex string",
-                ],
+                "zz000000000000000000000000000000",
             ),
-            (
-                "trace_id != '7f00'".to_string(),
-                [COL_TRACE_ID, "'7f00'", "expected 16 bytes, got 2"],
-            ),
-            (
-                format!("span_id = '{HEX_7F}'"),
-                [COL_SPAN_ID, &quoted_hex_7f, "expected 8 bytes, got 16"],
-            ),
-            (
-                format!("trace_id in ('{HEX_01}', 'abc')"),
-                [COL_TRACE_ID, "'abc'", "not an even-length hex string"],
-            ),
-            (
-                "'xyz' < trace_id".to_string(),
-                [COL_TRACE_ID, "'xyz'", "not an even-length hex string"],
-            ),
+            ("trace_id != '7f00'".to_string(), "7f00"),
+            (format!("span_id = '{HEX_7F}'"), HEX_7F),
+            (format!("trace_id in ('{HEX_01}', 'abc')"), "abc"),
+            ("'xyz' < trace_id".to_string(), "xyz"),
         ] {
             let query = format!("source=spans | where {condition}");
             let refused_reply = refuse_ppl(&server, TENANT_A, &query).await;
-            assert_semantic_refusal_naming(&refused_reply, &fragments);
+            assert_semantic_refusal_naming(&refused_reply, literal);
         }
         server.shutdown().await;
     }
 
     /// Only a string literal folds: an id compared with a column, a number or a listed number of another type
-    /// is refused, naming the id field and both PPL types.
+    /// is refused, naming the id field.
     #[tokio::test]
     async fn an_id_compared_with_a_non_string_literal_operand_of_another_type_is_a_400() {
         // Reads no rows: the refusal comes while planning, so no other tenant's row could change it.
         let (server, _catalog) = TestServer::start().await;
-        for (condition, id_field, id_width, other_type) in [
-            ("trace_id = service_name", COL_TRACE_ID, 16, "string"),
-            ("span_id = 5", COL_SPAN_ID, 8, "bigint"),
-            ("name != parent_span_id", COL_PARENT_SPAN_ID, 8, "string"),
-            ("trace_id in (1, 2)", COL_TRACE_ID, 16, "bigint"),
+        for (condition, id_field) in [
+            ("trace_id = service_name", COL_TRACE_ID),
+            ("span_id = 5", COL_SPAN_ID),
+            ("name != parent_span_id", COL_PARENT_SPAN_ID),
+            ("trace_id in (1, 2)", COL_TRACE_ID),
         ] {
             let query = format!("source=spans | where {condition}");
             let refused_reply = refuse_ppl(&server, TENANT_A, &query).await;
-            assert_semantic_refusal(
-                &refused_reply,
-                &format!(
-                    "comparing the id field [{id_field}] (type string, {id_width} bytes written as hex) with a value \
-                     of type {other_type} is not supported; compare an id with another id or with a string literal \
-                     of hex digits"
-                ),
-            );
+            assert_semantic_refusal_naming(&refused_reply, id_field);
         }
         server.shutdown().await;
     }

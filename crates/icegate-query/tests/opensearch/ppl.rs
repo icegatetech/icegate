@@ -164,6 +164,23 @@ fn assert_ppl_error(answer: &PplAnswer, status: StatusCode, error_type: &str, co
     assert!(!reason.is_empty() && !details.is_empty(), "answer {}", answer.body);
 }
 
+/// A 400 `SEMANTIC_ERROR` PPL envelope whose `context` names `name`, what the refusal is about.
+/// Its reason is IceGate's own wording and is not read.
+fn assert_semantic_refusal_naming(answer: &PplAnswer, name: &str) {
+    assert_ppl_error(
+        answer,
+        StatusCode::BAD_REQUEST,
+        "SemanticCheckException",
+        "SEMANTIC_ERROR",
+    );
+    assert_eq!(
+        answer.body["error"]["context"],
+        json!({ "name": name }),
+        "answer {}",
+        answer.body
+    );
+}
+
 /// The `error` object of an answer in the `OpenSearch` envelope `illegal_argument_exception`,
 /// 400. Where the PPL handler's refusal carries a key, that key tells it apart from the listener's
 /// no-handler refusal, which has the same status and type and carries none; a keyless refusal
@@ -330,7 +347,6 @@ async fn an_unknown_source_is_a_404_index_not_found_with_its_code() {
         "IndexNotFoundException",
         "INDEX_NOT_FOUND",
     );
-    assert!(answer.body["error"]["reason"].as_str().expect("reason").contains("nope"));
     assert_eq!(answer.body["error"]["context"]["index"], json!("nope"));
     server.shutdown().await;
 }
@@ -535,13 +551,6 @@ async fn output_at_the_configured_row_limit_is_answered_and_one_row_more_is_a_40
         StatusCode::BAD_REQUEST,
         "IllegalArgumentException",
         "RESOURCE_LIMIT_EXCEEDED",
-    );
-    assert_eq!(
-        above_limit_answer.body["error"]["reason"],
-        json!(
-            "The query returns more than 2 rows, the configured opensearch.ppl.max_result_rows; add | head 2 to read \
-             the first rows."
-        )
     );
     assert_eq!(above_limit_answer.body["error"]["context"]["limit"], json!(2));
     server.shutdown().await;
@@ -798,6 +807,9 @@ async fn middleware_refusals_on_the_ppl_route_answer_in_the_envelope() {
         tenant_refusal.body["error"]["type"],
         json!("illegal_argument_exception")
     );
+    // The same request with a tenant is answered, so the refusal is the missing tenant's own.
+    let tenant_answer = post_ppl(&limited_server, TENANT, PPL_PATH, &body).await;
+    assert_eq!(tenant_answer.status, StatusCode::OK, "answer {}", tenant_answer.body);
     limited_server.shutdown().await;
 }
 
@@ -1360,99 +1372,51 @@ async fn rename_and_eval_feed_later_commands() {
 }
 
 #[tokio::test]
-async fn each_refused_expression_is_a_400_with_its_stated_reason() {
+async fn each_refused_expression_is_a_semantic_400_naming_what_it_refuses() {
     let (server, catalog) = TestServer::start().await;
     seed_logs(&catalog).await;
     commit_operation_rows(&catalog, &[build_test_operation_row(TENANT, NOON_MICROS, None)])
         .await
         .expect("commit operations");
-    // Each reason is IceGate's own wording, asserted literally.
+    // Each refusal names the function, field, pattern or specifier it refuses.
     let semantic_cases = [
-        (
-            "source=logs | eval v = lower(body, body)",
-            "function [lower] takes 1 argument(s), not 2",
-        ),
-        (
-            "source=logs | eval v = timestamp(5)",
-            "timestamp() takes a string or a timestamp, not Int64; use from_unixtime for numbers",
-        ),
-        (
-            "source=logs | eval v = date_format(timestamp, '%U')",
-            "date_format does not support the specifier %U",
-        ),
-        (
-            "source=logs | eval v = date_format(timestamp, body)",
-            "date_format takes a string literal here",
-        ),
-        (
-            "source=logs | eval v = like(body, 'x', severity_text)",
-            "like takes true or false as its third argument",
-        ),
-        (
-            "source=logs | eval v = mvindex(body, service_name)",
-            "mvindex takes integer literals as indexes",
-        ),
+        ("source=logs | eval v = lower(body, body)", "lower"),
+        ("source=logs | eval v = timestamp(5)", "timestamp"),
+        ("source=logs | eval v = date_format(timestamp, '%U')", "%U"),
+        ("source=logs | eval v = date_format(timestamp, body)", "date_format"),
+        ("source=logs | eval v = like(body, 'x', severity_text)", "like"),
+        ("source=logs | eval v = mvindex(body, service_name)", "mvindex"),
         (
             "source=operations | eval v = forall(finish_reasons, (x, y) -> x = y)",
-            "the lambda of forall takes one parameter",
+            "forall",
         ),
-        (
-            "source=logs | rename service* as svc",
-            "rename takes field names, not the pattern [service*]",
-        ),
-        ("source=logs | rename * as svc", "rename takes field names, not *"),
-        (
-            "source=logs | eval v = coalesce(x -> x = 'a')",
-            "a lambda is only an argument of an array function",
-        ),
-        (
-            "source=operations | eval v = exists(finish_reasons, 'stop')",
-            "exists takes a lambda as its second argument",
-        ),
+        // `body` is a string, not an array.
+        ("source=logs | eval v = forall(body, x -> x = 'a')", "forall"),
+        ("source=logs | rename service* as svc", "service*"),
+        ("source=logs | rename * as svc", "*"),
+        ("source=logs | eval v = coalesce(x -> x = 'a')", "coalesce"),
+        ("source=operations | eval v = exists(finish_reasons, 'stop')", "exists"),
         (
             "source=logs | fields - service_name | where resource_attributes.service.name = 'api'",
-            "field [resource_attributes.service.name] reads the column [service_name], which an earlier command \
-             removed, renamed or replaced",
+            "resource_attributes.service.name",
         ),
         (
             "source=logs | rename service_name as svc, body as service_name | where resource_attributes.service.name = 'api'",
-            "field [resource_attributes.service.name] reads the column [service_name], which an earlier command \
-             removed, renamed or replaced",
+            "resource_attributes.service.name",
         ),
         (
             "source=logs | eval service_name = 'x' | where resource_attributes.service.name = 'api'",
-            "field [resource_attributes.service.name] reads the column [service_name], which an earlier command \
-             removed, renamed or replaced",
+            "resource_attributes.service.name",
         ),
         // `logs` stores the attribute in a column, `spans` keeps it in its resource map.
         (
             "source=logs,spans | where resource_attributes.service.name = 'api'",
-            "field [resource_attributes.service.name] reads a column in some source indices and not in others",
+            "resource_attributes.service.name",
         ),
     ];
-    for (query, expected_reason) in semantic_cases {
-        let answer = run_query(&server, query).await;
-        assert_ppl_error(
-            &answer,
-            StatusCode::BAD_REQUEST,
-            "SemanticCheckException",
-            "SEMANTIC_ERROR",
-        );
-        assert_eq!(answer.body["error"]["reason"], json!(expected_reason), "query {query}");
+    for (query, expected_name) in semantic_cases {
+        assert_semantic_refusal_naming(&run_query(&server, query).await, expected_name);
     }
-    // The reason names the field's Arrow type after this prefix.
-    let not_a_list_answer = run_query(&server, "source=logs | eval v = forall(body, x -> x = 'a')").await;
-    assert_ppl_error(
-        &not_a_list_answer,
-        StatusCode::BAD_REQUEST,
-        "SemanticCheckException",
-        "SEMANTIC_ERROR",
-    );
-    let reason = not_a_list_answer.body["error"]["reason"].as_str().expect("reason");
-    assert!(
-        reason.starts_with("forall takes an array as its first argument, not "),
-        "reason {reason}"
-    );
     let cast_answer = run_query(&server, "source=logs | eval v = cast(body as date)").await;
     assert_ppl_error(
         &cast_answer,
@@ -1954,18 +1918,7 @@ async fn a_field_name_starting_with_the_reserved_prefix_is_a_400_naming_it() {
         ("source=logs | where __ppl_main = 'x'", "__ppl_main"),
     ];
     for (query, name) in cases {
-        let answer = run_query(&server, query).await;
-        assert_ppl_error(
-            &answer,
-            StatusCode::BAD_REQUEST,
-            "SemanticCheckException",
-            "SEMANTIC_ERROR",
-        );
-        assert_eq!(
-            answer.body["error"]["reason"],
-            json!(format!("field name [{name}] starts with the reserved prefix [__ppl_]")),
-            "query {query}"
-        );
+        assert_semantic_refusal_naming(&run_query(&server, query).await, name);
     }
     // A name that only contains the prefix is a field like any other.
     let unreserved_answer = run_query(
@@ -2100,14 +2053,7 @@ async fn timechart_with_more_series_than_its_limit_groups_the_rest_as_the_stated
         "source=logs | timechart timefield=timestamp span=1y limit=1 min(body) by service_name",
     )
     .await;
-    assert_ppl_error(
-        &string_ranked_answer,
-        StatusCode::BAD_REQUEST,
-        "SemanticCheckException",
-        "SEMANTIC_ERROR",
-    );
-    let details = string_ranked_answer.body["error"]["details"].as_str().expect("details");
-    assert!(details.contains("[min(body)]"), "details {details}");
+    assert_semantic_refusal_naming(&string_ranked_answer, "min(body)");
     let string_unranked_answer = run_query(
         &server,
         "source=logs | timechart timefield=timestamp span=1y limit=0 min(body) by service_name",
@@ -2438,14 +2384,7 @@ async fn bin_buckets_numeric_and_time_values() {
     // 5e18 fits an i64 but its double does not: the bin bounds would wrap.
     let wrapping_width_answer =
         run_query(&server, "source=operations | bin input_tokens span=5000000000000000000").await;
-    assert_ppl_error(
-        &wrapping_width_answer,
-        StatusCode::BAD_REQUEST,
-        "SemanticCheckException",
-        "SEMANTIC_ERROR",
-    );
-    let details = wrapping_width_answer.body["error"]["details"].as_str().expect("details");
-    assert!(details.contains("[5000000000000000000]"), "details {details}");
+    assert_semantic_refusal_naming(&wrapping_width_answer, "5000000000000000000");
     server.shutdown().await;
 }
 
@@ -2899,13 +2838,9 @@ mod commands_and_literals {
     use super::super::harness::TestServer;
     use super::super::test_rows::{OPERATION_NAME, STREAM, TEMPERATURE};
     use super::{
-        NOON_MICROS, OTHER_TENANT, PplAnswer, TENANT, assert_ppl_error, read_rows, run_query, seed_token_operations,
+        NOON_MICROS, OTHER_TENANT, TENANT, assert_ppl_error, assert_semantic_refusal_naming, read_rows, run_query,
+        seed_token_operations,
     };
-
-    /// `error.type` and `error.code` of a query the planner refuses as invalid.
-    const SEMANTIC_ERROR: (&str, &str) = ("SemanticCheckException", "SEMANTIC_ERROR");
-    /// `error.type` and `error.code` of a command or function IceGate does not plan.
-    const UNSUPPORTED_OPERATION: (&str, &str) = ("UnsupportedOperationException", "UNSUPPORTED_OPERATION");
 
     const fn build_log_row<'a>(
         tenant_id: &'a str,
@@ -2929,26 +2864,6 @@ mod commands_and_literals {
     /// the MAP keys committed here.
     fn compute_recent_micros() -> i64 {
         (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_micros()
-    }
-
-    /// `reason` and `details` of a PPL error envelope, joined, to check what the error names.
-    fn read_error_text(answer: &PplAnswer) -> String {
-        format!(
-            "{} {}",
-            answer.body["error"]["reason"].as_str().unwrap_or_default(),
-            answer.body["error"]["details"].as_str().unwrap_or_default()
-        )
-    }
-
-    /// A 400 PPL error envelope of `expected_error` (`error.type`, `error.code`) that names `named`.
-    fn assert_ppl_400(answer: &PplAnswer, expected_error: (&str, &str), named: &str) {
-        let (error_type, code) = expected_error;
-        assert_ppl_error(answer, StatusCode::BAD_REQUEST, error_type, code);
-        assert!(
-            read_error_text(answer).contains(named),
-            "error must name {named:?}: {}",
-            answer.body
-        );
     }
 
     #[tokio::test]
@@ -3034,7 +2949,7 @@ mod commands_and_literals {
             ("source=logs | parse body '(?<__ppl_a>.*)'", "__ppl_a"),
             ("source=logs | parse timestamp '(?<a>.+)'", "timestamp"),
         ] {
-            assert_ppl_400(&run_query(&server, query).await, SEMANTIC_ERROR, named);
+            assert_semantic_refusal_naming(&run_query(&server, query).await, named);
         }
         server.shutdown().await;
     }
@@ -3082,27 +2997,24 @@ mod commands_and_literals {
             assert_eq!(read_rows(&run_query(&server, query).await), &expected, "{query}");
         }
 
-        assert_ppl_400(
+        assert_semantic_refusal_naming(
             &run_query(&server, "source=logs | fillnull value=0 service_name").await,
-            SEMANTIC_ERROR,
             "service_name",
         );
-        assert_ppl_400(
+        assert_semantic_refusal_naming(
             &run_query(&server, "source=logs | fillnull using body = 'a', body = 'b'").await,
-            SEMANTIC_ERROR,
             "body",
         );
         // An id column renders as a hex string but accepts no replacement.
-        assert_ppl_400(
+        assert_semantic_refusal_naming(
             &run_query(&server, &format!("source=logs | fillnull with 'x' in {COL_TRACE_ID}")).await,
-            SEMANTIC_ERROR,
             COL_TRACE_ID,
         );
-        // Without a field list every column must accept the value; `logs` has timestamps and MAPs.
-        assert_ppl_400(
+        // Without a field list every column must accept the value; `logs` has timestamps and MAPs, and the
+        // refusal names the first column in schema order that does not take a string.
+        assert_semantic_refusal_naming(
             &run_query(&server, "source=logs | fillnull with 'x'").await,
-            SEMANTIC_ERROR,
-            "fillnull",
+            COL_TIMESTAMP,
         );
         // A number fills a numeric column only when the column's type holds it exactly: the integer
         // column `input_tokens` takes 7 but refuses 1.5, which it would truncate.
@@ -3116,10 +3028,9 @@ mod commands_and_literals {
             ),
             &json!([[3], [7]])
         );
-        assert_ppl_400(
+        assert_semantic_refusal_naming(
             &run_query(&server, "source=operations | fillnull value=1.5 input_tokens").await,
-            SEMANTIC_ERROR,
-            "field 'input_tokens' (type: bigint) cannot hold the replacement value 1.5",
+            "input_tokens",
         );
         let missing_field_reply = run_query(&server, "source=logs | fillnull with 'x' in no_such_field").await;
         assert_ppl_error(
@@ -3204,18 +3115,12 @@ mod commands_and_literals {
         .await;
         assert_eq!(read_rows(&int_reply), &json!([[2_147_483_647]]));
 
-        // An `int` column refuses a fraction and a literal one above its range, naming both.
+        // An `int` column refuses a fraction and a literal one above its range, naming the column.
         for (query, named) in [
-            (
-                "source=spans | fillnull value=1.5 status_code",
-                "field 'status_code' (type: int) cannot hold the replacement value 1.5",
-            ),
-            (
-                "source=spans | fillnull value=2147483648 status_code",
-                "field 'status_code' (type: int) cannot hold the replacement value 2147483648",
-            ),
+            ("source=spans | fillnull value=1.5 status_code", "status_code"),
+            ("source=spans | fillnull value=2147483648 status_code", "status_code"),
         ] {
-            assert_ppl_400(&run_query(&server, query).await, SEMANTIC_ERROR, named);
+            assert_semantic_refusal_naming(&run_query(&server, query).await, named);
         }
         server.shutdown().await;
     }
@@ -3373,14 +3278,14 @@ mod commands_and_literals {
             "IndexNotFoundException",
             "INDEX_NOT_FOUND",
         );
-        assert!(
-            read_error_text(&unknown_index_reply).contains("nope"),
+        assert_eq!(
+            unknown_index_reply.body["error"]["context"]["index"], "nope",
             "{}",
             unknown_index_reply.body
         );
 
         let several_indices_reply = run_query(&server, &format!("describe {LOGS_TABLE},{SPANS_TABLE}")).await;
-        assert_ppl_400(&several_indices_reply, SEMANTIC_ERROR, SPANS_TABLE);
+        assert_semantic_refusal_naming(&several_indices_reply, &format!("{LOGS_TABLE},{SPANS_TABLE}"));
 
         let kibana_creation = server
             .request(reqwest::Method::PUT, Some(TENANT), "/.kibana")
@@ -3390,7 +3295,7 @@ mod commands_and_literals {
             .await
             .expect("create .kibana");
         assert_eq!(kibana_creation.status().as_u16(), 200);
-        assert_ppl_400(&run_query(&server, "describe .kibana").await, SEMANTIC_ERROR, ".kibana");
+        assert_semantic_refusal_naming(&run_query(&server, "describe .kibana").await, ".kibana");
         server.shutdown().await;
     }
 
@@ -3398,11 +3303,24 @@ mod commands_and_literals {
     async fn patterns_and_take_are_400s_naming_them() {
         let (server, _catalog) = TestServer::start().await;
         let patterns_reply = run_query(&server, "source=logs | patterns body").await;
-        assert_ppl_400(&patterns_reply, UNSUPPORTED_OPERATION, "patterns");
-        assert_eq!(patterns_reply.body["error"]["context"]["command"], "patterns");
+        assert_ppl_error(
+            &patterns_reply,
+            StatusCode::BAD_REQUEST,
+            "UnsupportedOperationException",
+            "UNSUPPORTED_OPERATION",
+        );
+        assert_eq!(
+            patterns_reply.body["error"]["context"],
+            json!({ "command": "patterns" })
+        );
         let take_reply = run_query(&server, "source=logs | stats take(body, 2)").await;
-        assert_ppl_400(&take_reply, UNSUPPORTED_OPERATION, "take");
-        assert_eq!(take_reply.body["error"]["context"]["function"], "take");
+        assert_ppl_error(
+            &take_reply,
+            StatusCode::BAD_REQUEST,
+            "UnsupportedOperationException",
+            "UNSUPPORTED_OPERATION",
+        );
+        assert_eq!(take_reply.body["error"]["context"], json!({ "function": "take" }));
         server.shutdown().await;
     }
 
@@ -3466,11 +3384,7 @@ mod commands_and_literals {
             "source=logs | where timestamp between '2026-10-08 12:00:00.1234567' and '2026-10-09'",
             "source=logs | where timestamp in ('2026-10-08 12:00:00.1234567')",
         ] {
-            assert_ppl_400(
-                &run_query(&server, query).await,
-                SEMANTIC_ERROR,
-                "2026-10-08 12:00:00.1234567",
-            );
+            assert_semantic_refusal_naming(&run_query(&server, query).await, "2026-10-08 12:00:00.1234567");
         }
         let six_digit_reply = run_query(&server, "source=logs | where timestamp >= '2026-10-08 12:00:00.123456'").await;
         assert_eq!(six_digit_reply.status, StatusCode::OK, "{}", six_digit_reply.body);

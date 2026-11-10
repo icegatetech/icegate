@@ -148,18 +148,24 @@ async fn cluster_health_is_green_for_one_node_whatever_it_waits_for() {
 async fn an_unknown_parameter_is_refused_in_the_envelope() {
     let (server, _catalog) = TestServer::start().await;
 
-    for path in [
-        "/?unknown_knob=1",
-        "/_nodes?unknown_knob=1",
-        "/_cluster/health?unknown_knob=1",
-        "/_plugins/_query/_datasources?unknown_knob=1",
-    ] {
-        let response = server.request(Method::GET, Some(TENANT), path).send().await.expect("request");
+    // Each path answers without the parameter, so the refusal is the parameter's own.
+    for path in ["/", "/_nodes", "/_cluster/health", "/_plugins/_query/_datasources"] {
+        let known_response = server.request(Method::GET, Some(TENANT), path).send().await.expect("request");
+        let unknown_parameter_path = format!("{path}?unknown_knob=1");
+        let response = server
+            .request(Method::GET, Some(TENANT), &unknown_parameter_path)
+            .send()
+            .await
+            .expect("request");
 
-        assert_eq!(response.status(), 400, "{path}");
+        assert_eq!(known_response.status(), 200, "{path}");
+        assert_eq!(response.status(), 400, "{unknown_parameter_path}");
         let body: Value = response.json().await.expect("JSON body");
-        assert_eq!(body["status"], 400, "{path}");
-        assert_eq!(body["error"]["type"], "illegal_argument_exception", "{path}");
+        assert_eq!(body["status"], 400, "{unknown_parameter_path}");
+        assert_eq!(
+            body["error"]["type"], "illegal_argument_exception",
+            "{unknown_parameter_path}"
+        );
     }
     server.shutdown().await;
 }

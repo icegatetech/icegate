@@ -359,7 +359,8 @@ pub(super) fn select_system_names<'a>(
 ///
 /// # Errors
 ///
-/// Returns `illegal_argument_exception` naming the system indices when both sides are non-empty,
+/// Returns `illegal_argument_exception` carrying the expression as `index` and the system side as
+/// `system_indices` when both sides are non-empty,
 /// and `index_not_found_exception` naming the expression when both are empty and
 /// `allow_no_indices` is false.
 pub(super) fn choose_index_target<'a>(
@@ -369,11 +370,7 @@ pub(super) fn choose_index_target<'a>(
     allow_no_indices: bool,
 ) -> Result<IndexTarget<'a>, OpenSearchError> {
     match (data_entries.is_empty(), system_indices.is_empty()) {
-        (false, false) => Err(OpenSearchError::illegal_argument(format!(
-            "[{}] mixes the system indices [{}] with data indices; one request reads one or the other",
-            expression.text(),
-            system_indices.join(",")
-        ))),
+        (false, false) => Err(OpenSearchError::mixed_index_target(expression.text(), &system_indices)),
         (true, false) => Ok(IndexTarget::System(system_indices)),
         (true, true) if !allow_no_indices => Err(OpenSearchError::index_not_found(expression.text())),
         (false | true, true) => Ok(IndexTarget::Data(data_entries)),
@@ -721,12 +718,8 @@ mod tests {
         let (status, body) = render_envelope(refusal).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "illegal_argument_exception");
-        assert!(
-            body["error"]["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains(".kibana_1")),
-            "{body}"
-        );
+        assert_eq!(body["error"]["index"], "logs,.kibana_1", "{body}");
+        assert_eq!(body["error"]["system_indices"], json!([".kibana_1"]), "{body}");
 
         let (expression, data_entries, system_indices) = resolve_sides(".kibana_1");
         assert!(matches!(

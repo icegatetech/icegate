@@ -144,7 +144,9 @@ async fn get_of_a_data_index_is_400_illegal_argument() {
     let response = get_index(&server, TENANT_A, "logs").await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(read_json(response).await["error"]["type"], "illegal_argument_exception");
+    let body = read_json(response).await;
+    assert_eq!(body["error"]["type"], "illegal_argument_exception");
+    assert_eq!(body["error"]["index"], "logs", "{body}");
     server.shutdown().await;
 }
 
@@ -155,9 +157,12 @@ async fn put_of_an_upper_case_dot_name_is_400_illegal_argument() {
     let (server, _catalog) = TestServer::start().await;
 
     let response = put_index(&server, TENANT_A, ".Kibana", "{}").await;
+    // The lower-case name is created by the same route, so the refusal is the name's own.
+    let lower_case_response = put_index(&server, TENANT_A, ".kibana", "{}").await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(read_json(response).await["error"]["type"], "illegal_argument_exception");
+    assert_eq!(lower_case_response.status(), StatusCode::OK);
     assert_eq!(
         get_index(&server, TENANT_A, ".Kibana").await.status(),
         StatusCode::NOT_FOUND,
@@ -661,10 +666,7 @@ async fn aliases_of_a_data_index_is_a_400_naming_it() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = read_json(response).await;
     assert_eq!(body["error"]["type"], "illegal_argument_exception");
-    assert!(
-        body["error"]["reason"].as_str().is_some_and(|reason| reason.contains("[logs]")),
-        "{body}"
-    );
+    assert_eq!(body["error"]["index"], "logs", "{body}");
     server.shutdown().await;
 }
 
@@ -813,12 +815,8 @@ async fn field_caps_over_logs_and_kibana_is_a_400_naming_kibana() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = read_json(response).await;
     assert_eq!(body["error"]["type"], "illegal_argument_exception");
-    assert!(
-        body["error"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains(".kibana_1")),
-        "{body}"
-    );
+    assert_eq!(body["error"]["index"], "logs,.kibana_1", "{body}");
+    assert_eq!(body["error"]["system_indices"], json!([".kibana_1"]), "{body}");
     server.shutdown().await;
 }
 
@@ -910,9 +908,14 @@ async fn field_mapping_of_a_system_index_is_a_400() {
     let response = send_bodiless_request(&server, Method::GET, TENANT_A, "/.kibana_1/_mapping/field/type")
         .await
         .expect("request");
+    // The same route answers a data index, so the refusal is the system index's own.
+    let data_index_response = send_bodiless_request(&server, Method::GET, TENANT_A, "/logs/_mapping/field/body")
+        .await
+        .expect("request");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(read_json(response).await["error"]["type"], "illegal_argument_exception");
+    assert_eq!(data_index_response.status(), StatusCode::OK);
     server.shutdown().await;
 }
 

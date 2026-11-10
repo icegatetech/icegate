@@ -10,8 +10,11 @@
 //! [`write_wal_segment`]. The rest serve the `pub` items only.
 //!
 //! Tables are created from `icegate_common::schema`, Iceberg appends go through the production
-//! Parquet writer with the table's production bloom-filter columns and encodings, and every
-//! append records [`COMMITTED_WAL_OFFSET`], so a merged scan reads the WAL from the next offset.
+//! Parquet writer with the table's production bloom-filter columns and encodings, WAL segments
+//! are written with the queue writer's Parquet properties and the columns and encodings of the
+//! table's production WAL topic (a table without one, `events` or `prices`, takes those of its
+//! Iceberg table), and every append records [`COMMITTED_WAL_OFFSET`], so a merged scan reads
+//! the WAL from the next offset.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -41,10 +44,9 @@ use icegate_common::{
     EVENTS_TABLE, ICEGATE_NAMESPACE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, PRICES_TABLE, SPANS_TABLE,
     WAL_OFFSET_PROPERTY, icegate_table_ident,
 };
-use icegate_queue::SegmentId;
+use icegate_queue::{QueueConfig, SegmentId, build_wal_writer_properties};
 use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload};
 use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 use tokio_util::sync::CancellationToken;
 
 /// Why a table could not be created or its rows written.
@@ -467,12 +469,7 @@ fn build_list_column(
 /// encodings, with sizes far above what a test writes. A name outside [`PRODUCTION_TABLES`]
 /// (an exact-name table a test creates) is written with none.
 pub fn select_write_config(table_name: &str) -> WriteConfig {
-    let (bloom_filter_columns, column_encodings) = PRODUCTION_TABLES
-        .iter()
-        .find(|table| table.name == table_name)
-        .map_or((&[][..], &[][..]), |table| {
-            (table.bloom_filter_columns, table.column_encodings)
-        });
+    let (bloom_filter_columns, column_encodings) = select_column_settings(table_name);
     WriteConfig {
         row_group_size: 8192,
         data_page_size_limit_bytes: 1024 * 1024,
@@ -480,6 +477,19 @@ pub fn select_write_config(table_name: &str) -> WriteConfig {
         bloom_filter_columns,
         column_encodings,
     }
+}
+
+/// The bloom-filter columns and column encodings production writes `table_name` with in its
+/// Iceberg table, and in its WAL topic for the tables ingest writes to the WAL (every one but
+/// `events` and `prices`, whose WAL segments here take their Iceberg lists); none for a name
+/// outside [`PRODUCTION_TABLES`].
+fn select_column_settings(table_name: &str) -> (&'static [&'static str], &'static [ColumnEncoding]) {
+    PRODUCTION_TABLES
+        .iter()
+        .find(|table| table.name == table_name)
+        .map_or((&[][..], &[][..]), |table| {
+            (table.bloom_filter_columns, table.column_encodings)
+        })
 }
 
 /// The Arrow schema of `table_name`'s current Iceberg schema, field ids included.
@@ -535,8 +545,10 @@ pub async fn commit_rows(catalog: &Arc<dyn Catalog>, table_name: &str, rows: &[R
 }
 
 /// Write `rows`, of any tenants, as the WAL segment `offset` of `table_name`'s topic: one
-/// Parquet file holding every row in order. The WAL is read as an unbroken run of offsets, from
-/// `0` for a table with no commit and from `COMMITTED_WAL_OFFSET + 1` otherwise.
+/// Parquet file holding every row in order, written with the queue's own writer properties
+/// ([`build_wal_writer_properties`] under the default queue configuration) and the table's
+/// production bloom-filter columns and column encodings. The WAL is read as an unbroken run of
+/// offsets, from `0` for a table with no commit and from `COMMITTED_WAL_OFFSET + 1` otherwise.
 pub async fn write_wal_segment(
     wal_store: &Arc<dyn ObjectStore>,
     catalog: &Arc<dyn Catalog>,
@@ -547,7 +559,10 @@ pub async fn write_wal_segment(
     let arrow_schema = read_arrow_schema(catalog, table_name).await?;
     let batch = build_rows_batch(&arrow_schema, rows)?;
     let mut buffer = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buffer, arrow_schema, Some(WriterProperties::builder().build()))?;
+    let (bloom_filter_columns, column_encodings) = select_column_settings(table_name);
+    let writer_properties =
+        build_wal_writer_properties(&QueueConfig::default(), bloom_filter_columns, column_encodings, None);
+    let mut writer = ArrowWriter::try_new(&mut buffer, arrow_schema, Some(writer_properties))?;
     writer.write(&batch)?;
     writer.close()?;
     let segment = SegmentId {

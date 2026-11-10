@@ -140,6 +140,7 @@ impl PplType {
             DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => Ok(Self::Array),
             other => Err(PplError::Semantic {
                 reason: format!("column [{column}] has type {other}, which a PPL query cannot return"),
+                name: None,
             }),
         }
     }
@@ -331,9 +332,10 @@ async fn resolve_data_entries<'session>(
     };
     match session.resolve_target(&index_expression, options).await? {
         IndexTarget::Data(entries) => Ok(entries),
-        IndexTarget::System(names) => Err(PplError::Semantic {
-            reason: format!("PPL reads data indices only; [{}] are system indices", names.join(", ")),
-        }),
+        IndexTarget::System(names) => {
+            let reason = format!("PPL reads data indices only; [{}] are system indices", names.join(", "));
+            Err(PplError::semantic_naming(expression, reason))
+        }
     }
 }
 
@@ -353,6 +355,7 @@ fn scan_entry(session: &TenantSession, entry: &IndexEntry) -> Result<LogicalPlan
                 entry.name(),
                 profile.name()
             ),
+            name: None,
         });
     }
     project_source_columns(session.scan_index(entry)?)
@@ -408,6 +411,7 @@ fn union_branches(branches: Vec<(&str, LogicalPlanBuilder)>) -> Result<LogicalPl
                              {field_type_name} in [{index}]",
                             conflict.name
                         ),
+                        name: None,
                     }
                 }
                 None => PplError::Internal {
@@ -1178,6 +1182,7 @@ fn lower_span(
             if !data_type.is_numeric() {
                 return Err(PplError::Semantic {
                     reason: format!("span takes a numeric or time field; [{field}] is {data_type}"),
+                    name: None,
                 });
             }
             let is_integer_bucket = data_type.is_integer() && length.fract() == 0.0;
@@ -1191,9 +1196,11 @@ fn lower_span(
         }
         (SpanUnit::Numeric, true) => Err(PplError::Semantic {
             reason: format!("span of the time field [{field}] needs a time unit"),
+            name: None,
         }),
         (_, false) => Err(PplError::Semantic {
             reason: format!("span with a time unit takes a time field; [{field}] is {data_type}"),
+            name: None,
         }),
         (unit, true) => {
             #[allow(clippy::cast_possible_truncation)]
@@ -1259,6 +1266,7 @@ fn compute_bucket_width(length: i64, unit_width: i64) -> Result<i64, PplError> {
         .filter(|width| width.checked_mul(2).is_some())
         .ok_or_else(|| PplError::Semantic {
             reason: "span length is out of range".to_string(),
+            name: None,
         })
 }
 
@@ -1275,6 +1283,7 @@ fn convert_whole_width(width: f64) -> Result<i64, PplError> {
     if width >= WHOLE_WIDTH_LIMIT {
         return Err(PplError::Semantic {
             reason: "span length is out of range".to_string(),
+            name: None,
         });
     }
     #[allow(clippy::cast_possible_truncation)]
@@ -1380,6 +1389,7 @@ fn rank_values(
                 "field [{}] already exists; name the count column with countfield='<name>'",
                 rank.count_field
             ),
+            name: None,
         });
     }
     let groups = rank
@@ -1497,12 +1507,13 @@ fn build_window_aggregate(
         ("min", 1) => (min_udaf(), lowered_arguments),
         ("max", 1) => (max_udaf(), lowered_arguments),
         (other, count) => {
-            return Err(PplError::Semantic {
-                reason: format!(
+            return Err(PplError::semantic_naming(
+                other,
+                format!(
                     "`{other}` with {count} argument(s) is not supported in eventstats or streamstats; \
                      use count, sum, avg, min or max"
                 ),
-            });
+            ));
         }
     };
     let (order_by, frame) = if is_running {
@@ -1569,9 +1580,10 @@ fn plan_window_command(
     let mut outputs: Vec<(&str, String)> = Vec::with_capacity(command.aggregations.len());
     for (name, aggregation) in command.aggregations {
         if outputs.iter().any(|(listed, _)| listed == name) {
-            return Err(PplError::Semantic {
-                reason: format!("{} names the column `{name}` twice", command.command_name),
-            });
+            return Err(PplError::semantic_naming(
+                name,
+                format!("{} names the column `{name}` twice", command.command_name),
+            ));
         }
         let window = build_window_aggregate(aggregation, &partition_by, command.is_running, scope)?;
         let window_name = window.schema_name().to_string();
@@ -1716,6 +1728,7 @@ fn chart_rows(
     if !is_time {
         return Err(PplError::Semantic {
             reason: format!("timechart needs a time field; [{}] is not one", chart.time_field),
+            name: None,
         });
     }
     let mut keys = vec![GroupKey {
@@ -1752,12 +1765,13 @@ fn chart_rows(
     }
     let aggregate_type = grouped_rows.schema().field_with_unqualified_name(aggregate_name)?.data_type();
     if !aggregate_type.is_numeric() {
-        return Err(PplError::Semantic {
-            reason: format!(
+        return Err(PplError::semantic_naming(
+            aggregate_name,
+            format!(
                 "timechart ranks series by the sum of [{aggregate_name}], which is not numeric ({aggregate_type}); \
                  set limit=0 to keep every series"
             ),
-        });
+        ));
     }
     // Refused before anything else is planned: with the other-series row in play, an aggregation it
     // cannot merge exactly would show an invalid value there.
@@ -1831,9 +1845,11 @@ fn render_series_label(schema: &DFSchema, by: &str) -> Result<Expr, PplError> {
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(ident(by)),
         DataType::Map(_, _) | DataType::Struct(_) => Err(PplError::Semantic {
             reason: format!("Cannot chart by [{by}] because it is an object."),
+            name: None,
         }),
         DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => Err(PplError::Semantic {
             reason: format!("Cannot chart by [{by}] because it holds multiple values."),
+            name: None,
         }),
         _ => Ok(cast(ident(by), DataType::Utf8)),
     }
@@ -1883,6 +1899,7 @@ fn bin_field(
             if !data_type.is_numeric() {
                 return Err(PplError::Semantic {
                     reason: format!("bin takes a numeric or time field; [{}] is {data_type}", bin.field),
+                    name: None,
                 });
             }
             bin_number(value, width, &data_type)?
@@ -1895,6 +1912,7 @@ fn bin_field(
                     "bin with a time span takes a time field; [{}] is {data_type}",
                     bin.field
                 ),
+                name: None,
             });
         }
     };
@@ -1923,6 +1941,7 @@ fn read_whole_width(width: f64) -> Result<i64, PplError> {
     if width.fract() != 0.0 || width < 1.0 {
         return Err(PplError::Semantic {
             reason: format!("bin span [{width}] must be a whole number"),
+            name: None,
         });
     }
     convert_whole_width(width)
@@ -1946,9 +1965,10 @@ const BIN_BOUND_TYPE: DataType = DataType::Decimal128(DECIMAL128_MAX_PRECISION, 
 fn bin_number(value: Expr, width: f64, data_type: &DataType) -> Result<Expr, PplError> {
     let whole_width = read_whole_width(width)?;
     if whole_width.checked_mul(2).is_none() {
-        return Err(PplError::Semantic {
-            reason: format!("bin span [{width}] is out of range"),
-        });
+        return Err(PplError::semantic_naming(
+            width.to_string(),
+            format!("bin span [{width}] is out of range"),
+        ));
     }
     let width_bound = cast(lit(whole_width), BIN_BOUND_TYPE);
     let start = if data_type.is_integer() {
@@ -2025,6 +2045,7 @@ fn check_calendar_bin_length(length: i64, max_length: i64) -> Result<(), PplErro
     if length > max_length {
         return Err(PplError::Semantic {
             reason: "span length is out of range".to_string(),
+            name: None,
         });
     }
     Ok(())
@@ -2074,6 +2095,7 @@ fn select_fields(
         if kept_columns.is_empty() {
             return Err(PplError::Semantic {
                 reason: "fields - removes every column".to_string(),
+                name: None,
             });
         }
         kept_columns.extend(order_columns.iter().map(ident));
@@ -2261,12 +2283,13 @@ async fn plan_where(
             has_subsearch = true;
             let subsearch = plan_subquery(query, planning).await?;
             if subsearch.columns.len() != 1 {
-                return Err(PplError::Semantic {
-                    reason: format!(
+                return Err(PplError::semantic_naming(
+                    "in",
+                    format!(
                         "the subsearch of `in` must return one column; it returns {}: end it with `| fields <column>`",
                         subsearch.columns.len()
                     ),
-                });
+                ));
             }
             in_subquery(lower_expression(expression, scope)?, Arc::new(subsearch.plan))
         } else {
@@ -2283,6 +2306,9 @@ async fn plan_where(
     }
     Ok(filtered_rows)
 }
+
+/// The reason of the refusal of a lambda anywhere but as the second argument of an array function.
+const MISPLACED_LAMBDA_REASON: &str = "a lambda is only an argument of an array function";
 
 /// Lower `expression` to a DataFusion expression over the columns of `scope`.
 ///
@@ -2303,7 +2329,8 @@ fn lower_expression(expression: &PplExpr, scope: &ExpressionScope<'_>) -> Result
         PplExpr::Case { branches, otherwise } => lower_case(branches, otherwise.as_deref(), scope),
         PplExpr::Cast { value, target } => lower_cast_operand(value, *target, scope),
         PplExpr::Lambda { .. } => Err(PplError::Semantic {
-            reason: "a lambda is only an argument of an array function".to_string(),
+            reason: MISPLACED_LAMBDA_REASON.to_string(),
+            name: None,
         }),
         PplExpr::In {
             value,
@@ -2317,10 +2344,10 @@ fn lower_expression(expression: &PplExpr, scope: &ExpressionScope<'_>) -> Result
             is_negated,
         } => lower_between(value, low, high, *is_negated, scope),
         PplExpr::IsNull { value, is_negated } => lower_null_test(value, *is_negated, scope),
-        PplExpr::InSubsearch { .. } => Err(PplError::Semantic {
-            reason: "`<expression> in [subsearch]` is supported only as a top-level `and` conjunct of `where`"
-                .to_string(),
-        }),
+        PplExpr::InSubsearch { .. } => Err(PplError::semantic_naming(
+            "in",
+            "`<expression> in [subsearch]` is supported only as a top-level `and` conjunct of `where`",
+        )),
     }
 }
 
@@ -2378,6 +2405,7 @@ fn lower_exclusive_disjunction(left: &PplExpr, right: &PplExpr, scope: &Expressi
                 name_ppl_type("operand", &left_type),
                 name_ppl_type("operand", &right_type),
             ),
+            name: None,
         });
     }
     Ok(left.not_eq(right))
@@ -2493,6 +2521,7 @@ fn check_between_types(value: &Expr, low: &Expr, high: &Expr, schema: &DFSchema)
             name_ppl_type(&value_name, &value_type),
             name_ppl_type("bound", bound_type),
         ),
+        name: None,
     };
     let low_common_type = comparison_coercion(&value_type, &low_type).ok_or_else(|| refuse_bound(&low_type))?;
     let high_common_type = comparison_coercion(&value_type, &high_type).ok_or_else(|| refuse_bound(&high_type))?;
@@ -2505,6 +2534,7 @@ fn check_between_types(value: &Expr, low: &Expr, high: &Expr, schema: &DFSchema)
                 name_ppl_type("bound", &low_type),
                 name_ppl_type("bound", &high_type),
             ),
+            name: None,
         })
 }
 
@@ -2514,23 +2544,26 @@ fn check_between_types(value: &Expr, low: &Expr, high: &Expr, schema: &DFSchema)
 fn lower_call(name: &str, arguments: &[PplExpr], scope: &ExpressionScope<'_>) -> Result<Expr, PplError> {
     if let ([list, lambda_argument], true) = (arguments, is_higher_order_function(name)) {
         let PplExpr::Lambda { parameters, body } = lambda_argument else {
-            return Err(PplError::Semantic {
-                reason: format!("{name} takes a lambda as its second argument"),
-            });
+            return Err(PplError::semantic_naming(
+                name,
+                format!("{name} takes a lambda as its second argument"),
+            ));
         };
-        let list = lower_expression(list, scope)?;
+        let list = lower_call_argument(name, list, scope)?;
         let element = match list.get_type(scope.schema)? {
             DataType::List(element) | DataType::LargeList(element) | DataType::FixedSizeList(element, _) => element,
             other => {
-                return Err(PplError::Semantic {
-                    reason: format!("{name} takes an array as its first argument, not {other}"),
-                });
+                return Err(PplError::semantic_naming(
+                    name,
+                    format!("{name} takes an array as its first argument, not {other}"),
+                ));
             }
         };
         let [parameter] = parameters.as_slice() else {
-            return Err(PplError::Semantic {
-                reason: format!("the lambda of {name} takes one parameter"),
-            });
+            return Err(PplError::semantic_naming(
+                name,
+                format!("the lambda of {name} takes one parameter"),
+            ));
         };
         let mut lambda_scope = ExpressionScope::new(scope.schema, scope.source, scope.now);
         lambda_scope.lambda_variables.clone_from(&scope.lambda_variables);
@@ -2541,9 +2574,19 @@ fn lower_call(name: &str, arguments: &[PplExpr], scope: &ExpressionScope<'_>) ->
     }
     let arguments = arguments
         .iter()
-        .map(|argument| lower_expression(argument, scope))
+        .map(|argument| lower_call_argument(name, argument, scope))
         .collect::<Result<Vec<_>, _>>()?;
     lower_function_call(name, arguments, &scope.build_function_context())
+}
+
+/// Lower `argument` of a call of `function`, other than the lambda of an array function. A lambda
+/// here is refused naming `function`; a lambda anywhere else, which names no call, is refused by
+/// [`lower_expression`] without a name.
+fn lower_call_argument(function: &str, argument: &PplExpr, scope: &ExpressionScope<'_>) -> Result<Expr, PplError> {
+    if matches!(argument, PplExpr::Lambda { .. }) {
+        return Err(PplError::semantic_naming(function, MISPLACED_LAMBDA_REASON));
+    }
+    lower_expression(argument, scope)
 }
 
 fn lower_literal(literal: &PplLiteral) -> Expr {
@@ -2629,20 +2672,22 @@ fn find_promoted_column(name: &str, scope: &ExpressionScope<'_>) -> Result<Optio
     if scope.schema.field_with_unqualified_name(&first_column).is_err()
         || source.replaced_columns.contains(&first_column)
     {
-        return Err(PplError::Semantic {
-            reason: format!(
+        return Err(PplError::semantic_naming(
+            name,
+            format!(
                 "field [{name}] reads the column [{first_column}], which an earlier command removed, renamed or replaced"
             ),
-        });
+        ));
     }
     Ok(Some(first_column))
 }
 
 /// The refusal of a promoted field the source indices disagree on.
 fn build_promoted_conflict_error(name: &str) -> PplError {
-    PplError::Semantic {
-        reason: format!("field [{name}] reads a column in some source indices and not in others"),
-    }
+    PplError::semantic_naming(
+        name,
+        format!("field [{name}] reads a column in some source indices and not in others"),
+    )
 }
 
 /// Folds a string literal compared with a timestamp operand into a microsecond timestamp literal,
@@ -2780,19 +2825,18 @@ fn fold_id_counterpart(
     }
 }
 
-/// The 400 for an id compared with a value that is neither a string literal nor an id. It names the
-/// id field (as [`name_compared_operand`]), the id's PPL type and its width of `id_width` bytes, and the PPL type
-/// of the other value.
+/// The 400 for an id compared with a value that is neither a string literal nor an id. Its reason
+/// names the id field (as [`name_compared_operand`]), the id's PPL type and its width of `id_width`
+/// bytes, and the PPL type of the other value; it names the id field.
 fn build_id_comparison_refusal(id_operand: &Expr, id_width: i32, counterpart_type: &DataType) -> PplError {
     let id_name = name_compared_operand(id_operand);
-    PplError::Semantic {
-        reason: format!(
-            "comparing the id field [{id_name}] (type {}, {id_width} bytes written as hex) with a value of \
-             type {} is not supported; compare an id with another id or with a string literal of hex digits",
-            name_ppl_type(&id_name, &DataType::FixedSizeBinary(id_width)),
-            name_ppl_type("value", counterpart_type),
-        ),
-    }
+    let reason = format!(
+        "comparing the id field [{id_name}] (type {}, {id_width} bytes written as hex) with a value of \
+         type {} is not supported; compare an id with another id or with a string literal of hex digits",
+        name_ppl_type(&id_name, &DataType::FixedSizeBinary(id_width)),
+        name_ppl_type("value", counterpart_type),
+    );
+    PplError::semantic_naming(id_name, reason)
 }
 
 /// The name a refusal gives a compared operand: its column name, or its expression for any other
@@ -2908,9 +2952,10 @@ async fn plan_describe<'session>(
         [entry] => *entry,
         matched_entries => {
             let names: Vec<&str> = matched_entries.iter().map(|entry| entry.name()).collect();
-            return Err(PplError::Semantic {
-                reason: format!("describe reads one index; [{index}] resolves to [{}]", names.join(", ")),
-            });
+            return Err(PplError::semantic_naming(
+                index,
+                format!("describe reads one index; [{index}] resolves to [{}]", names.join(", ")),
+            ));
         }
     };
     let fields = session.list_fields(entry, now, FieldListing::WithMapKeys).await?;
@@ -2979,6 +3024,7 @@ fn build_describe_row(
 ) -> Result<Vec<Expr>, PplError> {
     let ordinal = i32::try_from(position).map_err(|_| PplError::Semantic {
         reason: format!("[{index}] has more fields than describe can number"),
+        name: None,
     })?;
     let build_text_literal = |value: &str| lit(ScalarValue::Utf8(Some(value.to_owned())));
     let build_null_text = || lit(ScalarValue::Utf8(None));
@@ -3046,29 +3092,35 @@ fn plan_parse(
     let source = lower_expression(&command.source, scope)?;
     let source_type = source.get_type(scope.schema)?;
     if !is_string_type(&source_type) {
-        return Err(PplError::Semantic {
-            reason: format!("parse needs a string source; {source} has type {source_type}"),
-        });
+        return Err(PplError::semantic_naming(
+            source.to_string(),
+            format!("parse needs a string source; {source} has type {source_type}"),
+        ));
     }
-    let refuse_pattern = |error: regex::Error| PplError::Semantic {
-        reason: format!(
-            "parse pattern '{}' is not a supported regular expression: {error}",
-            command.pattern
-        ),
+    let refuse_pattern = |error: regex::Error| {
+        PplError::semantic_naming(
+            &command.pattern,
+            format!(
+                "parse pattern '{}' is not a supported regular expression: {error}",
+                command.pattern
+            ),
+        )
     };
     // The pattern compiles on its own first: an unbalanced pattern such as `x)|(?<a>.*` would
     // otherwise close the wrapping group below and escape both anchors.
     let regex = Regex::new(&command.pattern).map_err(refuse_pattern)?;
     let groups: Vec<&str> = regex.capture_names().flatten().collect();
     if groups.is_empty() {
-        return Err(PplError::Semantic {
-            reason: format!("parse pattern '{}' has no named group (?<name>…)", command.pattern),
-        });
+        return Err(PplError::semantic_naming(
+            &command.pattern,
+            format!("parse pattern '{}' has no named group (?<name>…)", command.pattern),
+        ));
     }
     if let Some(group) = groups.iter().find(|group| group.starts_with(RESERVED_NAME_PREFIX)) {
-        return Err(PplError::Semantic {
-            reason: format!("parse group [{group}] starts with the reserved prefix [{RESERVED_NAME_PREFIX}]"),
-        });
+        return Err(PplError::semantic_naming(
+            *group,
+            format!("parse group [{group}] starts with the reserved prefix [{RESERVED_NAME_PREFIX}]"),
+        ));
     }
     // The whole value must match, so the pattern is anchored at both ends; the non-capturing group
     // keeps an alternation inside the pattern under both anchors and leaves group numbers
@@ -3140,9 +3192,10 @@ fn plan_fillnull(
                     return Err(PplError::FieldNotFound { field: field.clone() });
                 }
                 if lowered_replacements.iter().any(|(listed, _)| listed == field) {
-                    return Err(PplError::Semantic {
-                        reason: format!("fillnull lists field '{field}' more than once"),
-                    });
+                    return Err(PplError::semantic_naming(
+                        field,
+                        format!("fillnull lists field '{field}' more than once"),
+                    ));
                 }
                 lowered_replacements.push((field.clone(), lower_expression(replacement, scope)?));
             }
@@ -3178,15 +3231,16 @@ fn cast_fillnull_replacement(replacement: &Expr, field: &Field, schema: &DFSchem
     let target = field.data_type();
     if target.is_numeric() && replacement_type.is_numeric() {
         if !is_numeric_replacement_accepted(replacement, &replacement_type, target) {
-            return Err(PplError::Semantic {
-                reason: format!(
+            return Err(PplError::semantic_naming(
+                field.name(),
+                format!(
                     "fillnull: field '{}' (type: {}) cannot hold the replacement value {} (type: {})",
                     field.name(),
                     name_ppl_type(field.name(), target),
                     replacement.human_display(),
                     name_ppl_type("replacement", &replacement_type)
                 ),
-            });
+            ));
         }
         return Ok(cast(replacement.clone(), target.clone()));
     }
@@ -3199,14 +3253,15 @@ fn cast_fillnull_replacement(replacement: &Expr, field: &Field, schema: &DFSchem
         } else {
             ""
         };
-        return Err(PplError::Semantic {
-            reason: format!(
+        return Err(PplError::semantic_naming(
+            field.name(),
+            format!(
                 "fillnull: replacement value type {} is not compatible with field '{}' (type: {}){id_clause}",
                 name_ppl_type("replacement", &replacement_type),
                 field.name(),
                 name_ppl_type(field.name(), target)
             ),
-        });
+        ));
     }
     Ok(cast(replacement.clone(), target.clone()))
 }
@@ -3338,13 +3393,12 @@ async fn plan_append(
     let mut columns = list_visible_column_types(builder.schema());
     merge_column_types(&mut columns, iterate_visible_fields(appended_branch.builder.schema())).map_err(|conflict| {
         let (pipeline_type_name, branch_type_name) = conflict.name_types();
-        PplError::Semantic {
-            reason: format!(
-                "append: column `{}` is {pipeline_type_name} in the pipeline and {branch_type_name} in the appended \
-                 branch",
-                conflict.name
-            ),
-        }
+        let reason = format!(
+            "append: column `{}` is {pipeline_type_name} in the pipeline and {branch_type_name} in the appended \
+             branch",
+            conflict.name
+        );
+        PplError::semantic_naming(conflict.name, reason)
     })?;
     let pipeline = align_append_branch(builder, sort_keys, &columns, 0)?;
     let aligned_branch =
@@ -3442,6 +3496,7 @@ fn name_right_join_columns(schema: &DFSchema, left_output: &[String]) -> Result<
                         "both join sides have a column `{name}`; \
                          name the right side with right=<alias> so it can be renamed"
                     ),
+                    name: None,
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -3449,12 +3504,13 @@ fn name_right_join_columns(schema: &DFSchema, left_output: &[String]) -> Result<
     // A second pass, because a renamed name can only be checked once it exists, and the set borrows
     // each output name rather than copying it.
     if let Some(taken_name) = right_output.iter().find(|name| !output_names.insert(name.as_str())) {
-        return Err(PplError::Semantic {
-            reason: format!(
+        return Err(PplError::semantic_naming(
+            taken_name,
+            format!(
                 "the join output would have two columns `{taken_name}`; \
                  name the right side with a different right=<alias>"
             ),
-        });
+        ));
     }
     Ok(right_output)
 }
@@ -3480,12 +3536,13 @@ async fn plan_join(
     planning: Planning<'_>,
 ) -> Result<LogicalPlanBuilder, PplError> {
     if join.max_matches > 0 {
-        return Err(PplError::Semantic {
-            reason: format!(
+        return Err(PplError::semantic_naming(
+            "max",
+            format!(
                 "join max={} is not supported; IceGate joins every matching right row (max=0)",
                 join.max_matches
             ),
-        });
+        ));
     }
     // A join keeps no row order, so its output never carries the left side's hidden columns; the right
     // side is planned by `plan_ppl`, which drops its own.
@@ -3517,6 +3574,7 @@ async fn plan_join(
     if criteria_type != DataType::Boolean {
         return Err(PplError::Semantic {
             reason: format!("join criteria must be a boolean expression; `{criteria}` has type {criteria_type}"),
+            name: None,
         });
     }
     let join_type = match join.kind {
@@ -3793,7 +3851,8 @@ mod tests {
             assert_eq!(
                 union_branches(vec![("first", first_scan), ("second", second_scan)]).err(),
                 Some(PplError::Semantic {
-                    reason: expected_reason.to_string()
+                    reason: expected_reason.to_string(),
+                    name: None,
                 }),
                 "{expected_reason}"
             );
@@ -4422,38 +4481,45 @@ mod tests {
             // A fraction into an integer column would be truncated.
             (
                 "fillnull using retries = 1.5",
+                "retries",
                 "fillnull: field 'retries' (type: int) cannot hold the replacement value 1.5 (type: double)",
             ),
             (
                 "fillnull using bytes = 1.5",
+                "bytes",
                 "fillnull: field 'bytes' (type: bigint) cannot hold the replacement value 1.5 (type: double)",
             ),
             // One above the largest 32-bit integer.
             (
                 "fillnull using retries = 2147483648",
+                "retries",
                 "fillnull: field 'retries' (type: int) cannot hold the replacement value 2147483648 (type: bigint)",
             ),
             // A computed bigint may lie outside the int range, whatever its value turns out to be.
             (
                 "fillnull using retries = 1 + 1",
+                "retries",
                 "fillnull: field 'retries' (type: int) cannot hold the replacement value 1 + 1 (type: bigint)",
             ),
             (
                 "fillnull using retries = 2147483647 + 1",
+                "retries",
                 "fillnull: field 'retries' (type: int) cannot hold the replacement value 2147483647 + 1 (type: bigint)",
             ),
             // 10^11 needs 12 integer digits; Decimal128(10, 2) has 8.
             (
                 "fillnull using price = 100000000000",
+                "price",
                 "fillnull: field 'price' (type: Decimal128(10, 2)) cannot hold the replacement value 100000000000 (type: bigint)",
             ),
         ];
-        for (fillnull_text, expected_reason) in numeric_refusals {
+        for (fillnull_text, expected_name, expected_reason) in numeric_refusals {
             let builder = LogicalPlanBuilder::scan("t", Arc::clone(&table) as _, None).expect("scan");
             assert_eq!(
                 plan_fillnull_text(builder, fillnull_text).err(),
                 Some(PplError::Semantic {
-                    reason: expected_reason.to_string()
+                    reason: expected_reason.to_string(),
+                    name: Some(expected_name.to_string()),
                 }),
                 "{fillnull_text}"
             );
@@ -4577,26 +4643,17 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_or_wrong_width_id_literal_is_a_semantic_error_naming_column_and_literal() {
+    fn an_invalid_or_wrong_width_id_literal_is_a_semantic_error_naming_the_literal() {
         let schema = build_id_columns_schema();
-        for (column, literal, detail) in [
-            (
-                COL_TRACE_ID,
-                "zz000000000000000000000000000000",
-                "not an even-length hex string",
-            ),
-            (COL_TRACE_ID, "abc", "not an even-length hex string"),
-            (COL_TRACE_ID, "7f00", "expected 16 bytes, got 2"),
-            (
-                COL_SPAN_ID,
-                "7f000000000000000000000000000000",
-                "expected 8 bytes, got 16",
-            ),
+        for (column, literal) in [
+            (COL_TRACE_ID, "zz000000000000000000000000000000"),
+            (COL_TRACE_ID, "abc"),
+            (COL_TRACE_ID, "7f00"),
+            (COL_SPAN_ID, "7f000000000000000000000000000000"),
         ] {
             let result = coerce_fixed_binary_operands(col(column), lit(literal), &schema);
             assert!(
-                matches!(&result, Err(PplError::Semantic { reason })
-                    if reason.contains(column) && reason.contains(&format!("'{literal}'")) && reason.contains(detail)),
+                matches!(&result, Err(PplError::Semantic { name: Some(name), .. }) if name == literal),
                 "{column} = '{literal}': {result:?}"
             );
         }
@@ -4606,7 +4663,7 @@ mod tests {
             &schema,
         );
         assert!(
-            matches!(&listed_result, Err(PplError::Semantic { reason }) if reason.contains(COL_TRACE_ID) && reason.contains("'xyz'")),
+            matches!(&listed_result, Err(PplError::Semantic { name: Some(name), .. }) if name == "xyz"),
             "{listed_result:?}"
         );
     }
@@ -4620,15 +4677,16 @@ mod tests {
         let span_refusal = "comparing the id field [span_id] (type string, 8 bytes written as hex) with a value of \
                             type bigint is not supported; compare an id with another id or with a string literal \
                             of hex digits";
-        for (left, right, expected_reason) in [
-            (col(COL_TRACE_ID), col(COL_BODY), trace_refusal),
-            (lit(5_i64), col(COL_SPAN_ID), span_refusal),
+        for (left, right, expected_name, expected_reason) in [
+            (col(COL_TRACE_ID), col(COL_BODY), COL_TRACE_ID, trace_refusal),
+            (lit(5_i64), col(COL_SPAN_ID), COL_SPAN_ID, span_refusal),
         ] {
             let result = coerce_fixed_binary_operands(left, right, &schema);
             assert_eq!(
                 result,
                 Err(PplError::Semantic {
-                    reason: expected_reason.to_string()
+                    reason: expected_reason.to_string(),
+                    name: Some(expected_name.to_string()),
                 })
             );
         }
@@ -4637,7 +4695,8 @@ mod tests {
         assert_eq!(
             listed_result,
             Err(PplError::Semantic {
-                reason: span_refusal.to_string()
+                reason: span_refusal.to_string(),
+                name: Some(COL_SPAN_ID.to_string()),
             })
         );
 
@@ -4730,7 +4789,7 @@ mod tests {
         // The refusal is the query's semantic 400; its reason names the value and the PPL types.
         for (between, fragments) in refused_cases {
             let refusal = lower_expression(&between, &scope);
-            let Err(PplError::Semantic { reason }) = &refusal else {
+            let Err(PplError::Semantic { reason, .. }) = &refusal else {
                 panic!("not a semantic refusal: {refusal:?} for {between:?}");
             };
             for fragment in fragments {
@@ -4765,7 +4824,7 @@ mod tests {
         );
 
         let refusal = lower_expression(&PplExpr::Xor(field("first"), field("count")), &scope);
-        let Err(PplError::Semantic { reason }) = &refusal else {
+        let Err(PplError::Semantic { reason, .. }) = &refusal else {
             panic!("not a semantic refusal: {refusal:?}");
         };
         for fragment in ["xor", "boolean", "bigint"] {

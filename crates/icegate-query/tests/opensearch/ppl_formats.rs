@@ -390,10 +390,7 @@ async fn explain_of_an_unknown_source_is_index_not_found_404() {
     assert_eq!(body["status"], 404);
     assert_eq!(body["error"]["type"], "IndexNotFoundException");
     assert_eq!(body["error"]["code"], "INDEX_NOT_FOUND");
-    assert!(
-        body["error"]["reason"].as_str().is_some_and(|reason| reason.contains("nope")),
-        "{body}"
-    );
+    assert_eq!(body["error"]["context"]["index"], "nope", "{body}");
     server.shutdown().await;
 }
 
@@ -438,16 +435,14 @@ async fn filter_path_on_csv_or_raw_is_a_400_and_jdbc_keeps_it() {
 }
 
 #[tokio::test]
-async fn an_unknown_explain_parameter_is_a_400_naming_it() {
+async fn an_unknown_explain_parameter_is_a_400_and_the_request_without_it_is_explained() {
     let (server, _catalog) = TestServer::start().await;
     let reply = post_ppl_query(&server, "/_plugins/_ppl/_explain?verbose=true", "source=logs").await;
-    // The serde refusal of an unknown parameter carries no structured key, so its reason is the
-    // only place that names it.
-    let error = read_illegal_argument_error(&reply);
-    assert!(
-        error["reason"].as_str().is_some_and(|reason| reason.contains("verbose")),
-        "the reason must name verbose: {error}"
-    );
+    // The refusal of an unknown parameter carries no key naming it; the same request without the
+    // parameter is explained, so the parameter alone is refused, not the route or the query.
+    read_illegal_argument_error(&reply);
+    let control_reply = post_ppl_query(&server, "/_plugins/_ppl/_explain", "source=logs").await;
+    assert_eq!(control_reply.status, 200, "{}", control_reply.text);
     server.shutdown().await;
 }
 

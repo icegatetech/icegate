@@ -66,11 +66,11 @@ pub(crate) fn render_ppl_error(error: &PplError) -> Response {
             Some(json!({"function": function})),
             None,
         ),
-        PplError::Semantic { .. } => (
+        PplError::Semantic { name, .. } => (
             StatusCode::BAD_REQUEST,
             "SemanticCheckException",
             "SEMANTIC_ERROR",
-            None,
+            name.as_ref().map(|name| json!({"name": name})),
             None,
         ),
         PplError::InexactOtherSeries { function } => (
@@ -253,6 +253,49 @@ mod tests {
         assert_eq!(
             body["error"]["context"],
             json!({"function": "avg", "cause": "inexact_other_series"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_semantic_refusal_answers_its_name_as_context_and_one_without_a_name_answers_no_context() {
+        let reason = "function [lower] takes 1 argument(s), not 2";
+        let (status, content_type, named_body) = render_ppl_answer(&PplError::Semantic {
+            reason: reason.to_string(),
+            name: Some("lower".to_string()),
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(content_type, "application/json; charset=UTF-8");
+        assert_eq!(
+            named_body,
+            json!({
+                "status": 400,
+                "error": {
+                    "type": "SemanticCheckException",
+                    "reason": reason,
+                    "details": reason,
+                    "code": "SEMANTIC_ERROR",
+                    "context": {"name": "lower"}
+                }
+            })
+        );
+        let (status, _, unnamed_body) = render_ppl_answer(&PplError::Semantic {
+            reason: reason.to_string(),
+            name: None,
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            unnamed_body,
+            json!({
+                "status": 400,
+                "error": {
+                    "type": "SemanticCheckException",
+                    "reason": reason,
+                    "details": reason,
+                    "code": "SEMANTIC_ERROR"
+                }
+            })
         );
     }
 

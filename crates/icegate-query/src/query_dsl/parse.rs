@@ -39,8 +39,9 @@ pub(super) const SLOP_REFUSAL: &str = "sloppy phrases are not evaluated";
 /// # Errors
 ///
 /// `parsing_exception` naming the offending leaf or key: a value that is not an object with
-/// exactly one leaf, an unknown leaf, an unknown key in a known leaf (`_name` included), a value
-/// of the wrong JSON type, a `wildcard` that states its value under both of its keys, a non-zero
+/// exactly one leaf (its keys under `keys`), an unknown leaf (under `construct`), an unknown key
+/// in a known leaf, `_name` included (under `key`), a value of the wrong JSON type, a `wildcard`
+/// that states its value under both of its keys (under `keys`), a non-zero
 /// `fuzziness`, `slop` or `phrase_slop`, a `simple_query_string` that
 /// [`parse_simple_query_string`] refuses, or a `query_string` that
 /// [`parse_query_string`](super::lucene::parse_query_string) refuses (fuzzy or proximity syntax,
@@ -101,13 +102,11 @@ pub(crate) fn parse_query(value: &Value) -> Result<Query, OpenSearchError> {
         "simple_query_string" => parse_simple_query_string_leaf(body).map(Query::SimpleQueryString),
         "query_string" => super::lucene::parse_query_string(body),
         "regexp" => parse_regexp_query(body),
-        other => Err(OpenSearchError::parsing(format!("unknown query [{other}]"))),
+        other => Err(OpenSearchError::unsupported_construct(
+            other,
+            format!("unknown query [{other}]"),
+        )),
     }
-}
-
-/// `keys` joined so that a refusal's single pair of brackets names each of them.
-fn render_key_list<'a>(keys: impl Iterator<Item = &'a String>) -> String {
-    keys.map(String::as_str).collect::<Vec<_>>().join("], [")
 }
 
 /// `value` as an object holding exactly one entry; a refusal of several entries names their keys.
@@ -119,10 +118,13 @@ fn read_single_entry<'a>(value: &'a Value, context: &str) -> Result<(&'a str, &'
     match (entries.next(), entries.next()) {
         (Some((key, body)), None) => Ok((key.as_str(), body)),
         (None, _) => Err(OpenSearchError::parsing(format!("[{context}] is empty"))),
-        (Some(_), Some(_)) => Err(OpenSearchError::parsing(format!(
-            "[{context}] holds more than one entry: [{}]",
-            render_key_list(object.keys())
-        ))),
+        (Some(_), Some(_)) => {
+            let keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            Err(OpenSearchError::conflicting_query_keys(
+                format!("[{context}] holds more than one entry: [{}]", keys.join("], [")),
+                &keys,
+            ))
+        }
     }
 }
 
@@ -147,9 +149,7 @@ pub(super) fn read_leaf_object<'a>(
         if key == "boost" {
             require_numeric_boost(value, leaf)?;
         } else if !allowed.contains(&key.as_str()) {
-            return Err(OpenSearchError::parsing(format!(
-                "[{leaf}] query does not support [{key}]"
-            )));
+            return Err(OpenSearchError::unknown_query_key(leaf, key));
         }
     }
     Ok(object)
@@ -264,10 +264,11 @@ fn parse_terms(body: &Value) -> Result<TermsQuery, OpenSearchError> {
             continue;
         }
         if field_values.is_some() {
-            let fields = render_key_list(options.keys().filter(|option| *option != "boost"));
-            return Err(OpenSearchError::parsing(format!(
-                "[terms] names more than one field: [{fields}]"
-            )));
+            let fields: Vec<&str> = options.keys().map(String::as_str).filter(|option| *option != "boost").collect();
+            return Err(OpenSearchError::conflicting_query_keys(
+                format!("[terms] names more than one field: [{}]", fields.join("], [")),
+                &fields,
+            ));
         }
         let Value::Array(values) = value else {
             return Err(OpenSearchError::parsing(format!(
@@ -407,10 +408,18 @@ fn parse_pattern_leaf(
                 .and_then(Value::as_str)
                 .ok_or_else(|| OpenSearchError::parsing(format!("[{leaf}] needs a string value")))?;
             if stated_values.next().is_some() {
-                return Err(OpenSearchError::parsing(format!(
-                    "[{leaf}] takes one value but holds more than one of [{}]",
-                    value_keys.join("], [")
-                )));
+                let stated_keys: Vec<&str> = options
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|key| value_keys.contains(key))
+                    .collect();
+                return Err(OpenSearchError::conflicting_query_keys(
+                    format!(
+                        "[{leaf}] takes one value but holds more than one of [{}]",
+                        value_keys.join("], [")
+                    ),
+                    &stated_keys,
+                ));
             }
             Ok((
                 field.to_string(),
@@ -1039,8 +1048,7 @@ mod tests {
             let (status, body) = render_refusal(json!({leaf: {}})).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{leaf}");
             assert_eq!(body["error"]["type"], "parsing_exception", "{leaf}");
-            let reason = body["error"]["reason"].as_str().expect("reason");
-            assert!(reason.contains(leaf), "the refusal names [{leaf}]: {reason}");
+            assert_eq!(body["error"]["construct"], leaf, "{body}");
         }
         for malformed_query in [
             json!({}),
@@ -1083,24 +1091,51 @@ mod tests {
 
     #[tokio::test]
     async fn a_leaf_name_key_is_refused() {
-        for query in [
-            json!({"term": {"type": {"value": "dashboard", "_name": "by-type"}}}),
-            json!({"bool": {"must": [], "_name": "outer"}}),
-            json!({"exists": {"field": "type", "_name": "has-type"}}),
-            // Beside the field, where a leaf holding one field reads it as a second entry.
-            json!({"term": {"type": "dashboard", "_name": "by-type"}}),
-            json!({"terms": {"type": ["dashboard"], "_name": "by-type"}}),
-            json!({"range": {"count": {"gte": 1}, "boost": 1, "_name": "by-count"}}),
-            json!({"prefix": {"type": "dash", "_name": "by-type"}}),
-            json!({"wildcard": {"type": "dash*", "_name": "by-type"}}),
-        ] {
+        // Inside a leaf's options `_name` is an unknown key; beside the field, a leaf holding one
+        // field reads it as a second entry and names every entry.
+        let cases = [
+            (
+                json!({"term": {"type": {"value": "dashboard", "_name": "by-type"}}}),
+                "key",
+                json!("_name"),
+            ),
+            (json!({"bool": {"must": [], "_name": "outer"}}), "key", json!("_name")),
+            (
+                json!({"exists": {"field": "type", "_name": "has-type"}}),
+                "key",
+                json!("_name"),
+            ),
+            (
+                json!({"term": {"type": "dashboard", "_name": "by-type"}}),
+                "keys",
+                json!(["type", "_name"]),
+            ),
+            (
+                json!({"terms": {"type": ["dashboard"], "_name": "by-type"}}),
+                "keys",
+                json!(["type", "_name"]),
+            ),
+            (
+                json!({"range": {"count": {"gte": 1}, "boost": 1, "_name": "by-count"}}),
+                "keys",
+                json!(["count", "boost", "_name"]),
+            ),
+            (
+                json!({"prefix": {"type": "dash", "_name": "by-type"}}),
+                "keys",
+                json!(["type", "_name"]),
+            ),
+            (
+                json!({"wildcard": {"type": "dash*", "_name": "by-type"}}),
+                "keys",
+                json!(["type", "_name"]),
+            ),
+        ];
+        for (query, error_key, expected_value) in cases {
             let (status, body) = render_refusal(query.clone()).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
             assert_eq!(body["error"]["type"], "parsing_exception", "{query}");
-            assert!(
-                body["error"]["reason"].as_str().expect("reason").contains("_name"),
-                "{body}"
-            );
+            assert_eq!(body["error"][error_key], expected_value, "{query}: {body}");
         }
     }
 
@@ -1142,11 +1177,7 @@ mod tests {
         let (status, body) = render_refusal(json!({"wildcard": {"type": {"value": "a*", "wildcard": "b*"}}})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "parsing_exception");
-        let reason = body["error"]["reason"].as_str().expect("reason");
-        assert!(
-            reason.contains("[value], [wildcard]"),
-            "the refusal names both keys: {reason}"
-        );
+        assert_eq!(body["error"]["keys"], json!(["value", "wildcard"]), "{body}");
     }
 
     #[test]

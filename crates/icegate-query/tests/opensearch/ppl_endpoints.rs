@@ -39,17 +39,19 @@ fn assert_envelope(status: StatusCode, body: &Value, expected_status: StatusCode
     assert_eq!(body["error"]["root_cause"][0]["type"], expected_type, "{body}");
 }
 
-/// Asserts that `GET path` with the unknown query parameter `bogus` is the 400
-/// `illegal_argument_exception` envelope naming the parameter.
-async fn assert_unknown_parameter_refused(server: &TestServer, path: &str) {
+/// Asserts that `GET path` answers `status_without_parameter` and that the same request with the
+/// unknown query parameter `bogus` is the 400 `illegal_argument_exception` envelope. The refusal
+/// carries no key naming the parameter; the answer without it shows that the route is served and
+/// the parameter alone is refused, which tells the refusal from the listener's no-handler 400.
+async fn assert_unknown_parameter_refused(server: &TestServer, path: &str, status_without_parameter: StatusCode) {
+    let (status, body) = send_request(server, Method::GET, TENANT_A, path, None)
+        .await
+        .expect("GET request");
+    assert_eq!(status, status_without_parameter, "{path}: {body}");
     let (status, body) = send_request(server, Method::GET, TENANT_A, &format!("{path}?bogus=1"), None)
         .await
         .expect("GET request");
     assert_envelope(status, &body, StatusCode::BAD_REQUEST, "illegal_argument_exception");
-    assert!(
-        body["error"]["reason"].as_str().is_some_and(|reason| reason.contains("bogus")),
-        "{path}: {body}"
-    );
 }
 
 #[tokio::test]
@@ -103,7 +105,7 @@ async fn cluster_settings_report_the_calcite_flags_through_an_escaped_filter_pat
     );
 
     // An unknown parameter is refused, not ignored.
-    assert_unknown_parameter_refused(&server, "/_cluster/settings").await;
+    assert_unknown_parameter_refused(&server, "/_cluster/settings", StatusCode::OK).await;
     server.shutdown().await;
 }
 
@@ -187,7 +189,8 @@ async fn any_other_sql_is_a_400_naming_ppl() {
     ] {
         let (status, body) = post_sql(&server, query).await.expect("POST request");
         assert_envelope(status, &body, StatusCode::BAD_REQUEST, "illegal_argument_exception");
-        assert_eq!(body["error"]["reason"], "SQL is not supported; use PPL", "{query}");
+        assert_eq!(body["error"]["key"], "query", "{query}: {body}");
+        assert_eq!(body["error"]["value"], query, "{query}: {body}");
     }
     let (status, body) = send_request(
         &server,
@@ -199,20 +202,19 @@ async fn any_other_sql_is_a_400_naming_ppl() {
     .await
     .expect("POST request");
     assert_envelope(status, &body, StatusCode::BAD_REQUEST, "illegal_argument_exception");
+    assert_eq!(body["error"]["key"], "query", "{body}");
+    assert_eq!(body["error"].get("value"), None, "{body}");
 
-    // A body that is not JSON is refused before any statement is read.
+    // A body that is not JSON is refused before any statement is read, so its refusal carries no
+    // key; the answers to a valid body below show that the route is served.
     let (status, body) = send_raw_request(&server, Method::POST, TENANT_A, "/_plugins/_sql", "not json")
         .await
         .expect("POST request");
     assert_envelope(status, &body, StatusCode::BAD_REQUEST, "illegal_argument_exception");
-    assert!(
-        body["error"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("request body is not valid JSON")),
-        "{body}"
-    );
+    assert_eq!(body["error"].get("key"), None, "{body}");
 
-    // An unknown query parameter is refused, not ignored; `format` is accepted and ignored.
+    // An unknown query parameter is refused, not ignored; `format` is accepted and ignored. The
+    // same request with `format` in its place answers 200, so the parameter alone is refused.
     let (status, body) = send_request(
         &server,
         Method::POST,
@@ -223,16 +225,13 @@ async fn any_other_sql_is_a_400_naming_ppl() {
     .await
     .expect("POST request");
     assert_envelope(status, &body, StatusCode::BAD_REQUEST, "illegal_argument_exception");
-    assert!(
-        body["error"]["reason"].as_str().is_some_and(|reason| reason.contains("bogus")),
-        "{body}"
-    );
+    assert_eq!(body["error"].get("key"), None, "{body}");
     let (status, body) = send_request(
         &server,
         Method::POST,
         TENANT_A,
         "/_plugins/_sql?format=jdbc",
-        Some(&json!({ "query": "SHOW TABLES LIKE 'logs'" })),
+        Some(&json!({ "query": "SHOW TABLES LIKE '%'" })),
     )
     .await
     .expect("POST request");
@@ -519,22 +518,17 @@ async fn ml_config_is_a_404_status_exception() {
     .await
     .expect("GET request");
     assert_envelope(status, &body, StatusCode::NOT_FOUND, "status_exception");
-    assert!(
-        body["error"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("agent-config")),
-        "{body}"
-    );
+    assert_eq!(body["error"]["id"], "agent-config", "{body}");
     server.shutdown().await;
 }
 
 #[tokio::test]
 async fn the_grammar_and_ml_config_routes_refuse_an_unknown_parameter() {
     let (server, _catalog) = TestServer::start().await;
-    assert_unknown_parameter_refused(&server, "/_plugins/_ppl/_grammar").await;
+    assert_unknown_parameter_refused(&server, "/_plugins/_ppl/_grammar", StatusCode::OK).await;
     // The query parameters are read before the id is looked up, so an unknown parameter is a 400,
     // not the 404 of an unknown id.
-    assert_unknown_parameter_refused(&server, "/_plugins/_ml/config/agent-config").await;
+    assert_unknown_parameter_refused(&server, "/_plugins/_ml/config/agent-config", StatusCode::NOT_FOUND).await;
     server.shutdown().await;
 }
 

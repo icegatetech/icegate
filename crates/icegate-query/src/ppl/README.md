@@ -482,7 +482,7 @@ its reason in the workbench` in `scripts/opensearch-e2e/osd.spec.ts` pins that.
 | A field reference that matches no column | 400 | `SemanticCheckException` | `FIELD_NOT_FOUND` | `{field}` |
 | A command IceGate does not plan | 400 | `UnsupportedOperationException` | `UNSUPPORTED_OPERATION` | `{command}` |
 | A function IceGate does not plan | 400 | `UnsupportedOperationException` | `UNSUPPORTED_OPERATION` | `{function}` |
-| A well-formed but invalid query (types, arguments, system indices) | 400 | `SemanticCheckException` | `SEMANTIC_ERROR` | — |
+| A well-formed but invalid query (types, arguments, system indices) | 400 | `SemanticCheckException` | `SEMANTIC_ERROR` | `{name}` where the refusal names what it is about, else none |
 | A `timechart` aggregation the other series cannot merge exactly | 400 | `SemanticCheckException` | `SEMANTIC_ERROR` | `{function, cause}`, `cause` being `inexact_other_series` |
 | More output rows than the row limit | 400 | `IllegalArgumentException` | `RESOURCE_LIMIT_EXCEEDED` | `{limit}` |
 | More memory than the per-query limit, the answer included | 400 | `IllegalArgumentException` | `RESOURCE_LIMIT_EXCEEDED` | `{limit_bytes}` |
@@ -490,6 +490,12 @@ its reason in the workbench` in `scripts/opensearch-e2e/osd.spec.ts` pins that.
 | Subsearches nested deeper than the subsearch limit | 400 | `IllegalArgumentException` | `RESOURCE_LIMIT_EXCEEDED` | `{limit_subsearch_depth}` |
 | More operators than the operator limit | 400 | `IllegalArgumentException` | `RESOURCE_LIMIT_EXCEEDED` | `{limit_operators}` |
 | A failure inside IceGate | 500 | `IllegalStateException` | `EXECUTION_ERROR` | — |
+
+The `name` of a `SEMANTIC_ERROR` is the field, alias, function, option or index the refusal is
+about, the operator, keyword or wildcard it refuses (for example `in`, `span` or `*`), or the
+argument it refuses (a literal or a pattern, without the quotes the query wrote around it), spelled
+as the reason spells it. A client reads what the refusal is about from it, never from the reason,
+which is IceGate's own wording; two refusals about the same name share it.
 
 A syntax error's `reason` is fixed and its `details` name the offending token; a 500's `reason`
 is fixed and its `details` carry the cause, which is also logged. A shed request, a passed

@@ -10,7 +10,9 @@ use crate::opensearch::error::{OpenSearchError, OpenSearchErrorKind};
 /// Why a PPL query cannot be answered.
 ///
 /// Every variant but [`PplError::Unavailable`] is answered in the PPL error envelope; a variant
-/// is added only for a new class of error, never to carry a new message.
+/// is added only for a new class of error, never to carry a new message. A field that names what
+/// a refusal is about is answered in the envelope's `context`, so a client reads it without
+/// parsing the reason.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub(crate) enum PplError {
     /// The query text does not parse. Names the first offending token and its position (1-based
@@ -55,6 +57,15 @@ pub(crate) enum PplError {
     Semantic {
         /// What is wrong, in IceGate's wording.
         reason: String,
+        /// What the refusal is about: the field, alias, function, option or index it names, the
+        /// operator, keyword or wildcard it refuses (`in`, `span`, `*`), or the argument it refuses
+        /// (a literal or a pattern, without its quotes), spelled as the reason spells it. A
+        /// refusal about a source names its index expression as the query wrote it, which may
+        /// name several indices. It identifies the subject, not the refusal: two refusals about
+        /// the same subject share it.
+        /// Answered as `context.name`; a refusal without one answers no `context`. Built by
+        /// [`PplError::semantic_naming`].
+        name: Option<String>,
     },
     /// A `timechart` aggregation whose value over several series is not a function of the
     /// per-series values (an average, a distinct count, a percentile), with the series beyond the
@@ -142,6 +153,7 @@ impl From<OpenSearchError> for PplError {
             },
             OpenSearchErrorKind::IllegalArgument | OpenSearchErrorKind::AggregationExecution => Self::Semantic {
                 reason: error.reason().to_string(),
+                name: None,
             },
             OpenSearchErrorKind::MemoryPressure
             | OpenSearchErrorKind::DeadlineExceeded
@@ -178,6 +190,7 @@ impl From<DataFusionError> for PplError {
             DataFusionError::Plan(_) | DataFusionError::SchemaError(..) | DataFusionError::NotImplemented(_) => {
                 Self::Semantic {
                     reason: error.strip_backtrace(),
+                    name: None,
                 }
             }
             _ => Self::Internal {
@@ -188,12 +201,23 @@ impl From<DataFusionError> for PplError {
 }
 
 impl PplError {
-    /// The 400 for a string literal compared with a fixed-width id column that is not a value of that
-    /// column: not hex, or another number of bytes. It names the column and the literal as written.
-    pub(crate) fn invalid_id_literal(column: &str, literal: &str, error: &FixedBinaryLiteralError) -> Self {
+    /// The semantic refusal `reason` that names `name`, which the envelope answers as
+    /// `context.name`.
+    pub(crate) fn semantic_naming(name: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::Semantic {
-            reason: format!("'{literal}' is not a valid {column}: {error}; write the id as hex, two digits per byte"),
+            reason: reason.into(),
+            name: Some(name.into()),
         }
+    }
+
+    /// The 400 for a string literal compared with a fixed-width id column that is not a value of that
+    /// column: not hex, or another number of bytes. Its reason names the column and the literal as
+    /// written; it names the literal.
+    pub(crate) fn invalid_id_literal(column: &str, literal: &str, error: &FixedBinaryLiteralError) -> Self {
+        Self::semantic_naming(
+            literal,
+            format!("'{literal}' is not a valid {column}: {error}; write the id as hex, two digits per byte"),
+        )
     }
 }
 
@@ -222,14 +246,14 @@ mod tests {
     fn a_system_or_mixed_target_refusal_becomes_a_ppl_semantic_error() {
         let refusal = OpenSearchError::illegal_argument("[.kibana] are system indices");
         let reason = refusal.reason().to_string();
-        assert_eq!(PplError::from(refusal), PplError::Semantic { reason });
+        assert_eq!(PplError::from(refusal), PplError::Semantic { reason, name: None });
     }
 
     #[test]
     fn an_aggregation_type_conflict_becomes_a_ppl_semantic_error() {
         let conflict = OpenSearchError::aggregation_execution("code");
         let reason = conflict.reason().to_string();
-        assert_eq!(PplError::from(conflict), PplError::Semantic { reason });
+        assert_eq!(PplError::from(conflict), PplError::Semantic { reason, name: None });
     }
 
     #[test]

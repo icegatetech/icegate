@@ -315,12 +315,13 @@ fn build_source_clause(clause: &TableOrSubqueryClauseContextAll<'_>) -> Result<P
         });
     }
     if let (Some(alias), PplSource::Index { expression }) = (&alias, &query.source) {
-        return Err(PplError::Semantic {
-            reason: format!(
+        return Err(PplError::semantic_naming(
+            alias,
+            format!(
                 "`source={expression} as {alias}`: an alias on an index source is not supported; \
                  name a join's sides with left=<alias> and right=<alias>"
             ),
-        });
+        ));
     }
     Ok(query.source)
 }
@@ -382,6 +383,7 @@ fn build_command(command: &CommandsContextAll<'_>) -> Result<PplCommand, PplErro
         if sort.count.is_some() {
             return Err(PplError::Semantic {
                 reason: "sort with a row count is not supported; append | head N instead".to_string(),
+                name: None,
             });
         }
         let clause = sort.sortbyClause().ok_or_else(|| build_missing_part_error("sort"))?;
@@ -473,6 +475,7 @@ fn build_command(command: &CommandsContextAll<'_>) -> Result<PplCommand, PplErro
 fn build_append_command(append: &AppendCommandContextAll<'_>) -> Result<PplCommand, PplError> {
     let search = append.searchCommand().ok_or_else(|| PplError::Semantic {
         reason: "append needs a search: write `append [ source=<index> | … ]`".to_string(),
+        name: None,
     })?;
     let commands = append
         .commands_all()
@@ -497,6 +500,7 @@ fn build_join_kind(text: &str) -> Result<JoinKind, PplError> {
         "left" | "left outer" | "outer" => Ok(JoinKind::Left),
         other => Err(PplError::Semantic {
             reason: format!("join type `{other}` is not supported; IceGate plans inner and left joins"),
+            name: None,
         }),
     }
 }
@@ -561,10 +565,12 @@ fn build_join_command(join: &JoinCommandContextAll<'_>) -> Result<PplCommand, Pp
     let criteria = join.joinCriteria().ok_or_else(|| PplError::Semantic {
         reason: "join needs criteria: write `join left=<l> right=<r> on <l>.<field> = <r>.<field> <right side>`"
             .to_string(),
+        name: None,
     })?;
     if join.joinHintList().is_some() {
         return Err(PplError::Semantic {
             reason: "join hints are not supported".to_string(),
+            name: None,
         });
     }
     let prefix = join
@@ -591,6 +597,7 @@ fn build_join_command(join: &JoinCommandContextAll<'_>) -> Result<PplCommand, Pp
                 {
                     return Err(PplError::Semantic {
                         reason: format!("join type={text} contradicts `{prefix_text}` written before `join`"),
+                        name: None,
                     });
                 }
                 option_kind = Some(written_kind);
@@ -608,6 +615,7 @@ fn build_join_command(join: &JoinCommandContextAll<'_>) -> Result<PplCommand, Pp
                         IntErrorKind::PosOverflow => format!("join max={text} is out of range"),
                         _ => format!("join max={text}: max must be a non-negative integer"),
                     },
+                    name: None,
                 })?;
                 max_matches = Some(limit);
             }
@@ -793,6 +801,7 @@ fn build_aggregate_call(function: &StatsFunctionContextAll<'_>) -> Result<PplExp
             let digits = token.trim_start_matches(|character: char| character.is_ascii_alphabetic());
             let percent = digits.parse::<f64>().map_err(|_| PplError::Semantic {
                 reason: format!("[{token}] names no percentile"),
+                name: None,
             })?;
             let value = shortcut
                 .valueExpression()
@@ -827,6 +836,7 @@ fn build_aggregate_call(function: &StatsFunctionContextAll<'_>) -> Result<PplExp
                 .ok_or_else(|| build_missing_part_error("percentile"))?;
             let percent = percent.get_text().parse::<f64>().map_err(|_| PplError::Semantic {
                 reason: format!("[{}] is not a percentile", percent.get_text()),
+                name: None,
             })?;
             Ok(call(
                 "percentile",
@@ -915,9 +925,10 @@ fn build_window_group_fields<T>(
         return Ok(Vec::new());
     };
     if clause.bySpanClause().is_some() {
-        return Err(PplError::Semantic {
-            reason: format!("{command_name} groups by fields; `by span(…)` is not supported"),
-        });
+        return Err(PplError::semantic_naming(
+            "span",
+            format!("{command_name} groups by fields; `by span(…)` is not supported"),
+        ));
     }
     clause.fieldList().map_or_else(
         || Ok(Vec::new()),
@@ -1030,6 +1041,7 @@ fn split_span_text(literal: &SpanLiteralContextAll<'_>) -> Result<SpanText, PplE
     if literal.SPANLENGTH().is_none() {
         return Err(PplError::Semantic {
             reason: format!("span length [{text}] must be a whole number of units"),
+            name: None,
         });
     }
     let unit_start = text.find(|character: char| !character.is_ascii_digit()).unwrap_or(text.len());
@@ -1090,6 +1102,7 @@ pub(crate) fn parse_span_unit(text: &str) -> Result<SpanUnit, PplError> {
         _ => {
             return Err(PplError::Semantic {
                 reason: format!("[{text}] is not a span unit"),
+                name: None,
             });
         }
     };
@@ -1122,6 +1135,7 @@ pub(crate) fn parse_bin_unit(text: &str) -> Result<SpanUnit, PplError> {
         _ => {
             return Err(PplError::Semantic {
                 reason: format!("[{text}] is not a bin span unit"),
+                name: None,
             });
         }
     };
@@ -1222,6 +1236,7 @@ fn build_timechart(timechart: &TimechartCommandContextAll<'_>) -> Result<Timecha
             if unit == SpanUnit::Numeric {
                 return Err(PplError::Semantic {
                     reason: format!("timechart span [{}] needs a time unit", span.get_text()),
+                    name: None,
                 });
             }
             command.span_length = length;
@@ -1251,6 +1266,7 @@ fn read_flag_identifier(parameter: &str) -> Result<bool, PplError> {
         "f" | "false" => Ok(false),
         _ => Err(PplError::Semantic {
             reason: format!("[{parameter}] is not true or false"),
+            name: None,
         }),
     }
 }
@@ -1271,6 +1287,7 @@ fn build_bin(bin: &BinCommandContextAll<'_>) -> Result<BinCommand, PplError> {
     }
     let span = span.ok_or_else(|| PplError::Semantic {
         reason: "bin needs span=<width>".to_string(),
+        name: None,
     })?;
     Ok(BinCommand {
         field: name_field(&field)?,
@@ -1299,6 +1316,7 @@ fn read_positive_count(literal: &IntegerLiteralContextAll<'_>, command: &str) ->
     if count == 0 {
         return Err(PplError::Semantic {
             reason: format!("{command} takes a count of at least 1"),
+            name: None,
         });
     }
     Ok(count)
@@ -1308,6 +1326,7 @@ fn read_positive_count(literal: &IntegerLiteralContextAll<'_>, command: &str) ->
 fn build_invalid_span_error(text: &str) -> PplError {
     PplError::Semantic {
         reason: format!("span length [{text}] must be positive"),
+        name: None,
     }
 }
 
@@ -1315,6 +1334,7 @@ fn build_invalid_span_error(text: &str) -> PplError {
 fn build_out_of_range_span_error(text: &str) -> PplError {
     PplError::Semantic {
         reason: format!("span length [{text}] is out of range"),
+        name: None,
     }
 }
 
@@ -1322,6 +1342,7 @@ fn build_out_of_range_span_error(text: &str) -> PplError {
 fn build_unsupported_option_error(command: &str, option: &str) -> PplError {
     PplError::Semantic {
         reason: format!("{command} option [{option}] is not supported"),
+        name: None,
     }
 }
 
@@ -1347,14 +1368,13 @@ fn build_rename(clause: &RenameClauseContextAll<'_>) -> Result<(String, String),
 
 /// The field name of one side of a `rename` pair; `*` and a wildcard pattern are refused.
 fn name_rename_field(field: &RenameFieldExpressionContextAll<'_>) -> Result<String, PplError> {
-    let qualified_name = field.wcQualifiedName().ok_or_else(|| PplError::Semantic {
-        reason: "rename takes field names, not *".to_string(),
-    })?;
+    let qualified_name = field
+        .wcQualifiedName()
+        .ok_or_else(|| PplError::semantic_naming("*", "rename takes field names, not *"))?;
     let name = name_wildcard_path(&qualified_name)?;
     if name.contains('*') {
-        return Err(PplError::Semantic {
-            reason: format!("rename takes field names, not the pattern [{name}]"),
-        });
+        let reason = format!("rename takes field names, not the pattern [{name}]");
+        return Err(PplError::semantic_naming(name, reason));
     }
     Ok(name)
 }
@@ -1405,6 +1425,7 @@ fn name_wildcard(wildcard: &WildcardContextAll<'_>) -> Result<String, PplError> 
                 "field pattern [{}] uses % as a wildcard; use * instead",
                 wildcard.get_text()
             ),
+            name: None,
         });
     }
     let idents = wildcard.ident_all();
@@ -1419,6 +1440,7 @@ fn build_sort_key(field: &SortFieldContextAll<'_>) -> Result<PplSortKey, PplErro
                     "sort key [{}] has both a +/- prefix and an asc/desc suffix; use one",
                     field.get_text()
                 ),
+                name: None,
             });
         }
         SortFieldContextAll::PrefixSortFieldContext(prefix_key) => {
@@ -1455,6 +1477,7 @@ fn read_count(literal: &IntegerLiteralContextAll<'_>, command: &str) -> Result<u
     let value = read_integer(literal)?;
     usize::try_from(value).map_err(|_| PplError::Semantic {
         reason: format!("{command} takes a non-negative count, not {value}"),
+        name: None,
     })
 }
 
@@ -1462,6 +1485,7 @@ fn read_integer(literal: &IntegerLiteralContextAll<'_>) -> Result<i64, PplError>
     let text = literal.get_text();
     text.parse::<i64>().map_err(|_| PplError::Semantic {
         reason: format!("integer literal [{text}] is out of range"),
+        name: None,
     })
 }
 
@@ -1670,6 +1694,7 @@ fn build_in_subsearch(in_subsearch: &InSubqueryExprContext<'_>) -> Result<PplExp
     if in_subsearch.NOT().is_some() {
         return Err(PplError::Semantic {
             reason: "`not in [subsearch]` is not supported; filter inside the subsearch instead".to_string(),
+            name: None,
         });
     }
     let values = in_subsearch.valueExpression_all();
@@ -1679,6 +1704,7 @@ fn build_in_subsearch(in_subsearch: &InSubqueryExprContext<'_>) -> Result<PplExp
                 "`(a, b) in [subsearch]` is not supported; compare one expression, not {}",
                 values.len()
             ),
+            name: None,
         });
     };
     let subsearch = in_subsearch.subSearch().ok_or_else(|| build_missing_part_error("in"))?;
@@ -1831,6 +1857,7 @@ fn build_literal(literal: &LiteralValueContextAll<'_>) -> Result<PplLiteral, Ppl
         let digits = text.trim_end_matches(['d', 'D', 'f', 'F']);
         return digits.parse::<f64>().map(PplLiteral::Double).map_err(|_| PplError::Semantic {
             reason: format!("numeric literal [{text}] is not a number"),
+            name: None,
         });
     }
     if literal.intervalLiteral().is_some() {
@@ -1856,9 +1883,8 @@ fn name_field(field: &FieldExpressionContextAll<'_>) -> Result<String, PplError>
 /// would collide with one of them or vanish with the hidden ones.
 fn check_field_name(name: String) -> Result<String, PplError> {
     if name.starts_with(RESERVED_NAME_PREFIX) {
-        return Err(PplError::Semantic {
-            reason: format!("field name [{name}] starts with the reserved prefix [{RESERVED_NAME_PREFIX}]"),
-        });
+        let reason = format!("field name [{name}] starts with the reserved prefix [{RESERVED_NAME_PREFIX}]");
+        return Err(PplError::semantic_naming(name, reason));
     }
     Ok(name)
 }
@@ -1966,6 +1992,7 @@ fn build_unsupported_function_error(function: &str) -> PplError {
 fn build_repeated_join_option_error(option: &str) -> PplError {
     PplError::Semantic {
         reason: format!("join option {option}= is written more than once; write it once"),
+        name: None,
     }
 }
 
@@ -2078,6 +2105,7 @@ mod tests {
                 parse_ppl(query),
                 Err(PplError::Semantic {
                     reason: format!("field name [__ppl_x] starts with the reserved prefix [{RESERVED_NAME_PREFIX}]"),
+                    name: Some("__ppl_x".to_string()),
                 }),
                 "{query}"
             );
@@ -2356,7 +2384,8 @@ mod tests {
             assert_eq!(
                 parse_ppl(query),
                 Err(PplError::Semantic {
-                    reason: reason.to_string()
+                    reason: reason.to_string(),
+                    name: None,
                 }),
                 "query {query:?}"
             );
@@ -2370,7 +2399,8 @@ mod tests {
             assert_eq!(
                 parse_ppl(&query),
                 Err(PplError::Semantic {
-                    reason: format!("span length [{overflowing_digits}] must be positive")
+                    reason: format!("span length [{overflowing_digits}] must be positive"),
+                    name: None,
                 }),
                 "query {query:?}"
             );
@@ -2419,7 +2449,8 @@ mod tests {
             assert_eq!(
                 parse_ppl(query),
                 Err(PplError::Semantic {
-                    reason: format!("field name [{name}] starts with the reserved prefix [__ppl_]")
+                    reason: format!("field name [{name}] starts with the reserved prefix [__ppl_]"),
+                    name: Some(name.to_string()),
                 }),
                 "query {query:?}"
             );
@@ -2585,7 +2616,7 @@ mod tests {
         ] {
             let result = parse_ppl(text);
             assert!(
-                matches!(&result, Err(PplError::Semantic { reason }) if reason.contains(expected_name)),
+                matches!(&result, Err(PplError::Semantic { reason, .. }) if reason.contains(expected_name)),
                 "{text}: {result:?}"
             );
         }
@@ -2647,8 +2678,7 @@ mod tests {
     fn an_alias_on_an_index_source_is_a_400() {
         let result = parse_ppl("source=logs as l | fields body");
         assert!(
-            matches!(&result, Err(PplError::Semantic { reason })
-                if reason.contains("source=logs as l") && reason.contains("left=<alias>")),
+            matches!(&result, Err(PplError::Semantic { name: Some(name), .. }) if name == "l"),
             "{result:?}"
         );
     }
@@ -2667,7 +2697,7 @@ mod tests {
         ] {
             let result = parse_ppl(text);
             assert!(
-                matches!(&result, Err(PplError::Semantic { reason }) if reason.contains(expected_name)),
+                matches!(&result, Err(PplError::Semantic { reason, .. }) if reason.contains(expected_name)),
                 "{text}: {result:?}"
             );
         }
@@ -2736,27 +2766,23 @@ mod tests {
                 "source=logs | streamstats window=2 current=false count()",
                 "[window=2 current=false]",
             ),
-            (
-                "source=logs | streamstats count() by span(timestamp, 1h)",
-                "streamstats groups by fields; `by span(…)`",
-            ),
-            (
-                "source=logs | eventstats count() by service_name, span(timestamp, 1h)",
-                "eventstats groups by fields; `by span(…)`",
-            ),
-            // The span is refused before it is built, so its unit is never read: `us` names no span unit.
-            (
-                "source=logs | eventstats count() by span(timestamp, 1us)",
-                "eventstats groups by fields; `by span(…)`",
-            ),
-            (
-                "source=logs | streamstats count() by span(timestamp, 1us)",
-                "streamstats groups by fields; `by span(…)`",
-            ),
         ] {
             let result = parse_ppl(text);
             assert!(
-                matches!(&result, Err(PplError::Semantic { reason }) if reason.contains(expected_name)),
+                matches!(&result, Err(PplError::Semantic { reason, .. }) if reason.contains(expected_name)),
+                "{text}: {result:?}"
+            );
+        }
+        for text in [
+            "source=logs | streamstats count() by span(timestamp, 1h)",
+            "source=logs | eventstats count() by service_name, span(timestamp, 1h)",
+            // The span is refused before it is built, so its unit is never read: `us` names no span unit.
+            "source=logs | eventstats count() by span(timestamp, 1us)",
+            "source=logs | streamstats count() by span(timestamp, 1us)",
+        ] {
+            let result = parse_ppl(text);
+            assert!(
+                matches!(&result, Err(PplError::Semantic { name: Some(name), .. }) if name == "span"),
                 "{text}: {result:?}"
             );
         }
@@ -2778,7 +2804,7 @@ mod tests {
 
         let result = parse_ppl("source=logs | append [ | fields body ]");
         assert!(
-            matches!(&result, Err(PplError::Semantic { reason }) if reason.contains("append needs a search")),
+            matches!(&result, Err(PplError::Semantic { reason, .. }) if reason.contains("append needs a search")),
             "{result:?}"
         );
     }

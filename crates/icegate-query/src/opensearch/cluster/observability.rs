@@ -27,10 +27,10 @@ pub(crate) async fn list_observability_objects(
 }
 
 /// `GET /_plugins/_ml/config/{id}`: IceGate holds no ML configs, so every id is a 404
-/// `status_exception` naming it.
+/// `status_exception` naming it, with the id under `id`.
 pub(crate) async fn read_ml_config(
     PathParameters(id): PathParameters<String>,
     Parameters(NoParameters {}): Parameters<NoParameters>,
 ) -> OpenSearchError {
-    OpenSearchError::status_not_found(format!("no ML config [{id}]"))
+    OpenSearchError::ml_config_not_found(&id)
 }

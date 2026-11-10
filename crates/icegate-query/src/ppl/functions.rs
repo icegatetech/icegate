@@ -229,12 +229,14 @@ pub(crate) fn plan_aggregate_call(name: &str, arguments: Vec<Expr>) -> Result<Pl
                 _ => {
                     return Err(PplError::Semantic {
                         reason: "percentile takes a numeric literal percent".to_string(),
+                        name: None,
                     });
                 }
             };
             if !(0.0..=100.0).contains(&percent) {
                 return Err(PplError::Semantic {
                     reason: format!("percentile [{percent}] is outside 0..=100"),
+                    name: None,
                 });
             }
             Ok(PlannedAggregate::Percentile(
@@ -310,6 +312,7 @@ fn lower_modulo(dividend: Expr, divisor: Expr) -> Expr {
 pub(crate) fn parse_timestamp_literal(text: &str) -> Result<i64, PplError> {
     let build_malformed_error = || PplError::Semantic {
         reason: format!("[{text}] is not a timestamp of the form yyyy-MM-dd HH:mm:ss[.SSSSSS]"),
+        name: None,
     };
     let trimmed_text = text.trim();
     if let Ok(date) = NaiveDate::parse_from_str(trimmed_text, "%Y-%m-%d") {
@@ -322,12 +325,13 @@ pub(crate) fn parse_timestamp_literal(text: &str) -> Result<i64, PplError> {
         return Err(build_malformed_error());
     }
     if fraction_text.len() > MAX_FRACTION_DIGITS {
-        return Err(PplError::Semantic {
-            reason: format!(
+        return Err(PplError::semantic_naming(
+            text,
+            format!(
                 "[{text}] has {} fraction digits; timestamps hold at most {MAX_FRACTION_DIGITS}",
                 fraction_text.len()
             ),
-        });
+        ));
     }
     if !fraction_text.chars().all(|digit| digit.is_ascii_digit()) {
         return Err(build_malformed_error());
@@ -358,9 +362,10 @@ fn lower_timestamp(value: Expr, context: &FunctionContext<'_>) -> Result<Expr, P
         DataType::Timestamp(_, _) | DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Date32 => {
             Ok(cast(value, DataType::Timestamp(TimeUnit::Microsecond, None)))
         }
-        other => Err(PplError::Semantic {
-            reason: format!("timestamp() takes a string or a timestamp, not {other}; use from_unixtime for numbers"),
-        }),
+        other => Err(PplError::semantic_naming(
+            "timestamp",
+            format!("timestamp() takes a string or a timestamp, not {other}; use from_unixtime for numbers"),
+        )),
     }
 }
 
@@ -380,6 +385,7 @@ fn lower_timestampdiff(arguments: Vec<Expr>, context: &FunctionContext<'_>) -> R
         other => {
             return Err(PplError::Semantic {
                 reason: format!("timestampdiff with the unit {other} is not supported"),
+                name: None,
             });
         }
     };
@@ -415,6 +421,7 @@ fn translate_date_format(format_pattern: &str) -> Result<String, PplError> {
         }
         let specifier = characters.next().ok_or_else(|| PplError::Semantic {
             reason: format!("date_format pattern [{format_pattern}] ends with %"),
+            name: None,
         })?;
         let replacement = match specifier {
             'Y' => "%Y",
@@ -440,9 +447,10 @@ fn translate_date_format(format_pattern: &str) -> Result<String, PplError> {
             'r' => "%I:%M:%S %p",
             '%' => "%%",
             other => {
-                return Err(PplError::Semantic {
-                    reason: format!("date_format does not support the specifier %{other}"),
-                });
+                return Err(PplError::semantic_naming(
+                    format!("%{other}"),
+                    format!("date_format does not support the specifier %{other}"),
+                ));
             }
         };
         translated_format.push_str(replacement);
@@ -541,9 +549,10 @@ fn lower_like(arguments: Vec<Expr>) -> Result<Expr, PplError> {
     let (text, pattern, is_case_sensitive) = match <[Expr; 3]>::try_from(arguments) {
         Ok([text, pattern, case_sensitivity_flag]) => {
             let Expr::Literal(ScalarValue::Boolean(Some(is_case_sensitive)), _) = case_sensitivity_flag else {
-                return Err(PplError::Semantic {
-                    reason: "like takes true or false as its third argument".to_string(),
-                });
+                return Err(PplError::semantic_naming(
+                    "like",
+                    "like takes true or false as its third argument",
+                ));
             };
             (text, pattern, is_case_sensitive)
         }
@@ -586,9 +595,10 @@ fn lower_mvindex(arguments: Vec<Expr>, context: &FunctionContext<'_>) -> Result<
     // DataFusion's array indexes are 1-based; a negative index counts from the end in both.
     let convert_to_one_based = |index: &Expr| -> Result<i64, PplError> {
         let Expr::Literal(ScalarValue::Int64(Some(index)), _) = index else {
-            return Err(PplError::Semantic {
-                reason: "mvindex takes integer literals as indexes".to_string(),
-            });
+            return Err(PplError::semantic_naming(
+                "mvindex",
+                "mvindex takes integer literals as indexes",
+            ));
         };
         Ok(if *index >= 0 { index + 1 } else { *index })
     };
@@ -647,9 +657,7 @@ fn render_timestamp_text(value: Expr) -> Expr {
 fn read_string_literal(function: &str, value: &Expr) -> Result<String, PplError> {
     match_string_literal(value)
         .map(str::to_string)
-        .ok_or_else(|| PplError::Semantic {
-            reason: format!("{function} takes a string literal here"),
-        })
+        .ok_or_else(|| PplError::semantic_naming(function, format!("{function} takes a string literal here")))
 }
 
 /// The text of a non-null string literal of any DataFusion string type (`Utf8`, `LargeUtf8`,
@@ -673,9 +681,10 @@ fn take_arguments<const N: usize>(function: &str, arguments: Vec<Expr>) -> Resul
 
 /// The refusal of a call of `function` with `actual` arguments where it takes `expected`.
 fn build_wrong_arity_error(function: &str, expected: &str, actual: usize) -> PplError {
-    PplError::Semantic {
-        reason: format!("function [{function}] takes {expected} argument(s), not {actual}"),
-    }
+    PplError::semantic_naming(
+        function,
+        format!("function [{function}] takes {expected} argument(s), not {actual}"),
+    )
 }
 
 #[cfg(test)]
