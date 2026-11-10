@@ -79,6 +79,7 @@ metrics:
   enabled: true
   host: 0.0.0.0
   port: 9091
+  path: /metrics
 
 # Server-side TLS for every listener of this service, `/metrics` and `/health`
 # included. Off while this block is absent: the stand serves plaintext. To turn

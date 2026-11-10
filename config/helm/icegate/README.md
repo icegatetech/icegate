@@ -459,7 +459,7 @@ an image pinned by digest (`icegate-ingest@sha256:...`) verifies the same way.
 | query.opensearch.systemIndices.maxAnswerBytes | int | `268435456` | Bytes of stored documents one answer may carry; at least maxSnapshotBytes. An _mget or _search past it is refused whole with 400, and _bulk update items past it fail one by one. |
 | query.opensearch.systemIndices.maxScrollLifetimeSecs | int | `900` | Longest scroll a system-index search may open, in seconds. A superseded snapshot object is kept this long plus the query deadline. |
 | query.opensearch.systemIndices.maxSnapshotBytes | int | `134217728` | Largest decoded snapshot one tenant may hold, in bytes. A write past it is answered 413 and changes nothing. |
-| query.opensearch.version | string | `"3.9.0"` | Version reported by GET / and /_nodes: a canonical MAJOR.MINOR.PATCH with major 3. Any other value is refused at startup. |
+| query.opensearch.version | string | `"3.9.0"` | Version reported by GET / and /_nodes: a canonical MAJOR.MINOR.PATCH with major 3. Any other value is refused at startup. When OpenSearch Dashboards runs with opensearch.ignoreVersionMismatch false, keep this minor at or above the Dashboards minor: such a Dashboards holds its saved-object migration until IceGate reports a compatible version, then migrates without a restart (end-to-end case "a strict osd rejects icegate at 3.8.0 and migrates after icegate restarts at 3.9.0", scripts/opensearch-e2e/versions.spec.ts). IceGate does not check this; the chart deploys no Dashboards. |
 | query.pdb.enabled | bool | `false` |  |
 | query.pdb.minAvailable | int | `1` |  |
 | query.prometheus.enabled | bool | `true` |  |

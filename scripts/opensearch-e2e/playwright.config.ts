@@ -32,5 +32,15 @@ export default defineConfig({
       testMatch: 'grafana.spec.ts',
       use: { baseURL: GRAFANA_URL },
     },
+    {
+      // Each case resets the stand and starts the variant it needs, so this project runs alone
+      // and after the others; its cases address each service by absolute URL. Like the Grafana
+      // project, it keeps Playwright's default test-id attribute, `data-testid`.
+      name: 'versions',
+      testMatch: 'versions.spec.ts',
+      // Above the sum of the bounded waits of the longest case (the strict-mode case), so a slow
+      // boot fails on its own named poll rather than on the test timeout.
+      timeout: 1_800_000,
+    },
   ],
 });

@@ -14,6 +14,7 @@ client-shaped requests; they make no claim about a client.
 |---|---|---|
 | `osd` | `osd.spec.ts` | OpenSearch Dashboards: boot and migration, saved objects, index patterns, Discover, a dashboard, Query Workbench, Discover PPL, Observability Logs, the tenant header |
 | `grafana` | `grafana.spec.ts` | Grafana with the OpenSearch datasource plugin, through the stand's three OpenSearch datasources: health, Lucene and PPL logs, variables, ad-hoc filters, the metrics editor, traces, trace-to-logs |
+| `versions` | `versions.spec.ts` | The version IceGate reports: an OSD upgrade, a strict-mode OSD, a refused pre-release version, Grafana at another canonical version. Each case resets the stand and starts the variant it needs, so the project runs alone and last: `npx playwright test --project=versions` |
 
 The Grafana cases create their dashboards through Grafana's HTTP API in `beforeAll`, each
 named `e2e-<purpose>`, and run Explore queries from URLs, so every query reaches IceGate through
@@ -43,15 +44,39 @@ requests and IceGate's answers. Reset the stand between full runs with
 
 ## The stand
 
-`config/docker/docker-compose.e2e.yml` changes one thing in the stand: container logs use
-Docker's json-file driver instead of the bundled collector. The collector would write every
-service's logs into `demo`, the tenant the cases count rows in, and `docker compose logs` must
-work when a run fails.
+`config/docker/docker-compose.e2e.yml` changes the stand in five ways:
 
-The suite writes no port. `stand.ts` reads each service's host URL from the stand's Compose
-model (`docker compose config`, so the Docker CLI is needed even to list the cases) and each
+- Container logs use Docker's json-file driver instead of the bundled collector. The collector
+  would write every service's logs into `demo`, the tenant the cases count rows in, and
+  `docker compose logs` must work when a run fails.
+- `ICEGATE_E2E_QUERY_CONFIG`, when set, is the path of the query document the `query` service
+  mounts; `versions.spec.ts` points it at a copy of `config/docker/query.yaml` with one
+  `opensearch.version` line set.
+- `GRAFANA_E2E_PROVISIONING`, when set, is the provisioning directory Grafana mounts;
+  `versions.spec.ts` points it at a copy whose OpenSearch datasources state another version.
+- Two Dashboards services gated behind profiles, each extending the stand's
+  `opensearch-dashboards`: `opensearch-dashboards-3-8` (profile `upgrade`), the previous minor
+  image, and `opensearch-dashboards-strict` (profile `strict`), started with
+  `opensearch.ignoreVersionMismatch` set to false. They take the stand's Dashboards place (the
+  same port) and never run beside it.
+- The query service's metrics port is also published, on an ephemeral host port: the
+  strict-mode case reads the listener's request counter there to see the strict Dashboards ask
+  for `/_nodes` before it observes the hold.
+
+Unset, both variables mount the stand's own files, so the plain run is the stand as committed.
+The variant files are written under `.stand/variants/`, and every reset of the version cases
+first appends the stand's logs to `test-results/stand-versions.log`.
+
+The suite writes one port: `config/docker/docker-compose.e2e.yml` publishes the query service's
+metrics container port, a copy of `metrics.port` in `config/docker/query.yaml`. Nothing else in
+the suite states a port. `stand.ts` reads each service's host URL from the stand's Compose model
+(`docker compose config`, so the Docker CLI is needed even to list the cases) and each
 listener's container port from the stand's config documents under `config/docker/`; `seed.sh`
-does the same with `docker compose port`.
+does the same with `docker compose port`. If the two metrics ports drift apart,
+`docker compose port query <metrics.port>` finds no published port and the strict-mode case,
+"a strict osd rejects icegate at 3.8.0 and migrates after icegate restarts at 3.9.0", cannot
+read the `/_nodes` request counter; the `beforeAll` of `versions.spec.ts` therefore checks the
+copy first and fails naming both files.
 
 ## The seed
 

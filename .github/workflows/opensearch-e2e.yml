@@ -86,9 +86,17 @@ jobs:
         working-directory: scripts/opensearch-e2e
         run: npx playwright test --project=grafana
 
+      # Collected before the version cases, which reset the stand.
       - name: Collect the stand's logs
         if: failure()
         run: $COMPOSE logs --no-color --timestamps > stand.log
+
+      # The version cases append their stands' logs to test-results/stand-versions.log before
+      # each reset; the upload step below already carries test-results/.
+      - name: Version cases
+        if: ${{ !cancelled() }}
+        working-directory: scripts/opensearch-e2e
+        run: npx playwright test --project=versions
 
       - name: Upload the failure evidence
         if: failure()

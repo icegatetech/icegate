@@ -272,7 +272,7 @@ query:
     enabled: false
     # -- Listener port.
     port: 9200
-    # -- Version reported by GET / and /_nodes: a canonical MAJOR.MINOR.PATCH with major 3. Any other value is refused at startup.
+    # -- Version reported by GET / and /_nodes: a canonical MAJOR.MINOR.PATCH with major 3. Any other value is refused at startup. When OpenSearch Dashboards runs with opensearch.ignoreVersionMismatch false, keep this minor at or above the Dashboards minor: such a Dashboards holds its saved-object migration until IceGate reports a compatible version, then migrates without a restart (end-to-end case "a strict osd rejects icegate at 3.8.0 and migrates after icegate restarts at 3.9.0", scripts/opensearch-e2e/versions.spec.ts). IceGate does not check this; the chart deploys no Dashboards.
     version: "3.9.0"
     # -- Cluster name reported by GET /, /_nodes and /_cluster/health. It seeds the stable cluster and node identifiers, so changing it changes them.
     clusterName: icegate
