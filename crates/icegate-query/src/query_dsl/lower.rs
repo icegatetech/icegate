@@ -3061,7 +3061,7 @@ mod tests {
     async fn a_leaf_on_a_stored_column_the_span_profile_does_not_expose_matches_nothing() {
         let fixture = SearchFixture::new().await;
         let session = fixture.open_session(TENANT_A).await;
-        let entry = find_index_entry(&session, "otel-v1-apm-span");
+        let entry = find_index_entry(&session, "otel-v1-apm-span-000001");
         let scope = LoweringScope {
             session: &session,
             entry,

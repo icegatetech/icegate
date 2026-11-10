@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE};
 
-use super::data_prepper::DATA_PREPPER_SPAN_INDEX;
+use super::data_prepper::{DATA_PREPPER_SPAN_ALIAS, DATA_PREPPER_SPAN_INDEX};
 use super::expression::{ExpressionPart, IndexExpression, Selection, has_wildcard};
 use super::ss4o::{SS4O_LOGS_INDEX, SS4O_METRICS_INDEX, SS4O_TRACES_INDEX};
 use crate::opensearch::error::OpenSearchError;
@@ -73,19 +73,56 @@ impl Profile {
     }
 }
 
-/// The indices a non-native profile serves: index name, the table it reads, its profile. Each is
-/// listed when its table is, and is wildcard-visible.
-const PROFILE_INDICES: [(&str, &str, Profile); 4] = [
-    (DATA_PREPPER_SPAN_INDEX, SPANS_TABLE, Profile::DataPrepper),
-    (SS4O_LOGS_INDEX, LOGS_TABLE, Profile::Ss4o),
-    (SS4O_TRACES_INDEX, SPANS_TABLE, Profile::Ss4o),
-    (SS4O_METRICS_INDEX, METRICS_TABLE, Profile::Ss4o),
+/// One index a non-native profile serves.
+struct ProfileIndex {
+    /// The concrete index name.
+    name: &'static str,
+    /// The other names that select the index, in name order.
+    alias_names: &'static [&'static str],
+    /// The table the index reads.
+    table: &'static str,
+    /// How the index's field names map onto the table's columns.
+    profile: Profile,
+}
+
+/// The indices of the non-native profiles. Each is listed when its table is, and it is
+/// wildcard-visible through its name and each of its aliases.
+const PROFILE_INDICES: [ProfileIndex; 4] = [
+    ProfileIndex {
+        name: DATA_PREPPER_SPAN_INDEX,
+        alias_names: &[DATA_PREPPER_SPAN_ALIAS],
+        table: SPANS_TABLE,
+        profile: Profile::DataPrepper,
+    },
+    ProfileIndex {
+        name: SS4O_LOGS_INDEX,
+        alias_names: &[],
+        table: LOGS_TABLE,
+        profile: Profile::Ss4o,
+    },
+    ProfileIndex {
+        name: SS4O_TRACES_INDEX,
+        alias_names: &[],
+        table: SPANS_TABLE,
+        profile: Profile::Ss4o,
+    },
+    ProfileIndex {
+        name: SS4O_METRICS_INDEX,
+        alias_names: &[],
+        table: METRICS_TABLE,
+        profile: Profile::Ss4o,
+    },
 ];
 
 /// Something an index expression selects by name: a data index, or a system index or alias name.
 trait SelectableIndex {
     /// The name the expression's parts match.
     fn index_name(&self) -> &str;
+    /// The other names that select it, each as its own name would: an alias is a second name of
+    /// the item, never an item of its own.
+    fn alias_names(&self) -> &[&str] {
+        &[]
+    }
     /// Whether a wildcard can select it, or only its exact name.
     fn is_wildcard_visible(&self) -> bool;
 }
@@ -106,18 +143,20 @@ impl SelectableIndex for &str {
 /// One data index the tenant sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IndexEntry {
-    /// The index name clients use.
+    /// The concrete index name, which responses give the index.
     name: String,
     /// The table the index reads.
     table: String,
     /// How the index's field names map onto the table's columns.
     profile: Profile,
+    /// The other names that select the index, in name order.
+    alias_names: &'static [&'static str],
     /// Whether a wildcard can select the index, or only its exact name.
     is_wildcard_visible: bool,
 }
 
 impl IndexEntry {
-    /// The index name clients use.
+    /// The concrete index name, which responses give the index however a request named it.
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
@@ -131,11 +170,21 @@ impl IndexEntry {
     pub(crate) const fn profile(&self) -> Profile {
         self.profile
     }
+
+    /// The aliases of this index, in name order: other names an expression selects it by. A
+    /// response names the index by [`Self::name`], never by an alias.
+    pub(crate) const fn alias_names(&self) -> &'static [&'static str] {
+        self.alias_names
+    }
 }
 
 impl SelectableIndex for IndexEntry {
     fn index_name(&self) -> &str {
         &self.name
+    }
+
+    fn alias_names(&self) -> &[&str] {
+        self.alias_names
     }
 
     fn is_wildcard_visible(&self) -> bool {
@@ -161,11 +210,12 @@ impl IndexSet {
             entries.extend(
                 PROFILE_INDICES
                     .iter()
-                    .filter(|(_, table, _)| *table == name)
-                    .map(|(index, _, profile)| IndexEntry {
-                        name: (*index).to_string(),
+                    .filter(|profile_index| profile_index.table == name)
+                    .map(|profile_index| IndexEntry {
+                        name: profile_index.name.to_string(),
                         table: name.clone(),
-                        profile: *profile,
+                        profile: profile_index.profile,
+                        alias_names: profile_index.alias_names,
                         is_wildcard_visible: true,
                     }),
             );
@@ -173,6 +223,7 @@ impl IndexSet {
                 is_wildcard_visible: find_telemetry_table(&name).is_some(),
                 table: name.clone(),
                 profile: Profile::Native,
+                alias_names: &[],
                 name,
             });
         }
@@ -281,10 +332,10 @@ pub(super) fn check_table_uniqueness(
 }
 
 /// The items of `items` (sorted by name, each name once) that `parts` select under `options`, in
-/// name order, each with whether a concrete name selected it. The parts apply left to right: a
-/// wildcard inclusion adds what it expands to (see [`is_expanded_by_wildcard`]), a concrete
-/// inclusion adds the item of that exact name and marks it named, and an exclusion removes every
-/// item it matches and forgets that a name selected it.
+/// name order, each once, with whether a concrete name selected it. The parts apply left to right:
+/// a wildcard inclusion adds what it expands to (see [`is_expanded_by_wildcard`]), a concrete
+/// inclusion adds the item of that exact name or alias and marks it named, and an exclusion
+/// removes every item whose name or alias it matches and forgets that a name selected it.
 ///
 /// # Errors
 ///
@@ -303,22 +354,19 @@ fn select_items_by_parts<'a, T: SelectableIndex>(
                     *is_item_selected |= is_expanded_by_wildcard(item, pattern, options.expand_wildcards);
                 }
             }
-            // `items` is sorted by name, so a concrete name is one binary search.
-            ExpressionPart::Include(concrete_name) => {
-                match items.binary_search_by(|item| item.index_name().cmp(concrete_name.as_str())) {
-                    Ok(position) => {
-                        selection_flags[position] = true;
-                        naming_flags[position] = true;
-                    }
-                    Err(_) if options.ignore_unavailable => {}
-                    Err(_) => return Err(OpenSearchError::index_not_found(concrete_name)),
+            ExpressionPart::Include(concrete_name) => match find_item_position(items, concrete_name) {
+                Some(position) => {
+                    selection_flags[position] = true;
+                    naming_flags[position] = true;
                 }
-            }
+                None if options.ignore_unavailable => {}
+                None => return Err(OpenSearchError::index_not_found(concrete_name)),
+            },
             ExpressionPart::Exclude(pattern) => {
                 for ((is_item_selected, is_item_named), item) in
                     selection_flags.iter_mut().zip(naming_flags.iter_mut()).zip(items)
                 {
-                    let is_excluded = matches_glob(pattern, item.index_name());
+                    let is_excluded = is_matched_by_glob(item, pattern);
                     *is_item_selected &= !is_excluded;
                     *is_item_named &= !is_excluded;
                 }
@@ -329,6 +377,23 @@ fn select_items_by_parts<'a, T: SelectableIndex>(
         .iter()
         .zip(selection_flags.into_iter().zip(naming_flags))
         .filter_map(|(item, (is_item_selected, is_item_named))| is_item_selected.then_some((item, is_item_named))))
+}
+
+/// The position in `items` (sorted by name, each name once) of the item named `concrete_name`, by
+/// its own name or, failing that, by an alias.
+fn find_item_position<T: SelectableIndex>(items: &[T], concrete_name: &str) -> Option<usize> {
+    // `items` is sorted by name, so an own name is one binary search; only a miss pays for the
+    // scan of the aliases.
+    items
+        .binary_search_by(|item| item.index_name().cmp(concrete_name))
+        .ok()
+        .or_else(|| items.iter().position(|item| item.alias_names().contains(&concrete_name)))
+}
+
+/// Whether glob `pattern` matches the name of `item` or one of its aliases.
+fn is_matched_by_glob<T: SelectableIndex>(item: &T, pattern: &str) -> bool {
+    matches_glob(pattern, item.index_name())
+        || item.alias_names().iter().any(|alias_name| matches_glob(pattern, alias_name))
 }
 
 /// What an index expression resolves to on a request that reads one kind of index.
@@ -377,10 +442,11 @@ pub(super) fn choose_index_target<'a>(
     }
 }
 
-/// Whether wildcard `pattern` expands to `item`: only while open indices are expanded, and only
-/// to a wildcard-visible item. Without open indices no name is matched against the pattern.
+/// Whether wildcard `pattern` expands to `item`: only while open indices are expanded, only to a
+/// wildcard-visible item, and when it matches the item's name or an alias. Without open indices no
+/// name is matched against the pattern.
 fn is_expanded_by_wildcard<T: SelectableIndex>(item: &T, pattern: &str, expand_wildcards: ExpandWildcards) -> bool {
-    expand_wildcards.is_open && item.is_wildcard_visible() && matches_glob(pattern, item.index_name())
+    expand_wildcards.is_open && item.is_wildcard_visible() && is_matched_by_glob(item, pattern)
 }
 
 #[cfg(test)]
@@ -433,7 +499,7 @@ mod tests {
             "logs",
             "metrics",
             "operations",
-            "otel-v1-apm-span",
+            "otel-v1-apm-span-000001",
             "spans",
             "ss4o_logs-icegate-default",
             "ss4o_metrics-icegate-default",
@@ -448,14 +514,14 @@ mod tests {
     fn exclusions_and_single_character_wildcards_apply_in_order() {
         assert_eq!(
             resolve_names("*,-s*", build_search_options()),
-            ["events", "logs", "metrics", "operations", "otel-v1-apm-span"]
+            ["events", "logs", "metrics", "operations", "otel-v1-apm-span-000001"]
         );
         assert_eq!(resolve_names("l?gs", build_search_options()), ["logs"]);
         assert_eq!(resolve_names("*,-*,logs", build_search_options()), ["logs"]);
     }
 
     /// A table reached through two profiles is read twice only when each of its indices is
-    /// named: a wildcard reaching `spans` and `otel-v1-apm-span` is refused naming the
+    /// named: a wildcard reaching `spans` and the span profile index is refused naming the
     /// expression, the first such table in name order and its profiles in index-name order,
     /// while naming both, or excluding all but one, resolves.
     #[tokio::test]
@@ -492,11 +558,11 @@ mod tests {
         }
         assert_eq!(
             resolve_entry_names("spans,otel-v1-apm-span").expect("both named"),
-            ["otel-v1-apm-span", "spans"]
+            ["otel-v1-apm-span-000001", "spans"]
         );
         assert_eq!(
             resolve_entry_names("*,-s*").expect("one profile of each table left"),
-            ["events", "logs", "metrics", "operations", "otel-v1-apm-span"]
+            ["events", "logs", "metrics", "operations", "otel-v1-apm-span-000001"]
         );
         assert_eq!(
             resolve_entry_names("*,-otel*,-ss4o*").expect("one profile of each table left"),
@@ -508,13 +574,38 @@ mod tests {
         );
         assert_eq!(
             resolve_entry_names("otel-v1-apm-span").expect("one profile"),
-            ["otel-v1-apm-span"]
+            ["otel-v1-apm-span-000001"]
         );
         // A name an exclusion removed and a wildcard added back is no longer named.
         let (status, body) =
             render_envelope(resolve_entry_names("x*,spans,otel-v1-apm-span,-sp*,s*").expect_err("unnamed")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["table"], "spans");
+    }
+
+    /// An alias is a second name of its index: it selects the index as the index's own name does,
+    /// a wildcard or an exclusion matching either name reaches it, and the index is selected once.
+    #[test]
+    fn an_alias_selects_its_index_once_under_its_concrete_name() {
+        let span_index = ["otel-v1-apm-span-000001"];
+        for text in [
+            "otel-v1-apm-span",
+            "otel-v1-apm-span-000001",
+            "otel-v1-apm-span-*",
+            "otel-v1-apm-span*",
+            "otel-v1-apm-span,otel-v1-apm-span-000001",
+            "*-apm-span",
+        ] {
+            assert_eq!(resolve_names(text, build_search_options()), span_index, "{text}");
+        }
+        assert!(resolve_names("otel*,-otel-v1-apm-span", build_search_options()).is_empty());
+        assert!(resolve_names("otel*,-*-000001", build_search_options()).is_empty());
+        let no_expansion_options = IndexOptions {
+            expand_wildcards: ExpandWildcards::parse(Some("none")).expect("a served value"),
+            ..build_search_options()
+        };
+        assert_eq!(resolve_names("otel-v1-apm-span", no_expansion_options), span_index);
+        assert!(resolve_names("*-apm-span", no_expansion_options).is_empty());
     }
 
     #[test]

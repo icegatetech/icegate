@@ -15,7 +15,9 @@ use icegate_query::opensearch::OpenSearchConfig;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use super::data::{Cell, Row, RowWriteError, SPAN_INDEX, T0, TENANT_A, TENANT_B, build_span_row, commit_rows};
+use super::data::{
+    Cell, Row, RowWriteError, SPAN_ALIAS, SPAN_INDEX, T0, TENANT_A, TENANT_B, build_span_row, commit_rows,
+};
 use super::harness::TestServer;
 use super::requests::{send_ndjson, send_request};
 
@@ -115,7 +117,7 @@ async fn commit_trace_rows(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteErr
 /// One `_msearch` item against the span index as tenant A: the answer of that item, whatever its
 /// status, and an error when the `_msearch` itself does not answer `200`.
 async fn fetch_msearch_item(server: &TestServer, body: &Value) -> Result<Value, Box<dyn Error>> {
-    let header = json!({"index": SPAN_INDEX, "ignore_unavailable": true});
+    let header = json!({"index": SPAN_ALIAS, "ignore_unavailable": true});
     let (status, answer) = send_ndjson(
         server,
         TENANT_A,

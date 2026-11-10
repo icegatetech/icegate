@@ -101,7 +101,7 @@ async fn cat_indices_counts_only_the_requesting_tenants_rows() {
 /// Without an expression every index the tenant sees is listed, in name order, exact-name tables
 /// included: the global `prices` table counted whole (empty here) and its views
 /// `prices_effective` and `prices_effective_by_time_of_day`, whose counts are null. The span
-/// profile index `otel-v1-apm-span` is listed beside `spans`, the table it reads and counts, and
+/// profile index `otel-v1-apm-span-000001` is listed beside `spans`, the table it reads and counts, and
 /// so are the three ss4o indices beside `logs`, `metrics` and `spans`.
 #[tokio::test]
 async fn cat_indices_without_an_expression_lists_exact_name_tables_and_a_view_count_as_null() {
@@ -119,7 +119,7 @@ async fn cat_indices_without_an_expression_lists_exact_name_tables_and_a_view_co
             {"index": "logs", "docs.count": "0"},
             {"index": "metrics", "docs.count": "0"},
             {"index": "operations", "docs.count": "0"},
-            {"index": "otel-v1-apm-span", "docs.count": "0"},
+            {"index": "otel-v1-apm-span-000001", "docs.count": "0"},
             {"index": "prices", "docs.count": "0"},
             {"index": "prices_effective", "docs.count": null},
             {"index": "prices_effective_by_time_of_day", "docs.count": null},

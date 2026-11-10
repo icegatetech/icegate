@@ -9,7 +9,7 @@ use icegate_common::TenantId;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::opensearch::catalog::{IndexExpression, IndexOptions, merge_name_ordered_lists};
+use crate::opensearch::catalog::{IndexEntry, IndexExpression, IndexOptions, merge_name_ordered_lists};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::extract::{EndpointParameters, ExpandWildcards, Parameters, PathParameters};
 use crate::opensearch::state::OpenSearchState;
@@ -26,8 +26,10 @@ impl EndpointParameters for ResolveParameters {
     const IGNORED: &'static [&'static str] = &[];
 }
 
-/// `GET /_resolve/index/<expression>`: `{indices: [{name, attributes}], aliases: [{name, indices}],
-/// data_streams: []}`, each list in name order. A data index is open and has no alias. A
+/// `GET /_resolve/index/<expression>`: `{indices: [{name, aliases?, attributes}], aliases: [{name,
+/// indices}], data_streams: []}`, each list in name order. A data index is open and listed by its
+/// concrete name, whether the expression reached it by that name or by an alias; one with aliases
+/// carries them, and each is listed with the index it names whenever the index is listed. A
 /// dot-prefixed index is listed with the attributes `hidden` and `open`, and only when a part
 /// starts with `.` or `expand_wildcards` includes hidden; its aliases are listed with the index
 /// each names.
@@ -50,7 +52,7 @@ pub(crate) async fn resolve_index(
         listing
             .data_entries
             .iter()
-            .map(|entry| (entry.name(), json!({"name": entry.name(), "attributes": ["open"]}))),
+            .map(|entry| (entry.name(), render_data_index(entry))),
         listing
             .system_listing
             .indices
@@ -58,7 +60,19 @@ pub(crate) async fn resolve_index(
             .map(|name| (name.as_str(), json!({"name": name, "attributes": ["hidden", "open"]}))),
         |(name, _)| *name,
     );
-    let aliases: Vec<Value> = if listing.system_listing.aliases.is_empty() {
+    let mut data_aliases: Vec<(&str, Value)> = listing
+        .data_entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .alias_names()
+                .iter()
+                .map(|alias| (*alias, json!({"name": alias, "indices": [entry.name()]})))
+        })
+        .collect();
+    // Each entry's aliases are in name order, but not those of different entries.
+    data_aliases.sort_unstable_by_key(|(alias, _)| *alias);
+    let system_aliases: Vec<(&str, Value)> = if listing.system_listing.aliases.is_empty() {
         Vec::new()
     } else {
         let snapshot = &session.read_system_snapshot().await?.snapshot;
@@ -66,11 +80,21 @@ pub(crate) async fn resolve_index(
             .system_listing
             .aliases
             .iter()
-            .map(
-                |alias| json!({"name": alias, "indices": snapshot.resolve_name(alias).into_iter().collect::<Vec<_>>()}),
-            )
+            .map(|alias| {
+                (
+                    alias.as_str(),
+                    json!({"name": alias, "indices": snapshot.resolve_name(alias).into_iter().collect::<Vec<_>>()}),
+                )
+            })
             .collect()
     };
+    let aliases: Vec<Value> =
+        merge_name_ordered_lists(data_aliases.into_iter(), system_aliases.into_iter(), |(alias, _)| {
+            *alias
+        })
+        .into_iter()
+        .map(|(_, alias)| alias)
+        .collect();
     // The lists are moved into the body: interpolating them into `json!` would serialize copies.
     let mut body = Map::new();
     body.insert(
@@ -80,4 +104,13 @@ pub(crate) async fn resolve_index(
     body.insert("aliases".to_string(), Value::Array(aliases));
     body.insert("data_streams".to_string(), Value::Array(Vec::new()));
     Ok(Json(Value::Object(body)))
+}
+
+/// The `_resolve/index` row of a data index: open, with its aliases when it has any.
+fn render_data_index(entry: &IndexEntry) -> Value {
+    if entry.alias_names().is_empty() {
+        json!({"name": entry.name(), "attributes": ["open"]})
+    } else {
+        json!({"name": entry.name(), "aliases": entry.alias_names(), "attributes": ["open"]})
+    }
 }

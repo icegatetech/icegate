@@ -220,7 +220,7 @@ async fn a_workbench_style_index_tree_lists_the_tenants_indices() {
             "marks",
             "metrics",
             "operations",
-            "otel-v1-apm-span",
+            "otel-v1-apm-span-000001",
             "prices",
             "prices_effective",
             "prices_effective_by_time_of_day",

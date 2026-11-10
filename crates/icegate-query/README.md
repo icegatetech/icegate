@@ -179,7 +179,7 @@ successful JSON response; an error envelope is never filtered.
 | Index | Table | Fields |
 |---|---|---|
 | `logs`, `spans`, `events`, `metrics`, `operations` | the table of the same name | native: the schema's columns under their own names |
-| `otel-v1-apm-span` | `spans` | Data Prepper span documents (hex ids, nested `status`, `traceGroup*`; `src/opensearch/catalog/data_prepper.rs`) |
+| `otel-v1-apm-span-000001`, aliased `otel-v1-apm-span` | `spans` | Data Prepper span documents (hex ids, nested `status`, `traceGroup*`; `src/opensearch/catalog/data_prepper.rs`) |
 | `ss4o_logs-icegate-default`, `ss4o_traces-icegate-default`, `ss4o_metrics-icegate-default` | `logs`, `spans`, `metrics` | ss4o field names (`src/opensearch/catalog/ss4o.rs`) |
 | any other table the tenant's catalog lists | the table of the same name | native; resolved by its exact name only, never by a wildcard |
 | names starting with `.` | — | system indices, held per tenant on object storage |
@@ -188,7 +188,12 @@ Index names match case-sensitively. `_all` or an empty expression means every in
 can reach. An expression that reaches one table through the indices of several profiles is a 400
 naming the table and the profiles unless it names each of those indices explicitly, so a
 wildcard, `_all` or an empty expression never returns a row twice; listings (`_cat/indices`,
-`_resolve/index`) still list every index. Dot-prefixed names are hidden unless
+`_resolve/index`) still list every index. An alias is a second name of its index, not an index:
+it selects the index wherever the index's own name would, by name, wildcard or exclusion, the
+index is read once however many of its names an expression reaches, and every response names the
+index, never the alias. The one exception is `_mapping/field`, whose answer is keyed by the
+expression as requested. `_resolve/index` lists the index with its aliases and each alias with
+its index; `_cat/indices` and SQL `SHOW TABLES` list the index only. Dot-prefixed names are hidden unless
 `expand_wildcards` includes `hidden` or the pattern itself starts with `.`. OpenSearch
 Dashboards' index-pattern wizard therefore lists no system index until its switch for system and
 hidden indices is on, and offers `timestamp` as the time field of a pattern over `logs`
@@ -199,8 +204,8 @@ hidden indices is on, and offers `timestamp` as the time field of a pattern over
 - On a native index an attribute map is an `object` whose keys are flat `keyword` leaves named
   `<column>.<stored key>`: a stored key's dots are never split, in `_field_caps`, `_mapping`,
   `_source` or PPL values, and when `http` and `http.method` are both stored keys both are
-  `keyword` leaves. The ss4o indices keep a stored key's dots the same way; `otel-v1-apm-span`
-  writes each `.` of a stored key as `@`, so the key stays one property of its nested document.
+  `keyword` leaves. The ss4o indices keep a stored key's dots the same way; the span index
+  `otel-v1-apm-span-000001` writes each `.` of a stored key as `@`, so the key stays one property of its nested document.
   OpenSearch Dashboards lists such keys as flat fields of an index pattern
   (`an index pattern over logs lists dotted map keys as flat fields`,
   `an index pattern over a key that is both a leaf and a prefix lists both`) and filters on them
@@ -317,9 +322,10 @@ cannot see the deployed Dashboards and does not compare versions with it.
 - **Grafana**: one OpenSearch datasource per index whose `database` the panels read, each
   sending `x-scope-orgid` and stating `opensearch.version` as its `version`;
   `config/docker/grafana/provisioning/datasources/datasources.yaml` provisions the stand's three.
-  Open a trace by id on the `otel-v1-apm-span` datasource with a query of the form
+  Open a trace by id on the datasource of the span index (its `database` is the alias
+  `otel-v1-apm-span`) with a query of the form
   `traceId:<32 lowercase hex digits>` (`grafana opens a trace by id through the traceId input form`).
-  On `otel-v1-apm-span` the trace-list latency script answers 0, never null, for a trace without
+  On the span index the trace-list latency script answers 0, never null, for a trace without
   a root span, and Grafana's trace list shows no null latency or error count
   (`the grafana trace list shows no null latency or error count`). A span's `events` are its
   stored events only, none is synthesized from its status code, and Grafana shows no error flag

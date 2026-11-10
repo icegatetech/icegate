@@ -2197,7 +2197,7 @@ mod tests {
     use crate::query_dsl::date_math::{BoundSide, DateFormat, resolve_date_bound};
     use crate::test_support::{SearchFixture, TestCell, TestRow, find_index_entry};
 
-    const INDEX: &str = "otel-v1-apm-span";
+    const INDEX: &str = "otel-v1-apm-span-000001";
     /// The fixed seed of the round-trip property; a failure reproduces with it.
     const SEED: u64 = 0x7e57_0007;
     const ROW: &str = "row";

@@ -1,4 +1,6 @@
-//! The Data Prepper span profile: `otel-v1-apm-span` over the `spans` table.
+//! The Data Prepper span profile: the span index `otel-v1-apm-span-000001`, aliased
+//! `otel-v1-apm-span`, over the `spans` table, so an `otel-v1-apm-span-*` pattern and the
+//! `otel-v1-apm-span` name both reach it.
 //!
 //! Field names are camel-case (`traceId`, `spanId`, ...), ids are lowercase hex, the span kind is
 //! its `OTel` name, times are RFC 3339 text, and `_source` is a nested object. Attribute keys write
@@ -14,8 +16,11 @@ use icegate_common::schema::{
 use super::cross_row::CrossRowField;
 use super::encoding::{AttributeKeys, ProfileFieldSource, ProfileTable};
 
-/// The index name of the Data Prepper span profile.
-pub(crate) const DATA_PREPPER_SPAN_INDEX: &str = "otel-v1-apm-span";
+/// The concrete index name of the Data Prepper span profile: the name every response gives it.
+pub(crate) const DATA_PREPPER_SPAN_INDEX: &str = "otel-v1-apm-span-000001";
+
+/// The alias of [`DATA_PREPPER_SPAN_INDEX`]: a second name that selects the same index.
+pub(crate) const DATA_PREPPER_SPAN_ALIAS: &str = "otel-v1-apm-span";
 
 /// The trace id field: the key of a trace list's buckets and of a trace-by-id lookup.
 pub(crate) const TRACE_ID_FIELD: &str = "traceId";
@@ -86,7 +91,7 @@ const TRACE_GROUP_FIELDS: [(&str, ProfileFieldSource); 5] = [
     ),
 ];
 
-/// The field table of `otel-v1-apm-span`.
+/// The field table of the Data Prepper span index.
 pub(crate) static DATA_PREPPER_TABLE: ProfileTable = ProfileTable {
     table: SPANS_TABLE,
     fields: &[&SPAN_FIELDS, &TRACE_GROUP_FIELDS],

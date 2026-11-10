@@ -22,7 +22,8 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use super::data::{
-    Cell, Row, RowWriteError, SPAN_INDEX, T0, TENANT_A, TENANT_B, build_span_row, commit_rows, write_wal_segment,
+    Cell, Row, RowWriteError, SPAN_ALIAS, SPAN_INDEX, T0, TENANT_A, TENANT_B, build_span_row, commit_rows,
+    write_wal_segment,
 };
 use super::harness::TestServer;
 use super::requests::{send_ndjson, send_request};
@@ -199,6 +200,113 @@ async fn logs_and_spans_named_together_resolve() {
         both_span_indices["hits"]["total"],
         json!({"value": 6, "relation": "eq"})
     );
+    server.shutdown().await;
+}
+
+/// OSD's Trace Analytics span pattern reaches the span index by its concrete name, and every hit
+/// names that index. Tenant B's span would add one hit to the total.
+#[tokio::test]
+async fn the_osd_span_pattern_selects_the_span_index_by_its_concrete_name() {
+    let (server, catalog) = TestServer::start().await;
+    commit_three_spans(&catalog).await.expect("commit spans");
+
+    let (status, body) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/otel-v1-apm-span-*,opensearch_dashboards_sample_data_otel_spans*/_search",
+        Some(&json!({"size": 1, "track_total_hits": true})),
+    )
+    .await
+    .expect("search request");
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hits"]["total"]["value"], json!(3), "{body}");
+    assert_eq!(body["hits"]["hits"][0]["_index"], json!(SPAN_INDEX), "{body}");
+    server.shutdown().await;
+}
+
+/// An alias is a second name of the span index, not a second index: an expression reaching the
+/// index through its name and its alias reads each span once, and is no two-profiles 400.
+#[tokio::test]
+async fn span_wildcards_over_index_and_alias_read_each_span_once() {
+    let (server, catalog) = TestServer::start().await;
+    commit_three_spans(&catalog).await.expect("commit spans");
+
+    for expression in ["otel*", "otel-v1-apm-span*", "otel-v1-apm-span,otel-v1-apm-span-000001"] {
+        let (status, body) = send_request(
+            &server,
+            Method::POST,
+            TENANT_A,
+            &format!("/{expression}/_search"),
+            Some(&json!({"size": 0, "track_total_hits": true})),
+        )
+        .await
+        .expect("search request");
+
+        assert_eq!(status, StatusCode::OK, "{expression}: {body}");
+        assert_eq!(body["hits"]["total"]["value"], json!(3), "{expression}");
+    }
+    server.shutdown().await;
+}
+
+/// A request naming the alias answers under the concrete index wherever a response names an
+/// index. `_mapping/field` is the exception: it stays keyed by the expression as requested, the
+/// key a datasource health check reads back.
+#[tokio::test]
+async fn a_request_to_the_alias_answers_under_the_concrete_index() {
+    let (server, catalog) = TestServer::start().await;
+    commit_three_spans(&catalog).await.expect("commit spans");
+
+    let (caps_status, capabilities) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        "/otel-v1-apm-span/_field_caps?fields=traceId",
+        None,
+    )
+    .await
+    .expect("field caps");
+    let (mapping_status, mapping) = send_request(&server, Method::GET, TENANT_A, "/otel-v1-apm-span/_mapping", None)
+        .await
+        .expect("mapping");
+    let (field_status, field_mapping) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        "/otel-v1-apm-span/_mapping/field/traceId",
+        None,
+    )
+    .await
+    .expect("field mapping");
+    let (search_status, refusal) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/otel-v1-apm-span/_search",
+        Some(&json!({"query": {"term": {"status.code": "x"}}})),
+    )
+    .await
+    .expect("search request");
+
+    assert_eq!(caps_status, StatusCode::OK, "{capabilities}");
+    assert_eq!(capabilities["indices"], json!([SPAN_INDEX]));
+    assert_eq!(mapping_status, StatusCode::OK, "{mapping}");
+    assert_eq!(
+        mapping.as_object().map(|indices| indices.keys().cloned().collect::<Vec<_>>()),
+        Some(vec![SPAN_INDEX.to_string()])
+    );
+    assert_eq!(field_status, StatusCode::OK, "{field_mapping}");
+    assert_eq!(
+        field_mapping
+            .as_object()
+            .map(|indices| indices.keys().cloned().collect::<Vec<_>>()),
+        Some(vec![SPAN_ALIAS.to_string()])
+    );
+    assert_eq!(search_status, StatusCode::BAD_REQUEST, "{refusal}");
+    assert_eq!(refusal["error"]["root_cause"][0]["type"], "query_shard_exception");
+    assert_eq!(refusal["error"]["root_cause"][0]["field"], "status.code");
+    assert_eq!(refusal["error"]["root_cause"][0]["index"], SPAN_INDEX);
     server.shutdown().await;
 }
 
@@ -404,7 +512,7 @@ async fn the_profile_reports_date_for_every_time_field_and_object_for_events_and
     assert_eq!(field_status, StatusCode::OK, "{field_mapping}");
     assert_eq!(
         field_mapping,
-        json!({SPAN_INDEX: {"mappings": {"startTime": {"full_name": "startTime", "mapping": {"startTime": {"type": "date"}}}}}})
+        json!({SPAN_ALIAS: {"mappings": {"startTime": {"full_name": "startTime", "mapping": {"startTime": {"type": "date"}}}}}})
     );
     assert_eq!(mapping_status, StatusCode::OK, "{mapping}");
     let properties = &mapping[SPAN_INDEX]["mappings"]["properties"];
@@ -563,7 +671,7 @@ async fn a_ppl_source_on_a_profile_index_is_a_semantic_400() {
         .post_ppl(
             TENANT_A,
             "/_plugins/_ppl",
-            &json!({"query": format!("source={SPAN_INDEX} | head 1")}),
+            &json!({"query": format!("source={SPAN_ALIAS} | head 1")}),
         )
         .await;
     let native_reply = server

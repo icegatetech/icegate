@@ -711,14 +711,17 @@ async fn resolve_and_cat_indices_list_a_system_index_only_when_hidden_indices_ar
             "logs",
             "metrics",
             "operations",
-            "otel-v1-apm-span",
+            "otel-v1-apm-span-000001",
             "spans",
             "ss4o_logs-icegate-default",
             "ss4o_metrics-icegate-default",
             "ss4o_traces-icegate-default"
         ]
     );
-    assert_eq!(open_resolution["aliases"], json!([]));
+    assert_eq!(
+        open_resolution["aliases"],
+        json!([{"name": "otel-v1-apm-span", "indices": ["otel-v1-apm-span-000001"]}])
+    );
     assert_eq!(
         list_index_names(&hidden_resolution),
         [
@@ -727,7 +730,7 @@ async fn resolve_and_cat_indices_list_a_system_index_only_when_hidden_indices_ar
             "logs",
             "metrics",
             "operations",
-            "otel-v1-apm-span",
+            "otel-v1-apm-span-000001",
             "spans",
             "ss4o_logs-icegate-default",
             "ss4o_metrics-icegate-default",
@@ -740,7 +743,10 @@ async fn resolve_and_cat_indices_list_a_system_index_only_when_hidden_indices_ar
     );
     assert_eq!(
         hidden_resolution["aliases"],
-        json!([{"name": ".kibana", "indices": [".kibana_1"]}])
+        json!([
+            {"name": ".kibana", "indices": [".kibana_1"]},
+            {"name": "otel-v1-apm-span", "indices": ["otel-v1-apm-span-000001"]}
+        ])
     );
     assert_eq!(
         dot_pattern_resolution,
@@ -993,7 +999,11 @@ async fn every_index_endpoint_under_tenant_b_sees_none_of_tenant_a_indices_or_al
             .all(|index| index["name"].as_str().is_some_and(|name| !name.starts_with('.'))),
         "{resolution}"
     );
-    assert_eq!(resolution["aliases"], json!([]));
+    // Tenant B's own span alias only: none of tenant A's system aliases.
+    assert_eq!(
+        resolution["aliases"],
+        json!([{"name": "otel-v1-apm-span", "indices": ["otel-v1-apm-span-000001"]}])
+    );
     let cat_rows = read_json(
         send_bodiless_request(
             &server,

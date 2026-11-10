@@ -33,13 +33,13 @@ async fn resolve_index_lists_the_telemetry_indices_sorted_and_open() {
                 build_open_index("logs"),
                 build_open_index("metrics"),
                 build_open_index("operations"),
-                build_open_index("otel-v1-apm-span"),
+                {"name": "otel-v1-apm-span-000001", "aliases": ["otel-v1-apm-span"], "attributes": ["open"]},
                 build_open_index("spans"),
                 build_open_index("ss4o_logs-icegate-default"),
                 build_open_index("ss4o_metrics-icegate-default"),
                 build_open_index("ss4o_traces-icegate-default")
             ],
-            "aliases": [],
+            "aliases": [{"name": "otel-v1-apm-span", "indices": ["otel-v1-apm-span-000001"]}],
             "data_streams": []
         })
     );
@@ -54,6 +54,26 @@ async fn resolve_index_answers_200_with_empty_lists_for_a_missing_name() {
 
     assert_eq!(status, 200);
     assert_eq!(body, json!({"indices": [], "aliases": [], "data_streams": []}));
+    server.shutdown().await;
+}
+
+/// The span index is listed under its concrete name with its alias, and the alias is listed with
+/// the index it names.
+#[tokio::test]
+async fn resolve_index_lists_the_span_alias_with_its_index() {
+    let (server, _catalog) = TestServer::start().await;
+
+    let (status, body) = get_json(&server, "/_resolve/index/otel*").await.expect("a JSON answer");
+
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["indices"],
+        json!([{"name": "otel-v1-apm-span-000001", "aliases": ["otel-v1-apm-span"], "attributes": ["open"]}])
+    );
+    assert_eq!(
+        body["aliases"],
+        json!([{"name": "otel-v1-apm-span", "indices": ["otel-v1-apm-span-000001"]}])
+    );
     server.shutdown().await;
 }
 

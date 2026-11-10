@@ -107,8 +107,10 @@ pub const TENANT_A: &str = "tenant-a";
 pub const TENANT_B: &str = "tenant-b";
 /// 2025-10-09T08:53:20Z in microseconds, the instant the span fixtures start from.
 pub const T0: i64 = 1_760_000_000_000_000;
-/// The Data Prepper span index the span fixtures are searched through.
-pub const SPAN_INDEX: &str = "otel-v1-apm-span";
+/// The concrete Data Prepper span index: the name every response gives the span profile.
+pub const SPAN_INDEX: &str = "otel-v1-apm-span-000001";
+/// The alias of [`SPAN_INDEX`], the name the span fixtures are searched through.
+pub const SPAN_ALIAS: &str = "otel-v1-apm-span";
 
 /// A span row of `tenant`: trace `trace_id`, span `span_id`, `start` and its end `duration` later
 /// (both in microseconds, the end also the ingestion time), plus `cells`.

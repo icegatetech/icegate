@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn a_too_many_cross_row_traces_error_becomes_a_ppl_internal_error() {
-        let error = PplError::from(OpenSearchError::too_many_cross_row_traces("otel-v1-apm-span", 2));
+        let error = PplError::from(OpenSearchError::too_many_cross_row_traces("otel-v1-apm-span-000001", 2));
         assert!(matches!(error, PplError::Internal { .. }), "{error:?}");
     }
 }

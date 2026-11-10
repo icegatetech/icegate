@@ -1259,8 +1259,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_field_literal_carries_the_requested_field_on_its_query_shard_cause() {
-        let error =
-            OpenSearchError::malformed_field_literal("status.code", "otel-v1-apm-span", "cannot hold the value [x]");
+        let error = OpenSearchError::malformed_field_literal(
+            "status.code",
+            "otel-v1-apm-span-000001",
+            "cannot hold the value [x]",
+        );
         assert_eq!(error.kind(), &OpenSearchErrorKind::QueryShard);
 
         let (status, body) = render_envelope(error).await;
@@ -1270,10 +1273,10 @@ mod tests {
         let cause = &body["error"]["root_cause"][0];
         assert_eq!(cause["type"], "query_shard_exception");
         assert_eq!(cause["field"], "status.code");
-        assert_eq!(cause["index"], "otel-v1-apm-span");
+        assert_eq!(cause["index"], "otel-v1-apm-span-000001");
         assert_eq!(
             body["error"]["failed_shards"],
-            json!([{"shard": 0, "index": "otel-v1-apm-span", "reason": cause.clone()}])
+            json!([{"shard": 0, "index": "otel-v1-apm-span-000001", "reason": cause.clone()}])
         );
     }
 
@@ -1366,16 +1369,16 @@ mod tests {
                 json!({"key": "user@domain"}),
             ),
             (
-                OpenSearchError::field_pattern_on_profile_index("status.*", "otel-v1-apm-span"),
-                json!({"field": "status.*", "index": "otel-v1-apm-span"}),
+                OpenSearchError::field_pattern_on_profile_index("status.*", "otel-v1-apm-span-000001"),
+                json!({"field": "status.*", "index": "otel-v1-apm-span-000001"}),
             ),
             (
-                OpenSearchError::cross_row_field_in_field_request("traceGroup", "otel-v1-apm-span"),
-                json!({"field": "traceGroup", "index": "otel-v1-apm-span"}),
+                OpenSearchError::cross_row_field_in_field_request("traceGroup", "otel-v1-apm-span-000001"),
+                json!({"field": "traceGroup", "index": "otel-v1-apm-span-000001"}),
             ),
             (
-                OpenSearchError::unordered_missing_id("parentSpanId", "otel-v1-apm-span", "sort"),
-                json!({"field": "parentSpanId", "index": "otel-v1-apm-span", "operation": "sort"}),
+                OpenSearchError::unordered_missing_id("parentSpanId", "otel-v1-apm-span-000001", "sort"),
+                json!({"field": "parentSpanId", "index": "otel-v1-apm-span-000001", "operation": "sort"}),
             ),
         ];
         for (error, expected_metadata) in cases {
@@ -1502,7 +1505,7 @@ mod tests {
                 OpenSearchErrorKind::StatusNotFound,
             ),
             (
-                OpenSearchError::too_many_cross_row_traces("otel-v1-apm-span", 2),
+                OpenSearchError::too_many_cross_row_traces("otel-v1-apm-span-000001", 2),
                 OpenSearchErrorKind::TooManyCrossRowTraces,
             ),
         ];
@@ -1544,14 +1547,15 @@ mod tests {
 
     #[tokio::test]
     async fn too_many_cross_row_traces_names_the_index_and_the_limit() {
-        let (status, body) = render_envelope(OpenSearchError::too_many_cross_row_traces("otel-v1-apm-span", 2)).await;
+        let (status, body) =
+            render_envelope(OpenSearchError::too_many_cross_row_traces("otel-v1-apm-span-000001", 2)).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "illegal_argument_exception");
         assert_eq!(body["error"]["root_cause"][0]["type"], "illegal_argument_exception");
-        assert_eq!(body["error"]["index"], "otel-v1-apm-span");
+        assert_eq!(body["error"]["index"], "otel-v1-apm-span-000001");
         assert_eq!(body["error"]["limit"], 2);
-        assert_eq!(body["error"]["root_cause"][0]["index"], "otel-v1-apm-span");
+        assert_eq!(body["error"]["root_cause"][0]["index"], "otel-v1-apm-span-000001");
         assert_eq!(body["error"]["root_cause"][0]["limit"], 2);
     }
 }
