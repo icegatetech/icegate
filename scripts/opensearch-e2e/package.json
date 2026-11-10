@@ -1,0 +1,15 @@
+{
+  "name": "icegate-opensearch-e2e",
+  "private": true,
+  "description": "End-to-end cases that run OpenSearch Dashboards and Grafana against the OpenSearch listener of the Compose stand.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1"
+  }
+}

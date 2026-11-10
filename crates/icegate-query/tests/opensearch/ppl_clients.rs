@@ -27,7 +27,7 @@ use super::requests::send_request;
 const TENANT_A: &str = "tenant-a";
 const TENANT_B: &str = "tenant-b";
 const PPL_PATH: &str = "/_plugins/_ppl";
-const PPL_ERROR_CONTENT_TYPE: &str = "text/plain; charset=UTF-8";
+const PPL_ERROR_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 
 /// 2026-10-08T12:00:00Z in microseconds, computed outside the code.
 const NOON_MICROS: i64 = 1_791_460_800_000_000;

@@ -1,0 +1,25 @@
+# Overrides of the end-to-end suite (scripts/opensearch-e2e; its README explains each one).
+#
+#   docker compose -f config/docker/docker-compose.yml -f config/docker/docker-compose.e2e.yml up -d
+#
+# Container logs go to the default json-file driver instead of the bundled collector: the
+# collector writes every service's logs into `demo`, the tenant seed.sh writes and the cases
+# count exactly, and `docker compose logs` must work when a CI run fails. Services gated behind
+# a profile keep the base file's logging; the suite starts none of them.
+services:
+  rustfs:
+    logging: !reset null
+  rustfs-init:
+    logging: !reset null
+  migrate:
+    logging: !reset null
+  maintain:
+    logging: !reset null
+  query:
+    logging: !reset null
+  ingest:
+    logging: !reset null
+  grafana:
+    logging: !reset null
+  opensearch-dashboards:
+    logging: !reset null

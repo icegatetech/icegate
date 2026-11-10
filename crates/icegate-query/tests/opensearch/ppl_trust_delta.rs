@@ -17,7 +17,7 @@ use super::harness::{PplReply, TestServer};
 
 const TENANT_A: &str = "tenant-a";
 const TENANT_B: &str = "tenant-b";
-const PPL_ERROR_CONTENT_TYPE: &str = "text/plain; charset=UTF-8";
+const PPL_ERROR_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 /// A system index a test creates; no join side may read it.
 const SYSTEM_INDEX: &str = ".kibana_1";
 /// 2026-10-08T12:00:00Z in microseconds, computed outside the code.

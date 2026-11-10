@@ -97,8 +97,8 @@ impl PplFormat {
 /// Answer `POST /_plugins/_ppl` in the requested format, or an error in its envelope.
 ///
 /// `csv` and `raw` with a `filter_path` parameter are a 400 before the query runs: their body is
-/// text labelled `application/json`, which the listener's `filter_path` layer would fail to parse
-/// and answer as an internal error. `jdbc` and `viz` keep `filter_path`.
+/// text, which the listener's `filter_path` layer passes through unfiltered, so the parameter
+/// would be ignored without a word. `jdbc` and `viz` keep `filter_path`.
 pub(crate) async fn execute_ppl_query(
     State(state): State<OpenSearchState>,
     Extension(limits): Extension<PplLimitsConfig>,
@@ -125,7 +125,7 @@ pub(crate) async fn execute_ppl_query(
 }
 
 /// Refuse a `filter_path` parameter on a text format, whose body the `filter_path` layer cannot
-/// read as JSON.
+/// filter.
 fn refuse_filter_path_on_flat_text(format: PplFormat, uri: &Uri) -> Result<(), OpenSearchError> {
     if format.is_flat_text() && read_filter_path(uri).is_some() {
         return Err(OpenSearchError::unsupported_parameter_with_format(

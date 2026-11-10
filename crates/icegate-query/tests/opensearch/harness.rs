@@ -480,8 +480,8 @@ pub async fn is_serving(client: &reqwest::Client, base_url: &str) -> bool {
     false
 }
 
-/// One answer of a PPL-family endpoint. The body stays text: PPL execution errors are `text/plain`,
-/// every other answer is JSON.
+/// One answer of a PPL-family endpoint. The body stays text: the `csv` and `raw` formats answer
+/// text, every other answer is JSON.
 pub struct PplReply {
     /// HTTP status.
     pub status: u16,

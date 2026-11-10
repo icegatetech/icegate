@@ -32,7 +32,7 @@ const OTHER_TENANT: &str = "globex";
 
 const PPL_PATH: &str = "/_plugins/_ppl";
 
-const TEXT_PLAIN: &str = "text/plain; charset=UTF-8";
+const PPL_ERROR_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 
 /// 2026-10-08T12:00:00Z in microseconds since the epoch.
 const NOON_MICROS: i64 = 1_791_460_800_000_000;
@@ -151,11 +151,11 @@ fn read_column_names(answer: &PplAnswer) -> Vec<String> {
         .collect()
 }
 
-/// A PPL error envelope with `status`, `type` and `code`, as `text/plain`, with a non-empty
+/// A PPL error envelope with `status`, `type` and `code`, labelled as JSON, with a non-empty
 /// `reason` and `details`.
 fn assert_ppl_error(answer: &PplAnswer, status: StatusCode, error_type: &str, code: &str) {
     assert_eq!(answer.status, status, "answer {}", answer.body);
-    assert_eq!(answer.content_type, TEXT_PLAIN);
+    assert_eq!(answer.content_type, PPL_ERROR_CONTENT_TYPE);
     assert_eq!(answer.body["status"], json!(status.as_u16()));
     assert_eq!(answer.body["error"]["type"], json!(error_type));
     assert_eq!(answer.body["error"]["code"], json!(code));
@@ -379,7 +379,7 @@ async fn a_field_reference_in_another_case_is_field_not_found() {
 }
 
 #[tokio::test]
-async fn a_syntax_error_answers_invalid_query_with_details_naming_the_token_as_text_plain() {
+async fn a_syntax_error_answers_invalid_query_with_details_naming_the_token_as_json() {
     let (server, _catalog) = TestServer::start().await;
     let answer = run_query(&server, "source=logs | where = 1").await;
     assert_ppl_error(&answer, StatusCode::BAD_REQUEST, "SyntaxCheckException", "SYNTAX_ERROR");

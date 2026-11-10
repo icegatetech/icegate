@@ -23,7 +23,8 @@ use super::test_rows::{COMMITTED_WAL_OFFSET, FINISH_REASONS, OPERATION_NAME};
 const TENANT_A: &str = "tenant-a";
 const TENANT_B: &str = "tenant-b";
 const PPL_JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
-const PPL_ERROR_CONTENT_TYPE: &str = "text/plain; charset=UTF-8";
+const PPL_FLAT_TEXT_CONTENT_TYPE: &str = "text/plain; charset=UTF-8";
+const PPL_ERROR_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 
 /// 2026-10-08T12:00:00Z in microseconds, computed outside the code.
 const NOON_MICROS: i64 = 1_791_460_800_000_000;
@@ -330,17 +331,20 @@ async fn csv_and_raw_render_lists_and_large_numbers_in_plain_form() {
     server.shutdown().await;
 }
 
+/// A client that parses every body labelled JSON must take the flat formats as text: the E2E case
+/// `workbench runs a ppl query, explains it and downloads csv` downloads through one.
 #[tokio::test]
-async fn csv_and_raw_answer_with_the_json_content_type() {
+async fn csv_and_raw_answer_as_text_and_jdbc_and_viz_as_json() {
     let (server, _catalog) = TestServer::start().await;
-    for path in [
-        "/_plugins/_ppl?format=csv",
-        "/_plugins/_ppl?format=raw",
-        "/_plugins/_ppl?format=jdbc",
+    for (path, content_type) in [
+        ("/_plugins/_ppl?format=csv", PPL_FLAT_TEXT_CONTENT_TYPE),
+        ("/_plugins/_ppl?format=raw", PPL_FLAT_TEXT_CONTENT_TYPE),
+        ("/_plugins/_ppl?format=jdbc", PPL_JSON_CONTENT_TYPE),
+        ("/_plugins/_ppl?format=viz", PPL_JSON_CONTENT_TYPE),
     ] {
         let reply = post_ppl_query(&server, path, "source=logs | fields body").await;
         assert_eq!(reply.status, 200, "{path}: {}", reply.text);
-        assert_eq!(reply.content_type, PPL_JSON_CONTENT_TYPE, "{path}");
+        assert_eq!(reply.content_type, content_type, "{path}");
     }
     server.shutdown().await;
 }

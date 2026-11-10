@@ -1,9 +1,9 @@
 //! The PPL error envelope.
 //!
 //! A PPL execution error is answered as `{status, error: {type, reason, details, code,
-//! context?}}` with content type `text/plain; charset=UTF-8`; `reason` and `details` are always
-//! present. A shed, a passed deadline or write contention keeps the `OpenSearch` 503 envelope, and
-//! a request-parsing error the `OpenSearch` 400 envelope, so the listener has one retry contract.
+//! context?}}`, labelled as JSON; `reason` and `details` are always present. A shed, a passed
+//! deadline or write contention keeps the `OpenSearch` 503 envelope, and a request-parsing error
+//! the `OpenSearch` 400 envelope, so the listener has one retry contract.
 
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -11,8 +11,10 @@ use serde_json::{Map, Value, json};
 
 use crate::ppl::PplError;
 
-/// The content type of the PPL error envelope.
-const CONTENT_TYPE_TEXT: &str = "text/plain; charset=UTF-8";
+/// The content type of the PPL error envelope. It is JSON on purpose: a client that reads an
+/// error's reason only from a body labelled JSON shows it then, which the E2E case `a ppl error
+/// shows its reason in the workbench` pins.
+const PPL_ERROR_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 
 /// The reason a 500 PPL error reports; the cause goes into `details` and the log.
 const INTERNAL_REASON: &str = "There was internal problem at backend";
@@ -106,7 +108,7 @@ pub(crate) fn render_ppl_error(error: &PplError) -> Response {
     let mut response = (status, text).into_response();
     response
         .headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE_TEXT));
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(PPL_ERROR_CONTENT_TYPE));
     response
 }
 
@@ -132,7 +134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_syntax_error_is_invalid_query_with_the_token_in_details_as_text_plain() {
+    async fn a_syntax_error_is_invalid_query_with_the_token_in_details_as_json() {
         let error = PplError::Syntax {
             offending_text: "=".to_string(),
             line: 1,
@@ -140,7 +142,7 @@ mod tests {
         };
         let (status, content_type, mut body) = render_ppl_answer(&error).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(content_type, "text/plain; charset=UTF-8");
+        assert_eq!(content_type, "application/json; charset=UTF-8");
         // `details` is IceGate's own wording: only that it names the offending token is a contract.
         let details_value = body["error"]
             .as_object_mut()

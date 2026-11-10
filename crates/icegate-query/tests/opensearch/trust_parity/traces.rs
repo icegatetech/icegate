@@ -562,7 +562,7 @@ async fn trace_facets_values_of_case_without_else_match_the_sql_form() {
     );
     let reply = servers.post_ppl(TENANT_A, BARE_NULL_PPL).await;
     assert_eq!(reply.status, 400, "{}", reply.text);
-    assert_eq!(reply.content_type, "text/plain; charset=UTF-8", "{}", reply.text);
+    assert_eq!(reply.content_type, "application/json; charset=UTF-8", "{}", reply.text);
     let error = reply.parse_json_body();
     assert_eq!(error["error"]["type"], "SemanticCheckException", "{error}");
     assert_eq!(error["error"]["code"], "FIELD_NOT_FOUND", "{error}");

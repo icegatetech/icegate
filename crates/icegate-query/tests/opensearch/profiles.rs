@@ -575,7 +575,7 @@ async fn a_ppl_source_on_a_profile_index_is_a_semantic_400() {
         .await;
 
     assert_eq!(refused_reply.status, 400, "{}", refused_reply.text);
-    assert_eq!(refused_reply.content_type, "text/plain; charset=UTF-8");
+    assert_eq!(refused_reply.content_type, "application/json; charset=UTF-8");
     let body = refused_reply.parse_json_body();
     assert_eq!(body["error"]["type"], "SemanticCheckException", "{body}");
     assert_eq!(body["error"]["code"], "SEMANTIC_ERROR", "{body}");

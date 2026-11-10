@@ -42,7 +42,10 @@ in the PPL error envelope, as on `/_plugins/_ppl`.
 
 ## Response
 
-Every format answers `application/json; charset=UTF-8`, the `csv` and `raw` text included.
+`jdbc` and `viz` answer `application/json; charset=UTF-8`; `csv` and `raw` answer
+`text/plain; charset=UTF-8`, so that a client that parses every body labelled JSON takes their
+text as it is. The case `workbench runs a ppl query, explains it and downloads csv` in
+`scripts/opensearch-e2e/osd.spec.ts` pins the Workbench's csv download over this answer.
 
 `jdbc` is `{schema: [{name, type}], datarows, total, size}`, where `total` and `size` both count
 the rows returned. `schema` lists the output columns in order with their PPL types (`string`, `int`,
@@ -429,8 +432,10 @@ shedding of the listener bound every PPL query as they bound every other request
 
 ## Errors
 
-A PPL error is answered with content type `text/plain; charset=UTF-8` and the JSON body
-`{status, error: {type, reason, details, code, context?}}`:
+A PPL error is answered with content type `application/json; charset=UTF-8` and the JSON body
+`{status, error: {type, reason, details, code, context?}}`. The JSON label is deliberate, so
+that the Workbench of OpenSearch Dashboards shows the error's reason; the case `a ppl error shows
+its reason in the workbench` in `scripts/opensearch-e2e/osd.spec.ts` pins that.
 
 | Cause | Status | `type` | `code` | `context` |
 |---|---|---|---|---|

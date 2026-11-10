@@ -198,11 +198,16 @@ fn render_list(values: &dyn Array) -> Result<Value, PplError> {
         .map(Value::Array)
 }
 
-/// The content type of every successful PPL answer, the text formats included.
-const PPL_JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
+/// The content type of a successful `jdbc` or `viz` answer, a JSON document.
+const PPL_DOCUMENT_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 
-/// Renders a planned query's batches in the requested format, answered with
-/// [`PPL_JSON_CONTENT_TYPE`] whatever the format, the `csv` and `raw` text included.
+/// The content type of a successful `csv` or `raw` answer, flat text. A client that parses every
+/// body labelled JSON would fail on it; the E2E case `workbench runs a ppl query, explains it and
+/// downloads csv` pins the download through such a client.
+const PPL_FLAT_TEXT_CONTENT_TYPE: &str = "text/plain; charset=UTF-8";
+
+/// Renders a planned query's batches in the requested format: `jdbc` and `viz` as
+/// [`PPL_DOCUMENT_CONTENT_TYPE`], `csv` and `raw` as [`PPL_FLAT_TEXT_CONTENT_TYPE`].
 ///
 /// # Errors
 ///
@@ -212,13 +217,13 @@ pub(crate) fn render_ppl_response(
     columns: &[PplColumn],
     batches: &[RecordBatch],
 ) -> Result<Response, PplError> {
-    let body = match format {
-        PplFormat::Jdbc => render_jdbc(columns, batches)?.to_string(),
-        PplFormat::Viz => render_viz(columns, batches)?.to_string(),
-        PplFormat::Csv => render_csv(columns, batches)?,
-        PplFormat::Raw => render_raw(columns, batches)?,
+    let (body, content_type) = match format {
+        PplFormat::Jdbc => (render_jdbc(columns, batches)?.to_string(), PPL_DOCUMENT_CONTENT_TYPE),
+        PplFormat::Viz => (render_viz(columns, batches)?.to_string(), PPL_DOCUMENT_CONTENT_TYPE),
+        PplFormat::Csv => (render_csv(columns, batches)?, PPL_FLAT_TEXT_CONTENT_TYPE),
+        PplFormat::Raw => (render_raw(columns, batches)?, PPL_FLAT_TEXT_CONTENT_TYPE),
     };
-    Ok(([(header::CONTENT_TYPE, PPL_JSON_CONTENT_TYPE)], body).into_response())
+    Ok(([(header::CONTENT_TYPE, content_type)], body).into_response())
 }
 
 /// Renders the `viz` format: `{data: {<col>: [...]}, metadata: {fields: [{name, type}]}, size,
