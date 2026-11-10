@@ -140,3 +140,12 @@ image or mode of a deployment requires running both against it first:
 ```bash
 cargo test -p icegate-query --test opensearch_tests -- rustfs_conditional system_store_rustfs
 ```
+
+## Clients, end to end
+
+The end-to-end cases that pin how OpenSearch Dashboards uses these indices
+(`scripts/opensearch-e2e/osd.spec.ts` and `versions.spec.ts`):
+`osd boots and migrates against the default version`,
+`advanced settings persist across a reload`, `saved objects export and import round-trip`,
+`an osd upgrade from 3.8.0 to 3.9.0 migrates the saved objects` and
+`a strict osd rejects icegate at 3.8.0 and migrates after icegate restarts at 3.9.0`.

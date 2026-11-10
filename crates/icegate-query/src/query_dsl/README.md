@@ -111,3 +111,15 @@ When the pins change: update `SOURCES` in the generator, regenerate, compare the
 `StandardTokenizerImpl.jflex` with the rules `tokenizer.rs` transcribes, and re-derive every row
 of the curated table by hand from the token rules and the new property values (the generator's
 input files state them). Expected tokens are never taken from the output of the new code.
+
+## Clients, end to end
+
+The parser and the lowering in this module serve what OpenSearch Dashboards and Grafana send.
+The end-to-end cases that pin it (`scripts/opensearch-e2e/osd.spec.ts` and `grafana.spec.ts`):
+`discover shows rows and a histogram for a lucene query`, `discover shows rows for a dql query`,
+`discover filters on a dotted map key through a filter pill`,
+`discover filters on a key that is both a leaf and a prefix`,
+`a vertical bar visualization renders its buckets on a dashboard`,
+`grafana renders a lucene logs query with its logs volume`,
+`template variables from a lucene find query feed lucene and ppl panels` and
+`ad-hoc filters apply to lucene and ppl panels`.

@@ -11,7 +11,8 @@ source=logs-* | where severity_text = 'ERROR' | fields timestamp, service_name, 
 ## How a query runs
 
 1. The vendored grammar of the `icegate-query-grammar` crate (`src/ppl/`; the `PPL` section of
-   that crate's README states the pinned version and how to regenerate it) parses the text. Keywords match in any case; names keep their case.
+   [that crate's README](../../../icegate-query-grammar/README.md) states the pinned version and
+   how to regenerate it) parses the text. Keywords match in any case; names keep their case.
 2. `build.rs` walks the parse tree into the AST of `ast.rs`. Every command, function and
    argument IceGate does not plan is refused there by name, so an unplanned construct is a 400
    that names it, never a different query.
@@ -474,3 +475,16 @@ string column) is a 400 naming the id field and both PPL types. The folded value
 both the WAL scan and the Iceberg scan, so row groups are pruned by statistics and bloom filters. Ids render as
 lowercase hex, and lowercase hex order is byte order: `<` / `>` on an id agree with `sort` on it, which keyset
 paging relies on.
+
+## Clients, end to end
+
+The end-to-end cases that pin how the PPL clients use this endpoint
+(`scripts/opensearch-e2e/osd.spec.ts` and `grafana.spec.ts`):
+`workbench runs a ppl query, explains it and downloads csv`, `workbench lists the index tree`,
+`discover ppl renders documents and a histogram without highlight`,
+`observability logs renders events and the count chart`,
+`a ppl error shows its reason in the workbench`,
+`grafana renders a ppl logs query and a ppl time series`,
+`template variables from a lucene find query feed lucene and ppl panels`,
+`ad-hoc filters apply to lucene and ppl panels` and
+`a multi-value variable interpolates into a ppl panel`.
