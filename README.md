@@ -128,8 +128,9 @@ The tenant an OTLP request writes to is decided by the ingest `tenant` policy: a
 - **Tempo API**: `http://localhost:3200` - Query traces using Tempo-compatible API ✅ **Currently Supported** (`traces/{id}`, `search` with TraceQL, `search/tags`, `search/tag/{name}/values`, plus the `v2` variants). Unsupported TraceQL features return `501`
 - **Prometheus API**: `http://localhost:9090` - Query metrics ⚠️ **Planned** — the routes are mounted but every handler returns `501 Not Implemented`; only `/-/ready` responds
 - **Arrow Flight SQL**: `grpc://localhost:8815` - General-purpose SQL over the merged WAL + Iceberg view; read-only, tenant taken from the `x-scope-orgid` gRPC metadata header. See [Querying via Flight SQL](#querying-via-flight-sql) below for supported clients.
+- **OpenSearch API**: the `query` service's `opensearch` listener (its port is published in `config/docker/docker-compose.yml`) - the Query DSL, Lucene `query_string` and PPL over the merged WAL + Iceberg view, plus the saved objects of OpenSearch Dashboards; **Beta**. The stand runs OpenSearch Dashboards as the `opensearch-dashboards` service and provisions Grafana's OpenSearch datasources. See [crates/icegate-query/README.md](crates/icegate-query/README.md#opensearch) for the endpoints, the index profiles and the contract.
 
-Whose tenant a read serves is decided by the query `tenant` policy, the same shape ingest carries: under `single` the deployment serves one tenant and a request naming another is refused; under `multi` the tenant comes from `x-scope-orgid` and a request without a valid one is refused rather than served a default. The stand's query runs `multi` and reads the tenant `x-scope-orgid` names: the bundled Grafana datasources send `demo`, and a request without the header is refused. See [crates/icegate-query/README.md](crates/icegate-query/README.md).
+Whose tenant a read serves is decided by the query `tenant` policy, the same shape ingest carries: under `single` the deployment serves one tenant and a request naming another is refused; under `multi` the tenant comes from `x-scope-orgid` and a request without a valid one is refused rather than served a default. The stand's query runs `multi` and reads the tenant `x-scope-orgid` names: the bundled Grafana datasources and OpenSearch Dashboards (its `opensearch.customHeaders` in [config/docker/opensearch-dashboards/opensearch_dashboards.yml](config/docker/opensearch-dashboards/opensearch_dashboards.yml)) send `demo`, and a request without the header is refused. See [crates/icegate-query/README.md](crates/icegate-query/README.md).
 
 #### Visualization
 - **Grafana**: `http://localhost:3000` - Dashboard and visualization (no login required)
@@ -249,17 +250,18 @@ IceGate names third-party projects to describe, factually, which formats it writ
 protocols its APIs implement. Such nominative use implies no affiliation with, endorsement by, or
 sponsorship from the owners of those marks.
 
-Apache®, Apache Iceberg, Apache Arrow, Apache Parquet, Apache DataFusion, Apache Arrow Flight SQL
-and associated project logos are either registered trademarks or trademarks of The Apache Software
-Foundation in the United States and/or other countries. OpenTelemetry® and Prometheus® are
-registered trademarks of The Linux Foundation. Grafana®, Loki® and Tempo® are registered
-trademarks of Raintank, Inc. dba Grafana Labs. IceGate is not affiliated with, endorsed by, or
-sponsored by any of these organizations. All other trademarks are the property of their respective
-owners.
+Apache®, Apache Iceberg, Apache Arrow, Apache Parquet, Apache DataFusion, Apache Lucene, Apache
+Arrow Flight SQL and associated project logos are either registered trademarks or trademarks of
+The Apache Software Foundation in the United States and/or other countries. OpenTelemetry® and
+Prometheus® are registered trademarks of The Linux Foundation. Grafana®, Loki® and Tempo® are
+registered trademarks of Raintank, Inc. dba Grafana Labs. OpenSearch® is a registered trademark of
+LF Projects, LLC, and OpenSearch Dashboards is a product of the OpenSearch Project, a Series of LF
+Projects, LLC. IceGate is not affiliated with, endorsed by, or sponsored by any of these
+organizations. All other trademarks are the property of their respective owners.
 
-Where an API is described as Loki- or Tempo-compatible, IceGate implements a subset of that
-project's HTTP read API — not a complete reimplementation. See [Query APIs](#query-apis) for the
-endpoints served today and the current status of each.
+Where an API is described as Loki-, Tempo- or OpenSearch-compatible, IceGate implements a subset
+of that project's HTTP API — not a complete reimplementation. See [Query APIs](#query-apis) for
+the endpoints served today and the current status of each.
 
 ## Status
 
