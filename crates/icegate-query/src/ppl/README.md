@@ -138,9 +138,9 @@ types when the two share one PPL name).
 |---|---|
 | `=`, `!=`, `<`, `<=`, `>`, `>=` | NULL on either side is unknown. |
 | `<value> like <pattern>` | The same as `like(value, pattern)`. |
-| `and`, `or`, `xor`, `not` | Three-valued; `xor` is true when exactly one side is true. |
+| `and`, `or`, `xor`, `not` | Three-valued; `xor` is true when exactly one side is true, NULL when either side is NULL, and takes boolean operands only. |
 | `<value> [not] in (<literal>, …)` | Membership in the literal list. |
-| `<value> [not] between <low> and <high>` | Both bounds inclusive. |
+| `<value> [not] between <low> and <high>` | Both bounds inclusive. The value must compare with each bound and the two results with each other, as `>=` and `<=` would; otherwise the query is a 400 `SEMANTIC_ERROR` naming the value and the types. |
 | `<value> is [not] null` | Never NULL. |
 | `+`, `-`, `*`, `/`, `%` | `*`, `/` and `%` bind tighter than `+` and `-`. Integer `/` truncates toward zero; `/` and `%` by zero are NULL. |
 | `case(<condition>, <value>, … [else <value>])` | The value of the first true condition, else the `else` value, else NULL. |
@@ -248,8 +248,13 @@ naming the implicit field. `span` takes the span units above; without it the spa
 With a `by` field and a `limit` above 0 (default `DEFAULT_TIMECHART_LIMIT` in `build.rs`), the
 `limit` series with the greatest sum of the aggregation over all buckets keep their name, ties by
 name ascending; the other series merge into the series `OTHER_SERIES` of `plan.rs`, or are
-dropped with `useother=false`. Merged rows are re-aggregated per bucket with `min` for `min`,
-`max` for `max`, `avg` for `avg` and `sum` for every other aggregation. A NULL series is labelled
+dropped with `useother=false`. Merged rows are re-aggregated per bucket, exactly: `count` and
+`sum` by their sum, `min` by `min` and `max` by `max`. The average, distinct count and percentile
+of merged series are not determined by the per-series values, so with the other series in play
+(a `limit` above 0 and `useother=true`, the defaults) `avg`, `dc` / `distinct_count` and every
+percentile spelling are a 400 `SEMANTIC_ERROR` whose `context` names the function as planned
+(`avg`, `dc` or `percentile`) and the cause `inexact_other_series`, whether or not the data has
+more series than the limit; `useother=false` or `limit=0` charts them. A NULL series is labelled
 `NULL_SERIES` of `plan.rs`; with `useother=false` the NULL series is dropped together with the
 series beyond the limit. Because the series rank by a sum, an aggregation that is not numeric
 (`min(body)`, `values(x)`) is a 400 there. `limit=0` ranks nothing: it keeps every series under
@@ -431,6 +436,38 @@ naming the limit, never a truncated answer; the plan fetches one row beyond the 
 check reads no more than that. The per-query memory limit, the query deadline and load
 shedding of the listener bound every PPL query as they bound every other request.
 
+The per-query memory limit (`opensearch.max_query_memory_bytes`) also counts the answer: the
+output batches are reserved in the query's memory pool as they arrive, at their Arrow size, and
+the rendered body grows only by what the pool grants, written cell by cell from the batches on
+the blocking pool. An answer that does not fit is a 400 `RESOURCE_LIMIT_EXCEEDED` naming the
+limit in bytes, in every format.
+
+Parentheses and square brackets may nest `MAX_PPL_NESTING_DEPTH` levels deep, square brackets
+alone `MAX_PPL_SUBSEARCH_DEPTH` levels deep, and a query may hold `MAX_PPL_OPERATOR_COUNT`
+operators (all three in `build.rs`). All are counted on the lexer's tokens before the query is
+parsed; a bracket or an operator inside a string, a quoted name or a comment counts for nothing.
+
+- Brackets are counted together: a subsearch inside a group is two levels. The parser, the
+  builder, the planner and the executed plan recurse once per level.
+- Square brackets are counted alone. Every subsearch is written in them (`in`, `exists`, a scalar
+  subsearch, `append`, `appendcol`, `appendpipe`, `join`, `multisearch`), so they bound how deeply
+  subsearches nest; a square bracket that opens no subsearch counts all the same. Nested
+  subsearches are planned on the async worker, where the query deadline cannot preempt them, and
+  the cost of planning nested `in` subsearches grows steeply with their depth; the limit keeps it
+  well under a second in an unoptimized build.
+- Operators are counted over the whole query: every operator token, a logical, comparison or
+  arithmetic operator, `source=` and an assignment's `=` included, as `measure_ppl_nesting` of the
+  grammar crate lists them. Each operator of a chain such as `a = 1 or a = 1 or …` or
+  `not not … a = 1` adds a level of recursion to the parse, the build of the query, the drop of
+  the parse tree and the lowering of the expression, without a bracket.
+
+A query beyond a limit is a 400 `RESOURCE_LIMIT_EXCEEDED` naming the limit: as `limit_depth` for
+the nesting limit, `limit_subsearch_depth` for the subsearch limit and `limit_operators` for the
+operator limit. The limits are checked in that order, and the first one a query exceeds is named.
+The brackets and the operators together bound every recursion over a query. Parsing a nested or
+operator-heavy query runs on a thread sized for the limits, and the limits keep planning and
+execution within the stack of an async worker.
+
 ## Errors
 
 A PPL error is answered with content type `application/json; charset=UTF-8` and the JSON body
@@ -446,8 +483,12 @@ its reason in the workbench` in `scripts/opensearch-e2e/osd.spec.ts` pins that.
 | A command IceGate does not plan | 400 | `UnsupportedOperationException` | `UNSUPPORTED_OPERATION` | `{command}` |
 | A function IceGate does not plan | 400 | `UnsupportedOperationException` | `UNSUPPORTED_OPERATION` | `{function}` |
 | A well-formed but invalid query (types, arguments, system indices) | 400 | `SemanticCheckException` | `SEMANTIC_ERROR` | — |
+| A `timechart` aggregation the other series cannot merge exactly | 400 | `SemanticCheckException` | `SEMANTIC_ERROR` | `{function, cause}`, `cause` being `inexact_other_series` |
 | More output rows than the row limit | 400 | `IllegalArgumentException` | `RESOURCE_LIMIT_EXCEEDED` | `{limit}` |
-| More memory than the per-query limit | 400 | `IllegalArgumentException` | `RESOURCE_LIMIT_EXCEEDED` | `{limit_bytes}` |
+| More memory than the per-query limit, the answer included | 400 | `IllegalArgumentException` | `RESOURCE_LIMIT_EXCEEDED` | `{limit_bytes}` |
+| Brackets nested deeper than the nesting limit | 400 | `IllegalArgumentException` | `RESOURCE_LIMIT_EXCEEDED` | `{limit_depth}` |
+| Subsearches nested deeper than the subsearch limit | 400 | `IllegalArgumentException` | `RESOURCE_LIMIT_EXCEEDED` | `{limit_subsearch_depth}` |
+| More operators than the operator limit | 400 | `IllegalArgumentException` | `RESOURCE_LIMIT_EXCEEDED` | `{limit_operators}` |
 | A failure inside IceGate | 500 | `IllegalStateException` | `EXECUTION_ERROR` | — |
 
 A syntax error's `reason` is fixed and its `details` name the offending token; a 500's `reason`
@@ -466,12 +507,12 @@ both tenants' rows in one WAL segment.
 
 ## Id literals
 
-A string literal compared (`=`, `!=`, `<`, `>`, `<=`, `>=`, `in (…)`) with a fixed-width id (`trace_id`,
-`span_id`, `parent_span_id`) is read as hex, either case, and folded to the id's own fixed-width binary value
-before planning; the literal may stand on either side and the query stays standard PPL (`trace_id = '<hex>'`).
-Invalid hex or a wrong number of bytes is a 400 naming the column and the literal. Any other value compared
-with an id, or listed in an `in (…)` against one, must itself be an id: a value of another type (a number, a
-string column) is a 400 naming the id field and both PPL types. The folded value reaches
+A string literal compared (`=`, `!=`, `<`, `>`, `<=`, `>=`, `in (…)`, either bound of `between`) with a
+fixed-width id (`trace_id`, `span_id`, `parent_span_id`) is read as hex, either case, and folded to the id's own
+fixed-width binary value before planning; the literal may stand on either side and the query stays standard PPL
+(`trace_id = '<hex>'`). Invalid hex or a wrong number of bytes is a 400 naming the column and the literal. Any
+other value compared with an id, listed in an `in (…)` against one or bounding a `between` of one, must itself be
+an id: a value of another type (a number, a string column) is a 400 naming the id field and both PPL types. The folded value reaches
 both the WAL scan and the Iceberg scan, so row groups are pruned by statistics and bloom filters. Ids render as
 lowercase hex, and lowercase hex order is byte order: `<` / `>` on an id agree with `sort` on it, which keyset
 paging relies on.

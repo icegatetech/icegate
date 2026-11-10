@@ -22,6 +22,11 @@ const INTERNAL_REASON: &str = "There was internal problem at backend";
 /// The reason a PPL syntax error reports; the offending token goes into `details`.
 const SYNTAX_REASON: &str = "Invalid Query";
 
+/// The `cause` of the refusal of a `timechart` aggregation the other-series row cannot merge
+/// exactly; with the refused `function` beside it, a client tells this refusal from any other
+/// `SEMANTIC_ERROR` without reading its reason.
+const INEXACT_OTHER_SERIES_CAUSE: &str = "inexact_other_series";
+
 /// Answer `error` in its envelope.
 pub(crate) fn render_ppl_error(error: &PplError) -> Response {
     let (status, error_type, code, context, fixed_reason) = match error {
@@ -68,11 +73,39 @@ pub(crate) fn render_ppl_error(error: &PplError) -> Response {
             None,
             None,
         ),
+        PplError::InexactOtherSeries { function } => (
+            StatusCode::BAD_REQUEST,
+            "SemanticCheckException",
+            "SEMANTIC_ERROR",
+            Some(json!({"function": function, "cause": INEXACT_OTHER_SERIES_CAUSE})),
+            None,
+        ),
         PplError::RowLimitExceeded { limit } => (
             StatusCode::BAD_REQUEST,
             "IllegalArgumentException",
             "RESOURCE_LIMIT_EXCEEDED",
             Some(json!({"limit": limit})),
+            None,
+        ),
+        PplError::NestingLimitExceeded { limit_depth } => (
+            StatusCode::BAD_REQUEST,
+            "IllegalArgumentException",
+            "RESOURCE_LIMIT_EXCEEDED",
+            Some(json!({"limit_depth": limit_depth})),
+            None,
+        ),
+        PplError::SubsearchNestingLimitExceeded { limit_subsearch_depth } => (
+            StatusCode::BAD_REQUEST,
+            "IllegalArgumentException",
+            "RESOURCE_LIMIT_EXCEEDED",
+            Some(json!({"limit_subsearch_depth": limit_subsearch_depth})),
+            None,
+        ),
+        PplError::OperatorLimitExceeded { limit_operators } => (
+            StatusCode::BAD_REQUEST,
+            "IllegalArgumentException",
+            "RESOURCE_LIMIT_EXCEEDED",
+            Some(json!({"limit_operators": limit_operators})),
             None,
         ),
         PplError::MemoryLimitExceeded { limit_bytes } => (
@@ -182,6 +215,45 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["error"]["reason"], json!("There was internal problem at backend"));
         assert_eq!(body["error"]["details"], json!("disk on fire"));
+    }
+
+    #[tokio::test]
+    async fn the_nesting_subsearch_and_operator_limits_and_the_inexact_other_series_refusals_carry_their_fields_in_context()
+     {
+        let (status, content_type, body) = render_ppl_answer(&PplError::NestingLimitExceeded { limit_depth: 16 }).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(content_type, "application/json; charset=UTF-8");
+        assert_eq!(body["status"], json!(400));
+        assert_eq!(body["error"]["type"], json!("IllegalArgumentException"));
+        assert_eq!(body["error"]["code"], json!("RESOURCE_LIMIT_EXCEEDED"));
+        assert_eq!(body["error"]["context"], json!({"limit_depth": 16}));
+
+        let (status, _, body) = render_ppl_answer(&PplError::SubsearchNestingLimitExceeded {
+            limit_subsearch_depth: 4,
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], json!("IllegalArgumentException"));
+        assert_eq!(body["error"]["code"], json!("RESOURCE_LIMIT_EXCEEDED"));
+        assert_eq!(body["error"]["context"], json!({"limit_subsearch_depth": 4}));
+
+        let (status, _, body) = render_ppl_answer(&PplError::OperatorLimitExceeded { limit_operators: 128 }).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], json!("IllegalArgumentException"));
+        assert_eq!(body["error"]["code"], json!("RESOURCE_LIMIT_EXCEEDED"));
+        assert_eq!(body["error"]["context"], json!({"limit_operators": 128}));
+
+        let (status, _, body) = render_ppl_answer(&PplError::InexactOtherSeries {
+            function: "avg".to_string(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], json!("SemanticCheckException"));
+        assert_eq!(body["error"]["code"], json!("SEMANTIC_ERROR"));
+        assert_eq!(
+            body["error"]["context"],
+            json!({"function": "avg", "cause": "inexact_other_series"})
+        );
     }
 
     #[tokio::test]

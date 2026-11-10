@@ -56,6 +56,18 @@ pub(crate) enum PplError {
         /// What is wrong, in IceGate's wording.
         reason: String,
     },
+    /// A `timechart` aggregation whose value over several series is not a function of the
+    /// per-series values (an average, a distinct count, a percentile), with the series beyond the
+    /// limit merged into the other-series row: that row could only show an invalid value.
+    #[error(
+        "timechart cannot merge [{function}] of the series beyond its limit into the other-series row exactly; \
+         set useother=false to drop those series or limit=0 to keep every series"
+    )]
+    InexactOtherSeries {
+        /// The aggregation function as planned: `avg`, `dc`, or `percentile` for every percentile
+        /// spelling.
+        function: String,
+    },
     /// The output has more rows than `opensearch.ppl.max_result_rows` allows.
     #[error(
         "The query returns more than {limit} rows, the configured opensearch.ppl.max_result_rows; add | head {limit} to read the first rows."
@@ -63,6 +75,28 @@ pub(crate) enum PplError {
     RowLimitExceeded {
         /// The configured limit.
         limit: usize,
+    },
+    /// The query nests parentheses and square brackets deeper than a PPL query may: the parser
+    /// and the planner recurse once per level, so a deeper query is refused before it is parsed.
+    #[error("The query nests brackets deeper than {limit_depth} levels, the limit of a PPL query.")]
+    NestingLimitExceeded {
+        /// The most levels a query may nest.
+        limit_depth: usize,
+    },
+    /// The query nests subsearches (square brackets) deeper than a PPL query may: nested
+    /// subsearches are planned on the async worker, at a cost that grows with their depth, so a
+    /// deeper query is refused before it is parsed.
+    #[error("The query nests subsearches deeper than {limit_subsearch_depth} levels, the limit of a PPL query.")]
+    SubsearchNestingLimitExceeded {
+        /// The most levels of subsearches a query may nest.
+        limit_subsearch_depth: usize,
+    },
+    /// The query holds more operators than a PPL query may: a chain of operators nests one level
+    /// per operator, so a query with more is refused before it is parsed.
+    #[error("The query holds more than {limit_operators} operators, the limit of a PPL query.")]
+    OperatorLimitExceeded {
+        /// The most operators a query may hold.
+        limit_operators: usize,
     },
     /// The query needs more memory than the per-query limit allows.
     #[error("The query needs more than {limit_bytes} bytes of memory, the configured per-query limit.")]

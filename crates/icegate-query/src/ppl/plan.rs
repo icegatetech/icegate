@@ -21,12 +21,13 @@ use datafusion::functions::core::expr_fn::get_field;
 use datafusion::functions::expr_fn::{coalesce, date_part, floor, make_date, regexp_replace, to_char};
 use datafusion::functions_aggregate::average::avg_udaf;
 use datafusion::functions_aggregate::count::count_udaf;
-use datafusion::functions_aggregate::expr_fn::{array_agg, avg, count, max, min, sum};
+use datafusion::functions_aggregate::expr_fn::{array_agg, count, max, min, sum};
 use datafusion::functions_aggregate::min_max::{max_udaf, min_udaf};
 use datafusion::functions_aggregate::sum::sum_udaf;
 use datafusion::functions_nested::expr_fn::array_element;
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::expr::{Case, Lambda, LambdaVariable, WindowFunction};
+use datafusion::logical_expr::type_coercion::binary::comparison_coercion;
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{
     Between, EmptyRelation, Expr, ExprFunctionExt, ExprSchemable, JoinType, LogicalPlan, LogicalPlanBuilder, Operator,
@@ -38,9 +39,9 @@ use icegate_common::schema::COL_TENANT_ID;
 use regex::Regex;
 
 use super::ast::{
-    BinCommand, BinSpan, CompareOperator, DedupCommand, FillnullCommand, FillnullReplacements, JoinCommand, JoinKind,
-    ParseCommand, PplCommand, PplExpr, PplGroupKey, PplLiteral, PplQuery, PplSortKey, PplSource, RankCommand, SpanUnit,
-    StatsCommand, StreamStatsCommand, TimechartCommand,
+    ArithmeticOperator, BinCommand, BinSpan, CastTarget, CompareOperator, DedupCommand, FillnullCommand,
+    FillnullReplacements, JoinCommand, JoinKind, ParseCommand, PplCommand, PplExpr, PplGroupKey, PplLiteral, PplQuery,
+    PplSortKey, PplSource, RankCommand, SpanUnit, StatsCommand, StreamStatsCommand, TimechartCommand,
 };
 use super::error::PplError;
 use super::functions::{
@@ -1694,9 +1695,11 @@ fn plan_stream_stats(
 /// With a `by` field and a `limit` above 0, the series beyond the limit merge into
 /// [`OTHER_SERIES`] and a NULL series is [`NULL_SERIES`]; with `useother=false` the NULL series is
 /// dropped together with the series beyond the limit. Series rank by the sum of the aggregation,
-/// so there an aggregation that is not numeric is a [`PplError::Semantic`]. With `limit=0` a NULL series stays NULL. A
-/// non-string series is compared as its string form. The `Timechart` section of `ppl/README.md`
-/// states which series stay within the limit and how merged rows re-aggregate.
+/// so there an aggregation that is not numeric is a [`PplError::Semantic`]; with the other series
+/// in play, an aggregation it cannot merge exactly is [`PplError::InexactOtherSeries`] (see
+/// [`merge_series`]). With `limit=0` a NULL series stays NULL. A non-string series is compared as
+/// its string form. The `Timechart` section of `ppl/README.md` states which series stay within the
+/// limit and how merged rows re-aggregate.
 fn chart_rows(
     builder: LogicalPlanBuilder,
     chart: &TimechartCommand,
@@ -1756,6 +1759,12 @@ fn chart_rows(
             ),
         });
     }
+    // Refused before anything else is planned: with the other-series row in play, an aggregation it
+    // cannot merge exactly would show an invalid value there.
+    let merged_aggregate = chart
+        .uses_other
+        .then(|| merge_series(aggregation, ident(aggregate_name)))
+        .transpose()?;
     let series_label = render_series_label(grouped_rows.schema(), by)?;
     let charted_rows = grouped_rows.project(vec![time_column, series_label.alias(by), aggregate])?;
     let ranking = row_number()
@@ -1785,22 +1794,25 @@ fn chart_rows(
     )?;
     let limit = u64::try_from(chart.limit).unwrap_or(u64::MAX);
     let is_kept = qualify_column(RANK_RELATION, RANK_COLUMN).lt_eq(lit(limit));
-    let ranked_rows = if chart.uses_other {
-        ranked_rows
-    } else {
-        ranked_rows.filter(is_kept.clone())?
-    };
     let series = qualify_column(CHART_RELATION, by);
+    let time_output = qualify_column(CHART_RELATION, &chart.time_field).alias(&chart.time_field);
+    let aggregate_output = qualify_column(CHART_RELATION, aggregate_name).alias(aggregate_name);
+    let Some(merged_aggregate) = merged_aggregate else {
+        // A kept series has one grouped row per bucket, and the NULL series has no rank, so the
+        // filter drops it with the series beyond the limit: nothing is left to merge.
+        return Ok(ranked_rows
+            .filter(is_kept)?
+            .project(vec![time_output, series.alias(by), aggregate_output])?
+            .sort(vec![
+                ident(&chart.time_field).sort(true, false),
+                ident(by).sort(true, false),
+            ])?);
+    };
     let label = when(series.clone().is_null(), lit(NULL_SERIES))
         .when(is_kept, series)
         .otherwise(lit(OTHER_SERIES))?;
-    let merged_aggregate = merge_series(aggregation, ident(aggregate_name))?;
     Ok(ranked_rows
-        .project(vec![
-            qualify_column(CHART_RELATION, &chart.time_field).alias(&chart.time_field),
-            label.alias(by),
-            qualify_column(CHART_RELATION, aggregate_name).alias(aggregate_name),
-        ])?
+        .project(vec![time_output, label.alias(by), aggregate_output])?
         .aggregate(
             vec![ident(&chart.time_field), ident(by)],
             vec![merged_aggregate.alias(aggregate_name)],
@@ -1827,19 +1839,32 @@ fn render_series_label(schema: &DFSchema, by: &str) -> Result<Expr, PplError> {
     }
 }
 
-/// The aggregate that merges per-series values of `aggregation` into the [`OTHER_SERIES`] series.
+/// The aggregate that merges the per-series values of `aggregation` into the [`OTHER_SERIES`]
+/// series: `count` and `sum` by their sum, `min` and `max` by themselves. Each of those over the
+/// merged rows is a function of the per-series values, so the merged value is exact.
+///
+/// # Errors
+///
+/// [`PplError::InexactOtherSeries`] for `avg`, a distinct count and a percentile, whose value over
+/// the merged rows the per-series values do not determine; [`PplError::Internal`] for any other
+/// aggregation, which the planner never charts with a limit (a non-numeric one is refused before).
 fn merge_series(aggregation: &PplExpr, value: Expr) -> Result<Expr, PplError> {
     let PplExpr::FunctionCall { name, .. } = aggregation else {
         return Err(PplError::Internal {
             reason: "a timechart aggregation that is not a function call; the builder yields only calls".to_string(),
         });
     };
-    Ok(match name.as_str() {
-        "min" => min(value),
-        "max" => max(value),
-        "avg" => avg(value),
-        _ => sum(value),
-    })
+    match name.as_str() {
+        "count" | "sum" => Ok(sum(value)),
+        "min" => Ok(min(value)),
+        "max" => Ok(max(value)),
+        "avg" | "dc" | "distinct_count" | "percentile" | "percentile_approx" => {
+            Err(PplError::InexactOtherSeries { function: name.clone() })
+        }
+        other => Err(PplError::Internal {
+            reason: format!("a timechart merges no [{other}] into the other series; no such aggregation is charted"),
+        }),
+    }
 }
 
 /// `bin`: the field's value replaced by its bin. Numbers bin to `<start>-<end>` strings of a
@@ -2260,65 +2285,23 @@ async fn plan_where(
 }
 
 /// Lower `expression` to a DataFusion expression over the columns of `scope`.
+///
+/// This function recurses once per operator of the expression, on the async worker that plans
+/// the query, so it only dispatches: each variant is lowered by a function of its own, and a level
+/// of a deep expression holds the locals of the variant it lowers, not those of every variant.
 fn lower_expression(expression: &PplExpr, scope: &ExpressionScope<'_>) -> Result<Expr, PplError> {
     match expression {
         PplExpr::Field(name) => resolve_field(name, scope),
         PplExpr::Literal(literal) => Ok(lower_literal(literal)),
-        PplExpr::Compare { operator, left, right } => {
-            let left = lower_expression(left, scope)?;
-            let right = lower_expression(right, scope)?;
-            let (left, right) = coerce_timestamp_operands(left, right, scope.schema)?;
-            let (left, right) = coerce_fixed_binary_operands(left, right, scope.schema)?;
-            Ok(match operator {
-                CompareOperator::Equal => left.eq(right),
-                CompareOperator::NotEqual => left.not_eq(right),
-                CompareOperator::Less => left.lt(right),
-                CompareOperator::LessOrEqual => left.lt_eq(right),
-                CompareOperator::Greater => left.gt(right),
-                CompareOperator::GreaterOrEqual => left.gt_eq(right),
-            })
-        }
-        PplExpr::Not(inner) => Ok(not(lower_expression(inner, scope)?)),
-        PplExpr::And(left, right) => Ok(lower_expression(left, scope)?.and(lower_expression(right, scope)?)),
-        PplExpr::Or(left, right) => Ok(lower_expression(left, scope)?.or(lower_expression(right, scope)?)),
-        PplExpr::Xor(left, right) => {
-            let left = lower_expression(left, scope)?;
-            let right = lower_expression(right, scope)?;
-            Ok(left.clone().or(right.clone()).and(not(left.and(right))))
-        }
-        PplExpr::Arithmetic { operator, left, right } => Ok(lower_arithmetic(
-            *operator,
-            lower_expression(left, scope)?,
-            lower_expression(right, scope)?,
-        )),
+        PplExpr::Compare { operator, left, right } => lower_comparison(*operator, left, right, scope),
+        PplExpr::Not(inner) => lower_negation(inner, scope),
+        PplExpr::And(left, right) => lower_conjunction(left, right, scope),
+        PplExpr::Or(left, right) => lower_disjunction(left, right, scope),
+        PplExpr::Xor(left, right) => lower_exclusive_disjunction(left, right, scope),
+        PplExpr::Arithmetic { operator, left, right } => lower_arithmetic_operands(*operator, left, right, scope),
         PplExpr::FunctionCall { name, arguments } => lower_call(name, arguments, scope),
-        PplExpr::Case { branches, otherwise } => {
-            // The builder never yields a case without a condition; the grammar requires one.
-            if branches.is_empty() {
-                return Err(PplError::Internal {
-                    reason: "a case without a condition".to_string(),
-                });
-            }
-            let when_then_pairs = branches
-                .iter()
-                .map(|(condition, value)| {
-                    Ok((
-                        Box::new(lower_expression(condition, scope)?),
-                        Box::new(lower_expression(value, scope)?),
-                    ))
-                })
-                .collect::<Result<Vec<_>, PplError>>()?;
-            let else_value = otherwise
-                .as_ref()
-                .map(|value| lower_expression(value, scope).map(Box::new))
-                .transpose()?;
-            Ok(Expr::Case(Case::new(None, when_then_pairs, else_value)))
-        }
-        PplExpr::Cast { value, target } => lower_cast(
-            lower_expression(value, scope)?,
-            *target,
-            &scope.build_function_context(),
-        ),
+        PplExpr::Case { branches, otherwise } => lower_case(branches, otherwise.as_deref(), scope),
+        PplExpr::Cast { value, target } => lower_cast_operand(value, *target, scope),
         PplExpr::Lambda { .. } => Err(PplError::Semantic {
             reason: "a lambda is only an argument of an array function".to_string(),
         }),
@@ -2326,47 +2309,203 @@ fn lower_expression(expression: &PplExpr, scope: &ExpressionScope<'_>) -> Result
             value,
             list,
             is_negated,
-        } => {
-            let mut value = lower_expression(value, scope)?;
-            let mut listed_values = Vec::with_capacity(list.len());
-            for item in list {
-                let (folded_value, item) =
-                    coerce_timestamp_operands(value, lower_expression(item, scope)?, scope.schema)?;
-                value = folded_value;
-                listed_values.push(item);
-            }
-            let listed_values = coerce_fixed_binary_list(&value, listed_values, scope.schema)?;
-            Ok(value.in_list(listed_values, *is_negated))
-        }
+        } => lower_in_list(value, list, *is_negated, scope),
         PplExpr::Between {
             value,
             low,
             high,
             is_negated,
-        } => {
-            let value = lower_expression(value, scope)?;
-            let (value, low) = coerce_timestamp_operands(value, lower_expression(low, scope)?, scope.schema)?;
-            let (value, high) = coerce_timestamp_operands(value, lower_expression(high, scope)?, scope.schema)?;
-            Ok(Expr::Between(Between::new(
-                Box::new(value),
-                *is_negated,
-                Box::new(low),
-                Box::new(high),
-            )))
-        }
-        PplExpr::IsNull { value, is_negated } => {
-            let value = lower_expression(value, scope)?;
-            Ok(if *is_negated {
-                value.is_not_null()
-            } else {
-                value.is_null()
-            })
-        }
+        } => lower_between(value, low, high, *is_negated, scope),
+        PplExpr::IsNull { value, is_negated } => lower_null_test(value, *is_negated, scope),
         PplExpr::InSubsearch { .. } => Err(PplError::Semantic {
             reason: "`<expression> in [subsearch]` is supported only as a top-level `and` conjunct of `where`"
                 .to_string(),
         }),
     }
+}
+
+fn lower_comparison(
+    operator: CompareOperator,
+    left: &PplExpr,
+    right: &PplExpr,
+    scope: &ExpressionScope<'_>,
+) -> Result<Expr, PplError> {
+    let left = lower_expression(left, scope)?;
+    let right = lower_expression(right, scope)?;
+    let (left, right) = coerce_timestamp_operands(left, right, scope.schema)?;
+    let (left, right) = coerce_fixed_binary_operands(left, right, scope.schema)?;
+    Ok(match operator {
+        CompareOperator::Equal => left.eq(right),
+        CompareOperator::NotEqual => left.not_eq(right),
+        CompareOperator::Less => left.lt(right),
+        CompareOperator::LessOrEqual => left.lt_eq(right),
+        CompareOperator::Greater => left.gt(right),
+        CompareOperator::GreaterOrEqual => left.gt_eq(right),
+    })
+}
+
+fn lower_negation(inner: &PplExpr, scope: &ExpressionScope<'_>) -> Result<Expr, PplError> {
+    Ok(not(lower_expression(inner, scope)?))
+}
+
+fn lower_conjunction(left: &PplExpr, right: &PplExpr, scope: &ExpressionScope<'_>) -> Result<Expr, PplError> {
+    Ok(lower_expression(left, scope)?.and(lower_expression(right, scope)?))
+}
+
+fn lower_disjunction(left: &PplExpr, right: &PplExpr, scope: &ExpressionScope<'_>) -> Result<Expr, PplError> {
+    Ok(lower_expression(left, scope)?.or(lower_expression(right, scope)?))
+}
+
+/// `xor` as `left != right`: on booleans, three-valued, it is true when exactly one side is true and
+/// NULL when either side is. Each operand appears once in the lowered expression, so a chain of
+/// `xor` lowers to an expression as long as the chain; a form naming an operand twice would
+/// double the expression at every level of the chain.
+///
+/// # Errors
+///
+/// `PplError::Semantic` naming the PPL types when an operand is not a boolean, which a comparison
+/// would otherwise accept; and when the type of an operand cannot be computed against the scope.
+fn lower_exclusive_disjunction(left: &PplExpr, right: &PplExpr, scope: &ExpressionScope<'_>) -> Result<Expr, PplError> {
+    let left = lower_expression(left, scope)?;
+    let right = lower_expression(right, scope)?;
+    let left_type = left.get_type(scope.schema)?;
+    let right_type = right.get_type(scope.schema)?;
+    let is_logical = |data_type: &DataType| matches!(data_type, DataType::Boolean | DataType::Null);
+    if !is_logical(&left_type) || !is_logical(&right_type) {
+        return Err(PplError::Semantic {
+            reason: format!(
+                "xor takes boolean operands, not {} and {}",
+                name_ppl_type("operand", &left_type),
+                name_ppl_type("operand", &right_type),
+            ),
+        });
+    }
+    Ok(left.not_eq(right))
+}
+
+fn lower_arithmetic_operands(
+    operator: ArithmeticOperator,
+    left: &PplExpr,
+    right: &PplExpr,
+    scope: &ExpressionScope<'_>,
+) -> Result<Expr, PplError> {
+    Ok(lower_arithmetic(
+        operator,
+        lower_expression(left, scope)?,
+        lower_expression(right, scope)?,
+    ))
+}
+
+fn lower_case(
+    branches: &[(PplExpr, PplExpr)],
+    otherwise: Option<&PplExpr>,
+    scope: &ExpressionScope<'_>,
+) -> Result<Expr, PplError> {
+    // The builder never yields a case without a condition; the grammar requires one.
+    if branches.is_empty() {
+        return Err(PplError::Internal {
+            reason: "a case without a condition".to_string(),
+        });
+    }
+    let when_then_pairs = branches
+        .iter()
+        .map(|(condition, value)| {
+            Ok((
+                Box::new(lower_expression(condition, scope)?),
+                Box::new(lower_expression(value, scope)?),
+            ))
+        })
+        .collect::<Result<Vec<_>, PplError>>()?;
+    let else_value = otherwise
+        .map(|value| lower_expression(value, scope).map(Box::new))
+        .transpose()?;
+    Ok(Expr::Case(Case::new(None, when_then_pairs, else_value)))
+}
+
+fn lower_cast_operand(value: &PplExpr, target: CastTarget, scope: &ExpressionScope<'_>) -> Result<Expr, PplError> {
+    lower_cast(lower_expression(value, scope)?, target, &scope.build_function_context())
+}
+
+fn lower_in_list(
+    value: &PplExpr,
+    list: &[PplExpr],
+    is_negated: bool,
+    scope: &ExpressionScope<'_>,
+) -> Result<Expr, PplError> {
+    let mut value = lower_expression(value, scope)?;
+    let mut listed_values = Vec::with_capacity(list.len());
+    for item in list {
+        let (folded_value, item) = coerce_timestamp_operands(value, lower_expression(item, scope)?, scope.schema)?;
+        value = folded_value;
+        listed_values.push(item);
+    }
+    let listed_values = coerce_fixed_binary_list(&value, listed_values, scope.schema)?;
+    Ok(value.in_list(listed_values, is_negated))
+}
+
+fn lower_between(
+    value: &PplExpr,
+    low: &PplExpr,
+    high: &PplExpr,
+    is_negated: bool,
+    scope: &ExpressionScope<'_>,
+) -> Result<Expr, PplError> {
+    let value = lower_expression(value, scope)?;
+    let (value, low) = coerce_timestamp_operands(value, lower_expression(low, scope)?, scope.schema)?;
+    let (value, high) = coerce_timestamp_operands(value, lower_expression(high, scope)?, scope.schema)?;
+    let (value, low) = coerce_fixed_binary_operands(value, low, scope.schema)?;
+    let (value, high) = coerce_fixed_binary_operands(value, high, scope.schema)?;
+    check_between_types(&value, &low, &high, scope.schema)?;
+    Ok(Expr::Between(Between::new(
+        Box::new(value),
+        is_negated,
+        Box::new(low),
+        Box::new(high),
+    )))
+}
+
+fn lower_null_test(value: &PplExpr, is_negated: bool, scope: &ExpressionScope<'_>) -> Result<Expr, PplError> {
+    let value = lower_expression(value, scope)?;
+    Ok(if is_negated {
+        value.is_not_null()
+    } else {
+        value.is_null()
+    })
+}
+
+/// Refuses a `between` whose value and bounds share no comparison type under
+/// `comparison_coercion`: the value with each bound, then the two results with each other. Such a
+/// `between` is the query's 400, refused here before the plan is built.
+///
+/// # Errors
+///
+/// `PplError::Semantic` naming the value (as [`name_compared_operand`]) and the PPL types of the first
+/// pair without a common type; and when the type of an operand cannot be computed against `schema`
+/// (an ill-typed expression of the query).
+fn check_between_types(value: &Expr, low: &Expr, high: &Expr, schema: &DFSchema) -> Result<(), PplError> {
+    let value_type = value.get_type(schema)?;
+    let low_type = low.get_type(schema)?;
+    let high_type = high.get_type(schema)?;
+    let value_name = name_compared_operand(value);
+    let refuse_bound = |bound_type: &DataType| PplError::Semantic {
+        reason: format!(
+            "between cannot compare [{value_name}] (type {}) with a bound of type {}",
+            name_ppl_type(&value_name, &value_type),
+            name_ppl_type("bound", bound_type),
+        ),
+    };
+    let low_common_type = comparison_coercion(&value_type, &low_type).ok_or_else(|| refuse_bound(&low_type))?;
+    let high_common_type = comparison_coercion(&value_type, &high_type).ok_or_else(|| refuse_bound(&high_type))?;
+    comparison_coercion(&low_common_type, &high_common_type)
+        .map(|_| ())
+        .ok_or_else(|| PplError::Semantic {
+            reason: format!(
+                "between cannot compare [{value_name}] with bounds of type {} and {}, which do not compare with \
+                 each other",
+                name_ppl_type("bound", &low_type),
+                name_ppl_type("bound", &high_type),
+            ),
+        })
 }
 
 /// Lower a function call. The lambda argument of an array function is lowered with its
@@ -2642,10 +2781,10 @@ fn fold_id_counterpart(
 }
 
 /// The 400 for an id compared with a value that is neither a string literal nor an id. It names the
-/// id field (as [`name_id_operand`]), the id's PPL type and its width of `id_width` bytes, and the PPL type
+/// id field (as [`name_compared_operand`]), the id's PPL type and its width of `id_width` bytes, and the PPL type
 /// of the other value.
 fn build_id_comparison_refusal(id_operand: &Expr, id_width: i32, counterpart_type: &DataType) -> PplError {
-    let id_name = name_id_operand(id_operand);
+    let id_name = name_compared_operand(id_operand);
     PplError::Semantic {
         reason: format!(
             "comparing the id field [{id_name}] (type {}, {id_width} bytes written as hex) with a value of \
@@ -2656,20 +2795,21 @@ fn build_id_comparison_refusal(id_operand: &Expr, id_width: i32, counterpart_typ
     }
 }
 
-/// The name a refusal gives an id operand: its column name, or its expression for any other operand.
-fn name_id_operand(id_operand: &Expr) -> Cow<'_, str> {
-    match id_operand {
+/// The name a refusal gives a compared operand: its column name, or its expression for any other
+/// operand.
+fn name_compared_operand(operand: &Expr) -> Cow<'_, str> {
+    match operand {
         Expr::Column(column) => Cow::Borrowed(&column.name),
         other => Cow::Owned(other.schema_name().to_string()),
     }
 }
 
 /// The `id_type` literal the hex `text` denotes, compared with `id_operand`. The refusal names
-/// `id_operand` as [`name_id_operand`] does.
+/// `id_operand` as [`name_compared_operand`] does.
 fn decode_id_literal(text: &str, id_operand: &Expr, id_type: &DataType) -> Result<Expr, PplError> {
     decode_fixed_binary_literal(text, id_type)
         .map(lit)
-        .map_err(|error| PplError::invalid_id_literal(&name_id_operand(id_operand), text, &error))
+        .map_err(|error| PplError::invalid_id_literal(&name_compared_operand(id_operand), text, &error))
 }
 
 /// Build `builder` without its hidden columns ([`drop_hidden_columns`]), run the analyzer so a type
@@ -4504,6 +4644,133 @@ mod tests {
         let (left, right) =
             coerce_fixed_binary_operands(col(COL_TRACE_ID), col(COL_SPAN_ID), &schema).expect("an id pair plans");
         assert_eq!((left, right), (col(COL_TRACE_ID), col(COL_SPAN_ID)));
+    }
+
+    #[test]
+    fn between_folds_id_bounds_and_refuses_operands_without_a_common_comparison_type() {
+        let schema = DFSchema::try_from(Schema::new(vec![
+            Field::new(COL_TRACE_ID, DataType::FixedSizeBinary(16), false),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new(COL_BODY, DataType::Utf8, true),
+            Field::new("at", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        ]))
+        .expect("schema");
+        let scope = ExpressionScope::new(&schema, None, build_fixed_now());
+        let field = |name: &str| Box::new(PplExpr::Field(name.to_owned()));
+        let literal = |value: PplLiteral| Box::new(PplExpr::Literal(value));
+        let hex = |text: &str| literal(PplLiteral::String(text.to_owned()));
+        let first_byte_id = |byte: u8| {
+            let mut bytes = vec![0_u8; 16];
+            bytes[0] = byte;
+            lit(ScalarValue::FixedSizeBinary(16, Some(bytes)))
+        };
+
+        let id_between = PplExpr::Between {
+            value: field(COL_TRACE_ID),
+            low: hex("01000000000000000000000000000000"),
+            high: hex("7F000000000000000000000000000000"),
+            is_negated: true,
+        };
+        assert_eq!(
+            lower_expression(&id_between, &scope).expect("the id bounds fold"),
+            Expr::Between(Between::new(
+                Box::new(ident(COL_TRACE_ID)),
+                true,
+                Box::new(first_byte_id(0x01)),
+                Box::new(first_byte_id(0x7f)),
+            ))
+        );
+
+        let string_bounds = PplExpr::Between {
+            value: field(COL_BODY),
+            low: hex("a"),
+            high: literal(PplLiteral::Integer(2)),
+            is_negated: false,
+        };
+        // A string compares with a string and with a number: the bounds stay as written.
+        assert_eq!(
+            lower_expression(&string_bounds, &scope).expect("a string between plans"),
+            Expr::Between(Between::new(
+                Box::new(ident(COL_BODY)),
+                false,
+                Box::new(lit("a")),
+                Box::new(lit(2_i64)),
+            ))
+        );
+
+        let refused_cases = [
+            (
+                PplExpr::Between {
+                    value: field("flag"),
+                    low: literal(PplLiteral::Integer(1)),
+                    high: literal(PplLiteral::Integer(2)),
+                    is_negated: false,
+                },
+                ["[flag]", "boolean", "bigint"],
+            ),
+            (
+                PplExpr::Between {
+                    value: field(COL_BODY),
+                    low: literal(PplLiteral::Integer(1)),
+                    high: literal(PplLiteral::Boolean(true)),
+                    is_negated: false,
+                },
+                ["[body]", "string", "boolean"],
+            ),
+            (
+                PplExpr::Between {
+                    value: field(COL_BODY),
+                    low: literal(PplLiteral::Integer(1)),
+                    high: field("at"),
+                    is_negated: false,
+                },
+                ["[body]", "bigint", "timestamp"],
+            ),
+        ];
+        // The refusal is the query's semantic 400; its reason names the value and the PPL types.
+        for (between, fragments) in refused_cases {
+            let refusal = lower_expression(&between, &scope);
+            let Err(PplError::Semantic { reason }) = &refusal else {
+                panic!("not a semantic refusal: {refusal:?} for {between:?}");
+            };
+            for fragment in fragments {
+                assert!(reason.contains(fragment), "no `{fragment}` in {reason:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn xor_lowers_each_operand_once_and_refuses_an_operand_that_is_not_a_boolean() {
+        let schema = DFSchema::try_from(Schema::new(vec![
+            Field::new("first", DataType::Boolean, true),
+            Field::new("second", DataType::Boolean, true),
+            Field::new("third", DataType::Boolean, true),
+            Field::new("count", DataType::Int64, true),
+            Field::new("unknown", DataType::Null, true),
+        ]))
+        .expect("schema");
+        let scope = ExpressionScope::new(&schema, None, build_fixed_now());
+        let field = |name: &str| Box::new(PplExpr::Field(name.to_owned()));
+        // `first xor second xor third`, left-deep as the builder nests it.
+        let chain = PplExpr::Xor(Box::new(PplExpr::Xor(field("first"), field("second"))), field("third"));
+        assert_eq!(
+            lower_expression(&chain, &scope).expect("a chain of booleans lowers"),
+            ident("first").not_eq(ident("second")).not_eq(ident("third"))
+        );
+        // An operand of the Null type is a boolean that is NULL on every row, not a refusal.
+        assert_eq!(
+            lower_expression(&PplExpr::Xor(field("unknown"), field("first")), &scope)
+                .expect("a Null-typed operand lowers"),
+            ident("unknown").not_eq(ident("first"))
+        );
+
+        let refusal = lower_expression(&PplExpr::Xor(field("first"), field("count")), &scope);
+        let Err(PplError::Semantic { reason }) = &refusal else {
+            panic!("not a semantic refusal: {refusal:?}");
+        };
+        for fragment in ["xor", "boolean", "bigint"] {
+            assert!(reason.contains(fragment), "no `{fragment}` in {reason:?}");
+        }
     }
 
     /// The tenant of the bloom-filter fixture. It writes one tenant only: a second tenant's file would add

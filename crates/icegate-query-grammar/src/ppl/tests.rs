@@ -11,8 +11,210 @@ use antlr4rust::token::Token;
 
 use super::char_stream::UpperCaseCharStream;
 use super::{
-    OpenSearchPPLLexer, build_ppl_parser, find_first_unrecognized_character, opensearchppllexer, parse_ppl_root,
+    OpenSearchPPLLexer, build_ppl_parser, find_first_unrecognized_character, measure_ppl_nesting, opensearchppllexer,
+    parse_ppl_root,
 };
+
+#[test]
+fn nesting_depth_counts_the_bracket_tokens_the_parser_reads() {
+    let rows = [
+        ("", 0),
+        ("source=logs", 0),
+        ("source=logs | where (a = 1) and ((b = 2))", 2),
+        // Parentheses and square brackets open one count of levels: a subsearch inside a group.
+        ("source=logs | where (x in [ source=logs | where (y = 1) ])", 3),
+        ("source=logs | append [ source=logs | append [ source=logs ] ]", 2),
+        ("source=logs | eval x = abs(abs(abs(1)))", 3),
+        // A bracket inside a string, a quoted name or a comment is part of that token.
+        ("source=logs | where body = '((([[[' and (a = 1)", 1),
+        ("source=logs | where body = \"(((\" and (a = 1)", 1),
+        ("source=logs | fields `((x` | where (a = 1)", 1),
+        ("source=logs /* ((( */ | where (a = 1)", 1),
+        // A closing bracket with no level open closes nothing, of either kind.
+        ("source=logs | where ]) ((a = 1))", 2),
+        // A closing bracket of the other kind closes a level all the same.
+        ("source=logs | where ([a = 1)]", 2),
+        // A character that is no token neither opens nor closes a level.
+        ("source=logs | where (\u{E9}(a = 1))", 2),
+    ];
+    for (text, depth) in rows {
+        assert_eq!(measure_ppl_nesting(text).bracket_depth(), depth, "[{text}]");
+    }
+    // A run of one million opening parentheses is counted, not parsed.
+    assert_eq!(measure_ppl_nesting(&"(".repeat(1_000_000)).bracket_depth(), 1_000_000);
+}
+
+#[test]
+fn square_bracket_depth_counts_the_square_brackets_alone() {
+    let rows = [
+        ("", 0),
+        ("source=logs | where ((a = 1))", 0),
+        ("source=logs | where (x in [ source=logs | where (y = 1) ])", 1),
+        ("source=logs | append [ source=logs | append [ source=logs ] ]", 2),
+        (
+            "source=logs | where x in [ source=logs | where (y in [ source=logs | fields y ]) | fields x ]",
+            2,
+        ),
+        // Two subsearches side by side nest one level each.
+        ("source=logs | append [ source=logs ] | append [ source=logs ]", 1),
+        // A square bracket inside a string, a quoted name or a comment is part of that token.
+        ("source=logs | where body = '[[[' | append [ source=logs ]", 1),
+        ("source=logs | fields `[[x` /* [[ */ | append [ source=logs ]", 1),
+        // A parenthesis neither opens nor closes a level of square brackets; a `]` with none open
+        // closes none.
+        ("source=logs | where ([(a = 1)])", 1),
+        ("source=logs | where ]] [[a = 1", 2),
+        ("source=logs | where [)[", 2),
+    ];
+    for (text, depth) in rows {
+        assert_eq!(measure_ppl_nesting(text).square_bracket_depth(), depth, "[{text}]");
+    }
+    // A run of one million opening square brackets is counted, not parsed.
+    assert_eq!(
+        measure_ppl_nesting(&"[".repeat(1_000_000)).square_bracket_depth(),
+        1_000_000
+    );
+}
+
+#[test]
+fn operator_count_counts_every_operator_token_wherever_it_stands() {
+    let rows = [
+        ("", 0),
+        ("source=logs | head 5", 1),
+        // `source=` holds an `=`. Each logical keyword counts in any case, and so does each
+        // comparison it joins.
+        ("source=logs | where a = 1 or b = 2 AND c = 3 xor d = 4", 8),
+        ("source=logs | where not NOT not a = 1", 5),
+        (
+            "source=logs | where a == 1 and b != 2 and c < 3 and d <= 4 and e > 5 and f >= 6",
+            12,
+        ),
+        (
+            "source=logs | where a regexp 'x' or a like 'x' or a ilike 'x' or contains(a, 'x')",
+            8,
+        ),
+        (
+            "source=logs | where a in (1, 2) and b is not null and c not between 1 and 2",
+            9,
+        ),
+        ("source=logs | eval x = 1 * 2 / 3 % 4 + 5 - 6", 7),
+        ("source=logs | eval x = transform(list, y -> y + 1)", 4),
+        ("source=logs | where t > now() - interval 1 day", 4),
+        // A bare quote or backtick is a token of its own; a quoted string or name is one token.
+        ("source=logs | where body = 'a = b' | fields `a + b`", 2),
+        ("source=logs | where ' \" `", 4),
+        // An operator inside a comment counts for nothing.
+        ("source=logs /* not and or = + */ | head", 1),
+        // Brackets are counted as depth, not as operators.
+        ("source=logs | where ((a = 1))", 2),
+    ];
+    for (text, operator_count) in rows {
+        assert_eq!(measure_ppl_nesting(text).operator_count(), operator_count, "[{text}]");
+    }
+    // A run of one hundred thousand `not` is counted, not parsed.
+    assert_eq!(measure_ppl_nesting(&"not ".repeat(100_000)).operator_count(), 100_000);
+}
+
+/// The longest run of `delimiter`-quoted text starting at `start`, the way the quoted-string
+/// rules read it: the delimiter, any characters other than it or a doubled delimiter, the
+/// delimiter. `None` when no such text starts there, so the delimiter is a token of its own.
+/// The texts this reads hold no backslash, so the escape of the rules never applies.
+fn find_quoted_text_end(characters: &[char], start: usize, delimiter: char) -> Option<usize> {
+    let mut longest_end = None;
+    let mut index = start + 1;
+    while index < characters.len() {
+        if characters[index] != delimiter {
+            index += 1;
+            continue;
+        }
+        let run_end = characters[index..]
+            .iter()
+            .position(|&character| character != delimiter)
+            .map_or(characters.len(), |offset| index + offset);
+        let run_length = run_end - index;
+        if run_length % 2 == 1 {
+            // Pairs inside the text, then the closing delimiter: the text ends at the run's end.
+            return Some(run_end - 1);
+        }
+        // An even run reads as pairs and the text goes on; it could also close after any pair.
+        longest_end = Some(index);
+        index = run_end;
+    }
+    longest_end
+}
+
+/// The bracket depth, the square bracket depth and the operator count of `text` over the alphabet
+/// of [`measure_ppl_nesting_matches_a_character_model_of_random_texts`], read character by
+/// character from the lexing rules of strings, brackets, `+` and `=` / `==`, independently of the
+/// lexer.
+fn model_ppl_nesting(text: &str) -> (usize, usize, usize) {
+    let characters: Vec<char> = text.chars().collect();
+    let (mut depth, mut deepest, mut operator_count) = (0_usize, 0_usize, 0_usize);
+    let (mut square_depth, mut deepest_square) = (0_usize, 0_usize);
+    let mut index = 0;
+    while index < characters.len() {
+        match characters[index] {
+            '(' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            '[' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+                square_depth += 1;
+                deepest_square = deepest_square.max(square_depth);
+            }
+            ')' => depth = depth.saturating_sub(1),
+            ']' => {
+                depth = depth.saturating_sub(1);
+                square_depth = square_depth.saturating_sub(1);
+            }
+            '+' => operator_count += 1,
+            '=' => {
+                operator_count += 1;
+                if characters.get(index + 1) == Some(&'=') {
+                    index += 1;
+                }
+            }
+            delimiter @ ('\'' | '"' | '`') => match find_quoted_text_end(&characters, index, delimiter) {
+                Some(end) => index = end,
+                None => operator_count += 1,
+            },
+            _ => {}
+        }
+        index += 1;
+    }
+    (deepest, deepest_square, operator_count)
+}
+
+#[test]
+fn measure_ppl_nesting_matches_a_character_model_of_random_texts() {
+    const ALPHABET: [char; 11] = ['(', ')', '[', ']', '\'', '"', '`', '+', '=', 'q', ' '];
+    // xorshift64 with a fixed seed: the same texts on every run.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next_random = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..5_000 {
+        let length = usize::try_from(next_random() % 48).expect("a small length");
+        let text: String = (0..length)
+            .map(|_| ALPHABET[usize::try_from(next_random() % 11).expect("a small index")])
+            .collect();
+        let nesting = measure_ppl_nesting(&text);
+        assert_eq!(
+            (
+                nesting.bracket_depth(),
+                nesting.square_bracket_depth(),
+                nesting.operator_count()
+            ),
+            model_ppl_nesting(&text),
+            "[{text}]"
+        );
+    }
+}
 
 #[test]
 fn ppl_queries_parse_or_fail_as_the_pinned_grammar_and_lexing_rules_state() {

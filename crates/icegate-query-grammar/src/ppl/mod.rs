@@ -17,6 +17,7 @@ mod opensearchpplparservisitor;
 use std::rc::Rc;
 
 use antlr4rust::Parser as _;
+use antlr4rust::TokenSource as _;
 use antlr4rust::common_token_stream::CommonTokenStream;
 use antlr4rust::error_strategy::BailErrorStrategy;
 use antlr4rust::errors::ANTLRError;
@@ -73,6 +74,127 @@ pub fn parse_ppl_root(text: &str) -> Result<Rc<RootContextAll<'_>>, SyntaxError>
                 Some(character_error) if is_before(&character_error, &parse_error) => character_error,
                 _ => parse_error,
             })
+        }
+    }
+}
+
+/// How deeply [`parse_ppl_root`] would recurse through a PPL query, measured on its tokens
+/// without parsing it.
+///
+/// The parser recurses through a level of the parse tree for each bracket it is inside of, and
+/// otherwise only through an operator: every recursive rule of the vendored grammar that passes
+/// through no bracket consumes one of the operator tokens [`measure_ppl_nesting`] counts. A query
+/// nested [`Self::bracket_depth`] deep with [`Self::operator_count`] operators is therefore at
+/// most the sum of the two levels deep, whatever its shape, and so is every walk over its parse
+/// tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PplNesting {
+    bracket_depth: usize,
+    square_bracket_depth: usize,
+    operator_count: usize,
+}
+
+impl PplNesting {
+    /// The deepest bracket nesting: the most levels of parentheses and square brackets open at
+    /// once.
+    #[must_use]
+    pub const fn bracket_depth(&self) -> usize {
+        self.bracket_depth
+    }
+
+    /// The deepest nesting of square brackets alone: the most levels of square brackets open at
+    /// once. Every subsearch of the grammar is written in square brackets, so this bounds how
+    /// deeply subsearches nest.
+    #[must_use]
+    pub const fn square_bracket_depth(&self) -> usize {
+        self.square_bracket_depth
+    }
+
+    /// How many operator tokens the query holds, wherever they stand.
+    #[must_use]
+    pub const fn operator_count(&self) -> usize {
+        self.operator_count
+    }
+}
+
+/// Measure how deeply [`parse_ppl_root`] would recurse through `text`.
+///
+/// Only the lexer runs, in one pass and without recursion, so a caller can bound the parser's
+/// recursion before parsing. Both counts are taken from the same tokens the parser reads.
+///
+/// The bracket depth: each `(` or `[` token opens a level and each `)` or `]` token closes one,
+/// whatever kind opened it; a closing bracket with no level open closes none.
+///
+/// The square bracket depth: each `[` token opens a level and each `]` token closes one;
+/// parentheses neither open nor close one, and a `]` with no level open closes none.
+///
+/// The operator count: every token of a logical, comparison or arithmetic operator (`not`, `and`,
+/// `or`, `xor`, `=`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `regexp`, `like`, `ilike`, `contains`,
+/// `in`, `is`, `between`, `*`, `/`, `%`, `+`, `-`), of a lambda arrow (`->`), of `interval`,
+/// and a bare quote or backtick, each of which a recursive rule of the grammar consumes once per
+/// level. A keyword counts wherever it stands, also where the grammar reads it as a name.
+///
+/// A bracket or an operator inside another token (a quoted string or name, a comment) counts for
+/// nothing, nor does a character that is no token; its error is reported by
+/// [`parse_ppl_root`], not here.
+#[must_use]
+pub fn measure_ppl_nesting(text: &str) -> PplNesting {
+    let mut lexer = OpenSearchPPLLexer::new(UpperCaseCharStream::new(text));
+    // Lexer errors are reported by the parse; without a listener none is printed.
+    lexer.remove_error_listeners();
+    let (mut depth, mut square_depth) = (0_usize, 0_usize);
+    let mut nesting = PplNesting {
+        bracket_depth: 0,
+        square_bracket_depth: 0,
+        operator_count: 0,
+    };
+    loop {
+        match lexer.next_token().get_token_type() {
+            TOKEN_EOF => return nesting,
+            opensearchppllexer::LT_PRTHS => {
+                depth += 1;
+                nesting.bracket_depth = nesting.bracket_depth.max(depth);
+            }
+            opensearchppllexer::LT_SQR_PRTHS => {
+                depth += 1;
+                nesting.bracket_depth = nesting.bracket_depth.max(depth);
+                square_depth += 1;
+                nesting.square_bracket_depth = nesting.square_bracket_depth.max(square_depth);
+            }
+            opensearchppllexer::RT_PRTHS => depth = depth.saturating_sub(1),
+            opensearchppllexer::RT_SQR_PRTHS => {
+                depth = depth.saturating_sub(1);
+                square_depth = square_depth.saturating_sub(1);
+            }
+            opensearchppllexer::NOT
+            | opensearchppllexer::AND
+            | opensearchppllexer::OR
+            | opensearchppllexer::XOR
+            | opensearchppllexer::EQUAL
+            | opensearchppllexer::DOUBLE_EQUAL
+            | opensearchppllexer::NOT_EQUAL
+            | opensearchppllexer::LESS
+            | opensearchppllexer::NOT_LESS
+            | opensearchppllexer::GREATER
+            | opensearchppllexer::NOT_GREATER
+            | opensearchppllexer::REGEXP
+            | opensearchppllexer::LIKE
+            | opensearchppllexer::ILIKE
+            | opensearchppllexer::CONTAINS
+            | opensearchppllexer::IN
+            | opensearchppllexer::IS
+            | opensearchppllexer::BETWEEN
+            | opensearchppllexer::STAR
+            | opensearchppllexer::DIVIDE
+            | opensearchppllexer::MODULE
+            | opensearchppllexer::PLUS
+            | opensearchppllexer::MINUS
+            | opensearchppllexer::ARROW
+            | opensearchppllexer::INTERVAL
+            | opensearchppllexer::BACKTICK
+            | opensearchppllexer::SINGLE_QUOTE
+            | opensearchppllexer::DOUBLE_QUOTE => nesting.operator_count += 1,
+            _ => {}
         }
     }
 }

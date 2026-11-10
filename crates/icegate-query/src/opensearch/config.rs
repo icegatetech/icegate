@@ -234,7 +234,8 @@ pub struct PplLimitsConfig {
     /// The most rows a PPL query may return, counted after the request's `fetch_size`. A query
     /// whose output has more rows is refused with a 400 naming this limit; it is never
     /// truncated. `None` (the default) sets no row limit: the query deadline, the per-query
-    /// memory limit and load shedding still bound every query.
+    /// memory limit (which counts the returned rows and the answer rendered from them) and load
+    /// shedding still bound every query.
     pub max_result_rows: Option<usize>,
 }
 

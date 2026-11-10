@@ -2157,6 +2157,62 @@ mod hex_ids {
         server.shutdown().await;
     }
 
+    /// `between` folds both bounds as a comparison does, so its answer is that of `>=` and `<=` with the
+    /// same literals; tenant B's `b-two`, in the same WAL segment with `two`'s trace id, stays out.
+    #[tokio::test]
+    async fn between_on_an_id_folds_both_bounds_like_the_comparisons() {
+        let (server, catalog) = TestServer::start().await;
+        seed_id_spans(&server, &catalog).await.expect("seed spans");
+        for (condition, expected_rows) in [
+            (
+                format!("trace_id between '{HEX_01}' and '{HEX_7F}'"),
+                json!([["one"], ["two"]]),
+            ),
+            (
+                format!("trace_id between '{HEX_7F_UPPER}' and '{HEX_80}'"),
+                json!([["three"], ["two"]]),
+            ),
+            (
+                format!("trace_id not between '{HEX_01}' and '{HEX_7F}'"),
+                json!([["four"], ["three"]]),
+            ),
+            (
+                format!("trace_id >= '{HEX_01}' and trace_id <= '{HEX_7F}'"),
+                json!([["one"], ["two"]]),
+            ),
+            (
+                format!("span_id between '{SPAN_HEX_02}' and '{SPAN_HEX_03}'"),
+                json!([["three"], ["two"]]),
+            ),
+        ] {
+            let query = format!("source=spans | where {condition} | fields name | sort name");
+            assert_eq!(
+                run_ppl(&server, TENANT_A, &query).await["datarows"],
+                expected_rows,
+                "{query}"
+            );
+        }
+        server.shutdown().await;
+    }
+
+    /// A bound that is no id literal is refused as in a comparison: invalid hex names the column and the
+    /// literal, a value of another type names the id field and both PPL types.
+    #[tokio::test]
+    async fn between_on_an_id_with_an_invalid_or_mistyped_bound_is_a_400() {
+        // Reads no rows: the refusal comes while planning, so no other tenant's row could change it.
+        let (server, _catalog) = TestServer::start().await;
+        let invalid_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            &format!("source=spans | where trace_id between '{HEX_01}' and 'zz'"),
+        )
+        .await;
+        assert_semantic_refusal_naming(&invalid_reply, &[COL_TRACE_ID, "'zz'", "not an even-length hex string"]);
+        let mistyped_reply = refuse_ppl(&server, TENANT_A, "source=spans | where span_id between 1 and 2").await;
+        assert_semantic_refusal_naming(&mistyped_reply, &[COL_SPAN_ID, "string", "bigint"]);
+        server.shutdown().await;
+    }
+
     #[tokio::test]
     async fn invalid_hex_or_a_wrong_length_is_a_400() {
         // Reads no rows: the refusal comes while planning, so no other tenant's row could change it.

@@ -11,14 +11,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::error::render_ppl_error;
-use super::render::render_ppl_response;
-use crate::opensearch::catalog::TenantSession;
+use super::render::{RenderedAnswer, render_ppl_answer};
+use crate::opensearch::catalog::{ReservedBatches, TenantSession};
 use crate::opensearch::config::PplLimitsConfig;
 use crate::opensearch::context::RequestContext;
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::extract::{EndpointParameters, Parameters, RequestBody};
 use crate::opensearch::filter_path::read_filter_path;
 use crate::opensearch::state::OpenSearchState;
+use crate::opensearch::system_index::run_blocking_work;
 use crate::ppl::{PplColumn, PplError, parse_ppl, plan_ppl};
 
 /// The query parameters of `/_plugins/_ppl`.
@@ -118,10 +119,38 @@ pub(crate) async fn execute_ppl_query(
         Err(error) => return render_ppl_error(&error.into()),
     };
     let output = run_ppl_query(&session, &limits, &context, &request, &state.node.cluster_name).await;
-    match output.and_then(|(columns, batches)| render_ppl_response(format, &columns, &batches)) {
-        Ok(response) => response,
+    let answer = match output {
+        Ok((columns, reserved_batches)) => render_answer_on_blocking_pool(format, columns, reserved_batches).await,
+        Err(error) => Err(error),
+    };
+    match answer {
+        Ok(answer) => answer.into_response(),
         Err(error) => render_ppl_error(&error),
     }
+}
+
+/// Renders `reserved_batches` in `format` on the blocking pool: rendering is linear in the rows
+/// and columns of the answer, which must not hold an async worker. The batches' reservation is
+/// released once the body is rendered.
+///
+/// # Errors
+///
+/// What [`render_ppl_answer`] reports, and [`PplError::Internal`] when the rendering task panics or
+/// the runtime shuts down.
+async fn render_answer_on_blocking_pool(
+    format: PplFormat,
+    columns: Vec<PplColumn>,
+    reserved_batches: ReservedBatches,
+) -> Result<RenderedAnswer, PplError> {
+    run_blocking_work("rendering the PPL answer", move || {
+        Ok(render_ppl_answer(
+            format,
+            &columns,
+            &reserved_batches.batches,
+            &reserved_batches.reservation,
+        ))
+    })
+    .await?
 }
 
 /// Refuse a `filter_path` parameter on a text format, whose body the `filter_path` layer cannot
@@ -192,28 +221,34 @@ fn build_fetch_size_error(value: &Value) -> OpenSearchError {
     )
 }
 
-/// Parse, plan and run `request` in `session`: the output columns and their rows.
+/// Parse, plan and run `request` in `session`: the output columns and their rows, held against
+/// the session's memory pool.
 ///
 /// `fetch_size` keeps the first N rows of the final output, as a trailing `| head N` does; it is
 /// a bound the client asked for, never reported as truncation. `limits.max_result_rows` is then
 /// checked against the output: the plan fetches one row beyond it, so a breach is detected
 /// without reading the rest, and is refused instead of truncated. Both bounds apply before any
-/// format renders, so every format sees the same rows. `cluster_name` is the listener's
-/// `opensearch.cluster_name`, which `describe` reports.
+/// format renders, so every format sees the same rows. The output counts against the per-query
+/// memory limit as it arrives, so an answer larger than the limit is refused instead of held.
+/// `cluster_name` is the listener's `opensearch.cluster_name`, which `describe` reports.
 pub(crate) async fn run_ppl_query(
     session: &TenantSession,
     limits: &PplLimitsConfig,
     context: &RequestContext,
     request: &PplRequest,
     cluster_name: &str,
-) -> Result<(Vec<PplColumn>, Vec<RecordBatch>), PplError> {
+) -> Result<(Vec<PplColumn>, ReservedBatches), PplError> {
     let query = parse_ppl(&request.query)?;
     let ppl_plan = plan_ppl(&query, session, context, cluster_name).await?;
     let plan = bound_output_rows(ppl_plan.plan, request.fetch_size, limits.max_result_rows)?;
-    let batches = session.collect(plan).await?;
-    refuse_rows_beyond_limit(&batches, limits.max_result_rows)?;
-    Ok((ppl_plan.columns, batches))
+    let reserved_batches = session.collect_reserved_batches(plan, PPL_OUTPUT_CONSUMER).await?;
+    refuse_rows_beyond_limit(&reserved_batches.batches, limits.max_result_rows)?;
+    Ok((ppl_plan.columns, reserved_batches))
 }
+
+/// The memory consumer the output of a PPL query, and the answer rendered from it, are reserved
+/// under.
+const PPL_OUTPUT_CONSUMER: &str = "PPL output";
 
 /// `plan` with the client's `fetch_size` applied, then fetching at most one row beyond
 /// `max_result_rows`.

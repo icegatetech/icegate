@@ -55,7 +55,7 @@ use icegate_query_grammar::ppl::{
     ValueListContextAttrs, ValuesAggFunctionCallContextAttrs, ValuesAggFunctionContextAttrs,
     WcFieldExpressionContextAll, WcFieldExpressionContextAttrs, WcFieldListContextAttrs, WcQualifiedNameContextAll,
     WhereCommandContextAttrs, WildcardContextAll, WildcardContextAttrs, WindowFunctionContextAll,
-    WindowFunctionContextAttrs, parse_ppl_root, ruleNames,
+    WindowFunctionContextAttrs, measure_ppl_nesting, parse_ppl_root, ruleNames,
 };
 
 use super::ast::{
@@ -110,8 +110,117 @@ const DEFAULT_BUCKET_NULLABLE: bool = true;
 /// [`PplError::UnsupportedCommand`] / [`PplError::UnsupportedFunction`] naming a command or
 /// function IceGate does not plan, and [`PplError::Semantic`] for a construct the grammar accepts
 /// but whose meaning IceGate refuses (a negative `head`, a sort key with both a sign and a
-/// direction, a field name with the reserved prefix).
+/// direction, a field name with the reserved prefix). Before any of those, and without being
+/// parsed and in this order, a query whose parentheses and square brackets nest deeper than
+/// [`MAX_PPL_NESTING_DEPTH`] is [`PplError::NestingLimitExceeded`], a query whose subsearches nest
+/// deeper than [`MAX_PPL_SUBSEARCH_DEPTH`] is [`PplError::SubsearchNestingLimitExceeded`], and a
+/// query holding more than [`MAX_PPL_OPERATOR_COUNT`] operators is
+/// [`PplError::OperatorLimitExceeded`]; [`PplError::Internal`] when the thread that parses a nested
+/// query cannot start or panics.
 pub(crate) fn parse_ppl(text: &str) -> Result<PplQuery, PplError> {
+    // Measured on the parser's own tokens, so every level the parser recurses through counts.
+    let nesting = measure_ppl_nesting(text);
+    if nesting.bracket_depth() > MAX_PPL_NESTING_DEPTH {
+        return Err(PplError::NestingLimitExceeded {
+            limit_depth: MAX_PPL_NESTING_DEPTH,
+        });
+    }
+    if nesting.square_bracket_depth() > MAX_PPL_SUBSEARCH_DEPTH {
+        return Err(PplError::SubsearchNestingLimitExceeded {
+            limit_subsearch_depth: MAX_PPL_SUBSEARCH_DEPTH,
+        });
+    }
+    if nesting.operator_count() > MAX_PPL_OPERATOR_COUNT {
+        return Err(PplError::OperatorLimitExceeded {
+            limit_operators: MAX_PPL_OPERATOR_COUNT,
+        });
+    }
+    if nesting.bracket_depth() <= MAX_IN_PLACE_NESTING_DEPTH && nesting.operator_count() <= MAX_IN_PLACE_OPERATOR_COUNT
+    {
+        return build_parsed_query(text);
+    }
+    // See `DEEP_PARSE_STACK_BYTES` for why a deeply nested query gets its own thread.
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name(String::from("ppl-parse"))
+            .stack_size(DEEP_PARSE_STACK_BYTES)
+            .spawn_scoped(scope, || build_parsed_query(text))
+            .map_err(|error| PplError::Internal {
+                reason: format!("the PPL parser thread did not start: {error}"),
+            })?;
+        worker.join().map_err(|_| PplError::Internal {
+            reason: "the PPL parser thread panicked".to_string(),
+        })?
+    })
+}
+
+/// How deeply the parentheses and square brackets of one PPL query may nest, counted together
+/// (a subsearch inside a group is two levels).
+///
+/// The parser, the builder, the planner and the executed plan all recurse once per level, so a
+/// deeper query is refused before it is parsed. Parsing gets a thread sized for the limit, but
+/// planning and execution run on the async worker, whose stack this crate does not size: the
+/// limit is set so that a query nested this deep (a function call or a group per level, with
+/// subsearches up to [`MAX_PPL_SUBSEARCH_DEPTH`] among them), holding [`MAX_PPL_OPERATOR_COUNT`]
+/// operators as well, plans and executes on a default worker stack in an unoptimized build with
+/// room to spare. Over HTTP, the integration test
+/// `a_query_nested_to_the_limit_answers_and_one_level_deeper_is_a_400_naming_the_limit` answers
+/// each of those shapes at the limit, and
+/// `a_query_holding_the_operator_limit_answers_and_one_more_operator_is_a_400_naming_the_limit`
+/// answers them at the nesting and the operator limits at once.
+const MAX_PPL_NESTING_DEPTH: usize = 16;
+
+/// How deeply the square brackets of one PPL query may nest, counted alone.
+///
+/// Every subsearch is written in square brackets (`in`, `exists` and a scalar subsearch, `append`,
+/// `appendcol`, `appendpipe`, `join`, `multisearch`), so this bounds how deeply subsearches nest;
+/// a square bracket that opens no subsearch (a list of sources or of relevance fields) counts all
+/// the same. Each nested subsearch is planned synchronously on the async worker, where the query
+/// deadline cannot preempt it, and the cost of planning nested `in` subsearches grows steeply with
+/// their depth. The limit is set so that the slowest shape measured, `in` subsearches nested this
+/// deep, answers in well under a second in an unoptimized build; the
+/// integration test
+/// `a_query_nesting_subsearches_to_the_limit_answers_and_one_level_deeper_is_a_400_naming_the_limit`
+/// answers it at the limit over HTTP.
+const MAX_PPL_SUBSEARCH_DEPTH: usize = 4;
+
+/// How many operators one PPL query may hold: every operator token of the query, wherever it
+/// stands, as [`measure_ppl_nesting`] counts them (a logical, comparison or arithmetic operator,
+/// `source=` and an assignment's `=` included).
+///
+/// Each operator of a chain such as `a = 1 or a = 1 or …` or `not not … a = 1` adds one level of
+/// recursion to the parse, the build of the query, the drop of the parse tree and the lowering of
+/// the expression, without a single bracket. A query with more operators is refused before it is
+/// parsed, so the brackets and the operators of a query together bound every recursion over it.
+/// Like [`MAX_PPL_NESTING_DEPTH`], the limit is set for the async worker, which plans and executes
+/// the query; the integration test
+/// `a_query_holding_the_operator_limit_answers_and_one_more_operator_is_a_400_naming_the_limit`
+/// answers an operator chain at both limits at once over HTTP.
+const MAX_PPL_OPERATOR_COUNT: usize = 128;
+
+/// Deepest nesting parsed and built on the caller's thread; a query of this depth or less costs
+/// no thread. A parsed level takes far more stack than a planned one, so only shallow queries, the
+/// common case, parse where they are planned.
+const MAX_IN_PLACE_NESTING_DEPTH: usize = 4;
+
+/// Most operators of a query parsed and built on the caller's thread, with at most
+/// [`MAX_IN_PLACE_NESTING_DEPTH`] levels of brackets: a prefix `not` recurses in the parser, so a
+/// query with more operators parses on the sized thread as a deeply nested one does.
+const MAX_IN_PLACE_OPERATOR_COUNT: usize = 16;
+
+/// Stack of the thread that parses and builds a query nested deeper than
+/// [`MAX_IN_PLACE_NESTING_DEPTH`] or holding more than [`MAX_IN_PLACE_OPERATOR_COUNT`] operators.
+///
+/// The thread exists because the generated parser recurses through many rule frames per level,
+/// and the caller's thread (an async worker, a test thread) has a stack this crate does not size:
+/// [`MAX_PPL_NESTING_DEPTH`] levels, or a run of [`MAX_PPL_OPERATOR_COUNT`] `not`, overflow such a
+/// default stack in an unoptimized build. The parse tree is also dropped on this thread, which
+/// recurses once per level as well. The size leaves a wide margin over what the two limits take
+/// there together; the nesting tests of `parse_ppl` parse both limits at once through it.
+const DEEP_PARSE_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Parse `text` and build its query; [`parse_ppl`] states the contract.
+fn build_parsed_query(text: &str) -> Result<PplQuery, PplError> {
     let root = parse_ppl_root(text)?;
     let Some(statement) = root.pplStatement() else {
         let (line, column) = root
@@ -2671,6 +2780,210 @@ mod tests {
         assert!(
             matches!(&result, Err(PplError::Semantic { reason }) if reason.contains("append needs a search")),
             "{result:?}"
+        );
+    }
+
+    /// `source=logs | where severity_text = 'ERROR'` with the comparison wrapped in `depth`
+    /// parentheses.
+    fn nest_comparison_in_parentheses(depth: usize) -> String {
+        format!(
+            "source=logs | where {}severity_text = 'ERROR'{}",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        )
+    }
+
+    /// `depth` `append` commands, each branch holding the next: `source=logs | append [ source=logs
+    /// | append [ … source=logs … ] ]`.
+    fn nest_appends(depth: usize) -> String {
+        format!(
+            "source=logs{} | head 1{}",
+            " | append [ source=logs".repeat(depth),
+            " ]".repeat(depth)
+        )
+    }
+
+    fn build_logs_source() -> PplSource {
+        PplSource::Index {
+            expression: "logs".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_query_nested_up_to_the_limit_parses_and_one_level_deeper_is_refused() {
+        let error_filter = PplQuery {
+            source: build_logs_source(),
+            commands: vec![PplCommand::Where(PplExpr::Compare {
+                operator: CompareOperator::Equal,
+                left: Box::new(PplExpr::Field("severity_text".to_string())),
+                right: Box::new(PplExpr::Literal(PplLiteral::String("ERROR".to_string()))),
+            })],
+        };
+        // Depths at and just past the in-place threshold cover both the calling thread and the sized
+        // parser thread.
+        for depth in [0, 1, 4, 5, 15, 16] {
+            assert_eq!(
+                parse_ppl(&nest_comparison_in_parentheses(depth)),
+                Ok(error_filter.clone()),
+                "depth {depth}"
+            );
+        }
+        let limit_breach = Err(PplError::NestingLimitExceeded { limit_depth: 16 });
+        assert_eq!(parse_ppl(&nest_comparison_in_parentheses(17)), limit_breach);
+        // Square brackets count with parentheses: appends nested to the subsearch limit around a
+        // group that fills the rest reach the nesting limit, and one more parenthesis is beyond it.
+        let mixed_at_limit =
+            nest_appends(4).replacen("head 1", &format!("where {}a = 1{}", "(".repeat(12), ")".repeat(12)), 1);
+        let mut expected_query = PplQuery {
+            source: build_logs_source(),
+            commands: vec![PplCommand::Where(PplExpr::Compare {
+                operator: CompareOperator::Equal,
+                left: Box::new(PplExpr::Field("a".to_string())),
+                right: Box::new(PplExpr::Literal(PplLiteral::Integer(1))),
+            })],
+        };
+        for _ in 0..4 {
+            expected_query = PplQuery {
+                source: build_logs_source(),
+                commands: vec![PplCommand::Append(Box::new(expected_query))],
+            };
+        }
+        assert_eq!(parse_ppl(&mixed_at_limit), Ok(expected_query));
+        let mixed_beyond_limit = mixed_at_limit.replacen("where (", "where ((", 1).replacen(')', "))", 1);
+        assert_eq!(parse_ppl(&mixed_beyond_limit), limit_breach);
+        // A run of one MiB of opening parentheses is refused by the count, never parsed.
+        assert_eq!(parse_ppl(&"(".repeat(1_048_576)), limit_breach);
+    }
+
+    #[test]
+    fn subsearches_nested_to_the_limit_build_one_inside_the_other_and_one_level_deeper_is_refused() {
+        let mut expected_query = PplQuery {
+            source: build_logs_source(),
+            commands: vec![PplCommand::Head { count: 1, offset: 0 }],
+        };
+        for _ in 0..4 {
+            expected_query = PplQuery {
+                source: build_logs_source(),
+                commands: vec![PplCommand::Append(Box::new(expected_query))],
+            };
+        }
+        assert_eq!(parse_ppl(&nest_appends(4)), Ok(expected_query));
+        let subsearch_breach = Err(PplError::SubsearchNestingLimitExceeded {
+            limit_subsearch_depth: 4,
+        });
+        assert_eq!(parse_ppl(&nest_appends(5)), subsearch_breach);
+        // An `in` subsearch nests as an `append` branch does.
+        let nest_in_subsearches = |depth: usize| {
+            let mut query = "source=logs | fields a".to_string();
+            for _ in 0..depth {
+                query = format!("source=logs | where a in [ {query} ] | fields a");
+            }
+            query
+        };
+        let keep_a = PplCommand::Fields {
+            is_exclusion: false,
+            fields: vec!["a".to_string()],
+        };
+        let mut expected_in_query = PplQuery {
+            source: build_logs_source(),
+            commands: vec![keep_a.clone()],
+        };
+        for _ in 0..4 {
+            expected_in_query = PplQuery {
+                source: build_logs_source(),
+                commands: vec![
+                    PplCommand::Where(PplExpr::InSubsearch {
+                        expression: Box::new(PplExpr::Field("a".to_string())),
+                        query: Box::new(expected_in_query),
+                    }),
+                    keep_a.clone(),
+                ],
+            };
+        }
+        assert_eq!(parse_ppl(&nest_in_subsearches(4)), Ok(expected_in_query));
+        assert_eq!(parse_ppl(&nest_in_subsearches(5)), subsearch_breach);
+        // A query beyond both bracket limits names the nesting limit, which is checked first.
+        assert_eq!(
+            parse_ppl(&nest_appends(17)),
+            Err(PplError::NestingLimitExceeded { limit_depth: 16 })
+        );
+    }
+
+    /// `source=logs | where a = 1` with the comparison under `count` prefix `not`.
+    fn negate_comparison(count: usize) -> String {
+        format!("source=logs | where {}a = 1", "not ".repeat(count))
+    }
+
+    /// `source=logs | where a = 1`, the query a chain of `count` prefix `not` builds.
+    fn build_negated_comparison_query(count: usize) -> PplQuery {
+        let mut condition = PplExpr::Compare {
+            operator: CompareOperator::Equal,
+            left: Box::new(PplExpr::Field("a".to_string())),
+            right: Box::new(PplExpr::Literal(PplLiteral::Integer(1))),
+        };
+        for _ in 0..count {
+            condition = PplExpr::Not(Box::new(condition));
+        }
+        PplQuery {
+            source: build_logs_source(),
+            commands: vec![PplCommand::Where(condition)],
+        }
+    }
+
+    #[test]
+    fn a_query_holding_up_to_the_operator_limit_parses_and_one_more_operator_is_refused() {
+        // `source=` and the comparison hold two operators, so `count` prefix `not` make
+        // `count + 2`. Counts at and just past the in-place threshold cover both the calling
+        // thread and the sized parser thread.
+        for count in [0, 14, 15, 126] {
+            assert_eq!(
+                parse_ppl(&negate_comparison(count)),
+                Ok(build_negated_comparison_query(count)),
+                "{count} not"
+            );
+        }
+        let operator_breach = Err(PplError::OperatorLimitExceeded { limit_operators: 128 });
+        assert_eq!(parse_ppl(&negate_comparison(127)), operator_breach);
+
+        // A left-deep chain: `source=`, the first comparison, then an `or` and a comparison per
+        // further term, as many further terms as reach the operator limit.
+        let comparison = PplExpr::Compare {
+            operator: CompareOperator::Equal,
+            left: Box::new(PplExpr::Field("a".to_string())),
+            right: Box::new(PplExpr::Literal(PplLiteral::Integer(1))),
+        };
+        let mut disjunction = comparison.clone();
+        for _ in 0..63 {
+            disjunction = PplExpr::Or(Box::new(disjunction), Box::new(comparison.clone()));
+        }
+        let chain_at_limit = format!("source=logs | where a = 1{}", " or a = 1".repeat(63));
+        assert_eq!(
+            parse_ppl(&chain_at_limit),
+            Ok(PplQuery {
+                source: build_logs_source(),
+                commands: vec![PplCommand::Where(disjunction)],
+            })
+        );
+        assert_eq!(parse_ppl(&format!("{chain_at_limit} or a = 1")), operator_breach);
+
+        // Both limits at once parse on the sized thread: the `not` chain at the operator limit
+        // inside groups at the nesting limit.
+        let both_limits = format!(
+            "source=logs | where {}{}a = 1{}",
+            "(".repeat(16),
+            "not ".repeat(126),
+            ")".repeat(16)
+        );
+        assert_eq!(parse_ppl(&both_limits), Ok(build_negated_comparison_query(126)));
+
+        // Long chains are refused by the count, never parsed.
+        assert_eq!(parse_ppl(&negate_comparison(10_000)), operator_breach);
+        let long_disjunction = format!("source=logs | where a = 1{}", " or a = 1".repeat(99_999));
+        assert_eq!(parse_ppl(&long_disjunction), operator_breach);
+        // Brackets beyond their limit are named first when a query breaches both limits.
+        assert_eq!(
+            parse_ppl(&format!("{}{}", "(".repeat(17), "not ".repeat(200))),
+            Err(PplError::NestingLimitExceeded { limit_depth: 16 })
         );
     }
 }

@@ -30,8 +30,10 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::common::TableReference;
 use datafusion::datasource::{TableProvider, provider_as_source};
 use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, TableType};
 use datafusion::prelude::SessionContext;
+use futures::StreamExt as _;
 use iceberg::expr::Predicate;
 use icegate_common::schema::{
     COL_DATA_POINT_ATTRIBUTES, COL_LOG_ATTRIBUTES, COL_METADATA, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES,
@@ -271,6 +273,57 @@ pub(crate) struct IndexListing<'a> {
     pub(crate) data_entries: Vec<&'a IndexEntry>,
     /// System indices and aliases.
     pub(crate) system_listing: SystemListing,
+}
+
+/// The batches a plan returned, held against the memory pool of the session that ran it
+/// ([`TenantSession::collect_reserved_batches`]).
+pub(crate) struct ReservedBatches {
+    /// The plan's output, in the order [`TenantSession::collect`] returns it.
+    pub(crate) batches: Vec<RecordBatch>,
+    /// Holds the batches' memory until it is dropped; whatever the caller builds from the batches
+    /// grows it.
+    pub(crate) reservation: QueryReservation,
+}
+
+/// A reservation in one session's memory pool, which holds `opensearch.max_query_memory_bytes`.
+/// Its memory returns to the pool when it is dropped.
+pub(crate) struct QueryReservation {
+    /// The reservation itself.
+    reservation: MemoryReservation,
+    /// The pool's size, which a refusal names.
+    limit_bytes: usize,
+}
+
+impl QueryReservation {
+    /// An empty reservation of a consumer named `consumer_name` in `pool`, a pool of `limit_bytes`.
+    pub(crate) fn new(pool: &Arc<dyn MemoryPool>, consumer_name: &str, limit_bytes: usize) -> Self {
+        Self {
+            reservation: MemoryConsumer::new(consumer_name).register(pool),
+            limit_bytes,
+        }
+    }
+
+    /// Grow the reservation by `additional_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `400 illegal_argument_exception` naming the per-query memory limit when the pool
+    /// cannot grant the growth; the reservation keeps its size then.
+    pub(crate) fn reserve_bytes(&self, additional_bytes: usize) -> Result<(), OpenSearchError> {
+        self.reservation
+            .try_grow(additional_bytes)
+            .map_err(|error| map_execution_error(error, self.limit_bytes))
+    }
+}
+
+/// Map a planning or execution failure of a session whose memory pool holds `limit_bytes` to the
+/// envelope. The memory pool refusing a reservation, at any depth of the error chain, is the
+/// client's 400 naming the per-query limit; any other failure keeps the mapping of `QueryError`.
+fn map_execution_error(error: DataFusionError, limit_bytes: usize) -> OpenSearchError {
+    if matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)) {
+        return OpenSearchError::memory_limit_exceeded(limit_bytes);
+    }
+    OpenSearchError::from(QueryError::from(error))
 }
 
 /// A tenant-scoped view of the catalog for one request.
@@ -538,14 +591,49 @@ impl TenantSession {
         frame.collect().await.map_err(|error| self.map_execution_error(error))
     }
 
-    /// Map a planning or execution failure of this session to the envelope. The memory pool
-    /// refusing a reservation, at any depth of the error chain, is the client's 400 naming the
-    /// per-query limit; any other failure keeps the mapping of `QueryError`.
-    fn map_execution_error(&self, error: DataFusionError) -> OpenSearchError {
-        if matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)) {
-            return OpenSearchError::memory_limit_exceeded(self.settings.max_query_memory_bytes);
+    /// Execute `plan` in the tenant-scoped session and collect its batches, as [`Self::collect`]
+    /// does, with every batch held against the session's memory pool as it arrives.
+    ///
+    /// The batches a plan returns are reserved here, as they arrive, so the answer counts against
+    /// the per-query memory limit whatever operators produced it. They are reserved at their Arrow
+    /// memory size under a consumer named `consumer_name`; the returned [`ReservedBatches`] keeps
+    /// the reservation until it is dropped, and the caller grows it for whatever it builds from
+    /// the batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns `400 illegal_argument_exception` naming the per-query memory limit when the pool
+    /// refuses a reservation, an operator's or the output's; any other planning or execution
+    /// failure as the envelope `From<QueryError>` maps it to.
+    pub(crate) async fn collect_reserved_batches(
+        &self,
+        plan: LogicalPlan,
+        consumer_name: &str,
+    ) -> Result<ReservedBatches, OpenSearchError> {
+        let limit_bytes = self.settings.max_query_memory_bytes;
+        let frame = self
+            .context
+            .execute_logical_plan(plan)
+            .await
+            .map_err(|error| map_execution_error(error, limit_bytes))?;
+        let mut stream = frame
+            .execute_stream()
+            .await
+            .map_err(|error| map_execution_error(error, limit_bytes))?;
+        let reservation = QueryReservation::new(&self.context.runtime_env().memory_pool, consumer_name, limit_bytes);
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|error| map_execution_error(error, limit_bytes))?;
+            reservation.reserve_bytes(batch.get_array_memory_size())?;
+            batches.push(batch);
         }
-        OpenSearchError::from(QueryError::from(error))
+        Ok(ReservedBatches { batches, reservation })
+    }
+
+    /// Map a planning or execution failure of this session to the envelope; see
+    /// [`map_execution_error`].
+    fn map_execution_error(&self, error: DataFusionError) -> OpenSearchError {
+        map_execution_error(error, self.settings.max_query_memory_bytes)
     }
 
     /// The tenant's system-index state, read from the store on the first call of this session.

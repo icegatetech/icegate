@@ -997,6 +997,30 @@ async fn each_supported_function_returns_the_stated_value() {
     server.shutdown().await;
 }
 
+/// A `between` whose value and bounds share no comparable type is the query's 400, as the same
+/// comparison written with `>=` and `<=` is, never an internal error of the planner.
+#[tokio::test]
+async fn between_over_types_with_no_common_comparison_type_is_a_400() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    for query in [
+        // A MAP against strings.
+        "source=logs | where log_attributes between 'a' and 'b'",
+        // A boolean against numbers.
+        "source=logs | where isnull(body) between 1 and 2",
+        // Each bound compares with the string value, but a number and a timestamp do not compare.
+        "source=logs | where body between 1 and timestamp('2026-10-08 12:00:00')",
+    ] {
+        assert_ppl_error(
+            &run_query(&server, query).await,
+            StatusCode::BAD_REQUEST,
+            "SemanticCheckException",
+            "SEMANTIC_ERROR",
+        );
+    }
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn now_returns_the_request_time() {
     let (server, catalog) = TestServer::start().await;
@@ -2118,6 +2142,126 @@ async fn timechart_with_more_series_than_its_limit_groups_the_rest_as_the_stated
     server.shutdown().await;
 }
 
+/// `n` per row of [`seed_aggregation_logs`]: 10 for an `INFO` row, otherwise 1.
+const WEIGHTED_ROWS: &str = "source=logs | eval n = if(severity_text = 'INFO', 10, 1)";
+
+#[tokio::test]
+async fn timechart_merges_sum_and_max_into_the_other_series_exactly() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    // n per row: api a1 1, a2 10 (2026) and a6 10 (2027); web a3 10, a7 1; db a5 1; NULL a4 1.
+    // sum totals: api 21, web 11, db 1, so limit=1 keeps api; OTHER in 2026 is web 11 + db 1.
+    let sum_answer = run_query(
+        &server,
+        &format!("{WEIGHTED_ROWS} | timechart timefield=timestamp span=1y limit=1 sum(n) by service_name"),
+    )
+    .await;
+    assert_eq!(
+        read_rows(&sum_answer),
+        &json!([
+            ["2026-01-01 00:00:00", "NULL", 1],
+            ["2026-01-01 00:00:00", "OTHER", 12],
+            ["2026-01-01 00:00:00", "api", 11],
+            ["2027-01-01 00:00:00", "api", 10]
+        ])
+    );
+    // max totals over the buckets: api 10 + 10, web 10, db 1; OTHER in 2026 is the larger of web's
+    // 10 and db's 1.
+    let max_answer = run_query(
+        &server,
+        &format!("{WEIGHTED_ROWS} | timechart timefield=timestamp span=1y limit=1 max(n) by service_name"),
+    )
+    .await;
+    assert_eq!(
+        read_rows(&max_answer),
+        &json!([
+            ["2026-01-01 00:00:00", "NULL", 1],
+            ["2026-01-01 00:00:00", "OTHER", 10],
+            ["2026-01-01 00:00:00", "api", 10],
+            ["2027-01-01 00:00:00", "api", 10]
+        ])
+    );
+    server.shutdown().await;
+}
+
+/// An average, a distinct count or a percentile of the merged series is not a function of the
+/// per-series values, so with the OTHER series in play each is refused, naming the function as
+/// planned (every percentile spelling is `percentile`) and the cause.
+#[tokio::test]
+async fn timechart_refuses_an_aggregation_the_other_series_cannot_merge_exactly() {
+    let (server, catalog) = TestServer::start().await;
+    seed_aggregation_logs(&catalog).await.expect("seed aggregation logs");
+    for (aggregation, function) in [
+        ("avg(n)", "avg"),
+        ("dc(n)", "dc"),
+        ("distinct_count(n)", "dc"),
+        ("percentile(n, 50)", "percentile"),
+        ("percentile_approx(n, 50)", "percentile"),
+        ("p95(n)", "percentile"),
+        ("median(n)", "percentile"),
+    ] {
+        for options in ["", "limit=1 ", "limit=1 useother=true "] {
+            let query = format!(
+                "{WEIGHTED_ROWS} | timechart timefield=timestamp span=1y {options}{aggregation} by service_name"
+            );
+            let answer = run_query(&server, &query).await;
+            assert_ppl_error(
+                &answer,
+                StatusCode::BAD_REQUEST,
+                "SemanticCheckException",
+                "SEMANTIC_ERROR",
+            );
+            assert_eq!(
+                answer.body["error"]["context"],
+                json!({"function": function, "cause": "inexact_other_series"}),
+                "{query}"
+            );
+        }
+    }
+    // Without the OTHER series every series keeps its own value, so the same aggregation answers:
+    // avg per bucket of api is (1 + 10) / 2 in 2026 and 10 in 2027.
+    let dropped_answer = run_query(
+        &server,
+        &format!(
+            "{WEIGHTED_ROWS} | timechart timefield=timestamp span=1y limit=1 useother=false avg(n) by service_name"
+        ),
+    )
+    .await;
+    assert_eq!(
+        read_rows(&dropped_answer),
+        &json!([
+            ["2026-01-01 00:00:00", "api", 5.5],
+            ["2027-01-01 00:00:00", "api", 10.0]
+        ])
+    );
+    let unlimited_answer = run_query(
+        &server,
+        &format!("{WEIGHTED_ROWS} | timechart timefield=timestamp span=1y limit=0 dc(n) by service_name"),
+    )
+    .await;
+    assert_eq!(
+        read_rows(&unlimited_answer),
+        &json!([
+            ["2026-01-01 00:00:00", "api", 2],
+            ["2026-01-01 00:00:00", "db", 1],
+            ["2026-01-01 00:00:00", "web", 2],
+            ["2026-01-01 00:00:00", null, 1],
+            ["2027-01-01 00:00:00", "api", 1]
+        ])
+    );
+    // Without a `by` field there is no series to merge: (1 + 10 + 10 + 1 + 1 + 1) / 6 in 2026.
+    let unsplit_answer = run_query(
+        &server,
+        &format!("{WEIGHTED_ROWS} | timechart timefield=timestamp span=1y avg(n)"),
+    )
+    .await;
+    assert_eq!(
+        read_rows(&unsplit_answer),
+        &json!([["2026-01-01 00:00:00", 4.0], ["2027-01-01 00:00:00", 10.0]])
+    );
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn timechart_on_a_native_index_without_timefield_is_field_not_found() {
     let (server, catalog) = TestServer::start().await;
@@ -2419,6 +2563,322 @@ async fn percentile_values_lie_within_the_stated_tolerance() {
         let value = row[index].as_f64().expect("percentile value");
         assert!((value - exact).abs() <= 2.0, "column {index}: {value} vs {exact}");
     }
+    server.shutdown().await;
+}
+
+/// `opensearch.max_query_memory_bytes` of the memory-limit test: a per-query memory limit the
+/// large-body fixture exceeds twice over.
+const SMALL_QUERY_MEMORY_BYTES: usize = 262_144;
+
+/// How many bytes of `x` the body of each row the memory-limit test reads holds.
+const LARGE_BODY_BYTES: usize = 8_192;
+
+/// How many `acme` rows carry a [`LARGE_BODY_BYTES`] body: enough that their bodies alone add up
+/// to twice [`SMALL_QUERY_MEMORY_BYTES`].
+const LARGE_BODY_ROWS: usize = 64;
+
+#[tokio::test]
+async fn an_answer_larger_than_the_query_memory_limit_is_a_400_naming_the_limit_in_every_format() {
+    let (server, catalog) = TestServer::start_with_config(OpenSearchConfig {
+        max_query_memory_bytes: SMALL_QUERY_MEMORY_BYTES,
+        ..OpenSearchConfig::default()
+    })
+    .await;
+    let large_body = "x".repeat(LARGE_BODY_BYTES);
+    let rows: Vec<LogRow<'_>> = (0..=LARGE_BODY_ROWS)
+        .map(|index| LogRow {
+            // The last row is another tenant's, written in the same batch.
+            tenant_id: if index < LARGE_BODY_ROWS { TENANT } else { OTHER_TENANT },
+            timestamp_micros: NOON_MICROS + i64::try_from(index).expect("a small index"),
+            service_name: Some("api"),
+            severity_text: Some("INFO"),
+            body: Some(large_body.as_str()),
+            resource_attributes: &[],
+            log_attributes: &[],
+        })
+        .collect();
+    commit_log_rows(&catalog, &rows).await.expect("commit logs");
+    // The fixture reaches the condition: the bodies the tenant reads add up past the limit.
+    let size_answer = run_query(
+        &server,
+        "source=logs | eval size = length(body) | stats count() as row_count, sum(size) as body_bytes",
+    )
+    .await;
+    assert_eq!(read_rows(&size_answer), &json!([[64, 524_288]]));
+    for path in [
+        PPL_PATH,
+        "/_plugins/_ppl?format=viz",
+        "/_plugins/_ppl?format=csv",
+        "/_plugins/_ppl?format=raw",
+    ] {
+        let answer = post_ppl(&server, TENANT, path, &json!({"query": "source=logs | fields body"})).await;
+        assert_ppl_error(
+            &answer,
+            StatusCode::BAD_REQUEST,
+            "IllegalArgumentException",
+            "RESOURCE_LIMIT_EXCEEDED",
+        );
+        assert_eq!(
+            answer.body["error"]["context"],
+            json!({"limit_bytes": SMALL_QUERY_MEMORY_BYTES}),
+            "{path}"
+        );
+    }
+    // An answer within the limit is served under the same configuration.
+    let small_answer = run_query(&server, "source=logs | head 2 | fields severity_text").await;
+    assert_eq!(read_rows(&small_answer), &json!([["INFO"], ["INFO"]]));
+    server.shutdown().await;
+}
+
+/// The nesting limit of a PPL query (`MAX_PPL_NESTING_DEPTH` of `ppl/build.rs`), stated as a literal
+/// oracle.
+const PPL_NESTING_LIMIT: usize = 16;
+
+/// The 400 refusing a query nested deeper than [`PPL_NESTING_LIMIT`], with the limit as
+/// `limit_depth`.
+fn assert_nesting_limit_error(answer: &PplAnswer) {
+    assert_ppl_error(
+        answer,
+        StatusCode::BAD_REQUEST,
+        "IllegalArgumentException",
+        "RESOURCE_LIMIT_EXCEEDED",
+    );
+    assert_eq!(
+        answer.body["error"]["context"],
+        json!({"limit_depth": PPL_NESTING_LIMIT})
+    );
+}
+
+/// `source=logs | where severity_text = 'ERROR' | fields body`, followed by `depth` nested
+/// `append` branches of the same search, each branch holding the next.
+fn nest_error_appends(depth: usize) -> String {
+    let search = "source=logs | where severity_text = 'ERROR' | fields body";
+    format!(
+        "{search}{}{}",
+        format!(" | append [ {search}").repeat(depth),
+        " ]".repeat(depth)
+    )
+}
+
+#[tokio::test]
+async fn a_query_nested_to_the_limit_answers_and_one_level_deeper_is_a_400_naming_the_limit() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    // The parser, the builder and the planner recurse once per level, through parentheses, function
+    // calls and subsearches alike; each shape is answered at the limit.
+    let grouped_query = format!(
+        "source=logs | where {}severity_text = 'ERROR'{} | fields body",
+        "(".repeat(PPL_NESTING_LIMIT),
+        ")".repeat(PPL_NESTING_LIMIT)
+    );
+    assert_eq!(
+        read_rows(&run_query(&server, &grouped_query).await),
+        &json!([["disk full"]])
+    );
+    let called_query = format!(
+        "source=logs | where severity_text = 'ERROR' | eval x = {}-3{} | fields x",
+        "abs(".repeat(PPL_NESTING_LIMIT),
+        ")".repeat(PPL_NESTING_LIMIT)
+    );
+    assert_eq!(read_rows(&run_query(&server, &called_query).await), &json!([[3]]));
+    // Subsearches nested to their own limit around a group that fills the rest: the search and
+    // every nested branch each answer the one `acme` ERROR row.
+    let append_around_group = |groups: usize| {
+        let search = "source=logs | where severity_text = 'ERROR' | fields body";
+        format!(
+            "{search}{} | append [ source=logs | where {}severity_text = 'ERROR'{} | fields body{}",
+            format!(" | append [ {search}").repeat(PPL_SUBSEARCH_LIMIT - 1),
+            "(".repeat(groups),
+            ")".repeat(groups),
+            " ]".repeat(PPL_SUBSEARCH_LIMIT)
+        )
+    };
+    let appended_answer = run_query(&server, &append_around_group(PPL_NESTING_LIMIT - PPL_SUBSEARCH_LIMIT)).await;
+    let expected_rows: Vec<Value> = (0..=PPL_SUBSEARCH_LIMIT).map(|_| json!(["disk full"])).collect();
+    assert_eq!(read_rows(&appended_answer), &Value::Array(expected_rows));
+
+    let deeper_queries = [
+        format!(
+            "source=logs | where {}severity_text = 'ERROR'{}",
+            "(".repeat(PPL_NESTING_LIMIT + 1),
+            ")".repeat(PPL_NESTING_LIMIT + 1)
+        ),
+        append_around_group(PPL_NESTING_LIMIT - PPL_SUBSEARCH_LIMIT + 1),
+        // Beyond both bracket limits, the nesting limit is named: it is checked first.
+        nest_error_appends(PPL_NESTING_LIMIT + 1),
+        // One MiB of opening parentheses is refused by the count, never parsed.
+        "(".repeat(1_048_576),
+    ];
+    for query in &deeper_queries {
+        assert_nesting_limit_error(&run_query(&server, query).await);
+    }
+    // `_explain` parses through the same entry point.
+    let explain_answer = post_ppl(
+        &server,
+        TENANT,
+        "/_plugins/_ppl/_explain",
+        &json!({"query": nest_error_appends(PPL_NESTING_LIMIT + 1)}),
+    )
+    .await;
+    assert_nesting_limit_error(&explain_answer);
+    server.shutdown().await;
+}
+
+/// The subsearch nesting limit of a PPL query (`MAX_PPL_SUBSEARCH_DEPTH` of `ppl/build.rs`), stated
+/// as a literal oracle.
+const PPL_SUBSEARCH_LIMIT: usize = 4;
+
+/// The 400 refusing a query whose subsearches nest deeper than [`PPL_SUBSEARCH_LIMIT`], with the
+/// limit as `limit_subsearch_depth`.
+fn assert_subsearch_limit_error(answer: &PplAnswer) {
+    assert_ppl_error(
+        answer,
+        StatusCode::BAD_REQUEST,
+        "IllegalArgumentException",
+        "RESOURCE_LIMIT_EXCEEDED",
+    );
+    assert_eq!(
+        answer.body["error"]["context"],
+        json!({"limit_subsearch_depth": PPL_SUBSEARCH_LIMIT})
+    );
+}
+
+/// `source=logs | where severity_text = 'ERROR' | fields severity_text` inside `depth` nested `in`
+/// subsearches, each keeping the rows whose `severity_text` the next one returns.
+fn nest_error_in_subsearches(depth: usize) -> String {
+    let mut query = "source=logs | where severity_text = 'ERROR' | fields severity_text".to_string();
+    for _ in 0..depth {
+        query = format!("source=logs | where severity_text in [ {query} ] | fields severity_text");
+    }
+    query
+}
+
+#[tokio::test]
+async fn a_query_nesting_subsearches_to_the_limit_answers_and_one_level_deeper_is_a_400_naming_the_limit() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    // Nested `in` subsearches are the shape whose planning cost grows most with depth; each level
+    // keeps the one `acme` ERROR row.
+    assert_eq!(
+        read_rows(&run_query(&server, &nest_error_in_subsearches(PPL_SUBSEARCH_LIMIT)).await),
+        &json!([["ERROR"]])
+    );
+    // The search and every nested `append` branch each answer the one `acme` ERROR row.
+    let appended_answer = run_query(&server, &nest_error_appends(PPL_SUBSEARCH_LIMIT)).await;
+    let expected_rows: Vec<Value> = (0..=PPL_SUBSEARCH_LIMIT).map(|_| json!(["disk full"])).collect();
+    assert_eq!(read_rows(&appended_answer), &Value::Array(expected_rows));
+
+    for query in [
+        nest_error_in_subsearches(PPL_SUBSEARCH_LIMIT + 1),
+        nest_error_appends(PPL_SUBSEARCH_LIMIT + 1),
+    ] {
+        assert_subsearch_limit_error(&run_query(&server, &query).await);
+    }
+    // `_explain` parses through the same entry point.
+    let explain_answer = post_ppl(
+        &server,
+        TENANT,
+        "/_plugins/_ppl/_explain",
+        &json!({"query": nest_error_in_subsearches(PPL_SUBSEARCH_LIMIT + 1)}),
+    )
+    .await;
+    assert_subsearch_limit_error(&explain_answer);
+    server.shutdown().await;
+}
+
+/// The operator limit of a PPL query (`MAX_PPL_OPERATOR_COUNT` of `ppl/build.rs`), stated as a
+/// literal oracle.
+const PPL_OPERATOR_LIMIT: usize = 128;
+
+/// The 400 refusing a query holding more than [`PPL_OPERATOR_LIMIT`] operators, with the limit as
+/// `limit_operators`.
+fn assert_operator_limit_error(answer: &PplAnswer) {
+    assert_ppl_error(
+        answer,
+        StatusCode::BAD_REQUEST,
+        "IllegalArgumentException",
+        "RESOURCE_LIMIT_EXCEEDED",
+    );
+    assert_eq!(
+        answer.body["error"]["context"],
+        json!({"limit_operators": PPL_OPERATOR_LIMIT})
+    );
+}
+
+#[tokio::test]
+async fn a_query_holding_the_operator_limit_answers_and_one_more_operator_is_a_400_naming_the_limit() {
+    let (server, catalog) = TestServer::start().await;
+    seed_logs(&catalog).await;
+    let error_filter = "severity_text = 'ERROR'";
+    // Each shape holds the operator limit inside brackets at the nesting limit. `source=` and each
+    // comparison count as operators: the chains are as long as the limit leaves them.
+    let negated_query = |negations: usize| {
+        format!(
+            "source=logs | where {}{}{error_filter}{} | fields body",
+            "(".repeat(PPL_NESTING_LIMIT),
+            "not ".repeat(negations),
+            ")".repeat(PPL_NESTING_LIMIT)
+        )
+    };
+    // `source=`, the comparison and as many `not` as reach the operator limit.
+    assert_eq!(
+        read_rows(&run_query(&server, &negated_query(126)).await),
+        &json!([["disk full"]])
+    );
+    let summed_query = |additions: usize| {
+        format!(
+            "source=logs | where {error_filter} | eval x = {}1{}{} | fields x",
+            "abs(".repeat(PPL_NESTING_LIMIT),
+            " + 1".repeat(additions),
+            ")".repeat(PPL_NESTING_LIMIT)
+        )
+    };
+    // `source=`, the comparison, the assignment and as many `+` as reach the operator limit.
+    assert_eq!(
+        read_rows(&run_query(&server, &summed_query(125)).await),
+        &json!([[126]])
+    );
+    // Subsearches nested to their limit, each search holding two operators (`source=` and its
+    // comparison); the innermost search adds `or` comparisons of two operators each, as many as
+    // reach the operator limit, inside groups that fill the nesting limit.
+    let groups = PPL_NESTING_LIMIT - PPL_SUBSEARCH_LIMIT;
+    let search = format!("source=logs | where {error_filter} | fields body");
+    let innermost_search = format!(
+        "source=logs | where {}{error_filter}{}{} | fields body",
+        "(".repeat(groups),
+        format!(" or {error_filter}").repeat(59),
+        ")".repeat(groups)
+    );
+    let appended_query = format!(
+        "{search}{} | append [ {innermost_search}{}",
+        format!(" | append [ {search}").repeat(PPL_SUBSEARCH_LIMIT - 1),
+        " ]".repeat(PPL_SUBSEARCH_LIMIT)
+    );
+    let expected_rows: Vec<Value> = (0..=PPL_SUBSEARCH_LIMIT).map(|_| json!(["disk full"])).collect();
+    assert_eq!(
+        read_rows(&run_query(&server, &appended_query).await),
+        &Value::Array(expected_rows)
+    );
+
+    let longer_queries = [
+        negated_query(127),
+        summed_query(126),
+        // Long chains are refused by the count, never parsed.
+        format!("source=logs | where {}a = 1", "not ".repeat(200_000)),
+        format!("source=logs | where a = 1{}", " or a = 1".repeat(99_999)),
+    ];
+    for query in &longer_queries {
+        assert_operator_limit_error(&run_query(&server, query).await);
+    }
+    // `_explain` parses through the same entry point.
+    let explain_answer = post_ppl(
+        &server,
+        TENANT,
+        "/_plugins/_ppl/_explain",
+        &json!({"query": negated_query(127)}),
+    )
+    .await;
+    assert_operator_limit_error(&explain_answer);
     server.shutdown().await;
 }
 

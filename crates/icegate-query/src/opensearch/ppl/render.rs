@@ -1,5 +1,8 @@
-//! Rendering of PPL results: the jdbc response, which defines how every value renders, and the
-//! `viz`, `csv` and `raw` formats built from its rows.
+//! Rendering of PPL results in the `jdbc`, `viz`, `csv` and `raw` formats. One cell renderer
+//! defines how every value renders in all four, and each format writes its body straight from
+//! the result batches into memory the query's pool has granted.
+
+use std::collections::HashMap;
 
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
@@ -9,78 +12,194 @@ use datafusion::arrow::datatypes::{
     DataType, Date32Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
     UInt32Type, UInt64Type,
 };
+use serde::Serialize;
 use serde_json::{Map, Number, Value, json};
 
 use super::handlers::PplFormat;
+use crate::opensearch::catalog::QueryReservation;
 use crate::opensearch::search::read_timestamp_micros;
 use crate::ppl::{PplColumn, PplError, PplType};
 
 /// Microseconds in one second.
 const MICROS_PER_SECOND: i64 = 1_000_000;
 
-/// The jdbc response: `{schema: [{name, type}], datarows, total, size}`, where `total` and `size`
-/// both count the rows returned. There is no `status` and no `cursor`.
+/// An answer rendered in one format: its body and the content type it is served with.
+#[derive(Debug)]
+pub(crate) struct RenderedAnswer {
+    /// The body, UTF-8 text.
+    pub(crate) body: Vec<u8>,
+    /// The content type of the body.
+    pub(crate) content_type: &'static str,
+}
+
+impl IntoResponse for RenderedAnswer {
+    fn into_response(self) -> Response {
+        ([(header::CONTENT_TYPE, self.content_type)], self.body).into_response()
+    }
+}
+
+/// Renders a planned query's batches in the requested format: `jdbc` and `viz` as
+/// [`PPL_DOCUMENT_CONTENT_TYPE`], `csv` and `raw` as [`PPL_FLAT_TEXT_CONTENT_TYPE`].
+///
+/// Every format writes straight from the Arrow arrays into the body, one cell at a time through
+/// [`render_cell`], so the formats cannot disagree on how a value renders and no tree of the whole
+/// answer is ever built. The body grows only by what `reservation` grants first, so the answer
+/// counts against the per-query memory limit together with the batches it is rendered from.
+///
+/// # Errors
+///
+/// [`PplError::MemoryLimitExceeded`] when the body would grow past what the memory pool grants;
+/// [`PplError::Internal`] when a batch does not match `columns` or holds a type the planner never
+/// returns.
+pub(crate) fn render_ppl_answer(
+    format: PplFormat,
+    columns: &[PplColumn],
+    batches: &[RecordBatch],
+    reservation: &QueryReservation,
+) -> Result<RenderedAnswer, PplError> {
+    check_batch_widths(columns, batches)?;
+    let mut body = ReservedBody::new(reservation);
+    let content_type = match format {
+        PplFormat::Jdbc => {
+            write_jdbc(&mut body, columns, batches)?;
+            PPL_DOCUMENT_CONTENT_TYPE
+        }
+        PplFormat::Viz => {
+            write_viz(&mut body, columns, batches)?;
+            PPL_DOCUMENT_CONTENT_TYPE
+        }
+        PplFormat::Csv => {
+            write_flat(&mut body, columns, batches, FlatLayout::Csv)?;
+            PPL_FLAT_TEXT_CONTENT_TYPE
+        }
+        PplFormat::Raw => {
+            write_flat(&mut body, columns, batches, FlatLayout::Raw)?;
+            PPL_FLAT_TEXT_CONTENT_TYPE
+        }
+    };
+    Ok(RenderedAnswer {
+        body: body.bytes,
+        content_type,
+    })
+}
+
+/// A body that grows only by what its reservation grants first.
+struct ReservedBody<'r> {
+    /// The text written so far.
+    bytes: Vec<u8>,
+    /// Where every growth of `bytes`' capacity is reserved before it is allocated.
+    reservation: &'r QueryReservation,
+}
+
+impl<'r> ReservedBody<'r> {
+    /// An empty body reserving through `reservation`.
+    const fn new(reservation: &'r QueryReservation) -> Self {
+        Self {
+            bytes: Vec::new(),
+            reservation,
+        }
+    }
+
+    /// Append `text`. When it does not fit the capacity, the capacity at least doubles, as a
+    /// `Vec`'s does, so appending stays amortized linear; the added capacity is reserved before it
+    /// is allocated.
+    ///
+    /// # Errors
+    ///
+    /// [`PplError::MemoryLimitExceeded`] when the pool refuses the added capacity; the body is
+    /// unchanged then.
+    fn write_bytes(&mut self, text: &[u8]) -> Result<(), PplError> {
+        let required_length = self.bytes.len().saturating_add(text.len());
+        let capacity = self.bytes.capacity();
+        if required_length > capacity {
+            let grown_capacity = required_length.max(capacity.saturating_mul(2));
+            self.reservation.reserve_bytes(grown_capacity - capacity)?;
+            self.bytes.reserve_exact(grown_capacity - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(text);
+        Ok(())
+    }
+
+    /// Append the compact JSON text of `value`, through `scratch`, which holds it first.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write_bytes`].
+    fn write_json(&mut self, scratch: &mut Vec<u8>, value: &impl Serialize) -> Result<(), PplError> {
+        scratch.clear();
+        serde_json::to_writer(&mut *scratch, value).map_err(|error| PplError::Internal {
+            reason: format!("a PPL answer value did not serialize: {error}"),
+        })?;
+        self.write_bytes(scratch)
+    }
+}
+
+/// Refuses a batch whose width differs from `columns`: every format reads one cell per column.
+fn check_batch_widths(columns: &[PplColumn], batches: &[RecordBatch]) -> Result<(), PplError> {
+    batches
+        .iter()
+        .find(|batch| batch.num_columns() != columns.len())
+        .map_or(Ok(()), |batch| {
+            Err(PplError::Internal {
+                reason: format!(
+                    "a result batch has {} columns, the plan {}",
+                    batch.num_columns(),
+                    columns.len()
+                ),
+            })
+        })
+}
+
+/// The number of rows of `batches`.
+fn count_rows(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+/// Writes the jdbc response: `{schema: [{name, type}], datarows, total, size}`, where `total` and
+/// `size` both count the rows returned. There is no `status` and no `cursor`.
 ///
 /// Cells render as: timestamps `yyyy-MM-dd HH:mm:ss[.f]` in UTC with 1 to 6 fraction digits and
 /// trailing zeros dropped (none when zero); dates `yyyy-MM-dd`; fixed-size binary ids as
 /// lowercase hex strings; a MAP as one object keyed by its stored keys, never split on the dots
 /// inside a key; a struct as an object without its NULL fields; a list as an array; `NaN` and the
 /// infinities as the strings `"NaN"`, `"Infinity"` and `"-Infinity"`; NULL as `null`.
-///
-/// # Errors
-///
-/// Returns [`PplError::Internal`] when a batch does not match `columns` or holds a type the
-/// planner never returns.
-pub(crate) fn render_jdbc(columns: &[PplColumn], batches: &[RecordBatch]) -> Result<Value, PplError> {
-    let datarows = render_datarows(columns, batches)?;
-    let row_count = datarows.len();
+fn write_jdbc(body: &mut ReservedBody<'_>, columns: &[PplColumn], batches: &[RecordBatch]) -> Result<(), PplError> {
     let schema: Vec<Value> = columns
         .iter()
         .map(|column| json!({"name": column.name, "type": column.ppl_type.name()}))
         .collect();
-    // The rows move into the body: `json!` would serialize them through a reference, copying
-    // every cell.
-    let mut body = Map::with_capacity(4);
-    body.insert("schema".to_owned(), Value::Array(schema));
-    body.insert(
-        "datarows".to_owned(),
-        Value::Array(datarows.into_iter().map(Value::Array).collect()),
-    );
-    body.insert("total".to_owned(), json!(row_count));
-    body.insert("size".to_owned(), json!(row_count));
-    Ok(Value::Object(body))
-}
-
-/// The rows of `batches`, each cell rendered by [`render_cell`]; every format reads its cells
-/// from here, so the formats cannot disagree on how a value renders.
-///
-/// # Errors
-///
-/// Returns [`PplError::Internal`] when a batch does not match `columns` or holds a type the
-/// planner never returns.
-fn render_datarows(columns: &[PplColumn], batches: &[RecordBatch]) -> Result<Vec<Vec<Value>>, PplError> {
-    let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    let mut datarows = Vec::with_capacity(row_count);
+    let mut scratch = Vec::new();
+    body.write_bytes(b"{\"schema\":")?;
+    body.write_json(&mut scratch, &schema)?;
+    body.write_bytes(b",\"datarows\":[")?;
+    let mut is_first_row = true;
     for batch in batches {
-        if batch.num_columns() != columns.len() {
-            return Err(PplError::Internal {
-                reason: format!(
-                    "a result batch has {} columns, the plan {}",
-                    batch.num_columns(),
-                    columns.len()
-                ),
-            });
-        }
         for row in 0..batch.num_rows() {
-            let cells = batch
-                .columns()
-                .iter()
-                .map(|column| render_cell(column.as_ref(), row))
-                .collect::<Result<Vec<_>, _>>()?;
-            datarows.push(cells);
+            scratch.clear();
+            if !is_first_row {
+                scratch.push(b',');
+            }
+            is_first_row = false;
+            scratch.push(b'[');
+            for (index, column) in batch.columns().iter().enumerate() {
+                if index > 0 {
+                    scratch.push(b',');
+                }
+                serialize_cell(&mut scratch, column.as_ref(), row)?;
+            }
+            scratch.push(b']');
+            body.write_bytes(&scratch)?;
         }
     }
-    Ok(datarows)
+    let row_count = count_rows(batches);
+    body.write_bytes(format!("],\"total\":{row_count},\"size\":{row_count}}}").as_bytes())
+}
+
+/// Appends the compact JSON text of the cell of `array` at `row` to `text`.
+fn serialize_cell(text: &mut Vec<u8>, array: &dyn Array, row: usize) -> Result<(), PplError> {
+    serde_json::to_writer(text, &render_cell(array, row)?).map_err(|error| PplError::Internal {
+        reason: format!("a PPL answer value did not serialize: {error}"),
+    })
 }
 
 /// The JSON value of row `row` of `array`.
@@ -206,80 +325,53 @@ const PPL_DOCUMENT_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 /// downloads csv` pins the download through such a client.
 const PPL_FLAT_TEXT_CONTENT_TYPE: &str = "text/plain; charset=UTF-8";
 
-/// Renders a planned query's batches in the requested format: `jdbc` and `viz` as
-/// [`PPL_DOCUMENT_CONTENT_TYPE`], `csv` and `raw` as [`PPL_FLAT_TEXT_CONTENT_TYPE`].
-///
-/// # Errors
-///
-/// Whatever [`render_datarows`] reports for a column it cannot render.
-pub(crate) fn render_ppl_response(
-    format: PplFormat,
-    columns: &[PplColumn],
-    batches: &[RecordBatch],
-) -> Result<Response, PplError> {
-    let (body, content_type) = match format {
-        PplFormat::Jdbc => (render_jdbc(columns, batches)?.to_string(), PPL_DOCUMENT_CONTENT_TYPE),
-        PplFormat::Viz => (render_viz(columns, batches)?.to_string(), PPL_DOCUMENT_CONTENT_TYPE),
-        PplFormat::Csv => (render_csv(columns, batches)?, PPL_FLAT_TEXT_CONTENT_TYPE),
-        PplFormat::Raw => (render_raw(columns, batches)?, PPL_FLAT_TEXT_CONTENT_TYPE),
-    };
-    Ok(([(header::CONTENT_TYPE, content_type)], body).into_response())
-}
-
-/// Renders the `viz` format: `{data: {<col>: [...]}, metadata: {fields: [{name, type}]}, size,
+/// Writes the `viz` format: `{data: {<col>: [...]}, metadata: {fields: [{name, type}]}, size,
 /// status: 200}`, one array per column keyed by column name, each cell rendered as the jdbc
-/// response renders it, and each field typed with its `viz` name (see [`name_viz_type`]).
-///
-/// # Errors
-///
-/// Whatever [`render_datarows`] reports.
-pub(crate) fn render_viz(columns: &[PplColumn], batches: &[RecordBatch]) -> Result<Value, PplError> {
-    let rows = render_datarows(columns, batches)?;
-    let row_count = rows.len();
-    let mut column_cells: Vec<Vec<Value>> = columns.iter().map(|_| Vec::with_capacity(row_count)).collect();
-    // `render_datarows` refuses a batch whose width differs from `columns`, so every row has one
-    // cell per column and the zip drops none.
-    for row in rows {
-        for (cells, cell) in column_cells.iter_mut().zip(row) {
-            cells.push(cell);
+/// response renders it, and each field typed with its `viz` name (see [`name_viz_type`]). A name
+/// that two columns share keys one array, in the place of its first column, holding the cells of
+/// its last column.
+fn write_viz(body: &mut ReservedBody<'_>, columns: &[PplColumn], batches: &[RecordBatch]) -> Result<(), PplError> {
+    let mut keyed_columns: Vec<(&str, usize)> = Vec::with_capacity(columns.len());
+    let mut key_positions: HashMap<&str, usize> = HashMap::with_capacity(columns.len());
+    for (column_index, column) in columns.iter().enumerate() {
+        match key_positions.get(column.name.as_str()) {
+            Some(&position) => keyed_columns[position].1 = column_index,
+            None => {
+                key_positions.insert(column.name.as_str(), keyed_columns.len());
+                keyed_columns.push((column.name.as_str(), column_index));
+            }
         }
     }
-    let column_values: Map<String, Value> = columns
-        .iter()
-        .zip(column_cells)
-        .map(|(column, cells)| (column.name.clone(), Value::Array(cells)))
-        .collect();
+    let mut scratch = Vec::new();
+    body.write_bytes(b"{\"data\":{")?;
+    for (key_index, (name, column_index)) in keyed_columns.into_iter().enumerate() {
+        if key_index > 0 {
+            body.write_bytes(b",")?;
+        }
+        body.write_json(&mut scratch, &name)?;
+        body.write_bytes(b":[")?;
+        let mut is_first_cell = true;
+        for batch in batches {
+            let column = batch.column(column_index);
+            for row in 0..batch.num_rows() {
+                scratch.clear();
+                if !is_first_cell {
+                    scratch.push(b',');
+                }
+                is_first_cell = false;
+                serialize_cell(&mut scratch, column.as_ref(), row)?;
+                body.write_bytes(&scratch)?;
+            }
+        }
+        body.write_bytes(b"]")?;
+    }
     let fields: Vec<Value> = columns
         .iter()
         .map(|column| json!({ "name": column.name, "type": name_viz_type(column.ppl_type) }))
         .collect();
-    // The columns move into the body: `json!` would serialize them through a reference, copying
-    // every cell.
-    let mut body = Map::with_capacity(4);
-    body.insert("data".to_owned(), Value::Object(column_values));
-    body.insert("metadata".to_owned(), json!({ "fields": fields }));
-    body.insert("size".to_owned(), json!(row_count));
-    body.insert("status".to_owned(), json!(200));
-    Ok(Value::Object(body))
-}
-
-/// Renders the `csv` format: comma-separated, a cell quoted only when it holds a separator, a
-/// quote or a line break; see [`render_flat`].
-///
-/// # Errors
-///
-/// Whatever [`render_datarows`] reports.
-pub(crate) fn render_csv(columns: &[PplColumn], batches: &[RecordBatch]) -> Result<String, PplError> {
-    render_flat(columns, batches, FlatLayout::Csv)
-}
-
-/// Renders the `raw` format: pipe-separated and never quoted; see [`render_flat`].
-///
-/// # Errors
-///
-/// Whatever [`render_datarows`] reports.
-pub(crate) fn render_raw(columns: &[PplColumn], batches: &[RecordBatch]) -> Result<String, PplError> {
-    render_flat(columns, batches, FlatLayout::Raw)
+    body.write_bytes(b"},\"metadata\":")?;
+    body.write_json(&mut scratch, &json!({ "fields": fields }))?;
+    body.write_bytes(format!(",\"size\":{},\"status\":200}}", count_rows(batches)).as_bytes())
 }
 
 /// The `viz` type name of a PPL type: the jdbc name, except that `string` is `keyword`, `int`
@@ -336,32 +428,43 @@ impl FlatLayout {
     }
 }
 
-/// Renders the header line of column names, then one line per row, joined by `\n` with no
-/// trailing line break. A top-level NULL cell is empty, a NULL list column included; `null`
-/// appears only inside a list, a MAP or a struct (see [`write_flat_cell`]).
-fn render_flat(columns: &[PplColumn], batches: &[RecordBatch], layout: FlatLayout) -> Result<String, PplError> {
-    let rows = render_datarows(columns, batches)?;
-    let mut text = String::new();
+/// Writes the header line of column names, then one line per row, joined by `\n` with no
+/// trailing line break: comma-separated for `csv`, a cell quoted only when it holds a separator, a
+/// quote or a line break; pipe-separated and never quoted for `raw`. A top-level NULL cell is
+/// empty, a NULL list column included; `null` appears only inside a list, a MAP or a struct (see
+/// [`write_flat_cell`]).
+fn write_flat(
+    body: &mut ReservedBody<'_>,
+    columns: &[PplColumn],
+    batches: &[RecordBatch],
+    layout: FlatLayout,
+) -> Result<(), PplError> {
+    let mut line = String::new();
     for (index, column) in columns.iter().enumerate() {
         if index > 0 {
-            text.push(layout.separator());
+            line.push(layout.separator());
         }
-        layout.write_cell(&mut text, &column.name);
+        layout.write_cell(&mut line, &column.name);
     }
+    body.write_bytes(line.as_bytes())?;
     // One buffer for every cell: a cell is written out before `layout` decides on its quoting.
     let mut cell_text = String::new();
-    for row in &rows {
-        text.push('\n');
-        for (index, cell) in row.iter().enumerate() {
-            if index > 0 {
-                text.push(layout.separator());
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            line.clear();
+            line.push('\n');
+            for (index, column) in batch.columns().iter().enumerate() {
+                if index > 0 {
+                    line.push(layout.separator());
+                }
+                cell_text.clear();
+                write_flat_cell(&mut cell_text, &render_cell(column.as_ref(), row)?);
+                layout.write_cell(&mut line, &cell_text);
             }
-            cell_text.clear();
-            write_flat_cell(&mut cell_text, cell);
-            layout.write_cell(&mut text, &cell_text);
+            body.write_bytes(line.as_bytes())?;
         }
     }
-    Ok(text)
+    Ok(())
 }
 
 /// Appends the text of one top-level cell to `text`: nothing for NULL (a NULL list or MAP column
@@ -432,12 +535,127 @@ fn write_plain_number(text: &mut String, number: &Number) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::{DateTime, TimeZone, Utc};
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use serde_json::json;
 
-    use super::{FlatLayout, PplType, format_timestamp, name_viz_type, write_flat_cell};
+    use super::{
+        FlatLayout, PplColumn, PplError, PplFormat, PplType, QueryReservation, RecordBatch, RenderedAnswer,
+        format_timestamp, name_viz_type, render_ppl_answer, write_flat_cell,
+    };
+
+    /// The columns `body` (string) and `n` (bigint) over the rows `("a,b", 1)` and `(NULL, 2)`.
+    fn build_answer_batch() -> (Vec<PplColumn>, RecordBatch) {
+        let columns = vec![
+            PplColumn {
+                name: "body".to_owned(),
+                ppl_type: PplType::String,
+            },
+            PplColumn {
+                name: "n".to_owned(),
+                ppl_type: PplType::Bigint,
+            },
+        ];
+        let batch = RecordBatch::try_from_iter([
+            ("body", Arc::new(StringArray::from(vec![Some("a,b"), None])) as ArrayRef),
+            ("n", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
+        ])
+        .expect("the answer batch");
+        (columns, batch)
+    }
+
+    /// `batch` rendered in `format` within a memory pool of `pool_bytes`.
+    fn render_answer_in_pool(
+        format: PplFormat,
+        columns: &[PplColumn],
+        batch: &RecordBatch,
+        pool_bytes: usize,
+    ) -> Result<RenderedAnswer, PplError> {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(pool_bytes));
+        let reservation = QueryReservation::new(&pool, "test answer", pool_bytes);
+        render_ppl_answer(format, columns, std::slice::from_ref(batch), &reservation)
+    }
+
+    #[test]
+    fn every_format_writes_its_body_from_the_batch_cells() {
+        let (columns, batch) = build_answer_batch();
+        let expected_answers = [
+            (
+                PplFormat::Jdbc,
+                r#"{"schema":[{"name":"body","type":"string"},{"name":"n","type":"bigint"}],"datarows":[["a,b",1],[null,2]],"total":2,"size":2}"#,
+                "application/json; charset=UTF-8",
+            ),
+            (
+                PplFormat::Viz,
+                r#"{"data":{"body":["a,b",null],"n":[1,2]},"metadata":{"fields":[{"name":"body","type":"keyword"},{"name":"n","type":"long"}]},"size":2,"status":200}"#,
+                "application/json; charset=UTF-8",
+            ),
+            (PplFormat::Csv, "body,n\n\"a,b\",1\n,2", "text/plain; charset=UTF-8"),
+            (PplFormat::Raw, "body|n\na,b|1\n|2", "text/plain; charset=UTF-8"),
+        ];
+        for (format, expected_body, expected_content_type) in expected_answers {
+            let answer = render_answer_in_pool(format, &columns, &batch, 4_096).expect("the answer fits the pool");
+            assert_eq!(
+                String::from_utf8(answer.body).expect("UTF-8"),
+                expected_body,
+                "{format:?}"
+            );
+            assert_eq!(answer.content_type, expected_content_type, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn a_viz_name_two_columns_share_keys_the_cells_of_the_last_in_the_place_of_the_first() {
+        let (mut columns, batch) = build_answer_batch();
+        columns[1].name = "body".to_owned();
+        let answer = render_answer_in_pool(PplFormat::Viz, &columns, &batch, 4_096).expect("the answer fits the pool");
+        assert_eq!(
+            String::from_utf8(answer.body).expect("UTF-8"),
+            r#"{"data":{"body":[1,2]},"metadata":{"fields":[{"name":"body","type":"keyword"},{"name":"body","type":"long"}]},"size":2,"status":200}"#
+        );
+    }
+
+    #[test]
+    fn a_body_growing_past_the_memory_pool_is_the_memory_limit_error_and_returns_its_memory() {
+        let (columns, batch) = build_answer_batch();
+        for format in [PplFormat::Jdbc, PplFormat::Viz, PplFormat::Csv, PplFormat::Raw] {
+            // Every body above is longer than 16 bytes.
+            assert_eq!(
+                render_answer_in_pool(format, &columns, &batch, 16).map(|answer| answer.body),
+                Err(PplError::MemoryLimitExceeded { limit_bytes: 16 }),
+                "{format:?}"
+            );
+        }
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(4_096));
+        let reservation = QueryReservation::new(&pool, "test answer", 4_096);
+        let answer = render_ppl_answer(PplFormat::Jdbc, &columns, std::slice::from_ref(&batch), &reservation)
+            .expect("the answer fits the pool");
+        // The body's whole capacity is reserved while the reservation lives, and returned with it.
+        assert!(pool.reserved() >= answer.body.len(), "reserved {}", pool.reserved());
+        drop(reservation);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[test]
+    fn a_batch_narrower_than_the_columns_is_an_internal_error() {
+        let (mut columns, batch) = build_answer_batch();
+        columns.push(PplColumn {
+            name: "extra".to_owned(),
+            ppl_type: PplType::String,
+        });
+        assert!(
+            matches!(
+                render_answer_in_pool(PplFormat::Jdbc, &columns, &batch, 4_096),
+                Err(PplError::Internal { .. })
+            ),
+            "a batch of two columns under three"
+        );
+    }
 
     #[test]
     fn rendered_timestamps_drop_the_trailing_zeros_of_a_six_digit_utc_fraction() {

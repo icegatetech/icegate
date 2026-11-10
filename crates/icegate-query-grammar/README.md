@@ -14,9 +14,12 @@ Each entry point stops at the first syntax error and returns it as `SyntaxError`
 comments of the entry point and of `SyntaxError` state where the error is reported and what
 it carries.
 
-`lucene` also exposes `measure_group_depth`, which runs only the lexer and answers how many
-group levels the parser would recurse through, so a caller can refuse a deeply nested string
-before parsing it. Its doc comment states what it counts.
+`lucene` also exposes `measure_group_depth`, and `ppl` `measure_ppl_nesting`: each runs only the
+lexer and answers how deeply the parser would recurse, so a caller can refuse a deeply nested
+query before parsing it. `measure_group_depth` counts levels of brackets; `measure_ppl_nesting`
+counts levels of brackets, levels of square brackets alone (which open every subsearch) and, apart,
+the operator tokens through which the PPL grammar recurses without a bracket. Their doc comments
+state what they count.
 
 ## The Lucene query-string grammar
 
@@ -129,8 +132,8 @@ file and the single trailing newline on every generated file. The generator prin
 
 `src/ppl/mod.rs` is hand-written: it declares the generated modules under
 `#![allow(missing_docs)]`, keeps `#[allow(dead_code)]` on the base listener and the base
-visitor, which nothing uses, and holds the entry point. `rustfmt.toml` ignores the generated
-files of `src/ppl/`.
+visitor, which nothing uses, and holds the entry point and the nesting measure. `rustfmt.toml`
+ignores the generated files of `src/ppl/`.
 
 Regeneration is byte-identical: running `gen` twice produces the same files.
 
