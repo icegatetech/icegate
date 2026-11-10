@@ -10,35 +10,28 @@
 //! buys in the maintain service.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/wal_fixture.rs"]
+mod wal_fixture;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, MapBuilder, MapFieldNames, StringArray, StringBuilder};
-use datafusion::arrow::datatypes::{DataType, SchemaRef as ArrowSchemaRef};
+use datafusion::arrow::array::{Array, ArrayRef, StringArray};
+use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
-use iceberg::spec::DataFileFormat;
-use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator};
-use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use iceberg::{Catalog, NamespaceIdent, TableCreation};
-use icegate_common::{
-    CatalogBackend, CatalogConfig, ICEGATE_NAMESPACE, IoHandle, LOGS_TABLE, LOGS_TOPIC, WAL_OFFSET_PROPERTY,
-    catalog::CatalogBuilder, icegate_table_ident, schema,
-};
+use iceberg::Catalog;
+use icegate_common::{ICEGATE_NAMESPACE, LOGS_TABLE, LOGS_TOPIC, icegate_table_ident, schema};
 use icegate_query::engine::{QueryEngine, QueryEngineConfig};
 use icegate_queue::{DeleteLimits, ParquetQueueReader, QueueCleaner, SegmentId};
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
+use object_store::{ObjectStore, ObjectStoreExt};
 use tokio_util::sync::CancellationToken;
+use wal_fixture::{
+    build_catalog, build_empty_attribute_map, commit_shifted_rows, derive_arrow_schema, write_wal_segment,
+};
 
 /// Segments seeded into the WAL: offsets `0..SEGMENT_COUNT`, one row each.
 const SEGMENT_COUNT: u64 = 6;
@@ -70,68 +63,6 @@ fn bodies_of_segments(offsets: impl IntoIterator<Item = u64>) -> Vec<String> {
     bodies
 }
 
-/// A memory catalog holding an empty `logs` table.
-///
-/// The temp warehouse is returned so the caller keeps it alive for the test.
-async fn build_catalog() -> (Arc<dyn Catalog>, tempfile::TempDir) {
-    let warehouse = tempfile::tempdir().expect("tempdir");
-    let catalog_config = CatalogConfig {
-        backend: CatalogBackend::Memory,
-        warehouse: warehouse.path().to_str().expect("warehouse path").to_string(),
-        properties: HashMap::new(),
-        cache: None,
-    };
-    let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop(), CancellationToken::new())
-        .await
-        .expect("build catalog");
-
-    let namespace = NamespaceIdent::new(ICEGATE_NAMESPACE.to_string());
-    if !catalog.namespace_exists(&namespace).await.expect("namespace exists") {
-        catalog
-            .create_namespace(&namespace, HashMap::new())
-            .await
-            .expect("create namespace");
-    }
-    let creation = TableCreation::builder()
-        .name(LOGS_TABLE.to_string())
-        .schema(schema::logs_schema().expect("logs schema"))
-        .build();
-    catalog.create_table(&namespace, creation).await.expect("create table");
-
-    (catalog, warehouse)
-}
-
-/// An all-empty attribute map for `column`, one entry per row.
-///
-/// The key and value fields are cloned from the target column: each OTLP level
-/// carries its own Iceberg field ids in that metadata, so an array built from
-/// another level's fields is a genuine `DataType` mismatch and
-/// `RecordBatch::try_new` rejects it.
-fn empty_attribute_map(arrow_schema: &ArrowSchemaRef, column: &str, row_count: usize) -> ArrayRef {
-    let field = arrow_schema.field_with_name(column).expect("attribute column");
-    let DataType::Map(entries_field, _) = field.data_type() else {
-        panic!("{column} must be a map in the canonical logs schema");
-    };
-    let DataType::Struct(entry_fields) = entries_field.data_type() else {
-        panic!("map entries must be a struct");
-    };
-    let mut builder = MapBuilder::new(
-        Some(MapFieldNames {
-            entry: entries_field.name().clone(),
-            key: entry_fields[0].name().clone(),
-            value: entry_fields[1].name().clone(),
-        }),
-        StringBuilder::new(),
-        StringBuilder::new(),
-    )
-    .with_keys_field(Arc::clone(&entry_fields[0]))
-    .with_values_field(Arc::clone(&entry_fields[1]));
-    for _ in 0..row_count {
-        builder.append(true).expect("append empty attribute map");
-    }
-    Arc::new(builder.finish())
-}
-
 /// One log row per offset, in the canonical `logs` schema.
 ///
 /// Only `body` distinguishes the rows; the other required columns carry fixed
@@ -160,7 +91,7 @@ fn logs_batch(arrow_schema: &ArrowSchemaRef, offsets: impl IntoIterator<Item = u
             schema::COL_SCOPE_ATTRIBUTES,
             schema::COL_LOG_ATTRIBUTES,
         ]
-        .map(|column| (column, empty_attribute_map(arrow_schema, column, row_count))),
+        .map(|column| (column, build_empty_attribute_map(arrow_schema, column, row_count))),
     );
 
     let arrays: Vec<ArrayRef> = arrow_schema
@@ -177,71 +108,6 @@ fn logs_batch(arrow_schema: &ArrowSchemaRef, offsets: impl IntoIterator<Item = u
     RecordBatch::try_new(Arc::clone(arrow_schema), arrays).expect("logs batch")
 }
 
-/// Write one WAL segment holding the row of `offset`.
-async fn write_wal_segment(store: &InMemory, arrow_schema: &ArrowSchemaRef, offset: u64) {
-    let batch = logs_batch(arrow_schema, [offset]);
-    let mut buffer = Vec::new();
-    let mut writer = ArrowWriter::try_new(
-        &mut buffer,
-        Arc::clone(arrow_schema),
-        Some(WriterProperties::builder().build()),
-    )
-    .expect("segment writer");
-    writer.write(&batch).expect("write segment batch");
-    writer.close().expect("close segment");
-
-    let segment = SegmentId {
-        topic: LOGS_TOPIC.to_string(),
-        offset,
-    };
-    store
-        .put(&segment.to_relative_path(), PutPayload::from(buffer))
-        .await
-        .expect("put segment");
-}
-
-/// Commit the rows of `offsets` into Iceberg and record `committed_offset` on the
-/// snapshot, the way the Shifter does.
-async fn commit_shifted_rows(
-    catalog: &Arc<dyn Catalog>,
-    table: &Table,
-    offsets: impl IntoIterator<Item = u64>,
-    committed_offset: u64,
-) {
-    let arrow_schema =
-        Arc::new(iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"));
-    let batch = logs_batch(&arrow_schema, offsets);
-
-    let parquet_writer_builder = ParquetWriterBuilder::new(
-        WriterProperties::builder().build(),
-        table.metadata().current_schema().clone(),
-    );
-    let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_writer_builder,
-        table.file_io().clone(),
-        DefaultLocationGenerator::new(table.metadata()).expect("location generator"),
-        DefaultFileNameGenerator::new(format!("shift-{committed_offset}"), None, DataFileFormat::Parquet),
-    );
-    let mut data_file_writer = DataFileWriterBuilder::new(rolling_writer_builder)
-        .build(None)
-        .await
-        .expect("data file writer");
-    data_file_writer.write(batch).await.expect("write data file");
-    let data_files = data_file_writer.close().await.expect("close data file writer");
-
-    let tx = Transaction::new(table);
-    let tx = tx
-        .fast_append()
-        .add_data_files(data_files)
-        .set_snapshot_properties(HashMap::from([(
-            WAL_OFFSET_PROPERTY.to_string(),
-            committed_offset.to_string(),
-        )]))
-        .apply(tx)
-        .expect("apply fast append");
-    tx.commit(catalog.as_ref()).await.expect("commit snapshot");
-}
-
 /// The seeded world: a catalog whose `logs` table holds the first commit and a
 /// WAL store holding every segment.
 struct Fixture {
@@ -254,19 +120,24 @@ impl Fixture {
     /// Seed the WAL and commit segments `0..=FIRST_COMMITTED_OFFSET` into
     /// Iceberg.
     async fn seed() -> Self {
-        let (catalog, warehouse) = build_catalog().await;
+        let (catalog, warehouse) = build_catalog(LOGS_TABLE, schema::logs_schema().expect("logs schema")).await;
         let table = catalog
             .load_table(&icegate_table_ident(LOGS_TABLE))
             .await
             .expect("load logs table");
-        let arrow_schema =
-            Arc::new(iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).expect("arrow schema"));
+        let arrow_schema = derive_arrow_schema(&table);
 
         let wal_store = Arc::new(InMemory::new());
         for offset in 0..SEGMENT_COUNT {
-            write_wal_segment(&wal_store, &arrow_schema, offset).await;
+            write_wal_segment(&wal_store, LOGS_TOPIC, offset, &logs_batch(&arrow_schema, [offset])).await;
         }
-        commit_shifted_rows(&catalog, &table, 0..=FIRST_COMMITTED_OFFSET, FIRST_COMMITTED_OFFSET).await;
+        commit_shifted_rows(
+            &catalog,
+            &table,
+            logs_batch(&arrow_schema, 0..=FIRST_COMMITTED_OFFSET),
+            FIRST_COMMITTED_OFFSET,
+        )
+        .await;
 
         Self {
             catalog,
@@ -311,7 +182,10 @@ impl Fixture {
         commit_shifted_rows(
             &self.catalog,
             &table,
-            FIRST_COMMITTED_OFFSET + 1..=SECOND_COMMITTED_OFFSET,
+            logs_batch(
+                &derive_arrow_schema(&table),
+                FIRST_COMMITTED_OFFSET + 1..=SECOND_COMMITTED_OFFSET,
+            ),
             SECOND_COMMITTED_OFFSET,
         )
         .await;

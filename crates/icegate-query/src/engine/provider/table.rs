@@ -28,6 +28,7 @@ use icegate_queue::{ParquetQueueReader, QueueError, SegmentFile};
 use tokio_util::sync::CancellationToken;
 
 use super::WalQueryConfig;
+use super::filter_pushdown::is_kept_above_iceberg_scan;
 use super::scan::IcegateIcebergScan;
 use crate::engine::core::WAL_STORE_URL;
 
@@ -193,9 +194,24 @@ impl TableProvider for IcegateTableProvider {
         }
     }
 
+    /// `Unsupported` for a filter [`is_kept_above_iceberg_scan`] keeps above the scan, so neither
+    /// reader is handed it and DataFusion evaluates it above the union; `Inexact` for every other
+    /// filter: the Iceberg scan applies only the conjuncts it can translate and the WAL reader only
+    /// prunes row groups with it, so DataFusion re-applies it above the union.
+    ///
+    /// The regression tests of `tests/wal_nested_column_filter_it.rs` fail when a kept filter
+    /// reaches the Iceberg scan.
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        // Inexact: both sources handle filters independently
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        filters
+            .iter()
+            .map(|filter| {
+                Ok(if is_kept_above_iceberg_scan(filter, &self.schema)? {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                })
+            })
+            .collect()
     }
 }
 

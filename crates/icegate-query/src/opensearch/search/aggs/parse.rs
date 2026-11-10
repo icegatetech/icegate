@@ -689,10 +689,10 @@ pub(super) fn resolve_metric_field(
     };
     let latency_field = CrossRowField::DurationInNanos.client_name();
     if missing.is_some() {
-        return Err(OpenSearchError::reject_latency_script_missing(name));
+        return Err(OpenSearchError::latency_script_with_missing(name));
     }
     match field {
-        Some(named_field) if named_field != latency_field => Err(OpenSearchError::reject_latency_script_field(
+        Some(named_field) if named_field != latency_field => Err(OpenSearchError::latency_script_field_mismatch(
             name,
             &named_field,
             latency_field,

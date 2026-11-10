@@ -900,6 +900,69 @@ mod tests {
         assert_eq!(parsed["message"], "OK");
     }
 
+    /// The stored text of a kvlist keeps its keys in the order they arrive, not sorted, in every
+    /// build of the crate: the keys here arrive in neither ascending nor descending order.
+    #[test]
+    fn a_kvlist_body_is_stored_with_its_keys_in_arrival_order() {
+        use opentelemetry_proto::tonic::common::v1::{KeyValueList, any_value::Value};
+
+        let build_entry = |key: &str, value: Value| KeyValue {
+            key_strindex: 0,
+            key: key.to_string(),
+            value: Some(AnyValue { value: Some(value) }),
+        };
+        let body = AnyValue {
+            value: Some(Value::KvlistValue(KeyValueList {
+                values: vec![
+                    build_entry("status", Value::IntValue(200)),
+                    build_entry("message", Value::StringValue("OK".to_string())),
+                    build_entry(
+                        "zone",
+                        Value::KvlistValue(KeyValueList {
+                            values: vec![
+                                build_entry("rack", Value::IntValue(7)),
+                                build_entry("aisle", Value::BoolValue(true)),
+                            ],
+                        }),
+                    ),
+                ],
+            })),
+        };
+
+        assert_eq!(
+            serialize_any_value_to_json(Some(&body)).as_deref(),
+            Some(r#"{"status":200,"message":"OK","zone":{"rack":7,"aisle":true}}"#)
+        );
+    }
+
+    /// The serializer of every attribute writes the keys in the attributes' order, and the
+    /// serializer of the requested keys writes them in the requested order. Both orders differ
+    /// from the sorted one, so a build that sorts object keys fails each assertion.
+    #[test]
+    fn attribute_objects_keep_the_attribute_order_and_the_requested_key_order() {
+        let build_attribute = |key: &str, value: &str| KeyValue {
+            key_strindex: 0,
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::StringValue(value.to_string())),
+            }),
+        };
+        let attributes = vec![
+            build_attribute("output", "done"),
+            build_attribute("bash_command", "ls"),
+            build_attribute("file_path", "/tmp/x"),
+        ];
+
+        assert_eq!(
+            serialize_all_attrs_to_json_object(&attributes).as_deref(),
+            Some(r#"{"output":"done","bash_command":"ls","file_path":"/tmp/x"}"#)
+        );
+        assert_eq!(
+            serialize_attrs_to_json_object(&attributes, &["file_path", "bash_command"]).as_deref(),
+            Some(r#"{"file_path":"/tmp/x","bash_command":"ls"}"#)
+        );
+    }
+
     #[test]
     fn flatten_nested_attributes_with_dot_separator() {
         use std::collections::HashMap;

@@ -129,7 +129,12 @@ clap = { version = "4", features = ["derive"] }
 
 # Configuration
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order`: a JSON object serializes its keys in insertion order, never sorted. Ingest
+# stores a kvlist body or attribute with its keys in arrival order, and the OpenSearch API renders
+# `_mapping` properties in the schema's column order. A cargo feature is unified across one build,
+# and the service image builds the whole workspace at once, so it is enabled once here: a crate
+# built or tested alone then serializes exactly as it does in that image.
+serde_json = { version = "1", features = ["preserve_order"] }
 # Query-string decoding of the OpenSearch endpoint parameters (strict, per-endpoint lists).
 serde_urlencoded = "0.7"
 serde_yaml = "0.9"

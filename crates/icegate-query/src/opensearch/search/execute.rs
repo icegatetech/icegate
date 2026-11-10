@@ -379,7 +379,7 @@ async fn prepare_cross_row_reads(
     if let Some(name) = tree.and_then(|tree| find_trace_list_latency(&tree.aggregations))
         && let Some(entry) = entries.iter().find(|entry| entry.profile() != Profile::DataPrepper)
     {
-        return Err(OpenSearchError::reject_latency_script_index(
+        return Err(OpenSearchError::latency_script_on_foreign_index(
             name,
             entry.name(),
             DATA_PREPPER_SPAN_INDEX,

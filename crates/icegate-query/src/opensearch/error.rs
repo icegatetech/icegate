@@ -304,7 +304,7 @@ impl OpenSearchError {
     /// names `field`, a field other than `latency_field`, the root duration the script reads
     /// (`400`, `illegal_argument_exception`): the script would run over a value it does not
     /// compute. `aggregation` carries the request's name for it and `field` the field it named.
-    pub(crate) fn reject_latency_script_field(aggregation: &str, field: &str, latency_field: &str) -> Self {
+    pub(crate) fn latency_script_field_mismatch(aggregation: &str, field: &str, latency_field: &str) -> Self {
         Self::unsupported_aggregation(
             aggregation,
             format!("the latency script of [{aggregation}] reads [{latency_field}], not the field [{field}]"),
@@ -316,7 +316,7 @@ impl OpenSearchError {
     /// names a `missing` (`400`, `illegal_argument_exception`): the script answers 0 for a span
     /// without a root, and a `missing` would replace that answer. `aggregation` carries the
     /// request's name for it and `key` is `missing`.
-    pub(crate) fn reject_latency_script_missing(aggregation: &str) -> Self {
+    pub(crate) fn latency_script_with_missing(aggregation: &str) -> Self {
         Self::unsupported_aggregation(
             aggregation,
             format!(
@@ -331,7 +331,7 @@ impl OpenSearchError {
     /// also reads `index`, an index outside the profile of `span_index`, whose spans carry no root
     /// fields (`400`, `illegal_argument_exception`). `aggregation` carries the request's name for
     /// it and `index` the other index.
-    pub(crate) fn reject_latency_script_index(aggregation: &str, index: &str, span_index: &str) -> Self {
+    pub(crate) fn latency_script_on_foreign_index(aggregation: &str, index: &str, span_index: &str) -> Self {
         Self::unsupported_aggregation(
             aggregation,
             format!(

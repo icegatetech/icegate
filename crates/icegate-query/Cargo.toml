@@ -71,9 +71,9 @@ regex = { workspace = true }
 
 # Configuration
 serde = { workspace = true }
-# `preserve_order`: OpenSearch `_mapping` properties keep the schema's column order, which is
-# IceGate's contract; without the feature serde_json sorts object keys.
-serde_json = { workspace = true, features = ["preserve_order"] }
+# Object keys keep insertion order (OpenSearch `_mapping` properties follow the schema's column
+# order): the workspace dependency enables `preserve_order` for every crate.
+serde_json = { workspace = true }
 # Bounded cache of OpenSearch MAP-key enumerations, keyed by tenant.
 lru = { workspace = true }
 serde_urlencoded = { workspace = true }

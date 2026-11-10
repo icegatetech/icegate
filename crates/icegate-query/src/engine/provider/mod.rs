@@ -17,9 +17,14 @@
 //! Tables without a corresponding WAL topic (currently `events`) fall through
 //! to the standard `IcebergStaticTableProvider`, wrapped in
 //! `IcebergOnlyTableProvider`, and read from committed Iceberg snapshots only.
+//!
+//! Both providers keep the filters the Iceberg scan cannot bind above the scan through one
+//! rule, `filter_pushdown::is_kept_above_iceberg_scan`, so a filter reaches committed data the
+//! same way whether or not the table has a WAL topic.
 
 mod catalog;
 mod expr_to_predicate;
+mod filter_pushdown;
 mod iceberg_only;
 mod iceberg_scan_metrics;
 mod metrics;

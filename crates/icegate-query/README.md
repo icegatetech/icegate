@@ -67,6 +67,7 @@ The Flight SQL `BeginTransaction` / `EndTransaction` actions are not implemented
 | Time-range filters on `timestamp`      | ✅ Iceberg partition pruning              |
 | Equality / range filters on indexed columns | ✅ Parquet statistics                |
 | Filters on attribute map keys (e.g. `resource_attributes[...]`) | ⚠️  Limited; reads row groups, evaluates after |
+| `IS NULL` / `IS NOT NULL` of a MAP, list or struct column; any filter casting to a floating type | Never; evaluated in DataFusion above the scan, on WAL-backed and Iceberg-only tables alike |
 | Projection (column pruning)            | ✅ Parquet column-chunk skip              |
 | `LIMIT`                                | ✅ Provided no inexact filters above it   |
 | Aggregations (`count`, `sum`, `approx_distinct`) | ❌ Always evaluated in DataFusion |

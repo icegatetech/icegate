@@ -19,8 +19,10 @@ use iceberg::arrow::schema_to_arrow_schema;
 use icegate_common::{
     METRICS_TABLE, TenantId,
     schema::{
-        COL_DATA_POINT_ATTRIBUTES, COL_METADATA, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES,
-        SERVICE_INSTANCE_ID_ATTRIBUTE_KEY, SERVICE_NAME_ATTRIBUTE_KEY, promoted_resource_keys,
+        AGGREGATION_TEMPORALITY_CUMULATIVE, AGGREGATION_TEMPORALITY_DELTA, COL_DATA_POINT_ATTRIBUTES, COL_METADATA,
+        COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, METRIC_TYPE_EXPONENTIAL_HISTOGRAM, METRIC_TYPE_GAUGE,
+        METRIC_TYPE_HISTOGRAM, METRIC_TYPE_SUM, METRIC_TYPE_SUMMARY, SERVICE_INSTANCE_ID_ATTRIBUTE_KEY,
+        SERVICE_NAME_ATTRIBUTE_KEY, promoted_resource_keys,
     },
 };
 use opentelemetry_proto::tonic::{
@@ -66,19 +68,6 @@ pub fn metrics_arrow_schema() -> crate::error::Result<Arc<Schema>> {
         ))),
     }
 }
-
-/// `metric_type` string value stored in the table (per `SCHEMA.md`, lowercase).
-///
-/// One constant per `metric::Data` variant; all five are emitted by the driver.
-const METRIC_TYPE_GAUGE: &str = "gauge";
-const METRIC_TYPE_SUM: &str = "sum";
-const METRIC_TYPE_HISTOGRAM: &str = "histogram";
-const METRIC_TYPE_EXPONENTIAL_HISTOGRAM: &str = "exponential_histogram";
-const METRIC_TYPE_SUMMARY: &str = "summary";
-
-/// `aggregation_temporality` string values stored in the table (per `SCHEMA.md`).
-const AGG_TEMPORALITY_DELTA: &str = "DELTA";
-const AGG_TEMPORALITY_CUMULATIVE: &str = "CUMULATIVE";
 
 /// Data-point `time_unix_nano` in micros, or the ingest time when unset (0).
 const fn timestamp_or_default(time_unix_nano: u64, ingested: i64) -> i64 {
@@ -142,9 +131,9 @@ const fn histogram_buckets_consistent(bucket_counts: usize, explicit_bounds: usi
 /// treats as a strict-conformance drop for Sum/Histogram/ExponentialHistogram.
 const fn temporality_str(value: i32) -> Option<&'static str> {
     if value == AggregationTemporality::Delta as i32 {
-        Some(AGG_TEMPORALITY_DELTA)
+        Some(AGGREGATION_TEMPORALITY_DELTA)
     } else if value == AggregationTemporality::Cumulative as i32 {
-        Some(AGG_TEMPORALITY_CUMULATIVE)
+        Some(AGGREGATION_TEMPORALITY_CUMULATIVE)
     } else {
         None
     }

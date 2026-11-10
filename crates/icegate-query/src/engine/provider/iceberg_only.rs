@@ -3,28 +3,21 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::tree_node::TreeNode;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 
+use super::filter_pushdown::is_kept_above_iceberg_scan;
+
 /// A table without a WAL topic, served by `inner` (the static Iceberg provider), whose scan is
-/// handed only filters on scalar values, and none that casts to a floating type.
+/// handed only the filters [`is_kept_above_iceberg_scan`] lets through.
 ///
-/// Two kinds of filter are answered `Unsupported` and never reach `inner`; DataFusion evaluates
-/// them above the scan:
-///
-/// - a null check (`IS NULL`, `IS NOT NULL`) of a struct, list or MAP column. The regression test
-///   `exists_on_a_struct_column_is_a_null_check` (`query_dsl::lower`) fails when such a filter
-///   reaches the scan;
-/// - a filter holding a cast to a floating type (a decimal or 32-bit float column read as a
-///   double). Handed to the inner scan, it fails the query; the regression test
-///   `a_decimal_rate_column_compares_as_a_double` (`query_dsl::lower`) fails when such a filter
-///   reaches the scan.
-///
-/// Every other filter gets `inner`'s answer.
+/// A filter kept above the scan is answered `Unsupported` and never reaches `inner`; DataFusion
+/// evaluates it above the scan. The regression tests `exists_on_a_struct_column_is_a_null_check`
+/// and `a_decimal_rate_column_compares_as_a_double` (`query_dsl::lower`) fail when such a filter
+/// reaches the scan. Every other filter gets `inner`'s answer.
 #[derive(Debug)]
 pub(super) struct IcebergOnlyTableProvider {
     /// The provider reading the committed snapshot.
@@ -60,21 +53,21 @@ impl TableProvider for IcebergOnlyTableProvider {
 
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let schema = self.inner.schema();
-        let is_held_back = filters
+        let kept_filter_flags = filters
             .iter()
-            .map(|filter| Ok(has_nested_null_check(filter, &schema)? || has_floating_cast(filter)?))
+            .map(|filter| is_kept_above_iceberg_scan(filter, &schema))
             .collect::<DataFusionResult<Vec<bool>>>()?;
         let pushable_filters: Vec<&Expr> = filters
             .iter()
-            .zip(&is_held_back)
-            .filter(|(_, is_held_back)| !**is_held_back)
+            .zip(&kept_filter_flags)
+            .filter(|(_, is_kept_above_scan)| !**is_kept_above_scan)
             .map(|(filter, _)| *filter)
             .collect();
         let mut inner_answers = self.inner.supports_filters_pushdown(&pushable_filters)?.into_iter();
-        is_held_back
+        kept_filter_flags
             .into_iter()
-            .map(|is_held_back| {
-                if is_held_back {
+            .map(|is_kept_above_scan| {
+                if is_kept_above_scan {
                     Ok(TableProviderFilterPushDown::Unsupported)
                 } else {
                     inner_answers.next().ok_or_else(|| {
@@ -84,23 +77,6 @@ impl TableProvider for IcebergOnlyTableProvider {
             })
             .collect()
     }
-}
-
-/// Whether `filter` holds a null check (`IS NULL`, `IS NOT NULL`) of a struct, list or MAP
-/// column of `schema`.
-fn has_nested_null_check(filter: &Expr, schema: &Schema) -> DataFusionResult<bool> {
-    let is_nested_column = |operand: &Expr| {
-        matches!(operand, Expr::Column(column)
-            if schema.field_with_name(&column.name).is_ok_and(|field| field.data_type().is_nested()))
-    };
-    filter.exists(|node| {
-        Ok(matches!(node, Expr::IsNull(operand) | Expr::IsNotNull(operand) if is_nested_column(operand)))
-    })
-}
-
-/// Whether `filter` holds a cast to a floating-point type.
-fn has_floating_cast(filter: &Expr) -> DataFusionResult<bool> {
-    filter.exists(|node| Ok(matches!(node, Expr::Cast(cast) if cast.field.data_type().is_floating())))
 }
 
 #[cfg(test)]
