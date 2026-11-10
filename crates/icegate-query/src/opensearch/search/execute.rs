@@ -342,7 +342,7 @@ fn find_trace_list_latency(aggregations: &[NamedAggregation]) -> Option<&str> {
             | AggregationKind::MinBucket(_)
             | AggregationKind::MaxBucket(_) => None,
         };
-        if matches!(script, Some(MetricScript::TraceListLatency)) {
+        if matches!(script, Some(MetricScript::TraceListLatency { .. })) {
             Some(aggregation.name.as_str())
         } else {
             find_trace_list_latency(&aggregation.children)

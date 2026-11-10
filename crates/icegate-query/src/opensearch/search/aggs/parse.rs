@@ -684,7 +684,7 @@ pub(super) fn resolve_metric_field(
     missing: Option<f64>,
     value_script: Option<&MetricScript>,
 ) -> Result<String, OpenSearchError> {
-    let Some(MetricScript::TraceListLatency) = value_script else {
+    let Some(MetricScript::TraceListLatency { .. }) = value_script else {
         return field.ok_or_else(|| report_missing_key(kind_name, name, "field"));
     };
     let latency_field = CrossRowField::DurationInNanos.client_name();
@@ -1773,7 +1773,9 @@ mod tests {
         let latency_metric = MetricSpec {
             field: "traceGroupFields.durationInNanos".to_string(),
             missing: None,
-            value_script: Some(MetricScript::TraceListLatency),
+            value_script: Some(MetricScript::TraceListLatency {
+                is_zero_when_absent: true,
+            }),
         };
         let script = json!({"source": LATENCY_SOURCE, "lang": "painless"});
 

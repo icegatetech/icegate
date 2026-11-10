@@ -531,10 +531,14 @@ pub(super) fn render_metric(
         MetricKind::Min => insert_extreme(&mut object, "value", &read(Statistic::Min)?, is_date, rendering)?,
         MetricKind::Max => {
             insert_extreme(&mut object, "value", &read(Statistic::Max)?, is_date, rendering)?;
-            // The latency of a trace list renders 0 for a bucket with no row: its value is
-            // never null.
-            if matches!(slot.spec.value_script, Some(MetricScript::TraceListLatency))
-                && object.get("value").is_none_or(Value::is_null)
+            // The latency script that ends in a default renders 0 for a bucket with no row: its
+            // value is never null.
+            if matches!(
+                slot.spec.value_script,
+                Some(MetricScript::TraceListLatency {
+                    is_zero_when_absent: true
+                })
+            ) && object.get("value").is_none_or(Value::is_null)
             {
                 object.insert("value".to_string(), render_float(Some(0.0), rendering)?);
             }
