@@ -42,15 +42,28 @@
 //! `index: false` or of such a type); and the `keyword` subfield of an undeclared string. Inside a
 //! `nested` query they name the paths of the current element instead of the document's, and nothing
 //! when a step of the query's path is under `enabled: false` or of such a type.
+//!
+//! What a leaf needs from the query alone (a `term` value or `range` bounds read for a field's
+//! kind, a translated `regexp` pattern, and what the mapping declares for a path) is prepared once
+//! per request and index, in [`IndexQueryEvaluator`], and reused for every document. A `term`,
+//! `terms` or `range` on `_id` or on a field the mapping declares is prepared before any document
+//! is read, so a value that does not fit the field is refused whatever the index holds and
+//! whichever clause a document reached first; on an undeclared path the kind comes from the
+//! document, so the value is read, and refused, only by a document that reaches it. A tree a
+//! `query_string` resolves for one document lives only for that document, so its `term` and
+//! `range` leaves are read per document.
 
 use std::borrow::Cow;
 use std::cell::{OnceCell, RefCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::hash::Hash;
+use std::ops::Deref;
 use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde_json::Value;
 
 use crate::opensearch::error::OpenSearchError;
@@ -58,13 +71,13 @@ use crate::opensearch::glob::matches_glob;
 use crate::query_dsl::analyzer::{Token, contains_token_phrase, normalize_standard, tokenize_standard};
 use crate::query_dsl::ast::{
     BoolQuery, MatchQuery, MultiMatchQuery, MultiMatchType, NestedQuery, Operator, Query, QueryStringClauses,
-    RangeBound, RangeQuery, RegexpQuery, SimpleQueryStringQuery, TokenPhraseQuery, ZeroTermsQuery,
+    RangeBound, RangeQuery, RegexpQuery, SimpleQueryStringQuery, TokenPhraseQuery, TokenSetQuery, ZeroTermsQuery,
 };
 use crate::query_dsl::date_math::{BoundSide, parse_stored_date_millis, resolve_date_bound};
 use crate::query_dsl::full_text::{
     FieldSelector, FullTextFields, FullTextQuery, SearchField, SearchKind, resolve_full_text, selects_all_fields,
 };
-use crate::query_dsl::regex::translate_lucene_regex;
+use crate::query_dsl::regex::{RegexFlags, translate_lucene_regex};
 use crate::query_dsl::simple_query::SimpleQuery;
 
 /// The metadata field naming a document's id.
@@ -74,7 +87,7 @@ pub(crate) const ID_FIELD: &str = "_id";
 const KEYWORD_SUBFIELD_SUFFIX: &str = ".keyword";
 
 /// How the evaluator compares a field's values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FieldKind {
     /// The document id (`_id`).
     Identifier,
@@ -140,37 +153,420 @@ impl DeclaredFieldType {
     }
 }
 
-/// Whether the document `id` of `index` with `source` matches `query` under `mappings`, with
-/// `now` the request's instant for date math.
+/// A request's query prepared for the documents of one index (see the module documentation):
+/// built once per request and index, then asked about each document.
+pub(crate) struct IndexQueryEvaluator<'q> {
+    /// The request's query, whose leaves key the prepared values by their address: it outlives
+    /// the evaluator, so an address names one leaf for every document.
+    query: &'q Query,
+    /// The concrete index, named by query-shard errors.
+    index: &'q str,
+    /// The index's mappings.
+    mappings: &'q Value,
+    /// The request's instant, for date math.
+    now: DateTime<Utc>,
+    /// What the leaves of `query` need, prepared once for every document.
+    preparations: LeafPreparations,
+}
+
+impl<'q> IndexQueryEvaluator<'q> {
+    /// `query` prepared for the index `index` with `mappings`, at the request's instant `now`.
+    /// Every `term`, `terms` and `range` on `_id` or on a declared field is read here, before any
+    /// document.
+    ///
+    /// # Errors
+    ///
+    /// For a `term`, `terms` or `range` on `_id` or on a field `mappings` declares, the refusal
+    /// [`Self::matches_document`] would answer for its value on any document (whether or not a
+    /// document reaches the leaf), and `illegal_argument_exception` for such a field of a type the
+    /// evaluator does not support.
+    pub(crate) fn new(
+        query: &'q Query,
+        index: &'q str,
+        mappings: &'q Value,
+        now: DateTime<Utc>,
+    ) -> Result<Self, OpenSearchError> {
+        let evaluator = Self {
+            query,
+            index,
+            mappings,
+            now,
+            preparations: LeafPreparations::default(),
+        };
+        evaluator.prepare_declared_leaves(query)?;
+        Ok(evaluator)
+    }
+
+    /// Whether the document `id` with `source` matches the query.
+    ///
+    /// # Errors
+    ///
+    /// - `search_phase_execution_exception` wrapping a `query_shard_exception` on the index for a
+    ///   `term` or `terms` value that does not parse for its field's type; for a full-text text
+    ///   that does not, or a `simple_query_string` prefix term on a number, date or boolean field,
+    ///   without `lenient`; and for a `match_phrase_prefix` on a keyword, `_id`, number, date or
+    ///   boolean field.
+    /// - `illegal_argument_exception` for a `range` value that does not parse for its field's type,
+    ///   a `prefix` or `wildcard` on a non-string field, or a mapping type the evaluator does not
+    ///   support.
+    pub(crate) fn matches_document(&self, id: &str, source: &Value) -> Result<bool, OpenSearchError> {
+        let analyzed_values = AnalyzedValues::default();
+        DocumentView {
+            index: self.index,
+            id,
+            source,
+            mappings: self.mappings,
+            now: self.now,
+            nested: None,
+            analyzed_values: &analyzed_values,
+            preparations: &self.preparations,
+            has_stable_leaves: true,
+        }
+        .matches_query(self.query)
+    }
+
+    /// Prepares every `term`, `terms` and `range` value under `query` whose field is `_id` or
+    /// declared, answering the first refusal, in the order a document evaluates the clauses.
+    fn prepare_declared_leaves(&self, query: &'q Query) -> Result<(), OpenSearchError> {
+        match query {
+            Query::Term(term) => self.prepare_declared_term_values(&term.field, std::slice::from_ref(&term.value)),
+            Query::Terms(terms) => self.prepare_declared_term_values(&terms.field, &terms.values),
+            Query::Range(range) => {
+                let Some(kind) = self.find_declared_kind(&range.field)? else {
+                    return Ok(());
+                };
+                self.preparations
+                    .find_range_operand(range, kind, || build_range_operand(range, kind, self.now))
+                    .map(drop)
+            }
+            Query::Bool(bool_query) => bool_query
+                .must
+                .iter()
+                .chain(&bool_query.filter)
+                .chain(&bool_query.must_not)
+                .chain(&bool_query.should)
+                .try_for_each(|clause| self.prepare_declared_leaves(clause)),
+            Query::ConstantScore(inner) => self.prepare_declared_leaves(inner),
+            Query::Nested(nested) => self.prepare_declared_leaves(&nested.query),
+            Query::MatchAll
+            | Query::MatchNone
+            | Query::Ids(_)
+            | Query::Exists(_)
+            | Query::Prefix(_)
+            | Query::Wildcard(_)
+            | Query::Regexp(_)
+            | Query::Match(_)
+            | Query::MatchPhrase(_)
+            | Query::MatchPhrasePrefix(_)
+            | Query::MultiMatch(_)
+            | Query::SimpleQueryString(_)
+            | Query::LuceneQueryString(_)
+            | Query::MapValues(_)
+            | Query::TokenPhrase(_)
+            | Query::TokenSet(_) => Ok(()),
+        }
+    }
+
+    /// Prepares each of `values` for `field` when its kind does not depend on a document.
+    fn prepare_declared_term_values(&self, field: &str, values: &[Value]) -> Result<(), OpenSearchError> {
+        let Some(kind) = self.find_declared_kind(field)? else {
+            return Ok(());
+        };
+        values.iter().try_for_each(|value| {
+            self.preparations
+                .find_term_operand(value, kind, || build_term_operand(field, value, kind, self.now))
+                .map(drop)
+                .map_err(|_| refuse_invalid_value(self.index, field, value))
+        })
+    }
+
+    /// The kind of `field` when no document decides it: `_id`, or a declared field.
+    fn find_declared_kind(&self, field: &str) -> Result<Option<FieldKind>, OpenSearchError> {
+        if field == ID_FIELD {
+            return Ok(Some(FieldKind::Identifier));
+        }
+        Ok(self
+            .preparations
+            .find_mapped_field(self.mappings, field)?
+            .map(|declared_type| declared_type.kind))
+    }
+}
+
+/// What the leaves of one request's query need on one index, prepared by the first document that
+/// needs it and reused by every later one. `term` values and `range` bounds are keyed by the leaf's
+/// address with the kind they were read for: the query outlives the preparations, so an address
+/// names one leaf, and an undeclared path can take another kind in another document. Patterns and
+/// paths are keyed by their text. Each map grows with the query (the paths, also with the paths
+/// the documents' own leaves offer to a field pattern), never with the number of documents.
+#[derive(Default)]
+struct LeafPreparations {
+    /// What the mappings declare for each path asked about.
+    mapped_fields: RefCell<HashMap<String, Result<Option<DeclaredFieldType>, OpenSearchError>>>,
+    /// `term` and `terms` values read for a field kind, by the value's address.
+    term_operands: RefCell<HashMap<(*const Value, FieldKind), Result<Rc<TermOperand<'static>>, OpenSearchError>>>,
+    /// `range` bounds read for a field kind, by the leaf's address.
+    range_operands:
+        RefCell<HashMap<(*const RangeQuery, FieldKind), Result<Rc<RangeOperand<'static>>, OpenSearchError>>>,
+    /// `regexp` translations, by the optional operators and the case sensitivity they were
+    /// translated with, then by pattern. Two levels, so a lookup borrows the query's pattern
+    /// instead of copying it into a key.
+    regex_translations: RefCell<HashMap<(RegexFlags, bool), Rc<RegexTranslations>>>,
+}
+
+/// The translations of `regexp` patterns for one set of optional operators and case sensitivity:
+/// the anchored pattern, or the refusal of the translation, by pattern.
+type RegexTranslations = RefCell<HashMap<String, Result<Rc<Regex>, OpenSearchError>>>;
+
+impl LeafPreparations {
+    /// What `mappings` declares for `path` (see [`find_mapped_field`]).
+    fn find_mapped_field(&self, mappings: &Value, path: &str) -> Result<Option<DeclaredFieldType>, OpenSearchError> {
+        find_or_insert_memo_entry(&self.mapped_fields, path, || find_mapped_field(mappings, path))
+    }
+
+    /// The `term` value at `value` read for `kind`, built by `build` the first time.
+    fn find_term_operand<'v>(
+        &self,
+        value: &'v Value,
+        kind: FieldKind,
+        build: impl FnOnce() -> Result<TermOperand<'v>, OpenSearchError>,
+    ) -> Result<Rc<TermOperand<'static>>, OpenSearchError> {
+        find_or_insert_memo_entry(&self.term_operands, &(std::ptr::from_ref(value), kind), || {
+            build().map(|operand| Rc::new(operand.into_owned()))
+        })
+    }
+
+    /// The bounds of the `range` at `range` read for `kind`, built by `build` the first time.
+    fn find_range_operand<'r>(
+        &self,
+        range: &'r RangeQuery,
+        kind: FieldKind,
+        build: impl FnOnce() -> Result<RangeOperand<'r>, OpenSearchError>,
+    ) -> Result<Rc<RangeOperand<'static>>, OpenSearchError> {
+        find_or_insert_memo_entry(&self.range_operands, &(std::ptr::from_ref(range), kind), || {
+            build().map(|operand| Rc::new(operand.into_owned()))
+        })
+    }
+
+    /// The translation of `query`'s pattern (see [`translate_lucene_regex`]), the first time it
+    /// is asked for with its flags and case sensitivity.
+    fn translate_regexp(&self, query: &RegexpQuery) -> Result<Rc<Regex>, OpenSearchError> {
+        let translations = find_or_insert_memo_entry(
+            &self.regex_translations,
+            &(query.flags, query.case_insensitive),
+            Rc::default,
+        );
+        find_or_insert_memo_entry(&translations, query.pattern.as_str(), || {
+            translate_lucene_regex(&query.pattern, query.flags, query.case_insensitive).map(Rc::new)
+        })
+    }
+}
+
+/// The value `memo` holds for `key`, inserting what `compute_value` answers the first time. The
+/// lookup borrows `key`; only a miss copies it into the map.
+fn find_or_insert_memo_entry<Q, V>(
+    memo: &RefCell<HashMap<Q::Owned, V>>,
+    key: &Q,
+    compute_value: impl FnOnce() -> V,
+) -> V
+where
+    Q: ?Sized + Eq + Hash + ToOwned,
+    Q::Owned: Eq + Hash,
+    V: Clone,
+{
+    // Bound to a local so the shared borrow ends before the insert below borrows mutably, and
+    // `compute_value` runs with no borrow held, free to use another memo.
+    let memoized_value = memo.borrow().get(key).cloned();
+    if let Some(value) = memoized_value {
+        return value;
+    }
+    let value = compute_value();
+    memo.borrow_mut().insert(key.to_owned(), value.clone());
+    value
+}
+
+/// A `term` value read for the kind of the field it is compared with.
+#[derive(Debug, Clone)]
+enum TermOperand<'v> {
+    /// A value no stored value equals: on an object or a `nested` field, or one without a text
+    /// form on `_id`.
+    Unmatchable,
+    /// The text the document id must equal.
+    IdentifierText(Cow<'v, str>),
+    /// The text a whole keyword value must equal.
+    WholeText(Cow<'v, str>),
+    /// The text one token of a text value must equal.
+    TokenText(Cow<'v, str>),
+    /// The number a numeric value must equal.
+    Number(ComparableNumber),
+    /// The boolean a boolean value must equal.
+    Flag(bool),
+    /// The instants a date term covers, in microseconds: `start` inclusive, `end` exclusive.
+    DateSpan {
+        /// The first instant covered.
+        start: i64,
+        /// The first instant past the covered ones.
+        end: i64,
+    },
+}
+
+impl TermOperand<'_> {
+    /// The operand owning its text, so it outlives the query value it was read from.
+    fn into_owned(self) -> TermOperand<'static> {
+        match self {
+            Self::Unmatchable => TermOperand::Unmatchable,
+            Self::IdentifierText(text) => TermOperand::IdentifierText(Cow::Owned(text.into_owned())),
+            Self::WholeText(text) => TermOperand::WholeText(Cow::Owned(text.into_owned())),
+            Self::TokenText(text) => TermOperand::TokenText(Cow::Owned(text.into_owned())),
+            Self::Number(number) => TermOperand::Number(number),
+            Self::Flag(flag) => TermOperand::Flag(flag),
+            Self::DateSpan { start, end } => TermOperand::DateSpan { start, end },
+        }
+    }
+}
+
+/// `value` of a `term` on `field` read for `kind`.
 ///
 /// # Errors
 ///
-/// - `search_phase_execution_exception` wrapping a `query_shard_exception` on `index` for a `term`
-///   or `terms` value that does not parse for its field's type; for a full-text text that does not,
-///   or a `simple_query_string` prefix term on a number, date or boolean field, without `lenient`;
-///   and for a `match_phrase_prefix` on a keyword, `_id`, number, date or boolean field.
-/// - `illegal_argument_exception` for a `range` value that does not parse for its field's type, a
-///   `prefix` or `wildcard` on a non-string field, or a mapping type the evaluator does not
-///   support.
-pub(crate) fn matches_document(
-    query: &Query,
-    index: &str,
-    id: &str,
-    source: &Value,
-    mappings: &Value,
+/// `illegal_argument_exception` for a value that does not parse for `kind`, and the date-math
+/// refusals of [`resolve_date_bound`] on a date field. A `term` answers either as the query-shard
+/// failure [`refuse_invalid_value`] builds.
+fn build_term_operand<'v>(
+    field: &str,
+    value: &'v Value,
+    kind: FieldKind,
     now: DateTime<Utc>,
-) -> Result<bool, OpenSearchError> {
-    let analyzed_values = AnalyzedValues::default();
-    DocumentView {
-        index,
-        id,
-        source,
-        mappings,
-        now,
-        nested: None,
-        analyzed_values: &analyzed_values,
+) -> Result<TermOperand<'v>, OpenSearchError> {
+    match kind {
+        FieldKind::Object | FieldKind::Nested => Ok(TermOperand::Unmatchable),
+        FieldKind::Identifier => Ok(render_text(value).map_or(TermOperand::Unmatchable, TermOperand::IdentifierText)),
+        FieldKind::Keyword => render_text(value)
+            .map(TermOperand::WholeText)
+            .ok_or_else(|| refuse_value(field, value)),
+        FieldKind::Text => render_text(value)
+            .map(TermOperand::TokenText)
+            .ok_or_else(|| refuse_value(field, value)),
+        FieldKind::Integer | FieldKind::Float => parse_numeric(value, field).map(TermOperand::Number),
+        FieldKind::Boolean => parse_boolean(value, field).map(TermOperand::Flag),
+        FieldKind::Date => {
+            let text = render_text(value).ok_or_else(|| refuse_value(field, value))?;
+            Ok(TermOperand::DateSpan {
+                start: resolve_date_bound(&text, None, None, now, BoundSide::LowerInclusive)?,
+                end: resolve_date_bound(&text, None, None, now, BoundSide::UpperInclusive)?,
+            })
+        }
     }
-    .matches_query(query)
+}
+
+/// The bounds of a `range` read for the kind of the field it is compared with.
+#[derive(Debug, Clone)]
+enum RangeOperand<'v> {
+    /// Bounds no stored value lies within: on an object or a `nested` field.
+    Unmatchable,
+    /// Text bounds the document id must lie within.
+    IdentifierText(TextBounds<'v>),
+    /// Text bounds a whole keyword value must lie within.
+    WholeText(TextBounds<'v>),
+    /// Text bounds one token of a text value must lie within.
+    TokenText(TextBounds<'v>),
+    /// Numeric bounds, for a numeric value.
+    Number(NumericBounds),
+    /// Boolean bounds ranked by [`rank_boolean`], for a boolean value.
+    Flag(NumericBounds),
+    /// Date bounds in microseconds, the lower one inclusive and the upper one exclusive; `None`
+    /// is open.
+    Date {
+        /// The first instant within the range.
+        lower: Option<i64>,
+        /// The first instant past the range.
+        upper: Option<i64>,
+    },
+}
+
+impl RangeOperand<'_> {
+    /// The operand owning its text, so it outlives the query it was read from.
+    fn into_owned(self) -> RangeOperand<'static> {
+        match self {
+            Self::Unmatchable => RangeOperand::Unmatchable,
+            Self::IdentifierText(bounds) => RangeOperand::IdentifierText(bounds.into_owned()),
+            Self::WholeText(bounds) => RangeOperand::WholeText(bounds.into_owned()),
+            Self::TokenText(bounds) => RangeOperand::TokenText(bounds.into_owned()),
+            Self::Number(bounds) => RangeOperand::Number(bounds),
+            Self::Flag(bounds) => RangeOperand::Flag(bounds),
+            Self::Date { lower, upper } => RangeOperand::Date { lower, upper },
+        }
+    }
+}
+
+/// The bounds of `range` read for `kind`.
+///
+/// # Errors
+///
+/// `illegal_argument_exception` for a bound that does not parse for `kind`, and the date-math
+/// refusals of [`resolve_date_bound`] on a date field.
+fn build_range_operand(
+    range: &RangeQuery,
+    kind: FieldKind,
+    now: DateTime<Utc>,
+) -> Result<RangeOperand<'_>, OpenSearchError> {
+    match kind {
+        FieldKind::Object | FieldKind::Nested => Ok(RangeOperand::Unmatchable),
+        FieldKind::Identifier => TextBounds::from_range(range).map(RangeOperand::IdentifierText),
+        FieldKind::Keyword => TextBounds::from_range(range).map(RangeOperand::WholeText),
+        FieldKind::Text => TextBounds::from_range(range).map(RangeOperand::TokenText),
+        FieldKind::Integer | FieldKind::Float => {
+            NumericBounds::from_range(range, parse_numeric).map(RangeOperand::Number)
+        }
+        FieldKind::Boolean => {
+            NumericBounds::from_range(range, |value, field| parse_boolean(value, field).map(rank_boolean))
+                .map(RangeOperand::Flag)
+        }
+        FieldKind::Date => {
+            let resolve_side = |bound: &RangeBound, inclusive_side, exclusive_side| {
+                resolve_date_side(
+                    bound,
+                    range,
+                    now,
+                    if bound.is_inclusive {
+                        inclusive_side
+                    } else {
+                        exclusive_side
+                    },
+                )
+            };
+            Ok(RangeOperand::Date {
+                lower: range
+                    .lower
+                    .as_ref()
+                    .map(|bound| resolve_side(bound, BoundSide::LowerInclusive, BoundSide::LowerExclusive))
+                    .transpose()?,
+                upper: range
+                    .upper
+                    .as_ref()
+                    .map(|bound| resolve_side(bound, BoundSide::UpperInclusive, BoundSide::UpperExclusive))
+                    .transpose()?,
+            })
+        }
+    }
+}
+
+/// `bound` of `range` in microseconds, read as `side`.
+fn resolve_date_side(
+    bound: &RangeBound,
+    range: &RangeQuery,
+    now: DateTime<Utc>,
+    side: BoundSide,
+) -> Result<i64, OpenSearchError> {
+    let text = render_text(&bound.value).ok_or_else(|| refuse_value(&range.field, &bound.value))?;
+    resolve_date_bound(&text, range.format, range.time_zone.as_ref(), now, side)
+}
+
+/// The query-shard failure on `index` for `value`, which does not parse for `field`.
+fn refuse_invalid_value(index: &str, field: &str, value: impl Display) -> OpenSearchError {
+    OpenSearchError::query_shard(
+        index,
+        &format!("[{value}] is not a valid value for the field [{field}]"),
+    )
 }
 
 /// What `mappings` declares for `path`; `None` when it does not declare the path.
@@ -239,28 +635,42 @@ struct NestedScope<'a> {
     element: &'a Value,
 }
 
+/// A leaf's operand as one document reads it (see `DocumentView::read_operand`).
+enum LeafOperand<T> {
+    /// Prepared once for the request and shared by every document.
+    Prepared(Rc<T>),
+    /// Read for this document alone.
+    Local(T),
+}
+
+impl<T> Deref for LeafOperand<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Self::Prepared(operand) => operand,
+            Self::Local(operand) => operand,
+        }
+    }
+}
+
 /// The tokens of each stored value one evaluation has analyzed, keyed by the value's address in
 /// the document. Every value a field resolves to is borrowed from the document, which outlives
 /// the evaluation, so an address names one value for the whole evaluation; a value is therefore
 /// tokenized once per document and query however many leaves, terms or fields read it.
 #[derive(Default)]
 struct AnalyzedValues {
-    /// The tokens by the value's address. The address is only compared, never read through.
-    tokens: RefCell<HashMap<*const Value, Rc<[Token]>>>,
+    /// The tokens by the value's address, `None` for a value without a text form. The address is
+    /// only compared, never read through.
+    tokens: RefCell<HashMap<*const Value, Option<Rc<[Token]>>>>,
 }
 
 impl AnalyzedValues {
     /// The standard analyzer's tokens of `value`'s text; `None` for a value without a text form.
     fn tokenize_value(&self, value: &Value) -> Option<Rc<[Token]>> {
-        let address = std::ptr::from_ref(value);
-        // Bound to a local so the shared borrow ends before the insert below borrows mutably.
-        let cached_tokens = self.tokens.borrow().get(&address).cloned();
-        if cached_tokens.is_some() {
-            return cached_tokens;
-        }
-        let tokens: Rc<[Token]> = tokenize_standard(&render_text(value)?).into();
-        self.tokens.borrow_mut().insert(address, Rc::clone(&tokens));
-        Some(tokens)
+        find_or_insert_memo_entry(&self.tokens, &std::ptr::from_ref(value), || {
+            render_text(value).map(|text| tokenize_standard(&text).into())
+        })
     }
 
     /// Whether `predicate` holds for one token of `stored_values`; a value without a text form
@@ -310,6 +720,12 @@ struct DocumentView<'a> {
     nested: Option<NestedScope<'a>>,
     /// The tokens of the stored values this evaluation has analyzed.
     analyzed_values: &'a AnalyzedValues,
+    /// What the request's leaves need on this index, shared by every document.
+    preparations: &'a LeafPreparations,
+    /// Whether the leaves under evaluation are the request's own, whose addresses key prepared
+    /// values; false inside a tree resolved for this document alone, whose addresses a later
+    /// document's tree may reuse.
+    has_stable_leaves: bool,
 }
 
 impl<'a> DocumentView<'a> {
@@ -354,6 +770,7 @@ impl<'a> DocumentView<'a> {
             }
             Query::LuceneQueryString(QueryStringClauses::Translated(tree)) => self.matches_query_string(tree),
             Query::TokenPhrase(phrase) => self.matches_token_phrase(phrase),
+            Query::TokenSet(token_set) => self.matches_token_set(token_set),
             Query::MapValues(_) => Err(OpenSearchError::internal(
                 "a MAP-value leaf built for data indices reached the system-index evaluator",
             )),
@@ -369,7 +786,11 @@ impl<'a> DocumentView<'a> {
         // `matches_query` borrows its query for the view's lifetime. The view only holds shared
         // references, so a copy of it at the shorter lifetime of `resolved_query` evaluates the
         // resolved query, keeping the `nested` scope and the analyzed values of this evaluation.
-        let view: DocumentView<'_> = *self;
+        // Its leaves die with this document, so their addresses key no prepared value.
+        let view: DocumentView<'_> = DocumentView {
+            has_stable_leaves: false,
+            ..*self
+        };
         view.matches_query(&resolved_query)
     }
 
@@ -385,6 +806,38 @@ impl<'a> DocumentView<'a> {
                 .tokenize_value(stored_value)
                 .is_some_and(|tokens| contains_token_phrase(&tokens, &phrase.tokens, phrase.is_last_token_prefix))
         }))
+    }
+
+    /// Tokens of one field joined by an operator, each compared as a `term` of it on the field:
+    /// the field is resolved once for all of them, and on a text field each stored value is
+    /// tokenized once (through the analyzed values). Like the `bool` of those terms, `and` stops
+    /// at the first token that does not match and `or` at the first that does.
+    fn matches_token_set(&self, query: &TokenSetQuery) -> Result<bool, OpenSearchError> {
+        let field_values = self.resolve_field(&query.field)?;
+        // The term values built below live for one call, so their addresses key nothing.
+        let term_view = Self {
+            has_stable_leaves: false,
+            ..*self
+        };
+        let matches_token = |token: &String| {
+            if field_values.kind == Some(FieldKind::Text) {
+                return self
+                    .analyzed_values
+                    .matches_any_token(&field_values.values, |stored_token| Ok(stored_token.text == *token));
+            }
+            term_view.matches_term_value(&query.field, &field_values, &Value::String(token.clone()), false)
+        };
+        match query.operator {
+            Operator::Or => matches_any_item(&query.tokens, matches_token),
+            Operator::And => {
+                for token in &query.tokens {
+                    if !matches_token(token)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
     }
 
     /// Whether this document satisfies the clauses of `query`, as [`BoolQuery`] states them.
@@ -460,14 +913,14 @@ impl<'a> DocumentView<'a> {
                 values: Vec::new(),
             });
         }
-        if let Some(declared_type) = find_mapped_field(self.mappings, field)? {
+        if let Some(declared_type) = self.preparations.find_mapped_field(self.mappings, field)? {
             return Ok(DocumentFieldValues {
                 kind: Some(declared_type.kind),
                 values: self.collect_values(declared_type.resolve_source_path(field)),
             });
         }
         if let Some(parent) = field.strip_suffix(KEYWORD_SUBFIELD_SUFFIX)
-            && find_mapped_field(self.mappings, parent)?.is_none()
+            && self.preparations.find_mapped_field(self.mappings, parent)?.is_none()
         {
             let values = self.collect_values(parent);
             if infer_kind(&values) == Some(FieldKind::Text) {
@@ -489,8 +942,9 @@ impl<'a> DocumentView<'a> {
         self.matches_term_value(field, &self.resolve_field(field)?, value, is_case_insensitive)
     }
 
-    /// [`Self::matches_field_values`] for a value of a `term` or `terms`. Every error that method
-    /// returns is a value that does not parse for the field, which fails the query on this index.
+    /// Whether `field_values`, resolved from `field`, hold `value` of a `term` or `terms`, read
+    /// for their kind once per request when the leaf is the request's own. Any value that does not
+    /// parse for the field fails the query on this index.
     fn matches_term_value(
         &self,
         field: &str,
@@ -498,140 +952,92 @@ impl<'a> DocumentView<'a> {
         value: &Value,
         is_case_insensitive: bool,
     ) -> Result<bool, OpenSearchError> {
-        self.matches_field_values(field, field_values, value, is_case_insensitive)
-            .map_err(|_| self.refuse_invalid_value(field, value))
-    }
-
-    /// The query-shard failure for `value`, which does not parse for `field`.
-    fn refuse_invalid_value(&self, field: &str, value: impl Display) -> OpenSearchError {
-        OpenSearchError::query_shard(
-            self.index,
-            &format!("[{value}] is not a valid value for the field [{field}]"),
-        )
-    }
-
-    /// Whether `field_values`, resolved from `field`, hold `value`. A `terms` compares several
-    /// values against one field, and the resolution is the same for each.
-    fn matches_field_values(
-        &self,
-        field: &str,
-        field_values: &DocumentFieldValues<'a>,
-        value: &Value,
-        is_case_insensitive: bool,
-    ) -> Result<bool, OpenSearchError> {
         let Some(kind) = field_values.kind else {
             return Ok(false);
         };
-        match kind {
-            FieldKind::Object | FieldKind::Nested => Ok(false),
-            FieldKind::Identifier => Ok(render_text(value)
-                .is_some_and(|expected_text| equals_text(self.id, &expected_text, is_case_insensitive))),
-            FieldKind::Keyword => {
-                let expected_text = render_text(value).ok_or_else(|| refuse_value(field, value))?;
-                Ok(field_values.values.iter().any(|stored_value| {
-                    render_text(stored_value)
-                        .is_some_and(|text| equals_text(&text, &expected_text, is_case_insensitive))
-                }))
-            }
-            FieldKind::Text => matches_text_term(
-                field,
-                value,
-                &field_values.values,
-                self.analyzed_values,
-                is_case_insensitive,
-            ),
-            FieldKind::Integer | FieldKind::Float => {
-                let expected_number = parse_numeric(value, field)?;
-                Ok(field_values
-                    .values
-                    .iter()
-                    .any(|stored_value| read_comparable_number(stored_value) == Some(expected_number)))
-            }
-            FieldKind::Boolean => {
-                let expected_flag = parse_boolean(value, field)?;
-                Ok(field_values
-                    .values
-                    .iter()
-                    .any(|stored_value| read_boolean(stored_value) == Some(expected_flag)))
-            }
-            FieldKind::Date => {
-                let text = render_text(value).ok_or_else(|| refuse_value(field, value))?;
-                let start = resolve_date_bound(&text, None, None, self.now, BoundSide::LowerInclusive)?;
-                let end = resolve_date_bound(&text, None, None, self.now, BoundSide::UpperInclusive)?;
-                Ok(field_values.values.iter().any(|stored_value| {
-                    read_date_micros(stored_value).is_some_and(|micros| (start..end).contains(&micros))
-                }))
-            }
+        let build = || build_term_operand(field, value, kind, self.now);
+        let operand = self
+            .read_operand(|| self.preparations.find_term_operand(value, kind, build), build)
+            .map_err(|_| refuse_invalid_value(self.index, field, value))?;
+        self.matches_field_values(field_values, &operand, is_case_insensitive)
+    }
+
+    /// A leaf's operand for this document: the one the request prepared (`find_prepared`) when
+    /// the leaf is the request's own, otherwise one `build` reads for this document alone, since
+    /// the leaf's address may name another leaf for a later document.
+    fn read_operand<T>(
+        &self,
+        find_prepared: impl FnOnce() -> Result<Rc<T>, OpenSearchError>,
+        build: impl FnOnce() -> Result<T, OpenSearchError>,
+    ) -> Result<LeafOperand<T>, OpenSearchError> {
+        if self.has_stable_leaves {
+            find_prepared().map(LeafOperand::Prepared)
+        } else {
+            build().map(LeafOperand::Local)
         }
     }
 
-    /// Whether `range.field` holds a value within the bounds, compared by the field's kind.
+    /// Whether `field_values` hold `operand`, read for their kind. A `terms` compares several
+    /// values against one field, and the resolution is the same for each.
+    fn matches_field_values(
+        &self,
+        field_values: &DocumentFieldValues<'a>,
+        operand: &TermOperand<'_>,
+        is_case_insensitive: bool,
+    ) -> Result<bool, OpenSearchError> {
+        let stored_values = &field_values.values;
+        match operand {
+            TermOperand::Unmatchable => Ok(false),
+            TermOperand::Number(expected_number) => Ok(stored_values
+                .iter()
+                .any(|stored_value| read_comparable_number(stored_value) == Some(*expected_number))),
+            TermOperand::Flag(expected_flag) => Ok(stored_values
+                .iter()
+                .any(|stored_value| read_boolean(stored_value) == Some(*expected_flag))),
+            TermOperand::DateSpan { start, end } => Ok(stored_values.iter().any(|stored_value| {
+                read_date_micros(stored_value).is_some_and(|micros| (*start..*end).contains(&micros))
+            })),
+            TermOperand::IdentifierText(expected_text) => Ok(equals_text(self.id, expected_text, is_case_insensitive)),
+            TermOperand::WholeText(expected_text) => Ok(stored_values.iter().any(|stored_value| {
+                render_text(stored_value).is_some_and(|text| equals_text(&text, expected_text, is_case_insensitive))
+            })),
+            TermOperand::TokenText(expected_text) => self.analyzed_values.matches_any_token(stored_values, |token| {
+                Ok(equals_text(&token.text, expected_text, is_case_insensitive))
+            }),
+        }
+    }
+
+    /// Whether `range.field` holds a value within the bounds, compared by the field's kind; the
+    /// bounds are read once per request when the leaf is the request's own.
     fn matches_range(&self, range: &RangeQuery) -> Result<bool, OpenSearchError> {
         let field_values = self.resolve_field(&range.field)?;
         let Some(kind) = field_values.kind else {
             return Ok(false);
         };
-        match kind {
-            FieldKind::Object | FieldKind::Nested => Ok(false),
-            FieldKind::Text => self
+        let build = || build_range_operand(range, kind, self.now);
+        let operand = self.read_operand(|| self.preparations.find_range_operand(range, kind, build), build)?;
+        let stored_values = &field_values.values;
+        Ok(match &*operand {
+            RangeOperand::Unmatchable => false,
+            RangeOperand::IdentifierText(bounds) => bounds.contains(self.id),
+            RangeOperand::WholeText(bounds) => stored_values
+                .iter()
+                .any(|stored_value| render_text(stored_value).is_some_and(|text| bounds.contains(&text))),
+            RangeOperand::TokenText(bounds) => self
                 .analyzed_values
-                .matches_any_token(&field_values.values, |token| is_within_text_range(&token.text, range)),
-            FieldKind::Identifier => is_within_text_range(self.id, range),
-            FieldKind::Keyword => matches_any_item(&field_values.values, |stored_value| {
-                render_text(stored_value).map_or(Ok(false), |text| is_within_text_range(&text, range))
+                .matches_any_token(stored_values, |token| Ok(bounds.contains(&token.text)))?,
+            RangeOperand::Number(bounds) => stored_values
+                .iter()
+                .any(|stored_value| read_comparable_number(stored_value).is_some_and(|number| bounds.contains(number))),
+            RangeOperand::Flag(bounds) => stored_values
+                .iter()
+                .any(|stored_value| read_boolean(stored_value).is_some_and(|flag| bounds.contains(rank_boolean(flag)))),
+            RangeOperand::Date { lower, upper } => stored_values.iter().any(|stored_value| {
+                read_date_micros(stored_value).is_some_and(|micros| {
+                    lower.is_none_or(|lower| micros >= lower) && upper.is_none_or(|upper| micros < upper)
+                })
             }),
-            FieldKind::Integer | FieldKind::Float => {
-                let bounds = NumericBounds::from_range(range, parse_numeric)?;
-                Ok(field_values.values.iter().any(|stored_value| {
-                    read_comparable_number(stored_value).is_some_and(|number| bounds.contains(number))
-                }))
-            }
-            FieldKind::Boolean => {
-                let bounds =
-                    NumericBounds::from_range(range, |value, field| parse_boolean(value, field).map(rank_boolean))?;
-                Ok(field_values.values.iter().any(|stored_value| {
-                    read_boolean(stored_value).is_some_and(|flag| bounds.contains(rank_boolean(flag)))
-                }))
-            }
-            FieldKind::Date => {
-                let lower = range
-                    .lower
-                    .as_ref()
-                    .map(|bound| {
-                        self.resolve_date_side(bound, range, BoundSide::LowerInclusive, BoundSide::LowerExclusive)
-                    })
-                    .transpose()?;
-                let upper = range
-                    .upper
-                    .as_ref()
-                    .map(|bound| {
-                        self.resolve_date_side(bound, range, BoundSide::UpperInclusive, BoundSide::UpperExclusive)
-                    })
-                    .transpose()?;
-                Ok(field_values.values.iter().any(|stored_value| {
-                    read_date_micros(stored_value).is_some_and(|micros| {
-                        lower.is_none_or(|lower| micros >= lower) && upper.is_none_or(|upper| micros < upper)
-                    })
-                }))
-            }
-        }
-    }
-
-    /// `bound` in microseconds, read as `inclusive_side` or `exclusive_side` by its inclusiveness.
-    fn resolve_date_side(
-        &self,
-        bound: &RangeBound,
-        range: &RangeQuery,
-        inclusive_side: BoundSide,
-        exclusive_side: BoundSide,
-    ) -> Result<i64, OpenSearchError> {
-        let text = render_text(&bound.value).ok_or_else(|| refuse_value(&range.field, &bound.value))?;
-        let side = if bound.is_inclusive {
-            inclusive_side
-        } else {
-            exclusive_side
-        };
-        resolve_date_bound(&text, range.format, range.time_zone.as_ref(), self.now, side)
+        })
     }
 
     /// Whether `field` holds a value; an object or a nested field needs a leaf under it.
@@ -677,9 +1083,10 @@ impl<'a> DocumentView<'a> {
     /// multi-field such as `title.keyword` reads its parent's values): each token of a text field,
     /// the whole value of a keyword field or of the id, with the pattern as given; a query-shard
     /// 400 on a date, numeric or boolean field. The pattern is translated before the field is
-    /// resolved, so a malformed one fails the query whatever the document and its mappings hold.
+    /// resolved, so a malformed one fails the query whatever the document and its mappings hold;
+    /// it is translated once per request.
     fn matches_regexp(&self, query: &RegexpQuery) -> Result<bool, OpenSearchError> {
-        let pattern = translate_lucene_regex(&query.pattern, query.flags, query.case_insensitive)?;
+        let pattern = self.preparations.translate_regexp(query)?;
         let field_values = self.resolve_field(&query.field)?;
         let is_pattern_match = |text: &str| pattern.is_match(text);
         self.match_string_field(&field_values, is_pattern_match, is_pattern_match, || {
@@ -884,10 +1291,10 @@ impl<'a> DocumentView<'a> {
                     &format!("a prefix applies to text and keyword fields and [{field}] is neither"),
                 )),
                 FullTextForm::Tokens(_) | FullTextForm::Phrase => {
-                    match self.matches_field_values(field, field_values, query_text.read_term_value(), false) {
-                        Ok(is_match) => Ok(Some(is_match)),
+                    match build_term_operand(field, query_text.read_term_value(), kind, self.now) {
+                        Ok(operand) => self.matches_field_values(field_values, &operand, false).map(Some),
                         Err(_) if is_lenient => Ok(Some(false)),
-                        Err(_) => Err(self.refuse_invalid_value(field, query_text.text)),
+                        Err(_) => Err(refuse_invalid_value(self.index, field, query_text.text)),
                     }
                 }
             },
@@ -1297,20 +1704,6 @@ fn has_leaf(value: &Value) -> bool {
     }
 }
 
-/// A `term` on a `text` field: the unanalyzed value equals one token of a stored value.
-fn matches_text_term(
-    field: &str,
-    value: &Value,
-    stored_values: &[&Value],
-    analyzed_values: &AnalyzedValues,
-    is_case_insensitive: bool,
-) -> Result<bool, OpenSearchError> {
-    let expected_text = render_text(value).ok_or_else(|| refuse_value(field, value))?;
-    analyzed_values.matches_any_token(stored_values, |token| {
-        Ok(equals_text(&token.text, &expected_text, is_case_insensitive))
-    })
-}
-
 /// How a full-text query text meets one field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FullTextForm {
@@ -1530,29 +1923,58 @@ pub(crate) fn read_date_micros(value: &Value) -> Option<i64> {
     millis.checked_mul(1000)
 }
 
-/// Whether `text` lies within the range's bounds, compared as strings.
-fn is_within_text_range(text: &str, range: &RangeQuery) -> Result<bool, OpenSearchError> {
-    let compare_with_bound = |bound: &RangeBound| {
-        render_text(&bound.value)
-            .map(|bound_text| text.cmp(&bound_text))
-            .ok_or_else(|| refuse_value(&range.field, &bound.value))
-    };
-    if let Some(lower) = &range.lower {
-        let ordering = compare_with_bound(lower)?;
-        if ordering == Ordering::Less || (ordering == Ordering::Equal && !lower.is_inclusive) {
-            return Ok(false);
+/// Range bounds compared as strings, each as `(text, is_inclusive)`; `None` is open.
+#[derive(Debug, Clone)]
+struct TextBounds<'v> {
+    /// The lower bound.
+    lower: Option<(Cow<'v, str>, bool)>,
+    /// The upper bound.
+    upper: Option<(Cow<'v, str>, bool)>,
+}
+
+impl<'v> TextBounds<'v> {
+    /// The bounds of `range` in their text form.
+    ///
+    /// # Errors
+    ///
+    /// `illegal_argument_exception` for a bound without a text form.
+    fn from_range(range: &'v RangeQuery) -> Result<Self, OpenSearchError> {
+        let read_bound = |bound: &'v RangeBound| {
+            render_text(&bound.value)
+                .map(|text| (text, bound.is_inclusive))
+                .ok_or_else(|| refuse_value(&range.field, &bound.value))
+        };
+        Ok(Self {
+            lower: range.lower.as_ref().map(read_bound).transpose()?,
+            upper: range.upper.as_ref().map(read_bound).transpose()?,
+        })
+    }
+
+    /// The bounds owning their text.
+    fn into_owned(self) -> TextBounds<'static> {
+        let own_bound = |(text, is_inclusive): (Cow<'_, str>, bool)| (Cow::Owned(text.into_owned()), is_inclusive);
+        TextBounds {
+            lower: self.lower.map(own_bound),
+            upper: self.upper.map(own_bound),
         }
     }
-    if let Some(upper) = &range.upper {
-        let ordering = compare_with_bound(upper)?;
-        if ordering == Ordering::Greater || (ordering == Ordering::Equal && !upper.is_inclusive) {
-            return Ok(false);
-        }
+
+    /// Whether `text` lies within the bounds.
+    fn contains(&self, text: &str) -> bool {
+        let is_above_lower = self.lower.as_ref().is_none_or(|(lower, is_inclusive)| {
+            let ordering = text.cmp(lower);
+            ordering == Ordering::Greater || (ordering == Ordering::Equal && *is_inclusive)
+        });
+        let is_below_upper = self.upper.as_ref().is_none_or(|(upper, is_inclusive)| {
+            let ordering = text.cmp(upper);
+            ordering == Ordering::Less || (ordering == Ordering::Equal && *is_inclusive)
+        });
+        is_above_lower && is_below_upper
     }
-    Ok(true)
 }
 
 /// Numeric range bounds as `(value, is_inclusive)`.
+#[derive(Debug, Clone, Copy)]
 struct NumericBounds {
     /// The lower bound; `None` is open.
     lower: Option<(ComparableNumber, bool)>,
@@ -1622,14 +2044,9 @@ mod tests {
     }
 
     fn evaluate(query: &Value, source: &Value, mappings: &Value) -> Result<bool, OpenSearchError> {
-        matches_document(
-            &parse_query(query).expect("the query parses"),
-            ".kibana_1",
-            "doc-1",
-            source,
-            mappings,
-            parse_request_instant(),
-        )
+        let query = parse_query(query).expect("the query parses");
+        IndexQueryEvaluator::new(&query, ".kibana_1", mappings, parse_request_instant())?
+            .matches_document("doc-1", source)
     }
 
     fn assert_matches(cases: &[(Value, bool)], source: &Value, mappings: &Value) {
@@ -2643,19 +3060,12 @@ mod tests {
     /// The ids of the sources `query` matches, in the order of [`build_find_sources`].
     fn find_matching_ids(query: &Value) -> Vec<&'static str> {
         let query = parse_query(query).expect("the query parses");
+        let mappings = build_find_mappings();
+        let evaluator = IndexQueryEvaluator::new(&query, ".kibana_1", &mappings, parse_request_instant())
+            .expect("the query prepares");
         build_find_sources()
             .into_iter()
-            .filter(|(id, source)| {
-                matches_document(
-                    &query,
-                    ".kibana_1",
-                    id,
-                    source,
-                    &build_find_mappings(),
-                    parse_request_instant(),
-                )
-                .expect("the query evaluates")
-            })
+            .filter(|(id, source)| evaluator.matches_document(id, source).expect("the query evaluates"))
             .map(|(id, _)| id)
             .collect()
     }
@@ -3444,6 +3854,30 @@ mod tests {
         assert_matches(&[(deepest_query, false)], &json!({"title": "rate"}), &mappings);
     }
 
+    /// A `query_string` text of several tokens on a text field resolves to one token set, which
+    /// answers what one `term` per token joined by the operator answers: `or` needs one token,
+    /// `and` needs each token in some stored value, not all of them in one. On a keyword field the
+    /// adjacent terms stay one whole value.
+    #[test]
+    fn a_query_string_text_of_several_tokens_matches_one_or_every_token_of_a_text_field() {
+        let mappings = json!({"properties": {"title": {"type": "text"}, "kind": {"type": "keyword"}}});
+        let source = json!({"title": ["Connection refused", "upstream timeout"], "kind": "refused timeout"});
+        let build_query = |text: &str, field: &str, operator: &str| json!({"query_string": {"query": text, "default_field": field, "default_operator": operator}});
+        assert_matches(
+            &[
+                (build_query("refused absent", "title", "or"), true),
+                (build_query("absent missing", "title", "or"), false),
+                (build_query("refused timeout", "title", "and"), true),
+                (build_query("refused absent", "title", "and"), false),
+                (build_query("Refused-Timeout", "title", "and"), true),
+                (build_query("refused", "kind", "or"), false),
+                (build_query("refused timeout", "kind", "and"), true),
+            ],
+            &source,
+            &mappings,
+        );
+    }
+
     #[test]
     fn a_query_string_on_a_system_document_resolves_against_its_mapping_and_its_own_leaves() {
         let mappings = json!({
@@ -3467,29 +3901,17 @@ mod tests {
         ];
         for (text, matches_logs, matches_metrics) in rows {
             let query = parse_query(&json!({"query_string": {"query": text}})).expect("the query parses");
+            let evaluator =
+                IndexQueryEvaluator::new(&query, ".kibana_1", &mappings, parse_request_instant()).expect("prepares");
             assert_eq!(
-                matches_document(
-                    &query,
-                    ".kibana_1",
-                    "index-pattern:logs",
-                    &logs,
-                    &mappings,
-                    parse_request_instant()
-                )
-                .expect("evaluates"),
+                evaluator.matches_document("index-pattern:logs", &logs).expect("evaluates"),
                 matches_logs,
                 "[{text}] on logs"
             );
             assert_eq!(
-                matches_document(
-                    &query,
-                    ".kibana_1",
-                    "index-pattern:metrics",
-                    &metrics,
-                    &mappings,
-                    parse_request_instant()
-                )
-                .expect("evaluates"),
+                evaluator
+                    .matches_document("index-pattern:metrics", &metrics)
+                    .expect("evaluates"),
                 matches_metrics,
                 "[{text}] on metrics"
             );
@@ -3501,15 +3923,10 @@ mod tests {
     #[tokio::test]
     async fn a_query_string_syntax_error_is_the_query_shard_failure_of_the_evaluated_index() {
         let query = parse_query(&json!({"query_string": {"query": "a/b"}})).expect("the query parses");
-        let error = matches_document(
-            &query,
-            ".kibana_7",
-            "1",
-            &json!({}),
-            &json!({}),
-            parse_request_instant(),
-        )
-        .expect_err("refused");
+        let mappings = json!({});
+        let error = IndexQueryEvaluator::new(&query, ".kibana_7", &mappings, parse_request_instant())
+            .and_then(|evaluator| evaluator.matches_document("1", &json!({})))
+            .expect_err("refused");
         let (status, body) = render_envelope(error).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "search_phase_execution_exception");

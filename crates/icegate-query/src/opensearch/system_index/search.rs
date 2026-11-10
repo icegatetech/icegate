@@ -18,7 +18,7 @@ use serde_json::{Map, Value, json};
 
 use super::documents::{filter_source, parse_json_body};
 use super::evaluate::{
-    FieldKind, ID_FIELD, collect_source_values, find_mapped_field, list_mapped_pattern_fields, matches_document,
+    FieldKind, ID_FIELD, IndexQueryEvaluator, collect_source_values, find_mapped_field, list_mapped_pattern_fields,
     read_boolean, read_date_micros, read_numeric, render_text,
 };
 use super::snapshot::{PRIMARY_TERM, StoredDocument, SystemIndex, SystemSnapshot};
@@ -185,7 +185,8 @@ fn find_query_string_error(query: &Query) -> Option<&str> {
         | Query::MultiMatch(_)
         | Query::SimpleQueryString(_)
         | Query::MapValues(_)
-        | Query::TokenPhrase(_) => None,
+        | Query::TokenPhrase(_)
+        | Query::TokenSet(_) => None,
     }
 }
 
@@ -246,7 +247,8 @@ fn verify_regex_patterns(
         | Query::MultiMatch(_)
         | Query::SimpleQueryString(_)
         | Query::MapValues(_)
-        | Query::TokenPhrase(_) => Ok(()),
+        | Query::TokenPhrase(_)
+        | Query::TokenSet(_) => Ok(()),
     }
 }
 
@@ -313,13 +315,30 @@ fn verify_leaf_regex_pattern(
     Ok(())
 }
 
+/// `query` prepared for each of `indices`, in their order, before any document is read: the
+/// query-shard failure of the first index for a `query_string` whose translation failed (a syntax
+/// error or a refused leading wildcard), then the refusals [`IndexQueryEvaluator::new`] answers,
+/// come whatever the indices hold.
+fn prepare_index_queries<'q>(
+    query: &'q Query,
+    indices: &[(&'q str, &'q SystemIndex)],
+    now: DateTime<Utc>,
+) -> Result<Vec<IndexQueryEvaluator<'q>>, OpenSearchError> {
+    if let (Some(reason), Some((index_name, _))) = (find_query_string_error(query), indices.first()) {
+        return Err(OpenSearchError::query_shard(index_name, reason));
+    }
+    indices
+        .iter()
+        .map(|&(index_name, index)| IndexQueryEvaluator::new(query, index_name, &index.mappings, now))
+        .collect()
+}
+
 /// How many documents of `indices` match `query` at `now`.
 ///
 /// # Errors
 ///
-/// The query-shard failure of the first index for a `query_string` whose translation failed (a
-/// syntax error or a refused leading wildcard), whatever the index holds, and the errors of
-/// [`find_system_indices`], [`verify_regex_patterns`] and [`matches_document`].
+/// The errors of [`find_system_indices`], [`verify_regex_patterns`], [`prepare_index_queries`]
+/// and [`IndexQueryEvaluator::matches_document`].
 pub(crate) fn count_system_documents(
     snapshot: &SystemSnapshot,
     indices: &[String],
@@ -328,14 +347,11 @@ pub(crate) fn count_system_documents(
 ) -> Result<u64, OpenSearchError> {
     let concrete_indices = find_system_indices(snapshot, indices)?;
     verify_regex_patterns(query, &concrete_indices, None)?;
-    let query_string_error = find_query_string_error(query);
+    let evaluators = prepare_index_queries(query, &concrete_indices, now)?;
     let mut count = 0_u64;
-    for (index_name, index) in concrete_indices {
-        if let Some(reason) = query_string_error {
-            return Err(OpenSearchError::query_shard(index_name, reason));
-        }
+    for ((_, index), evaluator) in concrete_indices.iter().zip(&evaluators) {
         for (id, document) in index.documents() {
-            if matches_document(query, index_name, id, &document.source, &index.mappings, now)? {
+            if evaluator.matches_document(id, &document.source)? {
                 count += 1;
             }
         }
@@ -418,9 +434,9 @@ enum SortKey<'s> {
 ///   reading one source of an index, naming the first such index of `indices`, or a stored value
 ///   that does not read as its sort field's kind;
 /// - `query_shard` for a sort on a field the mapping lacks without `unmapped_type`, or on a text,
-///   object or nested field, and, on the first index, for a `query_string` whose translation
-///   failed (a syntax error or a refused leading wildcard), whatever the index holds;
-/// - the errors of [`find_system_indices`], [`verify_regex_patterns`] and [`matches_document`].
+///   object or nested field;
+/// - the errors of [`find_system_indices`], [`verify_regex_patterns`], [`prepare_index_queries`]
+///   and [`IndexQueryEvaluator::matches_document`].
 pub(crate) fn search_system_indices(
     snapshot: &SystemSnapshot,
     indices: &[String],
@@ -450,21 +466,11 @@ pub(crate) fn search_system_indices(
         .collect::<Result<Vec<Vec<SortPlan<'_>>>, OpenSearchError>>()?;
     verify_sort_field_kinds(&concrete_indices, &sort_plans, &request.sort)?;
     verify_regex_patterns(&request.query, &concrete_indices, None)?;
-    let query_string_error = find_query_string_error(&request.query);
+    let evaluators = prepare_index_queries(&request.query, &concrete_indices, context.now)?;
     let mut keyed_hits = Vec::new();
-    for (&(index_name, index), clause_plans) in concrete_indices.iter().zip(&sort_plans) {
-        if let Some(reason) = query_string_error {
-            return Err(OpenSearchError::query_shard(index_name, reason));
-        }
+    for ((&(index_name, index), clause_plans), evaluator) in concrete_indices.iter().zip(&sort_plans).zip(&evaluators) {
         for (id, document) in index.documents() {
-            if matches_document(
-                &request.query,
-                index_name,
-                id,
-                &document.source,
-                &index.mappings,
-                context.now,
-            )? {
+            if evaluator.matches_document(id, &document.source)? {
                 let hit = SystemHit {
                     index: index_name,
                     id,
@@ -1968,5 +1974,110 @@ mod tests {
                 assert_eq!(counted.expect("the count is answered"), 0, "{query}");
             }
         }
+    }
+
+    /// The refusal of a value for its field's type, as both the count and the search answer it.
+    async fn assert_value_refusal(error: OpenSearchError, query: &Value, error_type: &str) {
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query} {body}");
+        assert_eq!(body["error"]["type"], error_type, "{query} {body}");
+        if error_type == "search_phase_execution_exception" {
+            assert_eq!(
+                body["error"]["root_cause"][0]["type"], "query_shard_exception",
+                "{query}"
+            );
+            assert_eq!(body["error"]["root_cause"][0]["index"], ".kibana_1", "{query}");
+        }
+    }
+
+    /// A `term`, `terms` or `range` value that does not fit a field the mapping declares is
+    /// refused before any document is read: on an index with no document, behind a `must` clause
+    /// no document matches, and behind a `should` clause every document already satisfies. Each
+    /// query would otherwise answer from which documents reach the leaf.
+    #[tokio::test]
+    async fn a_value_that_does_not_fit_a_declared_field_is_refused_whatever_document_reaches_it() {
+        let unmatched_must = |leaf: Value| json!({"bool": {"must": [{"term": {"type": "absent"}}, leaf]}});
+        let satisfied_should = |leaf: Value| json!({"bool": {"should": [{"term": {"type": "dashboard"}}, leaf]}});
+        let bad_range = json!({"range": {"count": {"gte": "zero"}}});
+        let bad_date_range = json!({"range": {"updated_at": {"lt": "not a date"}}});
+        let bad_term = json!({"term": {"enabled": "maybe"}});
+        let bad_terms = json!({"terms": {"ratio": [1.5, "half"]}});
+        let empty_snapshot = build_snapshot(&[]);
+        let filled_snapshot = build_snapshot(&[("dashboard:1", json!({"type": "dashboard"}))]);
+        let rows = [
+            (&empty_snapshot, bad_range.clone(), "illegal_argument_exception"),
+            (&empty_snapshot, bad_term.clone(), "search_phase_execution_exception"),
+            (
+                &filled_snapshot,
+                unmatched_must(bad_range.clone()),
+                "illegal_argument_exception",
+            ),
+            (
+                &filled_snapshot,
+                unmatched_must(bad_date_range.clone()),
+                "illegal_argument_exception",
+            ),
+            (
+                &filled_snapshot,
+                unmatched_must(bad_term.clone()),
+                "search_phase_execution_exception",
+            ),
+            (
+                &filled_snapshot,
+                satisfied_should(bad_terms),
+                "search_phase_execution_exception",
+            ),
+            (
+                &filled_snapshot,
+                satisfied_should(bad_date_range),
+                "illegal_argument_exception",
+            ),
+            (
+                &filled_snapshot,
+                json!({"nested": {"path": "references", "query": bad_term}}),
+                "search_phase_execution_exception",
+            ),
+        ];
+        let names = [String::from(".kibana_1")];
+        let now = build_context().now;
+        for (snapshot, query, error_type) in rows {
+            let searched = search_kibana_index(snapshot, &json!({"query": query}), "");
+            let parsed_query = parse_query(&query).expect("the query parses");
+            let counted = count_system_documents(snapshot, &names, &parsed_query, now);
+            assert_value_refusal(searched.expect_err("the search is refused"), &query, error_type).await;
+            assert_value_refusal(counted.expect_err("the count is refused"), &query, error_type).await;
+        }
+    }
+
+    /// A path the mapping does not declare takes its kind from each document, so a bound that fits
+    /// no number is refused only by a document that holds a number there: absent and string values
+    /// answer, compared as text.
+    #[tokio::test]
+    async fn a_bad_bound_on_an_undeclared_path_is_refused_only_by_a_document_holding_a_number_there() {
+        let mut snapshot = SystemSnapshot::default();
+        create_index(
+            &mut snapshot,
+            ".kibana_1",
+            json!({"properties": {"type": {"type": "keyword"}}}),
+        );
+        write_document(&mut snapshot, ".kibana_1", "a", &json!({"type": "dashboard"}));
+        write_document(&mut snapshot, ".kibana_1", "b", &json!({"count": "zero"}));
+        let query = json!({"range": {"count": {"gte": "zero"}}});
+        let parsed_query = parse_query(&query).expect("the query parses");
+        let names = [String::from(".kibana_1")];
+        let now = build_context().now;
+
+        let answer = search_kibana_index(&snapshot, &json!({"query": query}), "").expect("answered");
+        assert_eq!(read_hit_ids(&answer), ["b"]);
+        assert_eq!(
+            count_system_documents(&snapshot, &names, &parsed_query, now).expect("counted"),
+            1
+        );
+
+        write_document(&mut snapshot, ".kibana_1", "c", &json!({"count": 7}));
+        let searched = search_kibana_index(&snapshot, &json!({"query": query}), "");
+        let counted = count_system_documents(&snapshot, &names, &parsed_query, now);
+        assert_value_refusal(searched.expect_err("refused"), &query, "illegal_argument_exception").await;
+        assert_value_refusal(counted.expect_err("refused"), &query, "illegal_argument_exception").await;
     }
 }

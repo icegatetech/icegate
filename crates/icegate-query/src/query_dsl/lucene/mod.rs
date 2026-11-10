@@ -92,7 +92,7 @@ mod tests {
 
     use super::{MAX_QUERY_STRING_DEPTH, parse_query_string};
     use crate::{
-        opensearch::{error::render_envelope, system_index::evaluate::matches_document},
+        opensearch::{error::render_envelope, system_index::evaluate::IndexQueryEvaluator},
         query_dsl::{
             ast::{Query, QueryStringClauses},
             parse::parse_query,
@@ -172,9 +172,10 @@ mod tests {
         let mappings = json!({"properties": {"body": {"type": "text"}}});
         let at_limit = json!({"query_string": {"query": build_nested_groups(MAX_QUERY_STRING_DEPTH)}});
         let query = parse_query(&at_limit).expect("the limit itself parses");
+        let evaluator = IndexQueryEvaluator::new(&query, ".kibana_1", &mappings, now).expect("prepares");
         for (source, is_match) in [(json!({"body": "a"}), true), (json!({"body": "b"}), false)] {
             assert_eq!(
-                matches_document(&query, ".kibana_1", "1", &source, &mappings, now).expect("evaluates"),
+                evaluator.matches_document("1", &source).expect("evaluates"),
                 is_match,
                 "{source}"
             );
@@ -229,7 +230,10 @@ mod tests {
         ));
         let now: DateTime<Utc> = "2026-10-08T12:34:56.789Z".parse().expect("a literal instant");
         let query = parse_query(&json!({"query_string": {"query": text}})).expect("a syntax error is no refusal");
-        let error = matches_document(&query, ".kibana_1", "1", &json!({}), &json!({}), now).expect_err("refused");
+        let mappings = json!({});
+        let error = IndexQueryEvaluator::new(&query, ".kibana_1", &mappings, now)
+            .and_then(|evaluator| evaluator.matches_document("1", &json!({})))
+            .expect_err("refused");
         let (status, body) = render_envelope(error).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["type"], "search_phase_execution_exception");

@@ -8,6 +8,7 @@
 //! argument is an execution error, except a range bound, where NULL is an open bound.
 
 use std::{
+    collections::HashMap,
     hash::{Hash, Hasher},
     sync::Arc,
 };
@@ -64,6 +65,14 @@ impl Hash for MatchRegex {
 /// `text_term_match(text, term)`: a token of `text` equals `term`.
 pub(crate) fn build_text_term_match_udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(TextMatch::new(TextMatchKind::Term))
+}
+
+/// `text_tokens_match(text, tokens, require_all)`: a token of `text` equals one of the listed
+/// tokens, or with `require_all` each listed token equals a token of `text`. It answers what the
+/// `text_term_match` of each listed token joined by `or` (or `and`) answers, tokenizing each value
+/// once instead of once per listed token.
+pub(crate) fn build_text_tokens_match_udf() -> ScalarUDF {
+    ScalarUDF::new_from_impl(TextMatch::new(TextMatchKind::TokenSet))
 }
 
 /// `text_prefix_match(text, prefix)`: a token of `text` starts with `prefix`.
@@ -180,6 +189,8 @@ pub(super) fn compile_anchored_pattern(source: &str, translated: &str) -> Result
 enum TextMatchKind {
     /// A token equals the term argument.
     Term,
+    /// A token equals one listed token, or every listed token equals a token.
+    TokenSet,
     /// A token starts with the prefix argument.
     Prefix,
     /// The listed tokens occur at consecutive positions.
@@ -205,7 +216,7 @@ impl TextMatch {
         let arity = match kind {
             TextMatchKind::Regex(_) | TextMatchKind::WholeValueRegex(_) => 1,
             TextMatchKind::Term | TextMatchKind::Prefix => 2,
-            TextMatchKind::Phrase => 3,
+            TextMatchKind::Phrase | TextMatchKind::TokenSet => 3,
             TextMatchKind::Range => 5,
         };
         Self {
@@ -219,6 +230,7 @@ impl ScalarUDFImpl for TextMatch {
     fn name(&self) -> &'static str {
         match self.kind {
             TextMatchKind::Term => "text_term_match",
+            TextMatchKind::TokenSet => "text_tokens_match",
             TextMatchKind::Prefix => "text_prefix_match",
             TextMatchKind::Phrase => "text_phrase_match",
             TextMatchKind::Range => "text_range_match",
@@ -246,6 +258,12 @@ impl ScalarUDFImpl for TextMatch {
                 match_each_text(&texts, name, |text| {
                     tokenize_standard(text).iter().any(|token| token.text == term)
                 })?
+            }
+            TextMatchKind::TokenSet => {
+                let listed_tokens = read_list_argument(&args.args, 1, name)?;
+                let is_all_required = read_boolean_argument(&args.args, 2, name)?;
+                let mut token_search = ListedTokenSearch::new(&listed_tokens);
+                match_each_text(&texts, name, |text| token_search.matches_text(text, is_all_required))?
             }
             TextMatchKind::Prefix => {
                 let Some(prefix) = read_string_argument(&args.args, 1, name)? else {
@@ -280,12 +298,67 @@ impl ScalarUDFImpl for TextMatch {
     }
 }
 
-/// Applies `predicate` to every value of a string column; NULL stays NULL.
-fn match_each_text(texts: &ArrayRef, name: &str, predicate: impl Fn(&str) -> bool) -> Result<BooleanArray> {
+/// The listed tokens of one `text_tokens_match` call, matched against the texts of its column
+/// one after another.
+struct ListedTokenSearch<'t> {
+    /// Each distinct listed token with a position of its own among the distinct ones, so a text's
+    /// tokens are looked up in one hash probe each and a token listed twice counts once.
+    token_positions: HashMap<&'t str, usize>,
+    /// Per position, the number of the last text found to hold that token. Numbering the texts
+    /// lets one buffer, allocated once per call, serve every text without being cleared.
+    last_text_numbers: Vec<usize>,
+    /// The number of the text matched last; texts are numbered from 1, so 0 is no text.
+    text_number: usize,
+}
+
+impl<'t> ListedTokenSearch<'t> {
+    fn new(listed_tokens: &'t [String]) -> Self {
+        let mut token_positions = HashMap::with_capacity(listed_tokens.len());
+        for token in listed_tokens {
+            let next_position = token_positions.len();
+            token_positions.entry(token.as_str()).or_insert(next_position);
+        }
+        let last_text_numbers = vec![0; token_positions.len()];
+        Self {
+            token_positions,
+            last_text_numbers,
+            text_number: 0,
+        }
+    }
+
+    /// Whether a token of `text` is one of the listed tokens, or with `is_all_required` whether
+    /// each of them is a token of `text`; the text is tokenized once either way. Without a listed
+    /// token no text matches, unless `is_all_required`, when every text does: the answers of an
+    /// empty `or` and an empty `and`.
+    fn matches_text(&mut self, text: &str, is_all_required: bool) -> bool {
+        let tokens = tokenize_standard(text);
+        if !is_all_required {
+            return tokens
+                .iter()
+                .any(|token| self.token_positions.contains_key(token.text.as_str()));
+        }
+        self.text_number += 1;
+        let mut missing_count = self.token_positions.len();
+        for token in &tokens {
+            if missing_count == 0 {
+                break;
+            }
+            if let Some(&position) = self.token_positions.get(token.text.as_str())
+                && std::mem::replace(&mut self.last_text_numbers[position], self.text_number) != self.text_number
+            {
+                missing_count -= 1;
+            }
+        }
+        missing_count == 0
+    }
+}
+
+/// Applies `predicate` to every value of a string column, in order; NULL stays NULL.
+fn match_each_text(texts: &ArrayRef, name: &str, mut predicate: impl FnMut(&str) -> bool) -> Result<BooleanArray> {
     Ok(match texts.data_type() {
-        DataType::Utf8 => texts.as_string::<i32>().iter().map(|text| text.map(&predicate)).collect(),
-        DataType::LargeUtf8 => texts.as_string::<i64>().iter().map(|text| text.map(&predicate)).collect(),
-        DataType::Utf8View => texts.as_string_view().iter().map(|text| text.map(&predicate)).collect(),
+        DataType::Utf8 => texts.as_string::<i32>().iter().map(|text| text.map(&mut predicate)).collect(),
+        DataType::LargeUtf8 => texts.as_string::<i64>().iter().map(|text| text.map(&mut predicate)).collect(),
+        DataType::Utf8View => texts.as_string_view().iter().map(|text| text.map(&mut predicate)).collect(),
         other => return exec_err!("{name} needs a string column, got {other}"),
     })
 }
@@ -425,7 +498,7 @@ mod tests {
     use super::{
         build_keyword_regex_match_udf, build_map_value_match_udf, build_text_phrase_match_udf,
         build_text_prefix_match_udf, build_text_range_match_udf, build_text_regex_match_udf, build_text_term_match_udf,
-        escape_wildcard, translate_wildcard,
+        build_text_tokens_match_udf, escape_wildcard, translate_wildcard,
     };
     use crate::query_dsl::ast::MapValuePredicate;
 
@@ -560,6 +633,70 @@ mod tests {
             ),
             vec![Some(true), Some(false), None, Some(false)]
         );
+    }
+
+    /// One call stands for the `term` of each listed token, joined by `or` (`require_all` false)
+    /// or `and` (true), so it must answer what that join of `text_term_match` calls answers.
+    #[test]
+    fn the_token_set_udf_matches_one_or_every_listed_token_of_the_standard_analyzer() {
+        // Tokens: [connection, refused, by, upstream], [retrying, connection, in, 5s], NULL, [].
+        let cases: [(&[&str], bool, [Option<bool>; 4]); 6] = [
+            (
+                &["refused", "retrying"],
+                false,
+                [Some(true), Some(true), None, Some(false)],
+            ),
+            (
+                &["absent", "upstream"],
+                false,
+                [Some(true), Some(false), None, Some(false)],
+            ),
+            (
+                &["connection", "refused"],
+                true,
+                [Some(true), Some(false), None, Some(false)],
+            ),
+            (
+                &["connection", "connection"],
+                true,
+                [Some(true), Some(true), None, Some(false)],
+            ),
+            (
+                &["Connection", "refused"],
+                false,
+                [Some(true), Some(false), None, Some(false)],
+            ),
+            (
+                &["Connection", "refused"],
+                true,
+                [Some(false), Some(false), None, Some(false)],
+            ),
+        ];
+        for (tokens, is_all_required, expected_flags) in cases {
+            assert_eq!(
+                invoke_match_udf(
+                    &build_text_tokens_match_udf(),
+                    build_body_array(),
+                    vec![
+                        build_phrase_literal(tokens),
+                        ScalarValue::Boolean(Some(is_all_required))
+                    ]
+                ),
+                expected_flags,
+                "{tokens:?} requiring all: {is_all_required}"
+            );
+        }
+        let tokens_with_null = ScalarValue::List(ScalarValue::new_list_nullable(
+            &[build_utf8_literal("refused"), ScalarValue::Utf8(None)],
+            &DataType::Utf8,
+        ));
+        let error = try_invoke_match_udf(
+            &build_text_tokens_match_udf(),
+            build_body_array(),
+            vec![tokens_with_null, ScalarValue::Boolean(Some(false))],
+        )
+        .expect_err("a NULL listed token is refused");
+        assert!(matches!(error, DataFusionError::Execution(_)), "{error}");
     }
 
     #[test]

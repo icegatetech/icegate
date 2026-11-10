@@ -41,8 +41,15 @@ snapshot, writes the new snapshot object, then swaps the pointer by compare-and-
 swap, and a batch that changes nothing stores nothing and swaps nothing. Both refusals of a swap
 (a stale update and a create on an existing pointer) are a conflict: the loop reloads and applies
 again, retrying with jittered backoff until `engine.max_query_duration_secs`, after which the
-write answers 503; contention is never a 409. A snapshot object whose swap is known to have
-failed is deleted by its writer.
+write answers 503; contention is never a 409. That deadline also cuts every object-store call of
+the write (a read of the pointer or of a lineage frame, a snapshot-object put, a swap, a delete),
+and no call is started once it has passed, so a store that stops answering holds the tenant's
+write loop for the deadline plus at most one backoff. The store's S3 client is built with its
+retry timeout set to the same `engine.max_query_duration_secs`. A swap cut at the deadline, or
+kept from being sent by it, is an unknown outcome, not a conflict: its snapshot object stays, so
+a swap that lands after the write answered 503 names a stored object. A snapshot object whose
+swap is known to have failed is deleted by its writer, unless that delete fails or is cut at the
+deadline too; the object then stays behind, named by nothing.
 
 **Landed detection.** After a conflict or an unknown outcome (a transient error, a lost answer),
 the writer cannot tell from the answer whether its swap landed. It reloads the pointer and walks

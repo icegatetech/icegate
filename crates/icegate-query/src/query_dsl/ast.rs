@@ -58,6 +58,10 @@ pub(crate) enum Query {
     /// Internal: consecutive tokens of one text field. Built by the full-text
     /// resolver for a phrase of two or more tokens; never parsed from a request.
     TokenPhrase(TokenPhraseQuery),
+    /// Internal: tokens of one text field joined by an operator, the `term` of each
+    /// token in one node, so a value is tokenized once for all of them. Built by the
+    /// full-text resolver for a text of two or more tokens; never parsed from a request.
+    TokenSet(TokenSetQuery),
 }
 
 /// `bool`: every `must` and `filter` clause matches, no `must_not` clause matches, and at least
@@ -316,6 +320,20 @@ pub(crate) struct TokenPhraseQuery {
     pub(crate) tokens: Vec<String>,
     /// Whether the last token is matched as a prefix.
     pub(crate) is_last_token_prefix: bool,
+}
+
+/// The analyzed tokens of one text on one text field: with `or`, one token of the field equals
+/// one of them; with `and`, each of them equals a token of the field. Each token is compared as
+/// an unanalyzed `term` on the field is, so the node matches what the `bool` of one `term` per
+/// token joined by the operator matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TokenSetQuery {
+    /// The text field.
+    pub(crate) field: String,
+    /// The analyzed tokens, at least two, in the order the text holds them.
+    pub(crate) tokens: Vec<String>,
+    /// How the tokens join.
+    pub(crate) operator: Operator,
 }
 
 /// A range over keyword-like values in UTF-8 byte order; an absent bound is open.

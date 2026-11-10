@@ -31,7 +31,8 @@ use crate::query_dsl::analyzer::normalize_standard;
 use crate::query_dsl::ast::{
     BoolQuery, ExistsQuery, IdsQuery, MapValuesQuery, MatchPhrasePrefixQuery, MatchPhraseQuery, MatchQuery,
     MultiMatchQuery, MultiMatchType, Operator, PrefixQuery, Query, QueryStringClauses, RangeBound, RangeQuery,
-    RegexpQuery, SimpleQueryStringQuery, TermQuery, TermsQuery, TokenPhraseQuery, WildcardQuery, ZeroTermsQuery,
+    RegexpQuery, SimpleQueryStringQuery, TermQuery, TermsQuery, TokenPhraseQuery, TokenSetQuery, WildcardQuery,
+    ZeroTermsQuery,
 };
 use crate::query_dsl::date_math::{BoundSide, resolve_date_bound};
 use crate::query_dsl::full_text::{
@@ -46,7 +47,7 @@ use crate::query_dsl::regex::translate_lucene_regex;
 use crate::query_dsl::udf::{
     MatchRegex, build_keyword_regex_match_udf, build_map_value_match_udf, build_text_phrase_match_udf,
     build_text_prefix_match_udf, build_text_range_match_udf, build_text_regex_match_udf, build_text_term_match_udf,
-    escape_wildcard, translate_wildcard,
+    build_text_tokens_match_udf, escape_wildcard, translate_wildcard,
 };
 
 /// What a query is lowered against: one index of one tenant-scoped session, at the request
@@ -108,6 +109,7 @@ pub(crate) fn lower_query(query: &Query, scope: &LoweringScope<'_>) -> Result<Ex
         }
         Query::MapValues(query) => Ok(lower_map_values(query)),
         Query::TokenPhrase(query) => lower_token_phrase(query, scope),
+        Query::TokenSet(query) => lower_token_set(query, scope),
     }
 }
 
@@ -282,19 +284,66 @@ fn lower_token_phrase(query: &TokenPhraseQuery, scope: &LoweringScope<'_>) -> Re
             query.field
         )));
     };
-    let tokens: Vec<ScalarValue> = query
-        .tokens
-        .iter()
-        .map(|token| ScalarValue::Utf8(Some(token.clone())))
-        .collect();
     Ok(build_text_phrase_match_udf().call(vec![
         ident(column),
-        lit(ScalarValue::List(ScalarValue::new_list_nullable(
-            &tokens,
-            &DataType::Utf8,
-        ))),
+        build_token_list_literal(&query.tokens),
         lit(query.is_last_token_prefix),
     ]))
+}
+
+/// The tokens of a text field joined by an operator. A text column, or a MAP key read as text,
+/// tests them all with one tokenization of each row; any other field a text field resolves to is
+/// lowered as the `bool` of one `term` per token, which the node stands for.
+fn lower_token_set(query: &TokenSetQuery, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
+    let Some(field) = resolve_lowering_field(scope, &query.field)? else {
+        return Ok(lit(false));
+    };
+    if field.field_type == FieldType::Text
+        && matches!(field.value, FieldValue::Column { .. } | FieldValue::MapKey { .. })
+    {
+        return Ok(match_text_tokens(
+            field.value.build_read_expr(),
+            &query.tokens,
+            query.operator == Operator::And,
+        ));
+    }
+    let token_terms = query
+        .tokens
+        .iter()
+        .map(|token| {
+            Query::Term(TermQuery {
+                field: query.field.clone(),
+                value: Value::String(token.clone()),
+                case_insensitive: false,
+            })
+        })
+        .collect();
+    let token_bool = match query.operator {
+        Operator::Or => BoolQuery {
+            should: token_terms,
+            ..BoolQuery::default()
+        },
+        Operator::And => BoolQuery {
+            must: token_terms,
+            ..BoolQuery::default()
+        },
+    };
+    lower_bool(&token_bool, scope)
+}
+
+/// `tokens` as the list literal a token-list function takes.
+fn build_token_list_literal(tokens: &[String]) -> Expr {
+    let token_values: Vec<ScalarValue> = tokens.iter().map(|token| ScalarValue::Utf8(Some(token.clone()))).collect();
+    lit(ScalarValue::List(ScalarValue::new_list_nullable(
+        &token_values,
+        &DataType::Utf8,
+    )))
+}
+
+/// One token of a text column equals one of `tokens`, or with `is_all_required` each of them
+/// equals a token; the tokens are never analyzed, as a `term`'s value is not.
+fn match_text_tokens(text: Expr, tokens: &[String], is_all_required: bool) -> Expr {
+    build_text_tokens_match_udf().call(vec![text, build_token_list_literal(tokens), lit(is_all_required)])
 }
 
 /// The column of a resolved text field; `None` for every other field.
@@ -313,19 +362,6 @@ fn match_text_token(text: Expr, term: &str, is_case_insensitive: bool) -> Result
         return Ok(build_text_regex_match_udf(translate_wildcard(&escape_wildcard(term), true)?).call(vec![text]));
     }
     Ok(build_text_term_match_udf().call(vec![text, lit(term.to_owned())]))
-}
-
-/// `terms` on a text column: one token equals one of the terms.
-fn lower_text_terms(text: Expr, terms: &[String]) -> Result<Expr, OpenSearchError> {
-    let Some((last_term, leading_terms)) = terms.split_last() else {
-        return Ok(lit(false));
-    };
-    let mut disjuncts = Vec::with_capacity(terms.len());
-    for term in leading_terms {
-        disjuncts.push(match_text_token(text.clone(), term, false)?);
-    }
-    disjuncts.push(match_text_token(text, last_term, false)?);
-    Ok(disjuncts.into_iter().reduce(Expr::or).unwrap_or_else(|| lit(false)))
 }
 
 /// `prefix` on a text column: one token starts with the value lowercased the way the
@@ -707,7 +743,8 @@ fn lower_terms(query: &TermsQuery, scope: &LoweringScope<'_>) -> Result<Expr, Op
             Ok(covered_ranges.into_iter().reduce(Expr::or).unwrap_or_else(|| lit(false)))
         }
         (FieldType::Object, _) => Ok(lit(false)),
-        (FieldType::Text, _) => lower_text_terms(read_expr, &texts),
+        // One token equals one of the terms, each row tokenized once for all of them.
+        (FieldType::Text, _) => Ok(match_text_tokens(read_expr, &texts, false)),
     }
 }
 
@@ -2006,6 +2043,93 @@ mod tests {
                 .await
                 .expect("search");
             assert_eq!(matched_values, build_name_set(&expected), "{query}");
+        }
+    }
+
+    /// The names of the scalar functions `predicate` calls, one entry per call.
+    fn list_function_calls(predicate: &Expr) -> Vec<String> {
+        let mut names = Vec::new();
+        predicate
+            .apply(|node| {
+                if let Expr::ScalarFunction(function) = node {
+                    names.push(function.name().to_string());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("the walk visits every node");
+        names
+    }
+
+    /// An analyzed text of several tokens, and a `terms` on a text column, read each row's text
+    /// with one tokenization: one `text_tokens_match` call, never one call per token. The rows
+    /// pin that the call answers what the join of one `term` per token answered.
+    #[tokio::test]
+    async fn the_tokens_of_one_text_on_a_text_column_lower_to_one_call_matching_one_or_every_token() {
+        let fixture = SearchFixture::new().await;
+        seed_logs(
+            &fixture,
+            &[
+                build_log_row(
+                    TENANT_A,
+                    T0,
+                    vec![(COL_BODY, TestCell::Text("a1 Connection refused upstream"))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    T0 + 1,
+                    vec![(COL_BODY, TestCell::Text("a2 connection reset"))],
+                ),
+                build_log_row(
+                    TENANT_B,
+                    T0 + 2,
+                    vec![(COL_BODY, TestCell::Text("b1 connection refused"))],
+                ),
+            ],
+            &[
+                build_log_row(
+                    TENANT_A,
+                    T0 + 3,
+                    vec![(COL_BODY, TestCell::Text("a3 upstream timeout"))],
+                ),
+                build_log_row(
+                    TENANT_B,
+                    T0 + 4,
+                    vec![(COL_BODY, TestCell::Text("b2 upstream timeout"))],
+                ),
+            ],
+        )
+        .await;
+        let cases = [
+            (
+                json!({"match": {"body": "Connection Refused"}}),
+                &["a1 Connection refused upstream", "a2 connection reset"][..],
+            ),
+            (
+                json!({"match": {"body": {"query": "Connection Refused", "operator": "and"}}}),
+                &["a1 Connection refused upstream"][..],
+            ),
+            (
+                json!({"query_string": {"query": "refused timeout", "default_field": "body"}}),
+                &["a1 Connection refused upstream", "a3 upstream timeout"][..],
+            ),
+            (
+                json!({"terms": {"body": ["reset", "timeout"]}}),
+                &["a2 connection reset", "a3 upstream timeout"][..],
+            ),
+        ];
+        let session = fixture.open_session(TENANT_A).await;
+        let scope = LoweringScope {
+            session: &session,
+            entry: find_index_entry(&session, LOGS_TABLE),
+            now: build_request_instant(),
+        };
+        for (query, expected_bodies) in cases {
+            let predicate = lower_query(&parse_query(&query).expect("parses"), &scope).expect("lowers");
+            assert_eq!(list_function_calls(&predicate), ["text_tokens_match"], "{query}");
+            let matched_values = select_matching_values(&fixture, TENANT_A, LOGS_TABLE, query.clone(), COL_BODY)
+                .await
+                .expect("search");
+            assert_eq!(matched_values, build_name_set(expected_bodies), "{query}");
         }
     }
 

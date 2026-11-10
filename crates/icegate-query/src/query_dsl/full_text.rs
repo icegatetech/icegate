@@ -10,6 +10,9 @@
 //! - a text field is analyzed with the standard analyzer; text yielding no token
 //!   there contributes nothing, and a leaf whose every field contributes nothing
 //!   is dropped (`Ok(None)`), so the caller decides what a dropped query matches;
+//!   the tokens of one text on one field are one node (a `term`, or a token set
+//!   joined by the leaf's operator), so a matcher tokenizes a stored value once
+//!   for all of them;
 //! - every other field compares the whole text as one value of its type; a value
 //!   that does not parse, and a wildcard, prefix, regular expression or range a
 //!   field type does not support, match nothing when the leaf is lenient and are a query-shard 400
@@ -32,7 +35,8 @@ use super::{
     analyzer::{normalize_standard, tokenize_standard},
     ast::{
         ALL_FIELDS, BoolQuery, ExistsQuery, KeywordBound, KeywordRange, MapValuePredicate, MapValuesQuery, Operator,
-        PrefixQuery, Query, RangeBound, RangeQuery, RegexpQuery, TermQuery, TokenPhraseQuery, WildcardQuery,
+        PrefixQuery, Query, RangeBound, RangeQuery, RegexpQuery, TermQuery, TokenPhraseQuery, TokenSetQuery,
+        WildcardQuery,
     },
     date_math::{BoundSide, DateFormat, TimeZoneSpec, resolve_date_bound},
     literal::{NumericTerm, parse_boolean_literal, parse_java_double, parse_numeric_term, resolve_date_term},
@@ -653,8 +657,9 @@ impl LeafContext<'_> {
     }
 
     /// The whole text as one value of the field: analyzed into terms on a text
-    /// field, exact on a keyword, parsed on the typed fields; a date without an
-    /// offset is read in `time_zone`.
+    /// field (one token a `term`, several a token set joined by the leaf's
+    /// operator), exact on a keyword, parsed on the typed fields; a date without
+    /// an offset is read in `time_zone`.
     fn build_exact_value_query(
         &self,
         name: &str,
@@ -663,13 +668,18 @@ impl LeafContext<'_> {
         time_zone: Option<&TimeZoneSpec>,
     ) -> Result<Option<Query>, OpenSearchError> {
         match kind {
-            SearchKind::Text => Ok(join_terms(
-                self.leaf.operator,
-                tokenize_standard(text)
-                    .into_iter()
-                    .map(|token| build_term_query(name, Value::String(token.text)))
-                    .collect(),
-            )),
+            SearchKind::Text => {
+                let mut tokens: Vec<String> = tokenize_standard(text).into_iter().map(|token| token.text).collect();
+                Ok(match tokens.len() {
+                    0 => None,
+                    1 => tokens.pop().map(|token| build_term_query(name, Value::String(token))),
+                    _ => Some(Query::TokenSet(TokenSetQuery {
+                        field: name.to_owned(),
+                        tokens,
+                        operator: self.leaf.operator,
+                    })),
+                })
+            }
             SearchKind::Keyword | SearchKind::EncodedKeyword => {
                 Ok(Some(build_term_query(name, Value::String(text.to_owned()))))
             }
@@ -1074,6 +1084,7 @@ mod tests {
             ast::{
                 BoolQuery, ExistsQuery, KeywordBound, KeywordRange, MapValuePredicate, MapValuesQuery, Operator,
                 PrefixQuery, Query, QueryStringQuery, RangeBound, RangeQuery, RegexpQuery, TermQuery, TokenPhraseQuery,
+                TokenSetQuery,
             },
             date_math::{DateFormat, TimeZoneSpec},
             lucene::{QueryStringError, translate_query_string},
@@ -1208,16 +1219,6 @@ mod tests {
             must: vec![],
             filter: vec![],
             should: queries,
-            must_not: vec![],
-            minimum_should_match: None,
-        })
-    }
-
-    const fn build_must_query(queries: Vec<Query>) -> Query {
-        Query::Bool(BoolQuery {
-            must: queries,
-            filter: vec![],
-            should: vec![],
             must_not: vec![],
             minimum_should_match: None,
         })
@@ -1459,32 +1460,29 @@ mod tests {
         .await;
     }
 
+    /// The tokens become one token-set node, not a `bool` of one `term` per token, so a matcher
+    /// tokenizes a stored value once for all of them.
     #[test]
     fn analyzed_text_joins_its_tokens_by_the_operator() {
-        let build_token_terms = || {
-            vec![
-                build_term("body", json!("connection")),
-                build_term("body", json!("refused")),
-            ]
+        let build_token_set = |operator: Operator| {
+            Query::TokenSet(TokenSetQuery {
+                field: String::from("body"),
+                tokens: vec![String::from("connection"), String::from("refused")],
+                operator,
+            })
         };
-        assert_eq!(
-            resolve_query(&build_leaf_query(
-                build_named_selectors("body"),
-                build_text_term("Connection Refused"),
-                Operator::Or,
-                false
-            )),
-            Some(build_should_query(build_token_terms()))
-        );
-        assert_eq!(
-            resolve_query(&build_leaf_query(
-                build_named_selectors("body"),
-                build_text_term("Connection Refused"),
-                Operator::And,
-                false
-            )),
-            Some(build_must_query(build_token_terms()))
-        );
+        for operator in [Operator::Or, Operator::And] {
+            assert_eq!(
+                resolve_query(&build_leaf_query(
+                    build_named_selectors("body"),
+                    build_text_term("Connection Refused"),
+                    operator,
+                    false
+                )),
+                Some(build_token_set(operator)),
+                "{operator:?}"
+            );
+        }
     }
 
     #[test]
@@ -2078,15 +2076,11 @@ mod tests {
             Some(build_bool(
                 vec![],
                 vec![
-                    build_bool(
-                        vec![],
-                        vec![
-                            build_term("body", json!("2026")),
-                            build_term("body", json!("10")),
-                            build_term("body", json!("08")),
-                        ],
-                        vec![],
-                    ),
+                    Query::TokenSet(TokenSetQuery {
+                        field: String::from("body"),
+                        tokens: vec![String::from("2026"), String::from("10"), String::from("08")],
+                        operator: Operator::Or,
+                    }),
                     build_term("severity_text", json!("2026-10-08")),
                     build_millisecond_range_query("timestamp", 1_791_417_600_000, 1_791_503_999_999),
                     build_map_values_query(MapValuePredicate::Equals(String::from("2026-10-08"))),

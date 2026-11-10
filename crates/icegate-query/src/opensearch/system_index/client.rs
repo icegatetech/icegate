@@ -6,13 +6,16 @@
 //! it would keep serving the first pointer it cached.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use iceberg::{Catalog, NamespaceIdent};
 use icegate_common::{ICEGATE_NAMESPACE, StorageBackend, TenantId, strip_s3_scheme};
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
-use object_store::{GetOptions, ObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutResult, UpdateVersion};
+use object_store::{
+    GetOptions, ObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutResult, RetryConfig, UpdateVersion,
+};
 use uuid::Uuid;
 
 use super::codec::{LINEAGE_FRAME_HEADER_LEN, SnapshotLineage, decode_lineage_frame, measure_lineage_frame};
@@ -203,8 +206,10 @@ pub(crate) fn resolve_system_indices_location(config: &QueryConfig) -> Result<St
 /// The client addresses the resolved location's bucket with the storage backend's S3 settings:
 /// its region and endpoint (plain HTTP allowed for an `http://` endpoint, path-style addressing
 /// whenever an endpoint is set, as the S3 catalog addresses one), and its access keys when both
-/// are set; the ambient `AWS_*` environment otherwise. Building sends no request: the listener's
-/// startup checks are the first.
+/// are set; the ambient `AWS_*` environment otherwise. The client's retry timeout is set to
+/// `engine.max_query_duration_secs`, the deadline of a write; the store cuts every call of a write
+/// at that deadline on its own. Building sends no request: the listener's startup checks are the
+/// first.
 ///
 /// # Errors
 ///
@@ -213,7 +218,13 @@ pub(crate) fn resolve_system_indices_location(config: &QueryConfig) -> Result<St
 pub fn build_system_object_store(config: &QueryConfig) -> Result<SystemObjectStore> {
     let location = resolve_system_indices_location(config)?;
     let s3_location = parse_s3_location(&location)?;
-    let mut builder = AmazonS3Builder::from_env().with_bucket_name(s3_location.bucket);
+    let retry = RetryConfig {
+        retry_timeout: Duration::from_secs(config.engine.max_query_duration_secs),
+        ..RetryConfig::default()
+    };
+    let mut builder = AmazonS3Builder::from_env()
+        .with_bucket_name(s3_location.bucket)
+        .with_retry(retry);
     if let StorageBackend::S3(s3) = &config.storage.backend {
         builder = builder
             .with_region(&s3.region)

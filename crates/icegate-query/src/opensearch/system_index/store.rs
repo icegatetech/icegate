@@ -32,17 +32,25 @@
 //! not moved, the lost attempts and the next one are all conditioned on the same `ETag`, so at most
 //! one of them lands. The path stays readable because garbage collection keeps a superseded
 //! snapshot object until its successor is older than the longest scroll lifetime plus the query
-//! deadline, longer than one write retries. A lineage frame missing on the path anyway ends the
-//! write with `503`, nothing re-applied.
+//! deadline, and no read of the walk is sent once the write's deadline has passed, which comes at
+//! most the query deadline after the write started, so before any successor it meets is that old.
+//! A lineage frame missing on the path anyway ends the write with `503`, nothing re-applied.
 //!
 //! Conflicts are retried with capped, jittered exponential backoff until the write deadline; the
 //! answer is then `503`, never a version conflict, because the operation itself was never refused.
+//! Every object-store call of a write is cut at that deadline too, and none is started once it has
+//! passed, so a store that stops answering holds the tenant's write loop for the deadline plus at
+//! most one backoff. A pointer swap cut there may still land, so it counts as a lost answer, and so
+//! does a swap the deadline kept from being sent: its snapshot object is kept for the walk, and a
+//! swap that lands after the write answered `503` names a stored object. A cut or unsent delete
+//! leaves its unused object behind, as a failed one does.
 //!
 //! Decoding a snapshot object, and copying, applying and encoding a snapshot for an attempt, run
 //! on the blocking pool: each is linear in the snapshot, which `max_snapshot_bytes` lets grow
 //! large, and on an async worker it would stall every other request that worker serves.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -297,7 +305,8 @@ enum SwapAnswer {
     /// first try landed is answered this way too, so only the lineage walk decides whether it
     /// landed.
     Conflict,
-    /// Any other error: the swap may or may not have landed.
+    /// Any other error, no answer by the write deadline, or a swap the deadline kept from being
+    /// sent: the caller cannot tell from the answer whether it landed.
     Lost(object_store::Error),
 }
 
@@ -315,6 +324,14 @@ enum PreparedBatch {
         /// `snapshot` with its lineage, ready to store.
         encoded_object: EncodedSnapshotObject,
     },
+}
+
+/// What the walk after a conflict or a lost answer needs of the batch that swapped.
+struct ReconcileScope<'a> {
+    /// The batch's operation ids, which no snapshot object the batch did not write may hold.
+    operation_ids: &'a [Uuid],
+    /// The batch's write deadline, which cuts every object-store call of the walk.
+    deadline: Instant,
 }
 
 /// Why a batch could not be swapped in as a whole.
@@ -403,8 +420,9 @@ impl SystemIndexStore {
     ///
     /// Returns the operation's own refusal (such as `resource_already_exists_exception`); `413`
     /// when it would grow the decoded snapshot past `max_snapshot_bytes`; `503` when it could not
-    /// be confirmed, or its snapshot object could not be stored, within the write deadline, or a
-    /// lineage it needed was missing (its outcome is then unknown); `500` when the object store
+    /// be confirmed, or its snapshot object could not be stored, within the write deadline, which
+    /// also cuts every object-store call of the write, or a lineage it needed was missing (its
+    /// outcome is then unknown); `500` when the object store
     /// refused the snapshot object, answered a swap without an `ETag` or failed otherwise.
     pub(crate) async fn write(
         &self,
@@ -621,6 +639,32 @@ fn compute_backoff_bound(retry: u32) -> Duration {
 fn choose_backoff(retry: u32) -> Duration {
     let bound_micros = u64::try_from(compute_backoff_bound(retry).as_micros()).unwrap_or(u64::MAX);
     Duration::from_micros(rand::random_range(0..=bound_micros))
+}
+
+/// The answer of `call`, an object-store call of a write, when it comes before `deadline`;
+/// `None` otherwise. A call that has not started by `deadline` is never polled, so it sends no
+/// request. A started call may still be polled once a wakeup lands past `deadline` before the
+/// timer is seen as elapsed, so it can send a request then. A call cut at `deadline` is dropped,
+/// so whether a request it sent took effect is unknown.
+async fn run_before_deadline<F: Future>(deadline: Instant, call: F) -> Option<F::Output> {
+    // `timeout_at` polls the call before it checks its timer, so without this check a call
+    // created after the deadline would still send its request.
+    if Instant::now() >= deadline {
+        return None;
+    }
+    tokio::time::timeout_at(deadline, call).await.ok()
+}
+
+/// `call`, an object-store call of a write, run by [`run_before_deadline`]: the `503` of
+/// contention when it does not answer before `deadline`. A caller for which an unknown outcome
+/// matters (the pointer swap) does not use this.
+async fn bound_store_call<T>(
+    deadline: Instant,
+    call: impl Future<Output = Result<T, OpenSearchError>>,
+) -> Result<T, OpenSearchError> {
+    run_before_deadline(deadline, call)
+        .await
+        .unwrap_or_else(|| Err(OpenSearchError::write_contention()))
 }
 
 /// The `ETag` and snapshot name of a pointer GET's answer.
@@ -892,7 +936,9 @@ impl StoreShared {
         let deadline = Instant::now() + self.limits.write_deadline;
         // Shared with the blocking task of every attempt; only an attempt that encodes copies it.
         let operation_ids: Arc<[Uuid]> = operations.iter().map(|pending_operation| pending_operation.id).collect();
-        let mut base_state = self.refresh_pointer_state(tenant).await.map_err(BatchFailure::Failed)?;
+        let mut base_state = bound_store_call(deadline, self.refresh_pointer_state(tenant))
+            .await
+            .map_err(BatchFailure::Failed)?;
         // Attempts conditioned on `base_state` whose swap answer was lost: any of them may still
         // land.
         let mut lost_attempts: Vec<Attempt> = Vec::new();
@@ -936,11 +982,13 @@ impl StoreShared {
                 outcomes,
             };
             let answer = self
-                .swap_pointer(tenant, base_state.etag.as_deref(), &attempt.snapshot_name)
+                .swap_pointer(tenant, base_state.etag.as_deref(), &attempt.snapshot_name, deadline)
                 .await
                 .map_err(BatchFailure::Failed)?;
             let conflicted_attempt = match answer {
-                SwapAnswer::Swapped(etag) => return self.finish_swap(tenant, attempt, etag, &lost_attempts).await,
+                SwapAnswer::Swapped(etag) => {
+                    return self.finish_swap(tenant, attempt, etag, &lost_attempts, deadline).await;
+                }
                 // Not deleted yet: the conflict may answer a retry of a try that landed.
                 SwapAnswer::Conflict => Some(attempt),
                 SwapAnswer::Lost(error) => {
@@ -955,7 +1003,10 @@ impl StoreShared {
                     &mut base_state,
                     &mut lost_attempts,
                     conflicted_attempt,
-                    &operation_ids,
+                    &ReconcileScope {
+                        operation_ids: &operation_ids,
+                        deadline,
+                    },
                 )
                 .await?
             {
@@ -970,16 +1021,18 @@ impl StoreShared {
     }
 
     /// Settle a swap that landed. The lost attempts were conditioned on the `ETag` it replaced, so
-    /// none of them can land any more and their objects are deleted. The new state is cached; a
-    /// swap answered without an `ETag` cannot be revalidated, so it fails the write instead.
+    /// none of them can land any more and their objects are deleted, until `deadline`. The new
+    /// state is cached; a swap answered without an `ETag` cannot be revalidated, so it fails the
+    /// write instead.
     async fn finish_swap(
         &self,
         tenant: &TenantId,
         attempt: Attempt,
         etag: Option<String>,
         lost_attempts: &[Attempt],
+        deadline: Instant,
     ) -> Result<Vec<Result<SystemOutcome, OpenSearchError>>, BatchFailure> {
-        self.delete_attempts(tenant, lost_attempts).await;
+        self.delete_attempts(tenant, lost_attempts, deadline).await;
         let Some(etag) = etag else {
             self.lock_cache().remove_state(tenant);
             return Err(BatchFailure::Failed(OpenSearchError::internal(
@@ -996,21 +1049,24 @@ impl StoreShared {
     /// outcomes are the answer. Otherwise `conflicted_attempt` is deleted (its request completed,
     /// so it can never land later), and when the pointer moved the lost attempts can no longer
     /// land either: they are deleted and `base_state` becomes the current state. `None` tells the
-    /// caller to re-apply. When the pointer cannot be reloaded, `conflicted_attempt` is kept with
-    /// the lost ones (whether it landed is still unknown) and the write is retried.
+    /// caller to re-apply. When the pointer cannot be reloaded before the deadline,
+    /// `conflicted_attempt` is kept with the lost ones (whether it landed is still unknown) and the
+    /// write is retried, or answers `503` when the deadline has passed.
     async fn reconcile_attempts(
         &self,
         tenant: &TenantId,
         base_state: &mut PointerState,
         lost_attempts: &mut Vec<Attempt>,
         conflicted_attempt: Option<Attempt>,
-        operation_ids: &[Uuid],
+        scope: &ReconcileScope<'_>,
     ) -> Result<Option<Vec<Result<SystemOutcome, OpenSearchError>>>, BatchFailure> {
+        let deadline = scope.deadline;
         self.lock_cache().remove_state(tenant);
         // The walk looks for the conflicted attempt among the candidates; it is the last one.
         let has_conflicted_attempt = conflicted_attempt.is_some();
         lost_attempts.extend(conflicted_attempt);
-        let current_pointer = match read_tenant_pointer(&self.system_object_store, tenant).await {
+        let pointer_read = bound_store_call(deadline, read_tenant_pointer(&self.system_object_store, tenant));
+        let current_pointer = match pointer_read.await {
             Ok(current_pointer) => current_pointer,
             Err(error) => {
                 tracing::warn!(%tenant, ?error, "the system-index pointer could not be reloaded; retrying");
@@ -1021,12 +1077,12 @@ impl StoreShared {
         let read_name = base_state.current_snapshot.snapshot_name.as_deref();
         let has_moved = current_name != read_name;
         let landed_position = self
-            .find_landed_attempt(tenant, current_name, read_name, lost_attempts, operation_ids)
+            .find_landed_attempt(tenant, current_name, read_name, lost_attempts, scope)
             .await
             .map_err(BatchFailure::Failed)?;
         if let Some(position) = landed_position {
             let landed_attempt = lost_attempts.swap_remove(position);
-            self.delete_attempts(tenant, lost_attempts).await;
+            self.delete_attempts(tenant, lost_attempts, deadline).await;
             if let Some((etag, snapshot_name)) = current_pointer
                 && *snapshot_name == *landed_attempt.snapshot_name
             {
@@ -1036,25 +1092,27 @@ impl StoreShared {
             return Ok(Some(landed_attempt.outcomes));
         }
         if has_moved {
-            self.delete_attempts(tenant, lost_attempts).await;
+            self.delete_attempts(tenant, lost_attempts, deadline).await;
             lost_attempts.clear();
-            *base_state = self
-                .load_pointer_state(tenant, current_pointer)
+            *base_state = bound_store_call(deadline, self.load_pointer_state(tenant, current_pointer))
                 .await
                 .map_err(BatchFailure::Failed)?;
         } else if has_conflicted_attempt && let Some(refused_attempt) = lost_attempts.pop() {
-            self.delete_snapshot_object(tenant, &refused_attempt.snapshot_name).await;
+            self.delete_snapshot_object(tenant, &refused_attempt.snapshot_name, deadline)
+                .await;
         }
         Ok(None)
     }
 
     /// Store a snapshot object, retrying transient failures (see [`is_transient_store_error`])
-    /// until `deadline`. Its name is fresh, so a retry overwrites nothing anyone reads.
+    /// until `deadline`; each put is run by [`run_before_deadline`]. Its name is fresh, so a
+    /// retry overwrites nothing anyone reads.
     ///
     /// # Errors
     ///
-    /// Returns `503` when a transient failure lasts until `deadline`, and `500` at once on any
-    /// other failure; the pointer is not swapped for this attempt in either case.
+    /// Returns `503` when a transient failure lasts until `deadline` or no put answers before it,
+    /// and `500` at once on any other failure; the pointer is not swapped for this attempt in any
+    /// case.
     async fn put_snapshot_object(
         &self,
         tenant: &TenantId,
@@ -1065,7 +1123,12 @@ impl StoreShared {
         let path = self.system_object_store.snapshot_path(tenant, snapshot_name);
         let mut retry: u32 = 0;
         loop {
-            match self.system_object_store.object_store().put(&path, bytes.clone().into()).await {
+            let put = self.system_object_store.object_store().put(&path, bytes.clone().into());
+            let Some(answer) = run_before_deadline(deadline, put).await else {
+                tracing::warn!(%tenant, "a system-index snapshot object put did not answer before the deadline");
+                return Err(BatchFailure::Failed(OpenSearchError::write_contention()));
+            };
+            match answer {
                 Ok(_) => return Ok(()),
                 Err(error) if !is_transient_store_error(&error) => {
                     return Err(BatchFailure::Failed(OpenSearchError::internal(format!(
@@ -1087,12 +1150,15 @@ impl StoreShared {
 
     /// Compare-and-swap the tenant's pointer to `snapshot_name`, conditioned on `expected_etag`
     /// (`None`: the pointer must not exist). A stale update and a create on an existing pointer
-    /// are both conflicts, the classification the S3 catalog uses.
+    /// are both conflicts, the classification the S3 catalog uses. The swap is run by
+    /// [`run_before_deadline`]; one that does not answer before `deadline` is a lost answer,
+    /// because a request it sent may still land.
     async fn swap_pointer(
         &self,
         tenant: &TenantId,
         expected_etag: Option<&str>,
         snapshot_name: &str,
+        deadline: Instant,
     ) -> Result<SwapAnswer, OpenSearchError> {
         let pointer = serde_json::to_vec(&Pointer {
             snapshot_name: snapshot_name.to_string(),
@@ -1108,21 +1174,21 @@ impl StoreShared {
             mode,
             ..PutOptions::default()
         };
-        let answer = self
+        let pointer_path = self.system_object_store.pointer_path(tenant);
+        let swap = self
             .system_object_store
             .object_store()
-            .put_opts(
-                &self.system_object_store.pointer_path(tenant),
-                PutPayload::from(pointer),
-                options,
-            )
-            .await;
-        Ok(match answer {
-            Ok(result) => SwapAnswer::Swapped(result.e_tag),
-            Err(object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. }) => {
+            .put_opts(&pointer_path, PutPayload::from(pointer), options);
+        Ok(match run_before_deadline(deadline, swap).await {
+            Some(Ok(result)) => SwapAnswer::Swapped(result.e_tag),
+            Some(Err(object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. })) => {
                 SwapAnswer::Conflict
             }
-            Err(error) => SwapAnswer::Lost(error),
+            Some(Err(error)) => SwapAnswer::Lost(error),
+            None => SwapAnswer::Lost(object_store::Error::Generic {
+                store: "system-index store",
+                source: "the pointer swap did not answer before the write deadline".into(),
+            }),
         })
     }
 
@@ -1131,16 +1197,16 @@ impl StoreShared {
     ///
     /// # Errors
     ///
-    /// Returns `503` when a lineage frame on the path is missing, and `500` when the store fails,
-    /// a frame is corrupt, or this batch's operations appear in a snapshot object no lost attempt
-    /// wrote.
+    /// Returns `503` when a lineage frame on the path is missing or not read before the scope's
+    /// deadline, and `500` when the store fails, a frame is corrupt, or this batch's operations
+    /// appear in a snapshot object no lost attempt wrote.
     async fn find_landed_attempt(
         &self,
         tenant: &TenantId,
         current_name: Option<&str>,
         read_name: Option<&str>,
         lost_attempts: &[Attempt],
-        operation_ids: &[Uuid],
+        scope: &ReconcileScope<'_>,
     ) -> Result<Option<usize>, OpenSearchError> {
         let mut cursor = current_name.map(str::to_string);
         while let Some(snapshot_name) = cursor {
@@ -1153,12 +1219,11 @@ impl StoreShared {
             {
                 return Ok(Some(position));
             }
-            let lineage = self
-                .system_object_store
-                .read_lineage_frame(tenant, &snapshot_name)
+            let lineage_read = self.system_object_store.read_lineage_frame(tenant, &snapshot_name);
+            let lineage = bound_store_call(scope.deadline, lineage_read)
                 .await?
                 .ok_or_else(OpenSearchError::write_contention)?;
-            if lineage.operation_ids.iter().any(|id| operation_ids.contains(id)) {
+            if lineage.operation_ids.iter().any(|id| scope.operation_ids.contains(id)) {
                 return Err(OpenSearchError::internal(format!(
                     "snapshot object {snapshot_name} applied operations of a write that did not store it"
                 )));
@@ -1168,21 +1233,26 @@ impl StoreShared {
         Ok(None)
     }
 
-    /// Delete the snapshot objects of attempts that can no longer land.
-    async fn delete_attempts(&self, tenant: &TenantId, attempts: &[Attempt]) {
+    /// Delete the snapshot objects of attempts that can no longer land, each until `deadline`.
+    async fn delete_attempts(&self, tenant: &TenantId, attempts: &[Attempt], deadline: Instant) {
         for attempt in attempts {
-            self.delete_snapshot_object(tenant, &attempt.snapshot_name).await;
+            self.delete_snapshot_object(tenant, &attempt.snapshot_name, deadline).await;
         }
     }
 
-    /// Delete one snapshot object. Not-found counts as deleted. Any other failure is logged and
-    /// leaves the object behind: nothing names it, so nothing reads it.
-    async fn delete_snapshot_object(&self, tenant: &TenantId, snapshot_name: &str) {
+    /// Delete one snapshot object, run by [`run_before_deadline`]. Not-found counts as deleted. Any
+    /// other failure, and a delete that does not answer before `deadline`, is logged and leaves the
+    /// object behind: nothing names it, so nothing reads it.
+    async fn delete_snapshot_object(&self, tenant: &TenantId, snapshot_name: &str, deadline: Instant) {
         let path = self.system_object_store.snapshot_path(tenant, snapshot_name);
-        match self.system_object_store.object_store().delete(&path).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-            Err(error) => {
+        let delete = self.system_object_store.object_store().delete(&path);
+        match run_before_deadline(deadline, delete).await {
+            Some(Ok(()) | Err(object_store::Error::NotFound { .. })) => {}
+            Some(Err(error)) => {
                 tracing::warn!(%tenant, %error, %path, "an unused system-index snapshot object could not be deleted");
+            }
+            None => {
+                tracing::warn!(%tenant, %path, "an unused system-index snapshot object was not deleted by the deadline");
             }
         }
     }
@@ -1272,15 +1342,20 @@ mod tests {
         OmitEtag,
         /// Hold it at the gate, then apply it.
         Pause(Gate),
+        /// Keep the request to apply later, as [`Self::Delay`] does, and never answer it: a
+        /// request that stalls on its way and lands late.
+        Stall,
     }
 
-    /// What the double does with the next read of a pointer.
+    /// What the double does with a read it was scripted for.
     #[derive(Debug, Clone, Copy)]
-    enum PointerReadFault {
+    enum ReadFault {
         /// Answer with a transient error without reading.
         Fail,
-        /// Serve it without the pointer's `ETag`.
+        /// Serve it without the object's `ETag`.
         OmitEtag,
+        /// Never answer it.
+        Stall,
     }
 
     /// How the double fails a snapshot-object put.
@@ -1290,6 +1365,8 @@ mod tests {
         Transient,
         /// A permission refusal, which every retry would meet again.
         Refused,
+        /// No answer at all.
+        Stall,
     }
 
     /// One read the double served.
@@ -1301,20 +1378,25 @@ mod tests {
         is_not_modified: bool,
     }
 
-    /// An object store over `InMemory` that injects pointer faults and snapshot-object put
-    /// failures, and records reads.
+    /// An object store over `InMemory` that injects pointer faults, snapshot-object read and put
+    /// failures and stalled deletes, and records reads.
     #[derive(Debug)]
     struct ScriptedObjectStore {
         memory_store: InMemory,
         swap_faults: Mutex<VecDeque<PointerSwapFault>>,
         /// One entry per upcoming pointer read: `None` serves it.
-        read_faults: Mutex<VecDeque<Option<PointerReadFault>>>,
+        read_faults: Mutex<VecDeque<Option<ReadFault>>>,
         /// How the upcoming snapshot-object puts fail, and how many of them.
         snapshot_put_failures: Mutex<(SnapshotPutFailure, usize)>,
         /// How many snapshot-object puts the double received.
         snapshot_put_count: Mutex<usize>,
-        /// How many of the upcoming snapshot-object reads answer with a transient error.
-        snapshot_read_failure_count: Mutex<usize>,
+        /// One entry per upcoming ranged snapshot-object read, the read of a lineage frame:
+        /// `None` serves it.
+        lineage_read_faults: Mutex<VecDeque<Option<ReadFault>>>,
+        /// One entry per upcoming whole snapshot-object read: `None` serves it.
+        snapshot_read_faults: Mutex<VecDeque<Option<ReadFault>>>,
+        /// Whether every delete stalls without an answer.
+        is_delete_stalled: Mutex<bool>,
         delayed_request: Mutex<Option<(Path, PutPayload, PutOptions)>>,
         reads: Mutex<Vec<RecordedRead>>,
         pointer_swaps: Mutex<Vec<&'static str>>,
@@ -1328,7 +1410,9 @@ mod tests {
                 read_faults: Mutex::new(VecDeque::new()),
                 snapshot_put_failures: Mutex::new((SnapshotPutFailure::Transient, 0)),
                 snapshot_put_count: Mutex::new(0),
-                snapshot_read_failure_count: Mutex::new(0),
+                lineage_read_faults: Mutex::new(VecDeque::new()),
+                snapshot_read_faults: Mutex::new(VecDeque::new()),
+                is_delete_stalled: Mutex::new(false),
                 delayed_request: Mutex::new(None),
                 reads: Mutex::new(Vec::new()),
                 pointer_swaps: Mutex::new(Vec::new()),
@@ -1339,7 +1423,7 @@ mod tests {
             self.swap_faults.lock().expect("swap faults").extend(faults);
         }
 
-        fn push_read_faults(&self, faults: impl IntoIterator<Item = Option<PointerReadFault>>) {
+        fn push_read_faults(&self, faults: impl IntoIterator<Item = Option<ReadFault>>) {
             self.read_faults.lock().expect("read faults").extend(faults);
         }
 
@@ -1347,16 +1431,17 @@ mod tests {
             *self.snapshot_put_failures.lock().expect("put failures") = (failure, failure_count);
         }
 
-        fn fail_snapshot_reads(&self, failure_count: usize) {
-            *self.snapshot_read_failure_count.lock().expect("snapshot read failures") = failure_count;
+        fn push_lineage_read_faults(&self, faults: impl IntoIterator<Item = Option<ReadFault>>) {
+            self.lineage_read_faults.lock().expect("lineage read faults").extend(faults);
         }
 
-        /// Whether the next snapshot-object read fails, counting it down when it does.
-        fn take_snapshot_read_failure(&self) -> bool {
-            let mut failure_count = self.snapshot_read_failure_count.lock().expect("snapshot read failures");
-            let has_failure = *failure_count > 0;
-            *failure_count = failure_count.saturating_sub(usize::from(has_failure));
-            has_failure
+        fn push_snapshot_read_faults(&self, faults: impl IntoIterator<Item = Option<ReadFault>>) {
+            self.snapshot_read_faults.lock().expect("snapshot read faults").extend(faults);
+        }
+
+        /// Stall every delete from now on: a delete never answers.
+        fn stall_deletes(&self) {
+            *self.is_delete_stalled.lock().expect("delete stall") = true;
         }
 
         fn count_snapshot_puts(&self) -> usize {
@@ -1472,6 +1557,7 @@ mod tests {
                     None => self.memory_store.put_opts(location, payload, options).await,
                     Some(SnapshotPutFailure::Transient) => Err(build_lost_answer()),
                     Some(SnapshotPutFailure::Refused) => Err(build_permission_refusal(location)),
+                    Some(SnapshotPutFailure::Stall) => std::future::pending().await,
                 };
             }
             let mode = if matches!(options.mode, PutMode::Create) {
@@ -1519,6 +1605,10 @@ mod tests {
                     gate.hold_request().await;
                     self.memory_store.put_opts(location, payload, options).await
                 }
+                Some(PointerSwapFault::Stall) => {
+                    *self.delayed_request.lock().expect("delayed request") = Some((location.clone(), payload, options));
+                    std::future::pending().await
+                }
             }
         }
 
@@ -1533,15 +1623,19 @@ mod tests {
         async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
             let is_conditional = options.if_none_match.is_some();
             let is_range = options.range.is_some();
-            let read_fault = if location.filename() == Some("current") {
-                self.read_faults.lock().expect("read faults").pop_front().flatten()
+            let read_faults = if location.filename() == Some("current") {
+                &self.read_faults
+            } else if is_range {
+                &self.lineage_read_faults
             } else {
-                self.take_snapshot_read_failure().then_some(PointerReadFault::Fail)
+                &self.snapshot_read_faults
             };
+            let read_fault = read_faults.lock().expect("read faults").pop_front().flatten();
             let result = match read_fault {
                 None => self.memory_store.get_opts(location, options).await,
-                Some(PointerReadFault::Fail) => Err(build_lost_answer()),
-                Some(PointerReadFault::OmitEtag) => {
+                Some(ReadFault::Fail) => Err(build_lost_answer()),
+                Some(ReadFault::Stall) => std::future::pending().await,
+                Some(ReadFault::OmitEtag) => {
                     self.memory_store.get_opts(location, options).await.map(|mut get_result| {
                         get_result.meta.e_tag = None;
                         get_result
@@ -1561,6 +1655,9 @@ mod tests {
             &self,
             locations: BoxStream<'static, object_store::Result<Path>>,
         ) -> BoxStream<'static, object_store::Result<Path>> {
+            if *self.is_delete_stalled.lock().expect("delete stall") {
+                return Box::pin(futures::stream::pending());
+            }
             self.memory_store.delete_stream(locations)
         }
 
@@ -2128,6 +2225,264 @@ mod tests {
         assert_eq!(scripted_replica.read(&tenant).await.expect("read").snapshot_name, None);
     }
 
+    /// Bound on how long a write may run once every object-store call of it is cut at the write
+    /// deadline: the deadline, plus the one backoff a retry may have started just before it.
+    fn compute_write_bound(limits: SystemIndexLimits) -> Duration {
+        limits.write_deadline + MAX_BACKOFF
+    }
+
+    /// A call that never answers must not hold the write loop past the write deadline, or every
+    /// queued write of the tenant waits behind it.
+    #[tokio::test(start_paused = true)]
+    async fn a_snapshot_object_put_that_never_answers_ends_the_write_with_503_within_the_write_deadline() {
+        let limits = SystemIndexLimits {
+            write_deadline: Duration::from_secs(2),
+            ..build_limits()
+        };
+        let (double, scripted_replica, _other_replica) = build_replicas(limits);
+        let tenant = build_tenant(TENANT_A);
+        double.fail_snapshot_puts(SnapshotPutFailure::Stall, 1);
+        let started_at = Instant::now();
+
+        let outcome = join_write(spawn_write(
+            &scripted_replica,
+            &tenant,
+            build_index_creation(".kibana_1"),
+        ))
+        .await;
+
+        assert_error(
+            outcome.expect_err("never stored"),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "write_contention_exception",
+        )
+        .await;
+        assert!(started_at.elapsed() <= compute_write_bound(limits));
+        assert_eq!(double.count_snapshot_puts(), 1);
+        assert!(double.list_pointer_swaps().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pointer_read_that_never_answers_ends_the_write_with_503_within_the_write_deadline() {
+        let limits = SystemIndexLimits {
+            write_deadline: Duration::from_secs(2),
+            ..build_limits()
+        };
+        let (double, scripted_replica, _other_replica) = build_replicas(limits);
+        let tenant = build_tenant(TENANT_A);
+        double.push_read_faults([Some(ReadFault::Stall)]);
+        let started_at = Instant::now();
+
+        let outcome = join_write(spawn_write(
+            &scripted_replica,
+            &tenant,
+            build_index_creation(".kibana_1"),
+        ))
+        .await;
+
+        assert_error(
+            outcome.expect_err("the pointer is never read"),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "write_contention_exception",
+        )
+        .await;
+        assert!(started_at.elapsed() <= compute_write_bound(limits));
+        assert_eq!(double.count_snapshot_puts(), 0);
+        assert!(double.list_pointer_swaps().is_empty());
+    }
+
+    /// A swap cut at the deadline may still land, so it counts as a lost answer, never as a
+    /// conflict: a conflict would delete the attempt's snapshot object, and the late swap would
+    /// then leave the pointer naming a missing object, which every read answers with a `500`.
+    #[tokio::test(start_paused = true)]
+    async fn a_pointer_swap_that_never_answers_ends_the_write_with_503_and_its_late_landing_names_a_stored_snapshot() {
+        let limits = SystemIndexLimits {
+            write_deadline: Duration::from_secs(2),
+            ..build_limits()
+        };
+        let (double, scripted_replica, other_replica) = build_replicas(limits);
+        let tenant = build_tenant(TENANT_A);
+        double.push_swap_faults([PointerSwapFault::Stall]);
+        let started_at = Instant::now();
+
+        let outcome = join_write(spawn_write(
+            &scripted_replica,
+            &tenant,
+            build_index_creation(".kibana_1"),
+        ))
+        .await;
+
+        assert_error(
+            outcome.expect_err("the swap is never answered"),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "write_contention_exception",
+        )
+        .await;
+        assert!(started_at.elapsed() <= compute_write_bound(limits));
+        assert_eq!(double.list_pointer_swaps(), ["create"]);
+        assert_eq!(
+            double.list_reads().len(),
+            1,
+            "only the first pointer read: no reload is sent once the deadline has passed"
+        );
+        double
+            .apply_delayed_request()
+            .await
+            .expect("the stalled create lands on the absent pointer");
+        let landed_snapshot = other_replica
+            .read(&tenant)
+            .await
+            .expect("the pointer names a stored snapshot object");
+        assert!(landed_snapshot.snapshot.find_index(".kibana_1").is_some());
+        scripted_replica
+            .write(&tenant, build_index_creation(".kibana_2"))
+            .await
+            .expect("the next write applies on the state the late swap installed");
+        let current_snapshot = other_replica.read(&tenant).await.expect("read");
+        assert!(current_snapshot.snapshot.find_index(".kibana_1").is_some());
+        assert!(current_snapshot.snapshot.find_index(".kibana_2").is_some());
+    }
+
+    /// Spawn a create of `.kibana_1` on the scripted replica whose swap is held at `gate` while
+    /// the other replica creates the pointer: once released, the create is refused as a conflict
+    /// and the pointer has moved past the state the write read.
+    async fn spawn_overtaken_write(
+        double: &ScriptedObjectStore,
+        scripted_replica: &Arc<SystemIndexStore>,
+        other_replica: &SystemIndexStore,
+        tenant: &TenantId,
+        gate: &Gate,
+    ) -> tokio::task::JoinHandle<Result<SystemOutcome, OpenSearchError>> {
+        double.push_swap_faults([PointerSwapFault::Pause(gate.clone())]);
+        let pending_write = spawn_write(scripted_replica, tenant, build_index_creation(".kibana_1"));
+        gate.wait_for_request().await;
+        other_replica
+            .write(tenant, build_index_creation(".other"))
+            .await
+            .expect("the other replica writes while the swap is held");
+        pending_write
+    }
+
+    /// The walk after a conflict reads the lineage frame of the snapshot the other replica
+    /// installed; that read never answering must not hold the write loop past its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_lineage_frame_read_that_never_answers_after_a_conflict_ends_the_write_with_503_within_the_write_deadline()
+     {
+        let limits = SystemIndexLimits {
+            write_deadline: Duration::from_secs(2),
+            ..build_limits()
+        };
+        let (double, scripted_replica, other_replica) = build_replicas(limits);
+        let tenant = build_tenant(TENANT_A);
+        let gate = Gate::default();
+        let started_at = Instant::now();
+
+        let pending_write = spawn_overtaken_write(&double, &scripted_replica, &other_replica, &tenant, &gate).await;
+        double.push_lineage_read_faults([Some(ReadFault::Stall)]);
+        gate.release_request();
+        let outcome = join_write(pending_write).await;
+
+        assert_error(
+            outcome.expect_err("the walk never reads the frame"),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "write_contention_exception",
+        )
+        .await;
+        assert!(started_at.elapsed() <= compute_write_bound(limits));
+        assert!(
+            double.lineage_read_faults.lock().expect("lineage read faults").is_empty(),
+            "the walk reached the stalled frame read"
+        );
+        assert_eq!(double.list_pointer_swaps(), ["create"], "nothing is re-applied");
+        let current_snapshot = other_replica.read(&tenant).await.expect("read");
+        assert!(current_snapshot.snapshot.find_index(".kibana_1").is_none());
+        assert!(current_snapshot.snapshot.find_index(".other").is_some());
+    }
+
+    /// After a conflict on a moved pointer the walk finds no attempt of the write, so the write
+    /// loads the snapshot object the pointer now names to apply again; that read never answering
+    /// must not hold the write loop past its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_moved_pointer_whose_snapshot_object_read_never_answers_ends_the_write_with_503_within_the_write_deadline()
+     {
+        let limits = SystemIndexLimits {
+            write_deadline: Duration::from_secs(2),
+            ..build_limits()
+        };
+        let (double, scripted_replica, other_replica) = build_replicas(limits);
+        let tenant = build_tenant(TENANT_A);
+        let gate = Gate::default();
+        let started_at = Instant::now();
+
+        let pending_write = spawn_overtaken_write(&double, &scripted_replica, &other_replica, &tenant, &gate).await;
+        double.push_snapshot_read_faults([Some(ReadFault::Stall)]);
+        gate.release_request();
+        let outcome = join_write(pending_write).await;
+
+        assert_error(
+            outcome.expect_err("the moved-to snapshot is never loaded"),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "write_contention_exception",
+        )
+        .await;
+        assert!(started_at.elapsed() <= compute_write_bound(limits));
+        assert!(
+            double.snapshot_read_faults.lock().expect("snapshot read faults").is_empty(),
+            "the write reached the stalled snapshot-object read"
+        );
+        assert_eq!(double.list_pointer_swaps(), ["create"], "nothing is re-applied");
+        let current_snapshot = other_replica.read(&tenant).await.expect("read");
+        let current_name = current_snapshot.snapshot_name.expect("a pointer");
+        assert_eq!(
+            double.list_snapshot_names(TENANT_A).await,
+            [current_name.to_string()],
+            "the refused attempt's object is deleted"
+        );
+        assert!(current_snapshot.snapshot.find_index(".kibana_1").is_none());
+    }
+
+    /// A lost swap, then a retry that lands: the lost attempt can no longer land, and the delete
+    /// of its object never answers. The write is answered once that delete is cut at the deadline,
+    /// and the unused object stays behind.
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_of_a_lost_attempt_that_never_answers_ends_at_the_write_deadline_and_leaves_its_object() {
+        let limits = SystemIndexLimits {
+            write_deadline: Duration::from_secs(2),
+            ..build_limits()
+        };
+        let (double, scripted_replica, other_replica) = build_replicas(limits);
+        let tenant = build_tenant(TENANT_A);
+        double.push_swap_faults([PointerSwapFault::Delay]);
+        double.stall_deletes();
+        let started_at = Instant::now();
+
+        let outcome = join_write(spawn_write(
+            &scripted_replica,
+            &tenant,
+            build_index_creation(".kibana_1"),
+        ))
+        .await;
+
+        assert_eq!(outcome.expect("the retry lands"), build_creation_outcome(".kibana_1"));
+        let elapsed = started_at.elapsed();
+        assert!(
+            elapsed >= limits.write_deadline,
+            "the stalled delete held the write until its deadline"
+        );
+        assert!(elapsed <= compute_write_bound(limits));
+        assert_eq!(double.list_pointer_swaps(), ["create", "create"]);
+        let current_snapshot = other_replica.read(&tenant).await.expect("read");
+        assert!(current_snapshot.snapshot.find_index(".kibana_1").is_some());
+        let current_name = current_snapshot.snapshot_name.expect("a pointer").to_string();
+        let snapshot_names = double.list_snapshot_names(TENANT_A).await;
+        assert_eq!(
+            snapshot_names.len(),
+            2,
+            "the lost attempt's object stays: {snapshot_names:?}"
+        );
+        assert!(snapshot_names.contains(&current_name));
+    }
+
     /// After a conflict or a lost answer the pointer reload fails once: the attempt is kept, the
     /// write retries on the state it read, and the next swap settles the kept attempt (deleted
     /// once the retry lands, or detected as landed when the retry meets the pointer it installed).
@@ -2138,10 +2493,10 @@ mod tests {
         let lost_tenant = build_tenant(TENANT_B);
 
         double.push_swap_faults([PointerSwapFault::Conflict]);
-        double.push_read_faults([None, Some(PointerReadFault::Fail)]);
+        double.push_read_faults([None, Some(ReadFault::Fail)]);
         let refused_outcome = scripted_replica.write(&refused_tenant, build_index_creation(".kibana_1")).await;
         double.push_swap_faults([PointerSwapFault::LoseAnswer(None)]);
-        double.push_read_faults([None, Some(PointerReadFault::Fail)]);
+        double.push_read_faults([None, Some(ReadFault::Fail)]);
         let lost_outcome = scripted_replica.write(&lost_tenant, build_index_creation(".kibana_1")).await;
 
         assert_eq!(
@@ -2304,7 +2659,7 @@ mod tests {
                 br#"{"snapshot_name":"snap-00000000-0000-4000-8000-000000000000"}"#,
             )
             .await;
-        double.push_read_faults([None, Some(PointerReadFault::OmitEtag), None]);
+        double.push_read_faults([None, Some(ReadFault::OmitEtag), None]);
 
         for tenant in [&corrupt_tenant, &etagless_tenant, &dangling_tenant] {
             let error = scripted_replica.read(tenant).await.expect_err("an unusable pointer");
@@ -2820,7 +3175,7 @@ mod tests {
         let (double, scripted_replica, _other_replica) = build_replicas(build_limits());
         let tenant = build_tenant(TENANT_A);
         let superseded_name = write_superseded_snapshot(&scripted_replica, &tenant).await;
-        double.fail_snapshot_reads(1);
+        double.push_snapshot_read_faults([Some(ReadFault::Fail)]);
 
         let read_error = scripted_replica
             .read_snapshot_by_name(&tenant, &superseded_name)
