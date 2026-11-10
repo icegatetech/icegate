@@ -11,6 +11,7 @@ use icegate_common::schema::{
     COL_SPAN_ID, COL_STATUS_CODE, COL_STATUS_MESSAGE, COL_TIMESTAMP, COL_TRACE_ID, COL_TRACE_STATE,
 };
 
+use super::cross_row::CrossRowField;
 use super::encoding::{AttributeKeys, ProfileFieldSource, ProfileTable};
 
 /// The index name of the Data Prepper span profile.
@@ -63,9 +64,31 @@ pub(super) const SPAN_FIELDS: [(&str, ProfileFieldSource); 24] = [
     ("links", ProfileFieldSource::Links),
 ];
 
+/// The cross-row fields of the Data Prepper profile: every span of a trace reads them from the
+/// trace's root span.
+const TRACE_GROUP_FIELDS: [(&str, ProfileFieldSource); 5] = [
+    (
+        CrossRowField::TraceGroup.client_name(),
+        ProfileFieldSource::CrossRow(CrossRowField::TraceGroup),
+    ),
+    ("traceGroupFields", ProfileFieldSource::Object),
+    (
+        CrossRowField::EndTime.client_name(),
+        ProfileFieldSource::CrossRow(CrossRowField::EndTime),
+    ),
+    (
+        CrossRowField::DurationInNanos.client_name(),
+        ProfileFieldSource::CrossRow(CrossRowField::DurationInNanos),
+    ),
+    (
+        CrossRowField::StatusCode.client_name(),
+        ProfileFieldSource::CrossRow(CrossRowField::StatusCode),
+    ),
+];
+
 /// The field table of `otel-v1-apm-span`.
 pub(crate) static DATA_PREPPER_TABLE: ProfileTable = ProfileTable {
     table: SPANS_TABLE,
-    fields: &[&SPAN_FIELDS],
+    fields: &[&SPAN_FIELDS, &TRACE_GROUP_FIELDS],
     attribute_keys: AttributeKeys::Escaped,
 };

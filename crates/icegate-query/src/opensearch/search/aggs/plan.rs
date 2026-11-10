@@ -334,10 +334,9 @@ impl<'a> AggregationLayout<'a> {
                 self.add_level(aggregation, LevelKind::DateRange { spec, bounds }, ancestors)
             }
             AggregationKind::Filters(spec) => {
-                let queries = spec.list_queries();
                 let first_filter_ordinal = self.bucket_queries.len();
-                let filter_count = queries.len();
-                self.bucket_queries.extend(queries);
+                self.bucket_queries.extend(spec.iter_queries());
+                let filter_count = self.bucket_queries.len() - first_filter_ordinal;
                 let kind = LevelKind::Filters {
                     spec,
                     first_filter_ordinal,

@@ -81,6 +81,8 @@ pub async fn run_with_port_tx(
             CatalogSettings {
                 field_discovery_window: Duration::from_secs(config.field_discovery_window_secs),
                 max_query_memory_bytes: config.max_query_memory_bytes,
+                max_trace_lookback: Duration::from_secs(config.max_trace_lookback_secs),
+                max_cross_row_traces: config.max_cross_row_traces,
             },
         ),
         system_store: system_index_store,

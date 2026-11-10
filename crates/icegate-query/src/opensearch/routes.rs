@@ -265,6 +265,8 @@ mod tests {
                 CatalogSettings {
                     field_discovery_window: Duration::from_secs(60),
                     max_query_memory_bytes: 1_073_741_824,
+                    max_trace_lookback: Duration::from_hours(1),
+                    max_cross_row_traces: 1_000,
                 },
             ),
             system_store,

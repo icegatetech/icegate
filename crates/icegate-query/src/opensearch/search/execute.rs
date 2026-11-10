@@ -22,6 +22,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{ArrowNativeType, DataType, Int64Type, TimeUnit};
 use datafusion::error::DataFusionError;
@@ -34,7 +35,10 @@ use futures::future::try_join_all;
 use icegate_common::schema::{COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID};
 use serde_json::{Map, Value, json};
 
-use super::aggs::{AggregationScope, execute_aggregations, parse_aggregations, plan_aggregation_rows};
+use super::aggs::{
+    AggregationKind, AggregationScope, AggregationTree, NamedAggregation, execute_aggregations, parse_aggregations,
+    plan_aggregation_rows,
+};
 use super::doc_id::{
     CanonicalEncoder, DOC_HASH_BITS, DOC_HASH_MASK, MICROS_PER_DAY, decode_time_and_doc, document_row_hash_udf,
     encode_doc_sort_value, encode_document_id, encode_span_document_id, hash_canonical_row, hash_span_key,
@@ -44,18 +48,20 @@ use super::hits::{
     SearchHit, render_array_value, render_field_value, render_hits, render_search_response, render_sort_scalar,
     summarize_total_hits,
 };
-use super::request::{DocValueField, SearchRequest, SortClause, SortOrder, TrackTotalHits};
+use super::request::{DocValueField, SearchRequest, SortClause, SortOrder, SourceFilter, TrackTotalHits};
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::error::QueryError;
 use crate::opensearch::SearchLimitsConfig;
 use crate::opensearch::catalog::{
-    EncodedField, FieldType, FieldValue, IndexEntry, ProfileTable, ResolvedField, TenantSession, find_profile_table,
-    native_column_type, render_derived_value, render_profile_field,
+    CrossRowField, EncodedField, FieldType, FieldValue, IndexEntry, Profile, ProfileTable, ResolvedField,
+    TRACE_ID_FIELD, TenantSession, TraceRoots, find_profile_table, lookup_page_trace_roots, lookup_trace_roots,
+    native_column_type, render_derived_value, render_profile_field, select_candidate_traces,
 };
 use crate::opensearch::context::RequestContext;
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::glob::matches_glob;
 use crate::opensearch::system_index::run_blocking_work;
+use crate::query_dsl::ast::Query;
 use crate::query_dsl::literal::parse_java_double;
 use crate::query_dsl::lower::{LoweringScope, lower_query};
 
@@ -92,7 +98,8 @@ pub(crate) fn check_result_window(request: &SearchRequest, limits: SearchLimitsC
 ///
 /// The errors of the hits search; the aggregation errors of `parse_aggregations`,
 /// `plan_aggregation_rows` and `execute_aggregations`, among them `400
-/// too_many_buckets_exception` past `limits.max_buckets`.
+/// too_many_buckets_exception` past `limits.max_buckets`; and the errors of
+/// [`prepare_cross_row_reads`].
 pub(crate) async fn search_data_indices(
     session: &TenantSession,
     entries: &[&IndexEntry],
@@ -101,6 +108,7 @@ pub(crate) async fn search_data_indices(
     limits: &SearchLimitsConfig,
 ) -> Result<Value, OpenSearchError> {
     let aggregation_tree = request.aggregations.as_ref().map(parse_aggregations).transpose()?;
+    prepare_cross_row_reads(session, entries, request, aggregation_tree.as_ref(), context.now).await?;
     let aggregation_rows = match &aggregation_tree {
         Some(tree) => Some(plan_aggregation_rows(
             session,
@@ -127,6 +135,173 @@ pub(crate) async fn search_data_indices(
     };
     body.insert("aggregations".to_string(), Value::Object(aggregations));
     Ok(response)
+}
+
+/// The predicate of the request's top-level `must` and `filter` clauses that read no cross-row
+/// field of `scope.entry`. Dropping the other clauses, and every `should` and `must_not`, only
+/// widens the rows, so the traces it selects include every trace the whole query selects.
+///
+/// # Errors
+///
+/// The lowering errors of [`lower_query`] for a kept clause.
+fn lower_outer_predicate(query: &Query, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
+    let conjuncts: Vec<&Query> = match query {
+        Query::Bool(bool_query) => bool_query.must.iter().chain(&bool_query.filter).collect(),
+        Query::ConstantScore(inner) => return lower_outer_predicate(inner, scope),
+        // Every other query is one conjunct by the same rule.
+        other => vec![other],
+    };
+    let mut lowered_conjuncts = Vec::with_capacity(conjuncts.len());
+    for conjunct in conjuncts {
+        let reads_before = scope.session.count_cross_row_reads();
+        let predicate = lower_query(conjunct, scope);
+        if scope.session.count_cross_row_reads() == reads_before {
+            lowered_conjuncts.push(predicate?);
+        }
+    }
+    Ok(lowered_conjuncts.into_iter().reduce(Expr::and).unwrap_or_else(|| lit(true)))
+}
+
+/// Lower the queries of every `filter` and `filters` aggregation of `aggregations`, and resolve
+/// the sort fields of every `top_hits`, for the cross-row probe; the results are discarded.
+fn probe_aggregation_reads(aggregations: &[NamedAggregation], scope: &LoweringScope<'_>) {
+    for aggregation in aggregations {
+        match &aggregation.kind {
+            AggregationKind::Filter(query) => {
+                let _ = lower_query(query, scope);
+            }
+            AggregationKind::Filters(spec) => {
+                for query in spec.iter_queries() {
+                    let _ = lower_query(query, scope);
+                }
+            }
+            // A `top_hits` plans its sort only when its hits are collected, after the rows plan,
+            // so the probe resolves it here.
+            AggregationKind::TopHits(spec) => probe_sort_fields(&spec.request.sort, scope),
+            // Each of these reads at most one field, which planning the rows resolves.
+            AggregationKind::DateHistogram(_)
+            | AggregationKind::Terms(_)
+            | AggregationKind::Histogram(_)
+            | AggregationKind::Avg(_)
+            | AggregationKind::Sum(_)
+            | AggregationKind::Min(_)
+            | AggregationKind::Max(_)
+            | AggregationKind::ValueCount(_)
+            | AggregationKind::Stats(_)
+            | AggregationKind::Cardinality(_)
+            | AggregationKind::Percentiles(_)
+            | AggregationKind::PercentileRanks(_)
+            | AggregationKind::ExtendedStats(_)
+            | AggregationKind::Range(_)
+            | AggregationKind::DateRange(_)
+            | AggregationKind::CumulativeSum(_)
+            | AggregationKind::Derivative(_)
+            | AggregationKind::SerialDiff(_)
+            | AggregationKind::MovingFn(_)
+            | AggregationKind::MovingAvg(_)
+            | AggregationKind::BucketScript(_)
+            | AggregationKind::AvgBucket(_)
+            | AggregationKind::SumBucket(_)
+            | AggregationKind::MinBucket(_)
+            | AggregationKind::MaxBucket(_) => {}
+        }
+        probe_aggregation_reads(&aggregation.children, scope);
+    }
+}
+
+/// Resolve the field of every field clause of `sort` in the scope's index, for the cross-row
+/// probe; the resolutions are discarded.
+fn probe_sort_fields(sort: &[SortClause], scope: &LoweringScope<'_>) {
+    for clause in sort {
+        if let SortClause::Field { field, .. } = clause {
+            let _ = scope.session.resolve_field(scope.entry, field);
+        }
+    }
+}
+
+/// Whether the request reads a cross-row field of `entry`: lowering the query, resolving the sort
+/// fields of the request and of every `top_hits`, planning the aggregation rows and lowering the
+/// filter aggregations resolve every field the request names, and an unattached cross-row field
+/// counts itself. Nothing is executed and every result is discarded.
+fn probe_cross_row_reads(
+    session: &TenantSession,
+    entry: &IndexEntry,
+    request: &SearchRequest,
+    tree: Option<&AggregationTree>,
+    now: DateTime<Utc>,
+) -> bool {
+    let reads_before = session.count_cross_row_reads();
+    let scope = LoweringScope { session, entry, now };
+    let _ = lower_query(&request.query, &scope);
+    probe_sort_fields(&request.sort, &scope);
+    if let Some(tree) = tree {
+        let _ = plan_aggregation_rows(session, &[entry], &Query::MatchAll, now, tree);
+        probe_aggregation_reads(&tree.aggregations, &scope);
+    }
+    session.count_cross_row_reads() != reads_before
+}
+
+/// Refuse a `terms` on `traceId` asking for more than `max` traces.
+///
+/// # Errors
+///
+/// Returns [`OpenSearchError::trace_terms_size_exceeded`] for the first such `terms`, parents
+/// before their children.
+fn check_trace_id_terms(aggregations: &[NamedAggregation], max: usize) -> Result<(), OpenSearchError> {
+    for aggregation in aggregations {
+        if let AggregationKind::Terms(spec) = &aggregation.kind
+            && spec.field == TRACE_ID_FIELD
+            && spec.size > max
+        {
+            return Err(OpenSearchError::trace_terms_size_exceeded(&aggregation.name, max));
+        }
+        check_trace_id_terms(&aggregation.children, max)?;
+    }
+    Ok(())
+}
+
+/// Attach to each Data Prepper index of the search the trace roots its cross-row reads need.
+///
+/// Roots an earlier search on the same session attached (an earlier `_msearch` item) are
+/// detached first, so the probe sees this search's own reads. Only when the probe finds a
+/// cross-row read are the candidate traces selected (at most `max_cross_row_traces`) and their
+/// roots looked up and attached, so every later scan of the index carries the root columns.
+///
+/// # Errors
+///
+/// Returns a 400 for a `terms` on `traceId` larger than `max_cross_row_traces` and for more
+/// candidate traces than that limit, the lowering errors of the request's other `must` and
+/// `filter` clauses, and the lookups' errors.
+async fn prepare_cross_row_reads(
+    session: &TenantSession,
+    entries: &[&IndexEntry],
+    request: &SearchRequest,
+    tree: Option<&AggregationTree>,
+    now: DateTime<Utc>,
+) -> Result<(), OpenSearchError> {
+    let settings = session.settings();
+    for entry in entries.iter().copied().filter(|entry| entry.profile() == Profile::DataPrepper) {
+        session.detach_trace_roots(entry)?;
+        if let Some(tree) = tree {
+            check_trace_id_terms(&tree.aggregations, settings.max_cross_row_traces)?;
+        }
+        if !probe_cross_row_reads(session, entry, request, tree, now) {
+            continue;
+        }
+        let scope = LoweringScope { session, entry, now };
+        let candidates =
+            select_candidate_traces(session, entry, lower_outer_predicate(&request.query, &scope)?).await?;
+        let roots = lookup_trace_roots(
+            session,
+            &candidates.trace_ids,
+            candidates.window_start_micros,
+            candidates.window_end_micros,
+            settings.max_trace_lookback,
+        )
+        .await?;
+        session.attach_trace_roots(entry, roots)?;
+    }
+    Ok(())
 }
 
 /// The hits part of a data search: everything `search_data_indices` answers except
@@ -156,9 +331,10 @@ pub(crate) async fn search_data_indices(
 /// the 400s of a `search_after` without a sort, with `from` above 0, with a value count other than
 /// the sort's or with a value that fits no sort key; the lowering errors of [`lower_query`]; the
 /// 400s of [`plan_field_requests`]; the 400s of request keys the data path does not serve;
-/// planning or execution failures; and `500` when a row has no canonical encoding or no span key,
-/// a sort value has another type than its key, a value has no JSON rendering, a field resolves to
-/// a column its hit's row does not hold, or the rendering does not finish.
+/// planning or execution failures; the errors of [`lookup_rendered_trace_roots`]; and `500` when a
+/// row has no canonical encoding or no span key, a sort value has another type than its key, a
+/// value has no JSON rendering, a field resolves to a column its hit's row does not hold, or the
+/// rendering does not finish.
 async fn search_hits(
     session: &TenantSession,
     entries: &[&IndexEntry],
@@ -195,10 +371,10 @@ async fn search_hits(
     );
     let mut candidates: Vec<Candidate<'_>> = pages.into_iter().flat_map(|page| page.candidates).collect();
     sort_candidates(&mut candidates, &sort.keys)?;
-    let page_hits = candidates
+    let page: Vec<Candidate<'_>> = candidates.into_iter().skip(request.from).take(request.size).collect();
+    let trace_roots = lookup_rendered_trace_roots(session, &page, &request.source).await?;
+    let page_hits = page
         .into_iter()
-        .skip(request.from)
-        .take(request.size)
         .map(|candidate| build_search_hit(session, candidate, &sort, &field_requests))
         .collect::<Result<Vec<PageHit>, OpenSearchError>>()?;
     // The work outlives the borrow of `request`, so it renders against its own copy.
@@ -206,7 +382,7 @@ async fn search_hits(
     run_blocking_work("rendering data search hits", move || {
         let mut page_hits = page_hits;
         let hits: Vec<SearchHit<'_>> = page_hits.iter_mut().map(PageHit::take_search_hit).collect();
-        render_search_response(started_at.elapsed(), total, &hits, &rendering_request)
+        render_search_response(started_at.elapsed(), total, &hits, &rendering_request, &trace_roots)
     })
     .await
 }
@@ -236,19 +412,56 @@ fn build_search_hit(
     })
 }
 
+/// The roots [`lookup_candidate_trace_roots`] answers for `candidates` when `source` renders a
+/// `_source`. `_source` is the only reader of the roots, so for a `source` rendering none this
+/// skips the lookup and answers no roots.
+///
+/// # Errors
+///
+/// The errors of [`lookup_candidate_trace_roots`].
+async fn lookup_rendered_trace_roots(
+    session: &TenantSession,
+    candidates: &[Candidate<'_>],
+    source: &SourceFilter,
+) -> Result<TraceRoots, OpenSearchError> {
+    if matches!(source, SourceFilter::Nothing) {
+        return Ok(TraceRoots::new());
+    }
+    lookup_candidate_trace_roots(session, candidates).await
+}
+
+/// The root spans of the traces of `candidates`, which the `traceGroup*` fields of their hits
+/// render from.
+///
+/// # Errors
+///
+/// The errors of [`lookup_page_trace_roots`].
+async fn lookup_candidate_trace_roots(
+    session: &TenantSession,
+    candidates: &[Candidate<'_>],
+) -> Result<TraceRoots, OpenSearchError> {
+    let rows: Vec<(&IndexEntry, &RecordBatch, usize)> = candidates
+        .iter()
+        .map(|candidate| (candidate.entry, candidate.batch.as_ref(), candidate.row))
+        .collect();
+    lookup_page_trace_roots(session, &rows).await
+}
+
 /// The `_search` hits of `batches`, rows of `entry` that a plan other than `_search`'s read: in
 /// each batch the first `table_column_count` columns are the index's table columns in scan
 /// order, followed by one column per key of `lower_hit_sort(session, entry, &request.sort)`, in
 /// key order; later columns are ignored. Each hit is the one `_search` renders for the row under
 /// `request` (`_index`, `_id`, `_score`, `_source`, `fields`, `sort`), one per row, in batch then
-/// row order.
+/// row order. The `traceGroup*` fields of a Data Prepper hit render from the roots of the hits'
+/// own traces.
 ///
 /// # Errors
 ///
 /// A 400 naming an index without a document-id rule; the sort and `fields` errors of `_search`;
-/// `500` for a `_doc` sort clause, a batch narrower than its table and sort columns, a row
-/// without a canonical encoding or a span key, and a value no JSON rendering exists for.
-pub(super) fn render_index_rows_as_hits(
+/// the errors of [`lookup_rendered_trace_roots`]; `500` for a `_doc` sort clause, a batch
+/// narrower than its table and sort columns, a row without a canonical encoding or a span key,
+/// and a value no JSON rendering exists for.
+pub(super) async fn render_index_rows_as_hits(
     session: &TenantSession,
     entry: &IndexEntry,
     request: &SearchRequest,
@@ -288,12 +501,14 @@ pub(super) fn render_index_rows_as_hits(
         sort: &sort,
         anchor: None,
     };
-    let mut page_hits = build_candidates(scope, batches, table_column_count, &sort_columns)?
+    let candidates = build_candidates(scope, batches, table_column_count, &sort_columns)?;
+    let trace_roots = lookup_rendered_trace_roots(session, &candidates, &request.source).await?;
+    let mut page_hits = candidates
         .into_iter()
         .map(|candidate| build_search_hit(session, candidate, &sort, &field_requests))
         .collect::<Result<Vec<PageHit>, OpenSearchError>>()?;
     let hits: Vec<SearchHit<'_>> = page_hits.iter_mut().map(PageHit::take_search_hit).collect();
-    render_hits(&hits, request)
+    render_hits(&hits, request, &trace_roots)
 }
 
 /// One hit of the returned page, owning what its rendering reads, so it moves to the blocking
@@ -566,9 +781,17 @@ fn has_bound_values(
 ///
 /// # Errors
 ///
-/// Returns the query-shard 400 for a text or object field, which has no sort value.
+/// Returns the query-shard 400 for a text or object field, which has no sort value, and
+/// `illegal_argument` for a cross-row field whose index has no trace roots attached.
 fn decide_field_kind(field: &ResolvedField, entry: &IndexEntry) -> Result<SortKeyKind, OpenSearchError> {
     match (field.field_type, &field.value) {
+        // A search attaches the roots of an index whose sort names a cross-row field before it
+        // plans the sort, and the field then resolves to its joined root column, so only a path
+        // that does not attach reaches this.
+        (_, FieldValue::CrossRow(_)) => Err(OpenSearchError::illegal_argument(format!(
+            "field [{}] is read from the root span of each trace; sort on it in a search of its index",
+            field.name
+        ))),
         (FieldType::Date | FieldType::Integer | FieldType::Long | FieldType::Boolean, _) => Ok(SortKeyKind::Long),
         (FieldType::Double, _) => Ok(SortKeyKind::Double),
         // An encoded hex id sorts as the bytes it renders in hex, every other encoded or derived
@@ -602,7 +825,11 @@ fn has_same_sort_type(left: &ResolvedField, right: &ResolvedField) -> bool {
 const fn find_hex_width(field: &ResolvedField) -> Option<i32> {
     match field.value {
         FieldValue::HexId { width, .. } | FieldValue::Encoded(EncodedField::HexIdOrEmpty { width, .. }) => Some(width),
-        FieldValue::Column { .. } | FieldValue::MapKey { .. } | FieldValue::Encoded(_) | FieldValue::Derived(_) => None,
+        FieldValue::Column { .. }
+        | FieldValue::MapKey { .. }
+        | FieldValue::Encoded(_)
+        | FieldValue::Derived(_)
+        | FieldValue::CrossRow(_) => None,
     }
 }
 
@@ -1691,7 +1918,8 @@ struct FieldRequestPlan<'r> {
 ///
 /// Returns [`OpenSearchError::field_projection_conflict`] for a name typed differently across
 /// `entries`, `illegal_argument_exception` for a format on a concrete field that is no date,
-/// [`OpenSearchError::field_pattern_on_profile_index`] for a pattern on an index of a non-native
+/// [`OpenSearchError::cross_row_field_in_field_request`] for a cross-row field of the Data
+/// Prepper profile, [`OpenSearchError::field_pattern_on_profile_index`] for a pattern on an index of a non-native
 /// profile, the error an index's table failed to open with, and `500` for a column a pattern
 /// matches whose type no `OpenSearch` type represents.
 fn plan_field_requests<'r>(
@@ -1731,6 +1959,12 @@ fn plan_field_requests<'r>(
                     }
                 }
                 continue;
+            }
+            if entry.profile() == Profile::DataPrepper && CrossRowField::find_by_name(&field_request.field).is_some() {
+                return Err(OpenSearchError::cross_row_field_in_field_request(
+                    &field_request.field,
+                    entry.name(),
+                ));
             }
             let resolution = session.resolve_field(entry, &field_request.field);
             entry_reads.push(profile_table.map(|table| decide_profile_field_read(table, resolution.as_ref())));
@@ -1847,8 +2081,8 @@ fn render_field_values(
             FieldValue::Derived(derived_field) => {
                 Some(render_derived_value(*derived_field, batch, row)?).filter(|value| !value.is_null())
             }
-            // A native index resolves no encoded field.
-            FieldValue::Encoded(_) => None,
+            // A native index resolves no encoded or cross-row field.
+            FieldValue::Encoded(_) | FieldValue::CrossRow(_) => None,
         };
         if let Some(value) = value {
             values.insert(field_request.field.clone(), json!([value]));

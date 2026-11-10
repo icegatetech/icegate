@@ -231,7 +231,8 @@ pub(super) async fn collect_top_hits(
             &slot.spec.request,
             &batches,
             context.table_columns.len(),
-        )?;
+        )
+        .await?;
         let paths = read_hit_paths(layout, slot.granularity, &batches)?;
         if paths.len() != hits.len() {
             return Err(OpenSearchError::internal(format!(

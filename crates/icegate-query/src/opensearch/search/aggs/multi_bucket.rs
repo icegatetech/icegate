@@ -115,12 +115,15 @@ pub(crate) enum FiltersBuckets {
 }
 
 impl FiltersSpec {
-    /// The bucket queries, in request order.
-    pub(super) fn list_queries(&self) -> Vec<&Query> {
-        match &self.filters {
-            FiltersBuckets::Named(filters) => filters.iter().map(|(_, query)| query).collect(),
-            FiltersBuckets::Anonymous(filters) => filters.iter().collect(),
-        }
+    /// The bucket queries, in request order, without allocating.
+    pub(crate) fn iter_queries(&self) -> impl Iterator<Item = &Query> {
+        // One iterator type serves both bucket forms: the form not in use contributes an empty
+        // slice to the chain.
+        let (named, anonymous): (&[(String, Query)], &[Query]) = match &self.filters {
+            FiltersBuckets::Named(filters) => (filters, &[]),
+            FiltersBuckets::Anonymous(filters) => (&[], filters),
+        };
+        named.iter().map(|(_, query)| query).chain(anonymous)
     }
 }
 

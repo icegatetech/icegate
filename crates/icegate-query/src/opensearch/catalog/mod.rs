@@ -6,6 +6,7 @@
 //! footprint count (see [`TenantSession::count_footprint`]), except in a global table, which it
 //! counts whole.
 
+mod cross_row;
 mod data_prepper;
 mod encoding;
 mod expression;
@@ -18,7 +19,8 @@ mod ss4o;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -38,7 +40,12 @@ use icegate_common::schema::{
 use icegate_common::{ICEGATE_NAMESPACE, TenantId, icegate_table_ident};
 use tokio::sync::OnceCell;
 
+use self::cross_row::{AttachedTraceRoots, build_trace_root_table, join_trace_roots};
+pub(crate) use self::cross_row::{
+    CrossRowField, TraceRoots, lookup_page_trace_roots, lookup_trace_roots, select_candidate_traces,
+};
 use self::data_prepper::DATA_PREPPER_TABLE;
+pub(crate) use self::data_prepper::TRACE_ID_FIELD;
 pub(crate) use self::encoding::{
     EncodedField, ProfileTable, lower_derived_exists, lower_derived_range, lower_derived_term, lower_encoded_exists,
     lower_encoded_range, lower_encoded_term, render_derived_value, render_profile_document, render_profile_field,
@@ -112,6 +119,11 @@ pub(crate) struct CatalogSettings {
     /// Size of the memory pool each session of the listener gets for itself; every plan the
     /// session runs, concurrent ones included, draws from it (`opensearch.max_query_memory_bytes`).
     pub(crate) max_query_memory_bytes: usize,
+    /// How far before the earliest decorated span a trace's root is looked for
+    /// (`opensearch.max_trace_lookback_secs`).
+    pub(crate) max_trace_lookback: Duration,
+    /// The most traces one search reads the roots of (`opensearch.max_cross_row_traces`).
+    pub(crate) max_cross_row_traces: usize,
 }
 
 /// Resolves indices and fields against the tables and the system indices a tenant may read.
@@ -189,6 +201,8 @@ impl IndexCatalog {
             map_key_cache: Arc::clone(&self.map_key_cache),
             system_store: Arc::clone(&self.system_store),
             system_snapshot: OnceCell::new(),
+            trace_roots: RwLock::new(HashMap::new()),
+            unattached_cross_row_reads: AtomicUsize::new(0),
         })
     }
 }
@@ -294,6 +308,15 @@ pub(crate) struct TenantSession {
     /// The tenant's system-index state, read at most once per session, so every system-index
     /// decision of one request sees one snapshot.
     system_snapshot: OnceCell<CurrentSnapshot>,
+    /// The trace roots attached to a Data Prepper index for the search being answered, by index
+    /// name, each with the table its joined scans read. A scan of an attached index joins them,
+    /// so its cross-row fields read the joined root columns. `_msearch` answers several searches
+    /// on one session, one after another, so each search detaches the roots of its indices before
+    /// it probes them.
+    trace_roots: RwLock<HashMap<String, Arc<AttachedTraceRoots>>>,
+    /// How many times a cross-row field was resolved while its index had no roots attached:
+    /// the probe that tells a search it must attach them.
+    unattached_cross_row_reads: AtomicUsize,
 }
 
 impl fmt::Debug for TenantSession {
@@ -329,12 +352,93 @@ impl TenantSession {
     /// `None` means the name names nothing in this index: a query leaf on it matches nothing.
     /// An index whose table failed to open also resolves nothing; its scan reports the failure,
     /// and every search scans before it lowers.
+    ///
+    /// A cross-row field resolves to its joined root column once the session attached the roots
+    /// of `entry`; before that it resolves to [`FieldValue::CrossRow`] and counts itself (see
+    /// [`Self::count_cross_row_reads`]).
     pub(crate) fn resolve_field(&self, entry: &IndexEntry, name: &str) -> Option<ResolvedField> {
         let schema = self.open_table(entry).ok()?.schema();
-        find_profile_table(entry).map_or_else(
+        let resolved_field = find_profile_table(entry).map_or_else(
             || resolve_native_field(&schema, entry.table(), name),
             |table| resolve_profile_field(table, &schema, name),
-        )
+        )?;
+        let FieldValue::CrossRow(field) = resolved_field.value else {
+            return Some(resolved_field);
+        };
+        // A poisoned lock reads as no attachment: the read counts itself, and the attachment the
+        // search then makes reports the poisoning.
+        if self.find_attached_trace_roots(entry).ok().flatten().is_some() {
+            return Some(ResolvedField {
+                value: FieldValue::Column {
+                    column: field.joined_column().to_string(),
+                },
+                ..resolved_field
+            });
+        }
+        self.unattached_cross_row_reads.fetch_add(1, Ordering::Relaxed);
+        Some(resolved_field)
+    }
+
+    /// The catalog settings the session was opened with.
+    pub(crate) const fn settings(&self) -> CatalogSettings {
+        self.settings
+    }
+
+    /// Join `roots` to every later scan of `entry`, so its cross-row fields resolve to the
+    /// joined root columns until [`Self::detach_trace_roots`] drops them. A second attachment
+    /// replaces the first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `500` when the roots cannot be built into a table, or when the lock was poisoned
+    /// by a panic of another writer.
+    pub(crate) fn attach_trace_roots(&self, entry: &IndexEntry, roots: TraceRoots) -> Result<(), OpenSearchError> {
+        let table = build_trace_root_table(&roots)?;
+        self.trace_roots
+            .write()
+            .map_err(|_| report_poisoned_trace_roots())?
+            .insert(entry.name().to_string(), Arc::new(AttachedTraceRoots { roots, table }));
+        Ok(())
+    }
+
+    /// Drop the roots attached to `entry`, so its cross-row fields resolve unattached again and
+    /// count themselves; a no-op when none are attached. Roots one search of a session attached
+    /// therefore never answer the cross-row reads of the next one.
+    ///
+    /// # Errors
+    ///
+    /// Returns `500` when the lock was poisoned by a panic of another writer.
+    pub(crate) fn detach_trace_roots(&self, entry: &IndexEntry) -> Result<(), OpenSearchError> {
+        self.trace_roots
+            .write()
+            .map_err(|_| report_poisoned_trace_roots())?
+            .remove(entry.name());
+        Ok(())
+    }
+
+    /// The roots attached to `entry`, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns `500` when the lock was poisoned by a panic of another writer.
+    fn find_attached_trace_roots(
+        &self,
+        entry: &IndexEntry,
+    ) -> Result<Option<Arc<AttachedTraceRoots>>, OpenSearchError> {
+        Ok(self
+            .trace_roots
+            .read()
+            .map_err(|_| report_poisoned_trace_roots())?
+            .get(entry.name())
+            .cloned())
+    }
+
+    /// The session's running count of unattached cross-row resolutions: how many times a
+    /// cross-row field was resolved while its index had no roots attached. Resolutions against
+    /// attached roots are not counted, so a probe compares the count before and after it runs
+    /// to learn whether it read a cross-row field.
+    pub(crate) fn count_cross_row_reads(&self) -> usize {
+        self.unattached_cross_row_reads.load(Ordering::Relaxed)
     }
 
     /// Whether `field`, resolved in `entry`, is an encoded id whose stored column admits NULL
@@ -355,7 +459,7 @@ impl TenantSession {
     }
 
     /// The Arrow type of `column` in `entry`'s tenant-scoped table, `None` when it has no such
-    /// column.
+    /// column. A joined root column (see [`Self::scan_index`]) has its cross-row field's type.
     ///
     /// # Errors
     ///
@@ -365,6 +469,9 @@ impl TenantSession {
         entry: &IndexEntry,
         column: &str,
     ) -> Result<Option<DataType>, OpenSearchError> {
+        if let Some(field) = CrossRowField::find_by_joined_column(column) {
+            return Ok(Some(field.data_type()));
+        }
         let schema = self.table_schema(entry)?;
         Ok(schema.field_with_name(column).ok().map(|field| field.data_type().clone()))
     }
@@ -379,7 +486,23 @@ impl TenantSession {
         Ok(self.open_table(entry)?.schema())
     }
 
-    /// A scan of `entry`'s table through the tenant scope.
+    /// A [`Self::scan_raw`] of `entry`, joined with the trace roots the session attached to
+    /// `entry` (see [`Self::attach_trace_roots`]) so its cross-row fields read the joined root
+    /// columns; unjoined when none are attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error the table failed to open with, or `500` when DataFusion refuses the scan
+    /// or the join.
+    pub(crate) fn scan_index(&self, entry: &IndexEntry) -> Result<LogicalPlanBuilder, OpenSearchError> {
+        let scan = self.scan_raw(entry)?;
+        match self.find_attached_trace_roots(entry)? {
+            Some(attached_roots) => join_trace_roots(scan, Arc::clone(&attached_roots.table)),
+            None => Ok(scan),
+        }
+    }
+
+    /// A scan of `entry`'s table through the tenant scope, never joined with trace roots.
     ///
     /// The table reference is built from its exact parts, never parsed, so the name passes no
     /// identifier normalization. Every row the scan yields belongs to the session's tenant, and
@@ -388,7 +511,7 @@ impl TenantSession {
     /// # Errors
     ///
     /// Returns the error the table failed to open with, or `500` when DataFusion refuses the scan.
-    pub(crate) fn scan_index(&self, entry: &IndexEntry) -> Result<LogicalPlanBuilder, OpenSearchError> {
+    fn scan_raw(&self, entry: &IndexEntry) -> Result<LogicalPlanBuilder, OpenSearchError> {
         let provider = self.open_table(entry)?;
         let reference = TableReference::full(
             self.engine.config().catalog_name.as_str(),
@@ -699,6 +822,11 @@ impl TenantSession {
     }
 }
 
+/// The `500` for a trace-roots lock a panicking thread poisoned.
+fn report_poisoned_trace_roots() -> OpenSearchError {
+    OpenSearchError::internal("the session's trace roots lock is poisoned")
+}
+
 /// Merge `left` and `right`, each in name order, into one list in name order, in one pass over
 /// both; on equal names the item of `left` comes first.
 pub(crate) fn merge_name_ordered_lists<'a, T>(
@@ -780,6 +908,8 @@ mod tests {
             CatalogSettings {
                 field_discovery_window,
                 max_query_memory_bytes: 1_073_741_824,
+                max_trace_lookback: Duration::from_hours(1),
+                max_cross_row_traces: 1_000,
             },
         )
     }

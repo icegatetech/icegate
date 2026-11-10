@@ -29,8 +29,9 @@ const CONTENT_TYPE_JSON: &str = "application/json; charset=UTF-8";
 /// their reason text. Each variant is one class of error. A decorating constructor, one that
 /// returns another constructor's error with its own reason or extra keys, keeps that base kind
 /// (for example `unsupported_construct`, `answer_too_large` and `invalid_request_key`) unless a
-/// caller must tell it apart. `memory_limit_exceeded` and `no_handler` are such exceptions: both
-/// decorate `illegal_argument` and carry their own kinds. A search-phase failure that wraps
+/// caller must tell it apart. `memory_limit_exceeded`, `no_handler` and
+/// `too_many_cross_row_traces` are such exceptions: each decorates `illegal_argument` and carries
+/// its own kind. A search-phase failure that wraps
 /// another error as its root cause (`query_shard`, `result_window_too_large`,
 /// `too_many_buckets`) carries its own kind, whatever the cause's kind is. A new class of error
 /// adds its variant, and every exhaustive match over the kinds (the PPL mapping) stops compiling
@@ -85,6 +86,8 @@ pub(crate) enum OpenSearchErrorKind {
     },
     /// A plugin resource IceGate does not hold, such as an ML config (404 `status_exception`).
     StatusNotFound,
+    /// [`OpenSearchError::too_many_cross_row_traces`].
+    TooManyCrossRowTraces,
 }
 
 /// An error answered in the `OpenSearch` envelope.
@@ -265,6 +268,39 @@ impl OpenSearchError {
             format!("a request may hold at most {limit} bucket aggregations; [{aggregation}] passes it"),
         )
         .with_metadata("limit", limit)
+    }
+
+    /// A `terms` aggregation on the trace id of the span profile asking for more traces than
+    /// `opensearch.max_cross_row_traces` (`400`, `illegal_argument_exception`); `aggregation`
+    /// carries the request's name for it and `limit` the most traces one search may ask for.
+    pub(crate) fn trace_terms_size_exceeded(aggregation: &str, limit: usize) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!(
+                "[terms] aggregation [{aggregation}] on the trace id asks for more traces than \
+                 opensearch.max_cross_row_traces ({limit}) allows"
+            ),
+        )
+        .with_metadata("limit", limit)
+    }
+
+    /// A filter, sort or aggregation on a cross-row field of `index` whose other filters select
+    /// more than `max` traces (`400`, `illegal_argument_exception`): the root of every selected
+    /// trace would be read, and IceGate never truncates the set. `index` and `limit` carry the
+    /// index and `max` for a client. It carries its own kind because the PPL mapping tells it
+    /// apart from `illegal_argument`: no PPL source reaches a cross-row field, so PPL answers it
+    /// as internal.
+    pub(crate) fn too_many_cross_row_traces(index: &str, max: usize) -> Self {
+        Self {
+            kind: OpenSearchErrorKind::TooManyCrossRowTraces,
+            ..Self::illegal_argument(format!(
+                "a filter, sort or aggregation on a cross-row field of [{index}] reads the root span of every \
+                 trace the rest of the request selects, and it selects more than \
+                 opensearch.max_cross_row_traces ({max}) traces; narrow the time range or the other filters"
+            ))
+        }
+        .with_metadata("index", index)
+        .with_metadata("limit", max)
     }
 
     /// A query text past a limit of its parser (`400`, `parsing_exception`), whose value `limit`
@@ -619,6 +655,17 @@ impl OpenSearchError {
     pub(crate) fn field_pattern_on_profile_index(field: &str, index: &str) -> Self {
         Self::illegal_argument(format!(
             "field pattern [{field}] is not supported on index [{index}]; name each field"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("index", index)
+    }
+
+    /// A `fields` or `docvalue_fields` entry naming `field`, a cross-row field of `index` that
+    /// renders in `_source` only (`400`); `field` and `index` are carried for a client.
+    pub(crate) fn cross_row_field_in_field_request(field: &str, index: &str) -> Self {
+        Self::illegal_argument(format!(
+            "field [{field}] is read from the root span of each trace and is not available in fields or \
+             docvalue_fields; read it from _source"
         ))
         .with_metadata("field", field)
         .with_metadata("index", index)
@@ -1184,6 +1231,10 @@ mod tests {
                 json!({"field": "status.*", "index": "otel-v1-apm-span"}),
             ),
             (
+                OpenSearchError::cross_row_field_in_field_request("traceGroup", "otel-v1-apm-span"),
+                json!({"field": "traceGroup", "index": "otel-v1-apm-span"}),
+            ),
+            (
                 OpenSearchError::unordered_missing_id("parentSpanId", "otel-v1-apm-span", "sort"),
                 json!({"field": "parentSpanId", "index": "otel-v1-apm-span", "operation": "sort"}),
             ),
@@ -1237,6 +1288,7 @@ mod tests {
             OpenSearchErrorKind::AggregationExecution => 18,
             OpenSearchErrorKind::MemoryLimitExceeded { .. } => 19,
             OpenSearchErrorKind::StatusNotFound => 20,
+            OpenSearchErrorKind::TooManyCrossRowTraces => 21,
         }
     }
 
@@ -1310,8 +1362,12 @@ mod tests {
                 OpenSearchError::status_not_found("x"),
                 OpenSearchErrorKind::StatusNotFound,
             ),
+            (
+                OpenSearchError::too_many_cross_row_traces("otel-v1-apm-span", 2),
+                OpenSearchErrorKind::TooManyCrossRowTraces,
+            ),
         ];
-        let mut positions: Vec<usize> = Vec::with_capacity(21);
+        let mut positions: Vec<usize> = Vec::with_capacity(22);
         for (error, kind) in &unit_cases {
             assert_eq!(error.kind(), kind, "error {error:?}");
             positions.push(find_kind_position(kind));
@@ -1332,7 +1388,7 @@ mod tests {
         positions.push(find_kind_position(memory_limit.kind()));
         // Every kind is covered exactly once.
         positions.sort_unstable();
-        assert_eq!(positions, (0..21).collect::<Vec<_>>());
+        assert_eq!(positions, (0..22).collect::<Vec<_>>());
         assert_eq!(OpenSearchError::illegal_argument("bad index").reason(), "bad index");
     }
 
@@ -1345,5 +1401,18 @@ mod tests {
         assert_eq!(body["error"]["reason"], "no ML config [abc]");
         assert_eq!(body["error"]["root_cause"][0]["type"], "status_exception");
         assert_eq!(body["error"]["root_cause"][0]["reason"], "no ML config [abc]");
+    }
+
+    #[tokio::test]
+    async fn too_many_cross_row_traces_names_the_index_and_the_limit() {
+        let (status, body) = render_envelope(OpenSearchError::too_many_cross_row_traces("otel-v1-apm-span", 2)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        assert_eq!(body["error"]["root_cause"][0]["type"], "illegal_argument_exception");
+        assert_eq!(body["error"]["index"], "otel-v1-apm-span");
+        assert_eq!(body["error"]["limit"], 2);
+        assert_eq!(body["error"]["root_cause"][0]["index"], "otel-v1-apm-span");
+        assert_eq!(body["error"]["root_cause"][0]["limit"], 2);
     }
 }

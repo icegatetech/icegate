@@ -376,6 +376,8 @@ OPENSEARCH_VALUES = {
     "maxRequestBodyBytes": 1048577,
     "maxQueryMemoryBytes": 1073741825,
     "fieldDiscoveryWindowSecs": 3601,
+    "maxTraceLookbackSecs": 3601,
+    "maxCrossRowTraces": 1001,
     "systemIndices": {
         "location": "s3://saved-objects/tenants",
         "maxScrollLifetimeSecs": 901,
@@ -395,6 +397,8 @@ OPENSEARCH_SECTION = {
     "max_request_body_bytes": 1048577,
     "max_query_memory_bytes": 1073741825,
     "field_discovery_window_secs": 3601,
+    "max_trace_lookback_secs": 3601,
+    "max_cross_row_traces": 1001,
     "system_indices": {
         "location": "s3://saved-objects/tenants",
         "max_scroll_lifetime_secs": 901,

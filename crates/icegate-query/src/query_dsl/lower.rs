@@ -153,7 +153,11 @@ const fn read_search_kind(field: &ResolvedField) -> Option<SearchKind> {
         (FieldValue::Encoded(EncodedField::EscapedMapKey { .. }), _) => {}
         (FieldValue::Encoded(_), FieldType::Keyword) => return Some(SearchKind::EncodedKeyword),
         (
-            FieldValue::Column { .. } | FieldValue::MapKey { .. } | FieldValue::Encoded(_) | FieldValue::Derived(_),
+            FieldValue::Column { .. }
+            | FieldValue::MapKey { .. }
+            | FieldValue::Encoded(_)
+            | FieldValue::Derived(_)
+            | FieldValue::CrossRow(_),
             _,
         ) => {}
     }
@@ -504,8 +508,9 @@ enum ProfileLeaf<'q> {
 /// A leaf on a render-only field (see [`EncodedField::is_render_only`]), or on a path below one,
 /// is [`OpenSearchError::render_only_field`]; a term pattern on another encoded or derived field
 /// is the query-shard 400 of a term pattern on a typed field; otherwise the errors of the field's
-/// lowering. Each refusal names the field as the request did (`field.name`), never the column
-/// behind it.
+/// lowering. A leaf on a cross-row field whose index has no trace roots attached is
+/// `illegal_argument`. Each refusal names the field as the request did (`field.name`), never the
+/// column behind it.
 fn lower_profile_leaf(
     field: &ResolvedField,
     leaf: ProfileLeaf<'_>,
@@ -518,6 +523,14 @@ fn lower_profile_leaf(
     }
     let index = scope.entry.name();
     let lowered_predicate = match (&field.value, leaf) {
+        // A search attaches the roots of its index before it lowers, and the field then resolves
+        // to its joined root column, so only a path that does not attach reaches this.
+        (FieldValue::CrossRow(_), _) => {
+            return Err(OpenSearchError::illegal_argument(format!(
+                "field [{}] is read from the root span of each trace; filter on it in a search of its index",
+                field.name
+            )));
+        }
         (FieldValue::Column { .. } | FieldValue::MapKey { .. } | FieldValue::HexId { .. }, _) => return Ok(None),
         (FieldValue::Encoded(_) | FieldValue::Derived(_), ProfileLeaf::Pattern(leaf_name)) => {
             return Err(refuse_term_pattern(field, leaf_name, scope));
@@ -575,6 +588,7 @@ fn refuse_term_pattern(field: &ResolvedField, leaf: &str, scope: &LoweringScope<
                 FieldValue::HexId { .. } => "binary id",
                 FieldValue::Encoded(_) => "encoded",
                 FieldValue::Derived(_) => "derived",
+                FieldValue::CrossRow(_) => "cross-row",
                 FieldValue::Column { .. } | FieldValue::MapKey { .. } => field.field_type.name(),
             }
         ),
@@ -604,7 +618,9 @@ fn lower_term(query: &TermQuery, scope: &LoweringScope<'_>) -> Result<Expr, Open
     let text = render_literal_text(&query.value, &query.field)?;
     let read_expr = field.value.build_read_expr();
     match (field.field_type, &field.value) {
-        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => Err(report_unlowered_profile_field(&field)),
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_) | FieldValue::CrossRow(_)) => {
+            Err(report_unlowered_profile_field(&field))
+        }
         (FieldType::Keyword, FieldValue::HexId { width, .. }) => {
             Ok(read_expr.eq(decode_hex_literal(&text, *width, &field, scope)?))
         }
@@ -648,7 +664,9 @@ fn lower_terms(query: &TermsQuery, scope: &LoweringScope<'_>) -> Result<Expr, Op
         .collect::<Result<Vec<_>, _>>()?;
     let read_expr = field.value.build_read_expr();
     match (field.field_type, &field.value) {
-        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => Err(report_unlowered_profile_field(&field)),
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_) | FieldValue::CrossRow(_)) => {
+            Err(report_unlowered_profile_field(&field))
+        }
         (FieldType::Keyword, FieldValue::HexId { width, .. }) => {
             let literals = texts
                 .iter()
@@ -717,7 +735,9 @@ fn lower_range(query: &RangeQuery, scope: &LoweringScope<'_>) -> Result<Expr, Op
     }
     let read_expr = field.value.build_read_expr();
     match (field.field_type, &field.value) {
-        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => Err(report_unlowered_profile_field(&field)),
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_) | FieldValue::CrossRow(_)) => {
+            Err(report_unlowered_profile_field(&field))
+        }
         (FieldType::Keyword, FieldValue::HexId { width, .. }) => lower_keyword_range(query, read_expr, |text| {
             decode_hex_literal(&text, *width, &field, scope)
         }),
@@ -1166,7 +1186,9 @@ fn lower_exists(query: &ExistsQuery, scope: &LoweringScope<'_>) -> Result<Expr, 
     }
     let read_expr = field.value.build_read_expr();
     Ok(match (field.field_type, &field.value) {
-        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => return Err(report_unlowered_profile_field(&field)),
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_) | FieldValue::CrossRow(_)) => {
+            return Err(report_unlowered_profile_field(&field));
+        }
         (FieldType::Object, FieldValue::Column { column }) => {
             if matches!(
                 scope.session.column_data_type(scope.entry, column)?,
@@ -1201,7 +1223,9 @@ fn lower_prefix(query: &PrefixQuery, scope: &LoweringScope<'_>) -> Result<Expr, 
         return Ok(lowered_predicate);
     }
     match (field.field_type, &field.value) {
-        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => Err(report_unlowered_profile_field(&field)),
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_) | FieldValue::CrossRow(_)) => {
+            Err(report_unlowered_profile_field(&field))
+        }
         (FieldType::Keyword, FieldValue::Column { .. } | FieldValue::MapKey { .. }) => {
             let read_expr = field.value.build_read_expr();
             Ok(if query.case_insensitive {
@@ -1229,7 +1253,9 @@ fn lower_wildcard(query: &WildcardQuery, scope: &LoweringScope<'_>) -> Result<Ex
         return Ok(lowered_predicate);
     }
     match (field.field_type, &field.value) {
-        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => Err(report_unlowered_profile_field(&field)),
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_) | FieldValue::CrossRow(_)) => {
+            Err(report_unlowered_profile_field(&field))
+        }
         (FieldType::Keyword, FieldValue::Column { .. } | FieldValue::MapKey { .. }) => Ok(Expr::Like(Like::new(
             false,
             Box::new(field.value.build_read_expr()),
@@ -1263,7 +1289,9 @@ fn lower_regexp(query: &RegexpQuery, scope: &LoweringScope<'_>) -> Result<Expr, 
         return Ok(lowered_predicate);
     }
     match (field.field_type, &field.value) {
-        (_, FieldValue::Encoded(_) | FieldValue::Derived(_)) => Err(report_unlowered_profile_field(&field)),
+        (_, FieldValue::Encoded(_) | FieldValue::Derived(_) | FieldValue::CrossRow(_)) => {
+            Err(report_unlowered_profile_field(&field))
+        }
         (FieldType::Keyword, FieldValue::Column { .. } | FieldValue::MapKey { .. }) => {
             Ok(build_keyword_regex_match_udf(pattern).call(vec![field.value.build_read_expr()]))
         }

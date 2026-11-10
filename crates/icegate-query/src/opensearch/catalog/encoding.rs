@@ -25,6 +25,7 @@ use icegate_common::schema::{
 };
 use serde_json::{Map, Number, Value};
 
+use super::cross_row::{CrossRowField, TraceRoots, render_cross_row_field};
 use super::data_prepper::DURATION_IN_NANOS_FIELD;
 use super::field::{
     FieldType, FieldValue, IndexField, ResolvedField, SelectedField, covers_every_key, glob_matches_some_extension,
@@ -103,7 +104,7 @@ impl AttributeKeys {
 }
 
 /// Nanoseconds per microsecond: `durationInNanos` is `duration_micros` times this.
-const NANOS_PER_MICRO: i64 = 1_000;
+pub(super) const NANOS_PER_MICRO: i64 = 1_000;
 
 /// The smallest `f64` above every `i64`: 2^63. `[-2^63, 2^63)` converts to `i64` exactly when
 /// integral.
@@ -994,7 +995,7 @@ fn report_unexpected_type(expected: &str, actual: &DataType) -> OpenSearchError 
 
 /// The string at `row`, or `None` when it is NULL. Accepts every Arrow string encoding a scan
 /// may yield (`Utf8`, `LargeUtf8`, `Utf8View`).
-fn read_text(array: &ArrayRef, row: usize) -> Result<Option<&str>, OpenSearchError> {
+pub(super) fn read_text(array: &ArrayRef, row: usize) -> Result<Option<&str>, OpenSearchError> {
     if array.is_null(row) {
         return Ok(None);
     }
@@ -1478,6 +1479,8 @@ pub(crate) enum ProfileFieldSource {
     Events,
     /// The span's links.
     Links,
+    /// A value read from the root span of the row's trace.
+    CrossRow(CrossRowField),
 }
 
 /// The fields of one non-native profile index, in `_mapping` order, and how it spells attribute
@@ -1547,7 +1550,8 @@ const fn find_encoded_column(source: ProfileFieldSource) -> Option<&'static str>
         | ProfileFieldSource::Object
         | ProfileFieldSource::Attributes(_)
         | ProfileFieldSource::Events
-        | ProfileFieldSource::Links => None,
+        | ProfileFieldSource::Links
+        | ProfileFieldSource::CrossRow(_) => None,
     }
 }
 
@@ -1584,7 +1588,8 @@ const fn map_column_encoding(source: ProfileFieldSource, column_type: &DataType)
         | ProfileFieldSource::Object
         | ProfileFieldSource::Attributes(_)
         | ProfileFieldSource::Events
-        | ProfileFieldSource::Links => None,
+        | ProfileFieldSource::Links
+        | ProfileFieldSource::CrossRow(_) => None,
     }
 }
 
@@ -1614,7 +1619,8 @@ const fn map_derived_field(name: &'static str, source: ProfileFieldSource) -> Op
         | ProfileFieldSource::Object
         | ProfileFieldSource::Attributes(_)
         | ProfileFieldSource::Events
-        | ProfileFieldSource::Links => None,
+        | ProfileFieldSource::Links
+        | ProfileFieldSource::CrossRow(_) => None,
     }
 }
 
@@ -1661,6 +1667,7 @@ fn resolve_profile_source(schema: &Schema, name: &'static str, source: ProfileFi
         }
         ProfileFieldSource::Events => (FieldType::Object, FieldValue::Encoded(EncodedField::Events)),
         ProfileFieldSource::Links => (FieldType::Object, FieldValue::Encoded(EncodedField::Links)),
+        ProfileFieldSource::CrossRow(field) => (field.field_type(), FieldValue::CrossRow(field)),
         ProfileFieldSource::Alias(_) | ProfileFieldSource::Object | ProfileFieldSource::Attributes(_) => return None,
     };
     Some(ResolvedField {
@@ -1754,7 +1761,8 @@ pub(crate) fn resolve_profile_field(table: &ProfileTable, schema: &Schema, name:
             | ProfileFieldSource::ArrayLength(_)
             | ProfileFieldSource::Object
             | ProfileFieldSource::Events
-            | ProfileFieldSource::Links => None,
+            | ProfileFieldSource::Links
+            | ProfileFieldSource::CrossRow(_) => None,
         }
     })
 }
@@ -1839,7 +1847,8 @@ pub(crate) fn list_profile_fields(
             | ProfileFieldSource::ArrayLength(_)
             | ProfileFieldSource::ExponentialBuckets { .. }
             | ProfileFieldSource::Quantiles
-            | ProfileFieldSource::Exemplars => {
+            | ProfileFieldSource::Exemplars
+            | ProfileFieldSource::CrossRow(_) => {
                 let resolved_field = resolve_declared_field(table, schema, name).ok_or_else(|| {
                     OpenSearchError::internal(format!("the table lacks the column behind profile field [{name}]"))
                 })?;
@@ -1865,7 +1874,7 @@ pub(crate) fn list_profile_fields(
 /// attribute MAP whose every key path it covers, selected whole, as a native MAP column is. A
 /// pattern covering the resource attributes also reaches the columns `table` promotes resource
 /// keys to, as a native index's pattern does. Objects, lists and render-only fields are never
-/// reached.
+/// reached, and neither is a cross-row field, which only a search of its own index reads.
 ///
 /// # Errors
 ///
@@ -1885,7 +1894,8 @@ pub(crate) fn expand_profile_pattern(
             | ProfileFieldSource::Links
             | ProfileFieldSource::ExponentialBuckets { .. }
             | ProfileFieldSource::Quantiles
-            | ProfileFieldSource::Exemplars => {}
+            | ProfileFieldSource::Exemplars
+            | ProfileFieldSource::CrossRow(_) => {}
             ProfileFieldSource::Attributes(column) => {
                 if covers_every_key(pattern, name) {
                     selected_fields.push(SelectedField::AllMapValues {
@@ -1967,15 +1977,27 @@ fn read_batch_column<'b>(batch: &'b RecordBatch, column: &str) -> Result<&'b Arr
         .ok_or_else(|| OpenSearchError::internal(format!("a row lacks the column `{column}`")))
 }
 
-/// The value at `row` of the declared field `name`, which reads `source`; `Value::Null` when
-/// absent, and for an alias, whose target renders instead.
-fn render_source_field(
-    table: &ProfileTable,
-    batch: &RecordBatch,
+/// The row being rendered: the row `row` of `batch`, read under the fields of `table`.
+#[derive(Debug, Clone, Copy)]
+struct ProfileRow<'r> {
+    /// The profile the row is rendered under.
+    table: &'r ProfileTable,
+    /// The batch holding the row.
+    batch: &'r RecordBatch,
+    /// The row's index in `batch`.
     row: usize,
+}
+
+/// The value in `profile_row` of the declared field `name`, which reads `source`; `Value::Null`
+/// when absent, and for an alias, whose target renders instead. A cross-row field reads the root
+/// of the row's trace from `trace_roots`.
+fn render_source_field(
+    profile_row: ProfileRow<'_>,
     name: &'static str,
     source: ProfileFieldSource,
+    trace_roots: &TraceRoots,
 ) -> Result<Value, OpenSearchError> {
+    let ProfileRow { table, batch, row } = profile_row;
     match source {
         ProfileFieldSource::Column(column) | ProfileFieldSource::StoredHexId(column) => {
             render_array_value(read_batch_column(batch, column)?.as_ref(), row)
@@ -2011,6 +2033,7 @@ fn render_source_field(
         }
         ProfileFieldSource::Events => render_events(read_batch_column(batch, COL_EVENTS)?, row, table.attribute_keys),
         ProfileFieldSource::Links => render_links(read_batch_column(batch, COL_LINKS)?, row, table.attribute_keys),
+        ProfileFieldSource::CrossRow(field) => render_cross_row_field(field, batch, row, trace_roots),
         ProfileFieldSource::Alias(_) | ProfileFieldSource::Object => Ok(Value::Null),
     }
 }
@@ -2071,7 +2094,8 @@ fn filter_source_paths(
 }
 
 /// The `_source` of `batch[row]` under `table`: a nested object of the table's fields, absent
-/// fields omitted, under `filter`.
+/// fields omitted, under `filter`. Cross-row fields render from `trace_roots`, absent for a trace
+/// not in it.
 ///
 /// # Errors
 ///
@@ -2082,10 +2106,12 @@ pub(crate) fn render_profile_document(
     batch: &RecordBatch,
     row: usize,
     filter: &SourceFilter,
+    trace_roots: &TraceRoots,
 ) -> Result<Value, OpenSearchError> {
+    let profile_row = ProfileRow { table, batch, row };
     let mut document = Map::new();
     for (name, source) in table.iter_fields() {
-        let value = render_source_field(table, batch, row, name, *source)?;
+        let value = render_source_field(profile_row, name, *source, trace_roots)?;
         if !value.is_null() {
             insert_nested_value(&mut document, name, value);
         }
@@ -2099,7 +2125,8 @@ pub(crate) fn render_profile_document(
 
 /// The value of the field `name` of `table` at `row`, for `fields` and `docvalue_fields`;
 /// `Value::Null` when absent or when `name` is no leaf of the table. An alias renders its
-/// target's value.
+/// target's value. A cross-row field renders `Value::Null`: the search refuses to name one in
+/// `fields` or `docvalue_fields` before any row is read.
 ///
 /// # Errors
 ///
@@ -2112,7 +2139,12 @@ pub(crate) fn render_profile_field(
 ) -> Result<Value, OpenSearchError> {
     if let Some((declared_name, _)) = table.find_field(name) {
         return table.find_read_source(declared_name).map_or(Ok(Value::Null), |source| {
-            render_source_field(table, batch, row, declared_name, source)
+            render_source_field(
+                ProfileRow { table, batch, row },
+                declared_name,
+                source,
+                &TraceRoots::new(),
+            )
         });
     }
     match resolve_profile_field(table, &batch.schema(), name).map(|resolved_field| resolved_field.value) {
@@ -2121,7 +2153,8 @@ pub(crate) fn render_profile_field(
         }
         Some(FieldValue::MapKey { column, key }) => render_map_key(read_batch_column(batch, &column)?, row, &key),
         Some(FieldValue::Column { column }) => render_array_value(read_batch_column(batch, &column)?.as_ref(), row),
-        Some(FieldValue::HexId { .. } | FieldValue::Encoded(_) | FieldValue::Derived(_)) | None => Ok(Value::Null),
+        Some(FieldValue::HexId { .. } | FieldValue::Encoded(_) | FieldValue::Derived(_) | FieldValue::CrossRow(_))
+        | None => Ok(Value::Null),
     }
 }
 
@@ -2998,5 +3031,35 @@ mod tests {
                 json!({"name": "requests", "value": 20.0}),
             ]
         );
+    }
+
+    /// A cross-row field is read from another row, the root span of its trace, which only a
+    /// search of its own index looks up, so no full-text pattern ever selects one.
+    #[test]
+    fn a_field_pattern_never_selects_a_cross_row_field() {
+        for pattern in [
+            "traceGroup*",
+            "traceGroupFields.*",
+            "traceGroupFields.*Time",
+            "trace?roup",
+        ] {
+            assert_eq!(
+                expand_span_pattern(pattern).expect("a selection"),
+                (Vec::new(), Vec::new()),
+                "{pattern}"
+            );
+        }
+        let (every_field_names, _) = expand_span_pattern("*").expect("a selection");
+        for cross_row_name in [
+            "traceGroup",
+            "traceGroupFields.endTime",
+            "traceGroupFields.durationInNanos",
+            "traceGroupFields.statusCode",
+        ] {
+            assert!(
+                !every_field_names.iter().any(|name| name == cross_row_name),
+                "{cross_row_name}"
+            );
+        }
     }
 }

@@ -3,6 +3,7 @@
 //! field list and row set is stated here.
 #![allow(clippy::expect_used)]
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -17,12 +18,13 @@ use icegate_common::schema::{
     QUANTILE_FIELD_QUANTILE, QUANTILE_FIELD_VALUE,
 };
 use icegate_common::{LOGS_TABLE, METRICS_TABLE, SPANS_TABLE};
+use icegate_query::opensearch::OpenSearchConfig;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use super::data::{Cell, Row, RowWriteError, commit_rows};
+use super::data::{Cell, Row, RowWriteError, commit_rows, write_wal_segment};
 use super::harness::TestServer;
-use super::requests::send_request;
+use super::requests::{send_ndjson, send_request};
 
 const TENANT_A: &str = "tenant-a";
 const TENANT_B: &str = "tenant-b";
@@ -2162,5 +2164,621 @@ async fn a_full_text_leaf_matches_nothing_on_a_render_only_field_and_reads_names
             "{query}"
         );
     }
+    server.shutdown().await;
+}
+
+const TRACE_C: [u8; 16] = [0x0d; 16];
+const TRACE_S: [u8; 16] = [0x0e; 16];
+const LATE_CHILD_SPAN: [u8; 8] = [0x05; 8];
+const NEAR_CHILD_SPAN: [u8; 8] = [0x06; 8];
+const EDGE_CHILD_SPAN: [u8; 8] = [0x08; 8];
+const TRACE_C_SPAN: [u8; 8] = [0x07; 8];
+const TRACE_C_SPAN_HEX: &str = "0707070707070707";
+const TRACE_S_HEX: &str = "0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e";
+
+/// The hits' `_source`, keyed by span id.
+fn collect_sources_by_span_id(answer: &Value) -> Result<BTreeMap<String, Value>, Box<dyn Error>> {
+    answer["hits"]["hits"]
+        .as_array()
+        .ok_or_else(|| format!("no hits in {answer}"))?
+        .iter()
+        .map(|hit| {
+            hit["_source"]["spanId"]
+                .as_str()
+                .map(|span_id| (span_id.to_string(), hit["_source"].clone()))
+                .ok_or_else(|| format!("no spanId in {hit}").into())
+        })
+        .collect()
+}
+
+/// The cross-row fields of [`commit_three_spans`], derived by hand: trace A's root ends at
+/// `T0 + 152 175 µs` (`…20.152175Z`), lasts `152 175 000 ns` and has status 2; trace B's lone
+/// span is its own root, ends at `T0 + 2 000 + 500 µs` (`…20.002500Z`), lasts `500 000 ns`, and
+/// its NULL status renders 0. Tenant B's root of trace A, `tenant-b-root`, starts at `T0` like
+/// tenant A's, so a lookup leaking across tenants could name it. Each field filters, sorts and
+/// aggregates, and `fields`/`docvalue_fields` naming one is refused: it renders in `_source` only.
+#[tokio::test]
+async fn trace_group_fields_come_from_the_root_span_of_the_same_trace() {
+    let (server, catalog) = TestServer::start().await;
+    commit_three_spans(&catalog).await.expect("commit spans");
+
+    let answer = fetch_ok_answer(
+        &server,
+        TENANT_A,
+        SPAN_SEARCH_PATH,
+        &json!({"query": {"match_all": {}}}),
+    )
+    .await
+    .expect("every span");
+    let sources = collect_sources_by_span_id(&answer).expect("sources");
+    assert_eq!(sources.len(), 3, "{answer}");
+    let checkout = json!({
+        "endTime": "2025-10-09T08:53:20.152175Z",
+        "durationInNanos": 152_175_000,
+        "statusCode": 2
+    });
+    for span in [ROOT_SPAN_HEX, CHILD_SPAN_HEX] {
+        assert_eq!(sources[span]["traceGroup"], "GET /checkout", "{span}");
+        assert_eq!(sources[span]["traceGroupFields"], checkout, "{span}");
+    }
+    assert_eq!(sources[OTHER_SPAN_HEX]["traceGroup"], "cron");
+    assert_eq!(
+        sources[OTHER_SPAN_HEX]["traceGroupFields"],
+        json!({"endTime": "2025-10-09T08:53:20.002500Z", "durationInNanos": 500_000, "statusCode": 0})
+    );
+
+    assert_eq!(
+        search_span_ids(&server, json!({"term": {"traceGroup": "GET /checkout"}}))
+            .await
+            .expect("by trace group"),
+        [ROOT_SPAN_HEX, CHILD_SPAN_HEX]
+    );
+    assert_eq!(
+        search_span_ids(&server, json!({"term": {"traceGroupFields.statusCode": "2"}}))
+            .await
+            .expect("by root status"),
+        [ROOT_SPAN_HEX, CHILD_SPAN_HEX]
+    );
+    assert_eq!(
+        search_span_ids(
+            &server,
+            json!({"range": {"traceGroupFields.durationInNanos": {"lt": 1_000_000}}})
+        )
+        .await
+        .expect("by root duration"),
+        [OTHER_SPAN_HEX]
+    );
+
+    let sorted_answer = fetch_ok_answer(
+        &server,
+        TENANT_A,
+        SPAN_SEARCH_PATH,
+        &json!({"sort": [{"traceGroupFields.durationInNanos": "asc"}]}),
+    )
+    .await
+    .expect("sorted by root duration");
+    let sorted_span_ids = read_span_ids(&sorted_answer).expect("span ids");
+    assert_eq!(sorted_span_ids.len(), 3, "{sorted_answer}");
+    assert_eq!(sorted_span_ids[0], OTHER_SPAN_HEX, "{sorted_answer}");
+    // Both spans of trace A sort on their root's duration, so they tie; the sort leaves their
+    // relative order open.
+    let mut tied_span_ids = sorted_span_ids[1..].to_vec();
+    tied_span_ids.sort();
+    assert_eq!(tied_span_ids, [ROOT_SPAN_HEX, CHILD_SPAN_HEX], "{sorted_answer}");
+
+    let grouped_answer = fetch_ok_answer(
+        &server,
+        TENANT_A,
+        SPAN_SEARCH_PATH,
+        &json!({"size": 0, "aggs": {"groups": {"terms": {"field": "traceGroup"}}}}),
+    )
+    .await
+    .expect("grouped by trace group");
+    assert_eq!(
+        grouped_answer["aggregations"]["groups"]["buckets"],
+        json!([{"key": "GET /checkout", "doc_count": 2}, {"key": "cron", "doc_count": 1}])
+    );
+
+    let (status, capabilities) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        "/otel-v1-apm-span/_field_caps?fields=traceGroup,traceGroupFields.endTime,traceGroupFields.durationInNanos,\
+         traceGroupFields.statusCode",
+        None,
+    )
+    .await
+    .expect("field caps");
+    assert_eq!(status, StatusCode::OK, "{capabilities}");
+    let fields = &capabilities["fields"];
+    let capability =
+        |field_type: &str| json!({field_type: {"type": field_type, "searchable": true, "aggregatable": true}});
+    assert_eq!(fields["traceGroup"], capability("keyword"));
+    assert_eq!(fields["traceGroupFields.endTime"], capability("date"));
+    assert_eq!(fields["traceGroupFields.durationInNanos"], capability("long"));
+    assert_eq!(fields["traceGroupFields.statusCode"], capability("integer"));
+
+    for (body, field) in [
+        (json!({"fields": ["traceGroup"]}), "traceGroup"),
+        (
+            json!({"docvalue_fields": ["traceGroupFields.endTime"]}),
+            "traceGroupFields.endTime",
+        ),
+    ] {
+        let (status, error) = fetch_search_error(&server, &body).await.expect("search request");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {error}");
+        assert_eq!(error["type"], "illegal_argument_exception", "{body}");
+        assert_eq!(error["field"], field, "{body}: {error}");
+        assert_eq!(error["index"], SPAN_INDEX, "{body}: {error}");
+    }
+    server.shutdown().await;
+}
+
+/// One session answers both items. Their cross-row filters select disjoint traces: trace A's root
+/// is `GET /checkout`, trace B's is `cron`, so a second item reading the first item's roots would
+/// match nothing.
+#[tokio::test]
+async fn msearch_items_on_the_span_index_each_read_their_own_trace_roots() {
+    let (server, catalog) = TestServer::start().await;
+    commit_three_spans(&catalog).await.expect("commit spans");
+    let ndjson = concat!(
+        r#"{"index": "otel-v1-apm-span"}"#,
+        "\n",
+        r#"{"query": {"bool": {"filter": [{"term": {"traceId": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"}}], "must": [{"term": {"traceGroup": "GET /checkout"}}]}}}"#,
+        "\n",
+        r#"{"index": "otel-v1-apm-span"}"#,
+        "\n",
+        r#"{"query": {"bool": {"filter": [{"term": {"traceId": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"}}], "must": [{"term": {"traceGroup": "cron"}}]}}}"#,
+        "\n",
+    );
+
+    let (status, answer) = send_ndjson(&server, TENANT_A, "/_msearch", ndjson.to_string())
+        .await
+        .expect("msearch request");
+
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let items = answer["responses"].as_array().expect("responses");
+    assert_eq!(items.len(), 2, "{answer}");
+    assert_eq!(items[0]["status"], 200, "{answer}");
+    assert_eq!(items[1]["status"], 200, "{answer}");
+    assert_eq!(
+        read_sorted_span_ids(&items[0]).expect("first item"),
+        [ROOT_SPAN_HEX, CHILD_SPAN_HEX]
+    );
+    assert_eq!(read_sorted_span_ids(&items[1]).expect("second item"), [OTHER_SPAN_HEX]);
+    assert_eq!(items[1]["hits"]["hits"][0]["_source"]["traceGroup"], "cron");
+    server.shutdown().await;
+}
+
+/// With a 60 s lookback, a root at `T0` lies outside the window of a span starting at `T0 + 120 s`
+/// (`[T0 + 60 s, T0 + 120 s]`), inside that of a span starting at `T0 + 30 s`, and on the inclusive
+/// start of the window of a span starting at `T0 + 60 s`. Tenant B's root
+/// of the same trace starts at `T0 + 100 s`, inside the late span's window, so a lookup leaking
+/// across tenants would render it there.
+#[tokio::test]
+async fn a_root_outside_the_lookback_renders_the_fields_absent() {
+    let config = OpenSearchConfig {
+        max_trace_lookback_secs: 60,
+        ..OpenSearchConfig::default()
+    };
+    let (server, catalog) = TestServer::start_with_config(config).await;
+    commit_rows(
+        &catalog,
+        SPANS_TABLE,
+        &[
+            build_span_row(
+                TENANT_A,
+                &TRACE_A,
+                &ROOT_SPAN,
+                T0,
+                300_000_000,
+                vec![(COL_NAME, Cell::Text("GET /checkout"))],
+            ),
+            build_span_row(
+                TENANT_A,
+                &TRACE_A,
+                &LATE_CHILD_SPAN,
+                T0 + 120_000_000,
+                1_000,
+                vec![
+                    (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
+                    (COL_NAME, Cell::Text("late")),
+                ],
+            ),
+            build_span_row(
+                TENANT_A,
+                &TRACE_A,
+                &NEAR_CHILD_SPAN,
+                T0 + 30_000_000,
+                1_000,
+                vec![
+                    (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
+                    (COL_NAME, Cell::Text("near")),
+                ],
+            ),
+            build_span_row(
+                TENANT_A,
+                &TRACE_A,
+                &EDGE_CHILD_SPAN,
+                T0 + 60_000_000,
+                1_000,
+                vec![
+                    (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
+                    (COL_NAME, Cell::Text("edge")),
+                ],
+            ),
+            build_span_row(
+                TENANT_B,
+                &TRACE_A,
+                &TENANT_B_SPAN,
+                T0 + 100_000_000,
+                1_000,
+                vec![(COL_NAME, Cell::Text("tenant-b-root"))],
+            ),
+        ],
+    )
+    .await
+    .expect("commit");
+
+    let late_answer = fetch_tenant_a_span(&server, "0505050505050505").await.expect("the late span");
+    let near_answer = fetch_tenant_a_span(&server, "0606060606060606").await.expect("the near span");
+    let edge_answer = fetch_tenant_a_span(&server, "0808080808080808").await.expect("the edge span");
+
+    let late_source = &late_answer["hits"]["hits"][0]["_source"];
+    assert_eq!(late_source["name"], "late");
+    assert!(late_source.get("traceGroup").is_none(), "{late_source}");
+    assert!(late_source.get("traceGroupFields").is_none(), "{late_source}");
+    let near_source = &near_answer["hits"]["hits"][0]["_source"];
+    assert_eq!(near_source["name"], "near");
+    assert_eq!(near_source["traceGroup"], "GET /checkout");
+    let edge_source = &edge_answer["hits"]["hits"][0]["_source"];
+    assert_eq!(edge_source["name"], "edge");
+    assert_eq!(edge_source["traceGroup"], "GET /checkout");
+    server.shutdown().await;
+}
+
+/// The answer of a tenant A search of the span index for the span `span_id`.
+async fn fetch_tenant_a_span(server: &TestServer, span_id: &str) -> Result<Value, Box<dyn Error>> {
+    fetch_ok_answer(
+        server,
+        TENANT_A,
+        SPAN_SEARCH_PATH,
+        &json!({"query": {"term": {"spanId": span_id}}}),
+    )
+    .await
+}
+
+/// [`commit_three_spans`], then tenant A's lone span of trace C (`batch`, at `T0 + 3 000 µs`,
+/// 700 µs) and tenant B's roots of traces B (`tenant-b-cron`, at `T0 + 1 500 µs`, 100 µs) and C
+/// (`tenant-b-batch`, at `T0 + 2 500 µs`, 100 µs). Each of these tenant B roots starts before
+/// tenant A's root of the same trace, so a root lookup leaking across tenants would take it as the
+/// earliest root.
+async fn commit_three_traces(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteError> {
+    commit_three_spans(catalog).await?;
+    commit_rows(
+        catalog,
+        SPANS_TABLE,
+        &[
+            build_span_row(
+                TENANT_A,
+                &TRACE_C,
+                &TRACE_C_SPAN,
+                T0 + 3_000,
+                700,
+                vec![(COL_NAME, Cell::Text("batch"))],
+            ),
+            build_span_row(
+                TENANT_B,
+                &TRACE_B,
+                &TENANT_B_SPAN,
+                T0 + 1_500,
+                100,
+                vec![(COL_NAME, Cell::Text("tenant-b-cron"))],
+            ),
+            build_span_row(
+                TENANT_B,
+                &TRACE_C,
+                &TENANT_B_SPAN,
+                T0 + 2_500,
+                100,
+                vec![(COL_NAME, Cell::Text("tenant-b-batch"))],
+            ),
+        ],
+    )
+    .await
+}
+
+/// Tenant A holds three traces (A, B and C) and the limit is two, so a filter, a sort, an
+/// aggregation or a `top_hits` sort on a cross-row field whose other filters keep every trace is
+/// refused, naming the index and the limit; narrowed to two traces by the other filters, the same
+/// cross-row filter answers.
+#[tokio::test]
+async fn a_filter_or_sort_on_a_cross_row_field_without_a_bounded_outer_query_is_a_400() {
+    let config = OpenSearchConfig {
+        max_cross_row_traces: 2,
+        ..OpenSearchConfig::default()
+    };
+    let (server, catalog) = TestServer::start_with_config(config).await;
+    commit_three_traces(&catalog).await.expect("commit three traces");
+
+    for body in [
+        json!({"query": {"term": {"traceGroup": "GET /checkout"}}}),
+        json!({"sort": [{"traceGroupFields.durationInNanos": "desc"}]}),
+        json!({"size": 0, "aggs": {"groups": {"terms": {"field": "traceGroup"}}}}),
+        json!({"size": 0, "aggs": {"latest": {"top_hits": {"sort": [{"traceGroupFields.endTime": "desc"}]}}}}),
+    ] {
+        let (status, error) = fetch_search_error(&server, &body).await.expect("search request");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {error}");
+        assert_eq!(error["type"], "illegal_argument_exception", "{body}");
+        assert_eq!(error["index"], SPAN_INDEX, "{body}");
+        assert_eq!(error["limit"], 2, "{body}");
+    }
+
+    assert_eq!(
+        search_span_ids(
+            &server,
+            json!({"bool": {
+                "filter": [{"terms": {"traceId": [TRACE_A_HEX, TRACE_B_HEX]}}],
+                "must": [{"term": {"traceGroup": "GET /checkout"}}]
+            }})
+        )
+        .await
+        .expect("two traces"),
+        [ROOT_SPAN_HEX, CHILD_SPAN_HEX]
+    );
+    server.shutdown().await;
+}
+
+/// The limit is two and nothing in the request reads a cross-row field, so no roots are attached
+/// and `_source` looks up the roots of all three traces of tenant A's four spans after paging, in
+/// two chunks. Trace A's root is `GET /checkout`, trace B's `cron` and trace C's `batch`; tenant
+/// B's earlier roots of traces B and C would rename the last two if a lookup leaked across tenants.
+#[tokio::test]
+async fn a_page_with_more_traces_than_max_cross_row_traces_renders_every_trace_group() {
+    let config = OpenSearchConfig {
+        max_cross_row_traces: 2,
+        ..OpenSearchConfig::default()
+    };
+    let (server, catalog) = TestServer::start_with_config(config).await;
+    commit_three_traces(&catalog).await.expect("commit three traces");
+
+    let answer = fetch_ok_answer(
+        &server,
+        TENANT_A,
+        SPAN_SEARCH_PATH,
+        &json!({"query": {"match_all": {}}}),
+    )
+    .await
+    .expect("every span");
+
+    let trace_groups: BTreeMap<String, Value> = collect_sources_by_span_id(&answer)
+        .expect("sources")
+        .into_iter()
+        .map(|(span_id, source)| (span_id, source["traceGroup"].clone()))
+        .collect();
+    assert_eq!(
+        trace_groups,
+        BTreeMap::from([
+            (ROOT_SPAN_HEX.to_string(), json!("GET /checkout")),
+            (CHILD_SPAN_HEX.to_string(), json!("GET /checkout")),
+            (OTHER_SPAN_HEX.to_string(), json!("cron")),
+            (TRACE_C_SPAN_HEX.to_string(), json!("batch")),
+        ]),
+        "{answer}"
+    );
+    server.shutdown().await;
+}
+
+/// The limit is two and a `terms` filter keeps traces A and B only, so a `top_hits` sorted on the
+/// root duration answers. Trace B's root lasts `500 000 ns`, below trace A's `152 175 000 ns`, so
+/// trace B's span ranks first and trace A's two spans follow it. Tenant B's root of trace B
+/// (`tenant-b-cron`, `100 000 ns`) starts earlier than tenant A's, so a lookup leaking across
+/// tenants would change the first hit.
+#[tokio::test]
+async fn a_top_hits_sorted_on_a_cross_row_field_under_a_bounded_query_ranks_by_the_root() {
+    let config = OpenSearchConfig {
+        max_cross_row_traces: 2,
+        ..OpenSearchConfig::default()
+    };
+    let (server, catalog) = TestServer::start_with_config(config).await;
+    commit_three_traces(&catalog).await.expect("commit three traces");
+
+    let answer = fetch_ok_answer(
+        &server,
+        TENANT_A,
+        SPAN_SEARCH_PATH,
+        &json!({
+            "size": 0,
+            "query": {"bool": {"filter": [{"terms": {"traceId": [TRACE_A_HEX, TRACE_B_HEX]}}]}},
+            "aggs": {"fastest": {"top_hits": {"sort": [{"traceGroupFields.durationInNanos": "asc"}]}}}
+        }),
+    )
+    .await
+    .expect("top hits over two traces");
+
+    let ranked_hits: Vec<Value> = answer["aggregations"]["fastest"]["hits"]["hits"]
+        .as_array()
+        .expect("top hits")
+        .iter()
+        .map(|hit| {
+            json!({
+                "spanId": hit["_source"]["spanId"],
+                "traceGroup": hit["_source"]["traceGroup"],
+                "sort": hit["sort"]
+            })
+        })
+        .collect();
+    assert_eq!(ranked_hits.len(), 3, "{answer}");
+    assert_eq!(
+        ranked_hits[0],
+        json!({"spanId": OTHER_SPAN_HEX, "traceGroup": "cron", "sort": [500_000]}),
+        "{answer}"
+    );
+    // Both spans of trace A sort on their root's duration, so they tie; the sort leaves their
+    // relative order open.
+    let mut tied_hits = ranked_hits[1..].to_vec();
+    tied_hits.sort_by(|left, right| left["spanId"].as_str().cmp(&right["spanId"].as_str()));
+    assert_eq!(
+        tied_hits,
+        [
+            json!({"spanId": ROOT_SPAN_HEX, "traceGroup": "GET /checkout", "sort": [152_175_000]}),
+            json!({"spanId": CHILD_SPAN_HEX, "traceGroup": "GET /checkout", "sort": [152_175_000]}),
+        ],
+        "{answer}"
+    );
+    server.shutdown().await;
+}
+
+/// With `max_cross_row_traces` at two, a `terms` on the trace id of size two answers the two
+/// traces of tenant A as hex keys, most spans first (tenant B's root of trace A, leaking, would
+/// count three), and size three is refused naming the aggregation and the limit.
+#[tokio::test]
+async fn terms_on_the_trace_id_at_max_cross_row_traces_is_accepted_and_one_more_is_a_400() {
+    let config = OpenSearchConfig {
+        max_cross_row_traces: 2,
+        ..OpenSearchConfig::default()
+    };
+    let (server, catalog) = TestServer::start_with_config(config).await;
+    commit_three_spans(&catalog).await.expect("commit spans");
+    let build_terms_body =
+        |size: u64| json!({"size": 0, "aggs": {"traces": {"terms": {"field": "traceId", "size": size}}}});
+
+    let answer = fetch_ok_answer(&server, TENANT_A, SPAN_SEARCH_PATH, &build_terms_body(2))
+        .await
+        .expect("size at the limit");
+    let (status, error) = fetch_search_error(&server, &build_terms_body(3)).await.expect("search request");
+
+    assert_eq!(
+        answer["aggregations"]["traces"]["buckets"],
+        json!([{"key": TRACE_A_HEX, "doc_count": 2}, {"key": TRACE_B_HEX, "doc_count": 1}])
+    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["type"], "illegal_argument_exception");
+    assert_eq!(error["aggregation"], "traces");
+    assert_eq!(error["limit"], 2);
+    server.shutdown().await;
+}
+
+/// Trace S: tenant A has child spans only; tenant B has the roots. The rows of both tenants share
+/// one Parquet commit and one WAL segment. Tenant B's earliest root of S is `tenant-b-root` (`T0`,
+/// before its WAL root at `T0 + 500 µs`), and tenant A has none, so no span of tenant A renders a
+/// trace group and no cross-row filter of tenant A matches.
+#[tokio::test]
+async fn trace_group_fields_never_read_another_tenants_root_span_sharing_the_trace_id() {
+    let (server, catalog) = TestServer::start().await;
+    commit_rows(
+        &catalog,
+        SPANS_TABLE,
+        &[
+            build_span_row(
+                TENANT_A,
+                &TRACE_S,
+                &CHILD_SPAN,
+                T0 + 1_000,
+                1_000,
+                vec![
+                    (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
+                    (COL_NAME, Cell::Text("tenant-a-child")),
+                ],
+            ),
+            build_span_row(
+                TENANT_B,
+                &TRACE_S,
+                &ROOT_SPAN,
+                T0,
+                9_000,
+                vec![(COL_NAME, Cell::Text("tenant-b-root")), (COL_STATUS_CODE, Cell::Int(2))],
+            ),
+        ],
+    )
+    .await
+    .expect("commit");
+    write_wal_segment(
+        &server.wal_store,
+        &catalog,
+        SPANS_TABLE,
+        1,
+        &[
+            build_span_row(
+                TENANT_A,
+                &TRACE_S,
+                &OTHER_SPAN,
+                T0 + 2_000,
+                1_000,
+                vec![
+                    (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
+                    (COL_NAME, Cell::Text("tenant-a-wal-child")),
+                ],
+            ),
+            build_span_row(
+                TENANT_B,
+                &TRACE_S,
+                &TENANT_B_SPAN,
+                T0 + 500,
+                9_000,
+                vec![(COL_NAME, Cell::Text("tenant-b-wal-root"))],
+            ),
+        ],
+    )
+    .await
+    .expect("WAL segment");
+
+    let answer = fetch_ok_answer(
+        &server,
+        TENANT_A,
+        SPAN_SEARCH_PATH,
+        &json!({"query": {"term": {"traceId": TRACE_S_HEX}}}),
+    )
+    .await
+    .expect("trace S");
+    let sources = collect_sources_by_span_id(&answer).expect("sources");
+    assert_eq!(
+        sources.keys().map(String::as_str).collect::<Vec<_>>(),
+        [CHILD_SPAN_HEX, OTHER_SPAN_HEX],
+        "tenant A sees its two spans only: {answer}"
+    );
+    for source in sources.values() {
+        assert!(source.get("traceGroup").is_none(), "{source}");
+        assert!(source.get("traceGroupFields").is_none(), "{source}");
+    }
+
+    for query in [
+        json!({"bool": {"filter": [{"term": {"traceId": TRACE_S_HEX}}], "must": [{"term": {"traceGroup": "tenant-b-root"}}]}}),
+        json!({"bool": {"filter": [{"term": {"traceId": TRACE_S_HEX}}], "must": [{"term": {"traceGroupFields.statusCode": 2}}]}}),
+        json!({"bool": {"filter": [{"term": {"traceId": TRACE_S_HEX}}], "must": [{"exists": {"field": "traceGroup"}}]}}),
+    ] {
+        let filtered_answer = fetch_ok_answer(&server, TENANT_A, SPAN_SEARCH_PATH, &json!({"query": query}))
+            .await
+            .expect("a cross-row filter");
+        assert_eq!(
+            filtered_answer["hits"]["total"]["value"], 0,
+            "{query}: {filtered_answer}"
+        );
+    }
+
+    let grouped_answer = fetch_ok_answer(
+        &server,
+        TENANT_A,
+        SPAN_SEARCH_PATH,
+        &json!({"size": 0, "aggs": {"groups": {"terms": {"field": "traceGroup"}}}}),
+    )
+    .await
+    .expect("grouped by trace group");
+    assert_eq!(grouped_answer["aggregations"]["groups"]["buckets"], json!([]));
+
+    let tenant_b_answer = fetch_ok_answer(
+        &server,
+        TENANT_B,
+        SPAN_SEARCH_PATH,
+        &json!({"query": {"term": {"spanId": "0404040404040404"}}}),
+    )
+    .await
+    .expect("tenant B's WAL root");
+    assert_eq!(
+        tenant_b_answer["hits"]["hits"][0]["_source"]["traceGroup"],
+        "tenant-b-root"
+    );
     server.shutdown().await;
 }

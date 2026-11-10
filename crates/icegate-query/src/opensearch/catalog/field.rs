@@ -8,7 +8,7 @@ use datafusion::prelude::ident;
 use icegate_common::schema::{COL_RESOURCE_ATTRIBUTES, promoted_resource_keys};
 
 use super::encoding::{DerivedField, EncodedField, expand_profile_pattern};
-use super::{IndexEntry, TenantSession, find_profile_table};
+use super::{CrossRowField, IndexEntry, TenantSession, find_profile_table};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::glob::matches_glob;
 
@@ -127,6 +127,9 @@ pub(crate) enum FieldValue {
     Encoded(EncodedField),
     /// A per-row expression over stored columns.
     Derived(DerivedField),
+    /// A value every span of a trace takes from the trace's root span. A session that attached
+    /// the roots of the index resolves the same name to the joined root column instead.
+    CrossRow(CrossRowField),
 }
 
 impl FieldValue {
@@ -141,6 +144,7 @@ impl FieldValue {
             Self::MapKey { column, key } => get_field(ident(column), key.as_str()),
             Self::Encoded(encoded_field) => encoded_field.build_read_expr(),
             Self::Derived(derived_field) => derived_field.build_read_expr(),
+            Self::CrossRow(field) => field.build_null_literal(),
         }
     }
 }

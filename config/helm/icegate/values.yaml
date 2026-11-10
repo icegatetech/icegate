@@ -284,6 +284,10 @@ query:
     maxQueryMemoryBytes: 1073741824
     # -- How far back, in seconds, field discovery (_field_caps, _mapping) looks for attribute-map keys.
     fieldDiscoveryWindowSecs: 86400
+    # -- How far, in seconds, before the earliest start of the spans it decorates the root span of a trace is looked for (traceGroup and traceGroupFields of otel-v1-apm-span). A root that started earlier renders those fields absent.
+    maxTraceLookbackSecs: 3600
+    # -- The most traces whose root spans one search reads for a filter, sort or aggregation on traceGroup or traceGroupFields, and the largest terms size on traceId of otel-v1-apm-span. Above it the search answers 400.
+    maxCrossRowTraces: 1000
     ## Per-tenant store of the dot-prefixed system indices (saved objects).
     systemIndices:
       # -- s3:// or s3a:// URL the store writes under. Empty resolves to the default prefix under the storage bucket (SystemIndicesConfig::DEFAULT_LOCATION_PREFIX in crates/icegate-query/src/opensearch/config.rs). It must not overlap a table location or the WAL base path; the listener refuses to start otherwise.

@@ -125,6 +125,9 @@ impl From<OpenSearchError> for PplError {
             | OpenSearchErrorKind::SearchContextMissing
             | OpenSearchErrorKind::ResultWindowTooLarge
             | OpenSearchErrorKind::TooManyBuckets
+            // No PPL source reaches a cross-row field (a PPL source on a non-native profile is
+            // refused), so a PPL query never raises it.
+            | OpenSearchErrorKind::TooManyCrossRowTraces
             | OpenSearchErrorKind::StatusNotFound => Self::Internal {
                 reason: error.reason().to_string(),
             },
@@ -233,6 +236,12 @@ mod tests {
     #[test]
     fn a_status_not_found_error_becomes_a_ppl_internal_error() {
         let error = PplError::from(OpenSearchError::status_not_found("no ML config [abc]"));
+        assert!(matches!(error, PplError::Internal { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn a_too_many_cross_row_traces_error_becomes_a_ppl_internal_error() {
+        let error = PplError::from(OpenSearchError::too_many_cross_row_traces("otel-v1-apm-span", 2));
         assert!(matches!(error, PplError::Internal { .. }), "{error:?}");
     }
 }

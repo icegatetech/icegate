@@ -136,6 +136,8 @@
             "maxRequestBodyBytes": { "type": "integer", "minimum": 1, "description": "Largest request body accepted, in bytes." },
             "maxQueryMemoryBytes": { "type": "integer", "minimum": 1, "description": "Bytes of memory one OpenSearch query may hold; a query needing more answers 400." },
             "fieldDiscoveryWindowSecs": { "type": "integer", "minimum": 1, "description": "Field-discovery window, in seconds." },
+            "maxTraceLookbackSecs": { "type": "integer", "minimum": 1, "description": "Root-span lookback of the cross-row trace fields, in seconds." },
+            "maxCrossRowTraces": { "type": "integer", "minimum": 1, "description": "Most traces one search reads the root spans of." },
             "systemIndices": {
               "type": ["object", "null"],
               "additionalProperties": false,

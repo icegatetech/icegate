@@ -14,7 +14,7 @@ use serde_json::{Map, Number, Value, json};
 
 use super::doc_id::MICROS_PER_DAY;
 use super::request::{SearchRequest, SortClause, SourceFilter, TrackTotalHits};
-use crate::opensearch::catalog::{ProfileTable, render_profile_document};
+use crate::opensearch::catalog::{ProfileTable, TraceRoots, render_profile_document};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::glob::matches_glob;
 
@@ -38,15 +38,19 @@ pub(crate) struct SearchHit<'a> {
 }
 
 /// The `_source` of `hit` under `filter`: the stored columns for a native index, the profile's
-/// nested document otherwise.
+/// nested document otherwise, whose cross-row fields render from `trace_roots`.
 ///
 /// # Errors
 ///
 /// The renderer's errors (see [`render_source`] and `render_profile_document`).
-pub(crate) fn render_profile_source(hit: &SearchHit<'_>, filter: &SourceFilter) -> Result<Value, OpenSearchError> {
+pub(crate) fn render_profile_source(
+    hit: &SearchHit<'_>,
+    filter: &SourceFilter,
+    trace_roots: &TraceRoots,
+) -> Result<Value, OpenSearchError> {
     hit.profile_table.map_or_else(
         || render_source(hit.batch, hit.row, filter),
-        |table| render_profile_document(table, hit.batch, hit.row, filter),
+        |table| render_profile_document(table, hit.batch, hit.row, filter, trace_roots),
     )
 }
 
@@ -57,7 +61,8 @@ pub(crate) fn render_profile_source(hit: &SearchHit<'_>, filter: &SourceFilter) 
 /// untracked and the request does not ask for an integer total. Every hit scores `1.0` and
 /// `max_score` is `1.0` when the request sorts on `_score` alone or not at all; with any other
 /// sort clause both are `null`. `max_score` is `null` when no hit is returned. `hits.hits` is an
-/// array even for `size: 0`.
+/// array even for `size: 0`. `trace_roots` holds the root spans of the hits' traces, which the
+/// `traceGroup*` fields of a Data Prepper hit render from.
 ///
 /// # Errors
 ///
@@ -67,8 +72,9 @@ pub(crate) fn render_search_response(
     total: TotalHits,
     hits: &[SearchHit<'_>],
     request: &SearchRequest,
+    trace_roots: &TraceRoots,
 ) -> Result<Value, OpenSearchError> {
-    let rendered_hits = render_hits(hits, request)?;
+    let rendered_hits = render_hits(hits, request, trace_roots)?;
     let max_score = if rendered_hits.is_empty() {
         Value::Null
     } else {
@@ -97,14 +103,20 @@ pub(crate) fn render_search_response(
     Ok(Value::Object(response))
 }
 
-/// `hits` rendered in their order, each scored by [`choose_hit_score`].
+/// `hits` rendered in their order, each scored by [`choose_hit_score`]. `trace_roots` holds the
+/// root spans of the hits' traces, which the `traceGroup*` fields of a Data Prepper hit render
+/// from.
 ///
 /// # Errors
 ///
 /// Returns `500` when a row holds a value no JSON rendering exists for.
-pub(super) fn render_hits(hits: &[SearchHit<'_>], request: &SearchRequest) -> Result<Vec<Value>, OpenSearchError> {
+pub(super) fn render_hits(
+    hits: &[SearchHit<'_>],
+    request: &SearchRequest,
+    trace_roots: &TraceRoots,
+) -> Result<Vec<Value>, OpenSearchError> {
     let score = choose_hit_score(request);
-    hits.iter().map(|hit| render_hit(hit, &score, request)).collect()
+    hits.iter().map(|hit| render_hit(hit, &score, request, trace_roots)).collect()
 }
 
 /// The `_score` of every hit of `request`, which is also the `max_score` of a page that has a
@@ -118,7 +130,12 @@ pub(super) fn choose_hit_score(request: &SearchRequest) -> Value {
 /// One hit object: `_index`, `_id`, `_version` (with `version`), `_score` (`score`), `_source`
 /// under the request's filter (no key for `_source: false`), `fields` when any value was
 /// found, and `sort` when the request sorts.
-fn render_hit(hit: &SearchHit<'_>, score: &Value, request: &SearchRequest) -> Result<Value, OpenSearchError> {
+fn render_hit(
+    hit: &SearchHit<'_>,
+    score: &Value,
+    request: &SearchRequest,
+    trace_roots: &TraceRoots,
+) -> Result<Value, OpenSearchError> {
     let mut object = Map::new();
     object.insert("_index".to_string(), json!(hit.index));
     object.insert("_id".to_string(), json!(hit.document_id));
@@ -127,7 +144,10 @@ fn render_hit(hit: &SearchHit<'_>, score: &Value, request: &SearchRequest) -> Re
     }
     object.insert("_score".to_string(), score.clone());
     if !matches!(request.source, SourceFilter::Nothing) {
-        object.insert("_source".to_string(), render_profile_source(hit, &request.source)?);
+        object.insert(
+            "_source".to_string(),
+            render_profile_source(hit, &request.source, trace_roots)?,
+        );
     }
     if let Some(field_values) = hit.field_values.as_ref().filter(|values| !values.is_empty()) {
         object.insert("fields".to_string(), Value::Object(field_values.clone()));

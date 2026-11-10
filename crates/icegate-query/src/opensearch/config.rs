@@ -22,6 +22,10 @@ const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_MAX_QUERY_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 /// Default field-discovery window, in seconds.
 const DEFAULT_FIELD_DISCOVERY_WINDOW_SECS: u64 = 24 * 60 * 60;
+/// Default `max_trace_lookback_secs`.
+const DEFAULT_MAX_TRACE_LOOKBACK_SECS: u64 = 3_600;
+/// Default `max_cross_row_traces`.
+const DEFAULT_MAX_CROSS_ROW_TRACES: usize = 1_000;
 /// The only major version IceGate emulates.
 const EMULATED_MAJOR_VERSION: u32 = 3;
 /// Default longest scroll a system-index search may open, in seconds.
@@ -70,6 +74,16 @@ pub struct OpenSearchConfig {
     /// attribute-map keys. A key seen only before the window, or only in the WAL, is not listed;
     /// a path naming it still resolves.
     pub field_discovery_window_secs: u64,
+    /// How far, in seconds, before the earliest start of the spans it decorates the root span
+    /// of a trace is looked for (`traceGroup` and `traceGroupFields` of `otel-v1-apm-span`). A
+    /// root that started earlier renders those fields absent. Validated non-zero while the
+    /// listener is enabled.
+    pub max_trace_lookback_secs: u64,
+    /// The most traces whose root spans one search reads for a filter, sort or aggregation on
+    /// `traceGroup` or `traceGroupFields`, and the largest `terms` size on `traceId` of
+    /// `otel-v1-apm-span`. Above it the search is a 400: IceGate never truncates the set.
+    /// Validated non-zero while the listener is enabled.
+    pub max_cross_row_traces: usize,
     /// The per-tenant store of dot-prefixed system indices.
     pub system_indices: SystemIndicesConfig,
     /// Search limits (`search.max_result_window`, `search.max_buckets`).
@@ -85,7 +99,8 @@ impl OpenSearchConfig {
     /// # Errors
     ///
     /// Returns [`QueryError::Config`] for a blank host or cluster name, a zero
-    /// `max_request_body_bytes`, `max_query_memory_bytes` or `field_discovery_window_secs`, or
+    /// `max_request_body_bytes`, `max_query_memory_bytes`, `field_discovery_window_secs`,
+    /// `max_trace_lookback_secs` or `max_cross_row_traces`, or
     /// a [`version`](Self::version) outside its documented form, and every error of
     /// [`SearchLimitsConfig::validate`], [`PplLimitsConfig::validate`] and
     /// [`SystemIndicesConfig::validate`].
@@ -114,6 +129,16 @@ impl OpenSearchConfig {
                 "OpenSearch field_discovery_window_secs must be greater than zero".into(),
             ));
         }
+        if self.max_trace_lookback_secs == 0 {
+            return Err(QueryError::Config(
+                "OpenSearch max_trace_lookback_secs must be greater than zero".into(),
+            ));
+        }
+        if self.max_cross_row_traces == 0 {
+            return Err(QueryError::Config(
+                "OpenSearch max_cross_row_traces must be greater than zero".into(),
+            ));
+        }
         EmulatedVersion::parse(&self.version)?;
         self.search.validate()?;
         self.ppl.validate()?;
@@ -132,6 +157,8 @@ impl Default for OpenSearchConfig {
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             max_query_memory_bytes: DEFAULT_MAX_QUERY_MEMORY_BYTES,
             field_discovery_window_secs: DEFAULT_FIELD_DISCOVERY_WINDOW_SECS,
+            max_trace_lookback_secs: DEFAULT_MAX_TRACE_LOOKBACK_SECS,
+            max_cross_row_traces: DEFAULT_MAX_CROSS_ROW_TRACES,
             system_indices: SystemIndicesConfig::default(),
             search: SearchLimitsConfig::default(),
             ppl: PplLimitsConfig::default(),
@@ -514,6 +541,8 @@ mod tests {
             "max_request_body_bytes": 1_048_577,
             "max_query_memory_bytes": 1_073_741_825,
             "field_discovery_window_secs": 3601,
+            "max_trace_lookback_secs": 3601,
+            "max_cross_row_traces": 1001,
             "system_indices": {
                 "location": "s3://saved-objects/tenants",
                 "max_scroll_lifetime_secs": 901,
@@ -539,6 +568,8 @@ mod tests {
         assert_eq!(config.max_request_body_bytes, 1_048_577);
         assert_eq!(config.max_query_memory_bytes, 1_073_741_825);
         assert_eq!(config.field_discovery_window_secs, 3601);
+        assert_eq!(config.max_trace_lookback_secs, 3601);
+        assert_eq!(config.max_cross_row_traces, 1001);
         assert_eq!(
             config.system_indices.location.as_deref(),
             Some("s3://saved-objects/tenants")
@@ -796,5 +827,37 @@ mod tests {
         let null_limit_config: OpenSearchConfig =
             serde_json::from_value(json!({"ppl": {"max_result_rows": null}})).expect("null limit");
         assert_eq!(null_limit_config.ppl.max_result_rows, None);
+    }
+
+    #[test]
+    fn cross_row_limits_default_to_an_hour_and_a_thousand_traces_and_refuse_zero() {
+        let defaults = OpenSearchConfig::default();
+        assert_eq!(defaults.max_trace_lookback_secs, 3_600);
+        assert_eq!(defaults.max_cross_row_traces, 1_000);
+
+        let enabled = build_enabled_config();
+        assert!(enabled.validate().is_ok());
+        let no_lookback = OpenSearchConfig {
+            max_trace_lookback_secs: 0,
+            ..enabled.clone()
+        };
+        let error = no_lookback.validate().expect_err("a zero lookback is refused");
+        assert!(matches!(error, QueryError::Config(_)), "{error:?}");
+        let no_traces = OpenSearchConfig {
+            max_cross_row_traces: 0,
+            ..enabled
+        };
+        let error = no_traces.validate().expect_err("a zero trace bound is refused");
+        assert!(matches!(error, QueryError::Config(_)), "{error:?}");
+        assert!(
+            OpenSearchConfig {
+                max_trace_lookback_secs: 0,
+                max_cross_row_traces: 0,
+                ..OpenSearchConfig::default()
+            }
+            .validate()
+            .is_ok(),
+            "nothing is checked while disabled"
+        );
     }
 }
