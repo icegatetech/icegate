@@ -389,36 +389,65 @@ pub(crate) struct CandidateTraces {
     pub(crate) window_end_micros: i64,
 }
 
+/// Which candidate traces a cross-row read looks up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TraceSelection {
+    /// Every trace the outer predicate selects; more than `max_cross_row_traces` is a 400.
+    Bounded,
+    /// The first `size` trace ids in key order (byte order, which is hex order), reversed when
+    /// `is_descending`: exactly the buckets of a `terms` on the trace id ordered by key.
+    FirstByKey {
+        /// How many traces.
+        size: usize,
+        /// Whether the key order is descending.
+        is_descending: bool,
+    },
+}
+
 /// The distinct traces of the rows of `entry` that `outer` selects, with their start window.
+///
+/// Under [`TraceSelection::FirstByKey`] the first `size` traces in key order are selected and no
+/// bound applies; `size` is at most `max_cross_row_traces`, as the search checks for a `terms` on
+/// `traceId`.
 ///
 /// # Errors
 ///
-/// Returns `too_many_cross_row_traces` when more than `max_cross_row_traces` traces are
-/// selected, and the scan's errors.
+/// Returns `too_many_cross_row_traces` when [`TraceSelection::Bounded`] selects more than
+/// `max_cross_row_traces` traces, and the scan's errors.
 pub(crate) async fn select_candidate_traces(
     session: &TenantSession,
     entry: &IndexEntry,
     outer: Expr,
+    selection: TraceSelection,
 ) -> Result<CandidateTraces, OpenSearchError> {
     let limit = session.settings().max_cross_row_traces;
-    let plan = session
-        .scan_raw(entry)?
-        .filter(outer)
-        .and_then(|builder| {
-            builder.aggregate(
-                vec![ident(COL_TRACE_ID)],
-                vec![
-                    min(ident(COL_TIMESTAMP)).alias(START_MIN),
-                    max(ident(COL_TIMESTAMP)).alias(START_MAX),
-                ],
-            )
-        })
+    let grouped = session.scan_raw(entry)?.filter(outer).and_then(|builder| {
+        builder.aggregate(
+            vec![ident(COL_TRACE_ID)],
+            vec![
+                min(ident(COL_TIMESTAMP)).alias(START_MIN),
+                max(ident(COL_TIMESTAMP)).alias(START_MAX),
+            ],
+        )
+    });
+    let (planned, row_bound) = match selection {
         // One trace past the limit is enough to refuse, so no more are read.
-        .and_then(|builder| builder.limit(0, Some(limit.saturating_add(1))))
+        TraceSelection::Bounded => (
+            grouped.and_then(|builder| builder.limit(0, Some(limit.saturating_add(1)))),
+            limit,
+        ),
+        TraceSelection::FirstByKey { size, is_descending } => (
+            grouped
+                .and_then(|builder| builder.sort(vec![ident(COL_TRACE_ID).sort(!is_descending, false)]))
+                .and_then(|builder| builder.limit(0, Some(size))),
+            size,
+        ),
+    };
+    let plan = planned
         .and_then(LogicalPlanBuilder::build)
         .map_err(|error| OpenSearchError::from(QueryError::from(error)))?;
     let batches = session.collect(plan).await?;
-    collect_candidate_traces(&batches, limit)?
+    collect_candidate_traces(&batches, row_bound)?
         .ok_or_else(|| OpenSearchError::too_many_cross_row_traces(entry.name(), limit))
 }
 

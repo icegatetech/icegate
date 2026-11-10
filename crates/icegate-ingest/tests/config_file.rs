@@ -316,7 +316,7 @@ fn assert_datasource_reads_tenant(datasource: &Datasource, written_tenant: &str)
 /// The rule asserted here is "every datasource addressing the stand's query
 /// service sends the tenant header, carrying the tenant this stand writes to".
 /// It covers every port of that service the datasources address: Loki, Tempo,
-/// and the two `OpenSearch` datasources on `STAND_OPENSEARCH_URL`, which the test
+/// and the three `OpenSearch` datasources on `STAND_OPENSEARCH_URL`, which the test
 /// counts so that losing one fails here. `Prometheus` and `Jaeger` address
 /// services of their own and are not in scope.
 #[test]
@@ -336,8 +336,8 @@ fn every_stand_datasource_reads_the_tenant_the_stand_writes() {
         .filter(|datasource| datasource.url.as_deref() == Some(STAND_OPENSEARCH_URL))
         .count();
     assert_eq!(
-        opensearch_reader_count, 2,
-        "the stand provisions the logs and the metrics-exploration OpenSearch datasource"
+        opensearch_reader_count, 3,
+        "the stand provisions the logs, the metrics-exploration and the traces OpenSearch datasource"
     );
     for datasource in &icegate_readers {
         assert_datasource_reads_tenant(datasource, written_tenant);

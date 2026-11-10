@@ -36,8 +36,8 @@ use icegate_common::schema::{COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID};
 use serde_json::{Map, Value, json};
 
 use super::aggs::{
-    AggregationKind, AggregationScope, AggregationTree, NamedAggregation, execute_aggregations, parse_aggregations,
-    plan_aggregation_rows,
+    AggregationKind, AggregationScope, AggregationTree, NamedAggregation, TermsOrder, TermsSpec, execute_aggregations,
+    parse_aggregations, plan_aggregation_rows,
 };
 use super::doc_id::{
     CanonicalEncoder, DOC_HASH_BITS, DOC_HASH_MASK, MICROS_PER_DAY, decode_time_and_doc, document_row_hash_udf,
@@ -53,13 +53,15 @@ use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::error::QueryError;
 use crate::opensearch::SearchLimitsConfig;
 use crate::opensearch::catalog::{
-    CrossRowField, EncodedField, FieldType, FieldValue, IndexEntry, Profile, ProfileTable, ResolvedField,
-    TRACE_ID_FIELD, TenantSession, TraceRoots, find_profile_table, lookup_page_trace_roots, lookup_trace_roots,
-    native_column_type, render_derived_value, render_profile_field, select_candidate_traces,
+    CrossRowField, DATA_PREPPER_SPAN_INDEX, EncodedField, FieldType, FieldValue, IndexEntry, Profile, ProfileTable,
+    ResolvedField, TRACE_ID_FIELD, TenantSession, TraceRoots, TraceSelection, find_profile_table,
+    lookup_page_trace_roots, lookup_trace_roots, native_column_type, render_derived_value, render_profile_field,
+    select_candidate_traces,
 };
 use crate::opensearch::context::RequestContext;
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::glob::matches_glob;
+use crate::opensearch::script::MetricScript;
 use crate::opensearch::system_index::run_blocking_work;
 use crate::query_dsl::ast::Query;
 use crate::query_dsl::literal::parse_java_double;
@@ -260,18 +262,106 @@ fn check_trace_id_terms(aggregations: &[NamedAggregation], max: usize) -> Result
     Ok(())
 }
 
+/// The key-ordered selection of a trace list: the search's only aggregation is a `terms` on
+/// `traceId` ordered by `_key` that answers every key it counts (no `include`, `exclude` or
+/// `missing`, `min_doc_count` at most 1, which counts every key). Its buckets are then exactly
+/// the first `size` trace ids in key order, so only those traces' roots are needed.
+fn find_trace_list_selection(tree: Option<&AggregationTree>) -> Option<TraceSelection> {
+    let [aggregation] = tree?.aggregations.as_slice() else {
+        return None;
+    };
+    let AggregationKind::Terms(spec) = &aggregation.kind else {
+        return None;
+    };
+    // No `..`: a field added to `TermsSpec` stops this compiling until someone decides whether it
+    // keeps the buckets equal to the first keys.
+    let TermsSpec {
+        field,
+        size,
+        order,
+        include,
+        exclude,
+        missing,
+        min_doc_count,
+    } = spec;
+    let [TermsOrder::Key(key_order)] = order.as_slice() else {
+        return None;
+    };
+    let is_plain =
+        field == TRACE_ID_FIELD && include.is_none() && exclude.is_none() && missing.is_none() && *min_doc_count <= 1;
+    is_plain.then_some(TraceSelection::FirstByKey {
+        size: *size,
+        is_descending: matches!(key_order, SortOrder::Desc),
+    })
+}
+
+/// Whether no clause of `sort` names a cross-row field (a field read from the trace's root).
+fn is_sort_free_of_cross_row(sort: &[SortClause]) -> bool {
+    !sort
+        .iter()
+        .any(|clause| matches!(clause, SortClause::Field { field, .. } if CrossRowField::find_by_name(field).is_some()))
+}
+
+/// The name of the first aggregation of `aggregations`, parents before their children, whose
+/// metric runs the trace-list latency script.
+fn find_trace_list_latency(aggregations: &[NamedAggregation]) -> Option<&str> {
+    aggregations.iter().find_map(|aggregation| {
+        let script = match &aggregation.kind {
+            AggregationKind::Avg(spec)
+            | AggregationKind::Sum(spec)
+            | AggregationKind::Min(spec)
+            | AggregationKind::Max(spec) => spec.value_script.as_ref(),
+            AggregationKind::ExtendedStats(spec) => spec.metric.value_script.as_ref(),
+            AggregationKind::Percentiles(spec) => spec.metric.value_script.as_ref(),
+            // No other kind takes a value script.
+            AggregationKind::DateHistogram(_)
+            | AggregationKind::Terms(_)
+            | AggregationKind::Histogram(_)
+            | AggregationKind::ValueCount(_)
+            | AggregationKind::Stats(_)
+            | AggregationKind::Cardinality(_)
+            | AggregationKind::PercentileRanks(_)
+            | AggregationKind::Range(_)
+            | AggregationKind::DateRange(_)
+            | AggregationKind::Filter(_)
+            | AggregationKind::Filters(_)
+            | AggregationKind::TopHits(_)
+            | AggregationKind::CumulativeSum(_)
+            | AggregationKind::Derivative(_)
+            | AggregationKind::SerialDiff(_)
+            | AggregationKind::MovingFn(_)
+            | AggregationKind::MovingAvg(_)
+            | AggregationKind::BucketScript(_)
+            | AggregationKind::AvgBucket(_)
+            | AggregationKind::SumBucket(_)
+            | AggregationKind::MinBucket(_)
+            | AggregationKind::MaxBucket(_) => None,
+        };
+        if matches!(script, Some(MetricScript::TraceListLatency)) {
+            Some(aggregation.name.as_str())
+        } else {
+            find_trace_list_latency(&aggregation.children)
+        }
+    })
+}
+
 /// Attach to each Data Prepper index of the search the trace roots its cross-row reads need.
 ///
 /// Roots an earlier search on the same session attached (an earlier `_msearch` item) are
 /// detached first, so the probe sees this search's own reads. Only when the probe finds a
-/// cross-row read are the candidate traces selected (at most `max_cross_row_traces`) and their
-/// roots looked up and attached, so every later scan of the index carries the root columns.
+/// cross-row read are the candidate traces selected and their roots looked up and attached, so
+/// every later scan of the index carries the root columns. A trace list (see
+/// [`find_trace_list_selection`]) whose query and sort read no cross-row field selects the first
+/// `size` traces in key order under its whole query, however many traces the window holds; any
+/// other search selects every trace of its outer predicate, at most `max_cross_row_traces`.
 ///
 /// # Errors
 ///
-/// Returns a 400 for a `terms` on `traceId` larger than `max_cross_row_traces` and for more
-/// candidate traces than that limit, the lowering errors of the request's other `must` and
-/// `filter` clauses, and the lookups' errors.
+/// Returns a 400 for the trace-list latency script in a search that also reads an index outside
+/// the Data Prepper profile, for a `terms` on `traceId` larger than `max_cross_row_traces` and for
+/// more candidate traces than that limit outside a trace list, the lowering errors of the
+/// request's query (of its other `must` and `filter` clauses outside a trace list), and the
+/// lookups' errors.
 async fn prepare_cross_row_reads(
     session: &TenantSession,
     entries: &[&IndexEntry],
@@ -280,6 +370,16 @@ async fn prepare_cross_row_reads(
     now: DateTime<Utc>,
 ) -> Result<(), OpenSearchError> {
     let settings = session.settings();
+    // The latency script reads a root's duration, which only the Data Prepper profile computes.
+    if let Some(name) = tree.and_then(|tree| find_trace_list_latency(&tree.aggregations))
+        && let Some(entry) = entries.iter().find(|entry| entry.profile() != Profile::DataPrepper)
+    {
+        return Err(OpenSearchError::reject_latency_script_index(
+            name,
+            entry.name(),
+            DATA_PREPPER_SPAN_INDEX,
+        ));
+    }
     for entry in entries.iter().copied().filter(|entry| entry.profile() == Profile::DataPrepper) {
         session.detach_trace_roots(entry)?;
         if let Some(tree) = tree {
@@ -289,8 +389,22 @@ async fn prepare_cross_row_reads(
             continue;
         }
         let scope = LoweringScope { session, entry, now };
-        let candidates =
-            select_candidate_traces(session, entry, lower_outer_predicate(&request.query, &scope)?).await?;
+        // A trace list's buckets are its first keys under the whole query, so the whole query
+        // selects its traces. This holds only when neither the query nor the sort reads a root
+        // field; otherwise the query itself needs the roots of traces outside the first keys.
+        let trace_list = match find_trace_list_selection(tree) {
+            Some(selection) if is_sort_free_of_cross_row(&request.sort) => {
+                let reads_before = session.count_cross_row_reads();
+                let full_query = lower_query(&request.query, &scope);
+                (session.count_cross_row_reads() == reads_before).then_some((full_query, selection))
+            }
+            Some(_) | None => None,
+        };
+        let (outer, selection) = match trace_list {
+            Some((full_query, selection)) => (full_query?, selection),
+            None => (lower_outer_predicate(&request.query, &scope)?, TraceSelection::Bounded),
+        };
+        let candidates = select_candidate_traces(session, entry, outer, selection).await?;
         let roots = lookup_trace_roots(
             session,
             &candidates.trace_ids,

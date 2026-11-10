@@ -284,6 +284,48 @@ impl OpenSearchError {
         .with_metadata("limit", limit)
     }
 
+    /// The error rejecting a metric aggregation running the trace-list latency script that also
+    /// names `field`, a field other than `latency_field`, the root duration the script reads
+    /// (`400`, `illegal_argument_exception`): the script would run over a value it does not
+    /// compute. `aggregation` carries the request's name for it and `field` the field it named.
+    pub(crate) fn reject_latency_script_field(aggregation: &str, field: &str, latency_field: &str) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!("the latency script of [{aggregation}] reads [{latency_field}], not the field [{field}]"),
+        )
+        .with_metadata("field", field)
+    }
+
+    /// The error rejecting a metric aggregation running the trace-list latency script that also
+    /// names a `missing` (`400`, `illegal_argument_exception`): the script answers 0 for a span
+    /// without a root, and a `missing` would replace that answer. `aggregation` carries the
+    /// request's name for it and `key` is `missing`.
+    pub(crate) fn reject_latency_script_missing(aggregation: &str) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!(
+                "[missing] of [{aggregation}] does not apply to the latency script, which answers 0 for a span \
+                 without a root"
+            ),
+        )
+        .with_metadata("key", "missing")
+    }
+
+    /// The error rejecting a search running the trace-list latency script of `aggregation` that
+    /// also reads `index`, an index outside the profile of `span_index`, whose spans carry no root
+    /// fields (`400`, `illegal_argument_exception`). `aggregation` carries the request's name for
+    /// it and `index` the other index.
+    pub(crate) fn reject_latency_script_index(aggregation: &str, index: &str, span_index: &str) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!(
+                "the latency script of aggregation [{aggregation}] reads traceGroupFields of [{span_index}], and the \
+                 search also reads [{index}]"
+            ),
+        )
+        .with_metadata("index", index)
+    }
+
     /// A filter, sort or aggregation on a cross-row field of `index` whose other filters select
     /// more than `max` traces (`400`, `illegal_argument_exception`): the root of every selected
     /// trace would be read, and IceGate never truncates the set. `index` and `limit` carry the

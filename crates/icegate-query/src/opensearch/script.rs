@@ -10,9 +10,12 @@
 //! `+ - * / %`, unary minus and parentheses, at most [`MAX_SCRIPT_DEPTH`] levels deep (nesting and
 //! chained operators alike) and at most [`MAX_SCRIPT_LENGTH`] bytes long; it is evaluated in IEEE
 //! double precision, so `_value / 1000` over `1500` is `1.5` and `x / 0` is infinite, which
-//! renders `null`. Every other script is refused with a 400 whose `script` names it.
+//! renders `null`. A metric value script may also be the trace-list latency script, recognized
+//! verbatim (whitespace runs aside) and computed natively from the root span's duration. Every
+//! other script is refused with a 400 whose `script` names it.
 
 use datafusion::arrow::datatypes::DataType;
+use datafusion::functions::expr_fn::{coalesce, floor};
 use datafusion::logical_expr::{Expr, cast, lit};
 use serde_json::{Map, Value};
 
@@ -279,6 +282,61 @@ impl ArithmeticExpr {
             }
         }
     }
+}
+
+/// The trace-list latency script with its whitespace runs collapsed to one space. It reads the
+/// root span's duration and truncates it to hundredths of a millisecond, answering 0 for a span
+/// whose trace has no root.
+const TRACE_LIST_LATENCY_SCRIPT: &str = "if (doc.containsKey('traceGroupFields.durationInNanos') && !doc['traceGroupFields.durationInNanos'].empty) { return Math.round(doc['traceGroupFields.durationInNanos'].value / 10000) / 100.0 } return 0";
+
+/// The divisor of the latency script's integer division: nanoseconds to hundredths of a
+/// millisecond.
+const LATENCY_NANOS_PER_HUNDREDTH: f64 = 10_000.0;
+
+/// The latency script's second divisor: hundredths of a millisecond to milliseconds.
+const HUNDREDTHS_PER_MILLISECOND: f64 = 100.0;
+
+/// A recognized metric value script.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum MetricScript {
+    /// Arithmetic over `_value` and numeric literals.
+    Arithmetic(ArithmeticExpr),
+    /// The trace-list latency of a span: its root's duration in milliseconds, truncated to
+    /// hundredths; `0` for a span whose trace has no root, so never null. Only the Data Prepper
+    /// span index answers it: a search that also reads another index is refused.
+    TraceListLatency,
+}
+
+impl MetricScript {
+    /// The script applied to each row's `value` inside the aggregate.
+    ///
+    /// The latency script answers a `Float64` whether `value` is an integer or a double: a
+    /// metric aggregation hands it a double, and `floor` truncates the quotient to hundredths as
+    /// the script's integer division does (durations are never negative, so truncating is
+    /// flooring).
+    pub(crate) fn lower_value_script(&self, value: Expr) -> Expr {
+        match self {
+            Self::Arithmetic(arithmetic) => arithmetic.lower_value_script(value),
+            Self::TraceListLatency => coalesce(vec![
+                floor(cast(value, DataType::Float64) / lit(LATENCY_NANOS_PER_HUNDREDTH))
+                    / lit(HUNDREDTHS_PER_MILLISECOND),
+                lit(0.0),
+            ]),
+        }
+    }
+}
+
+/// Recognize a metric value `script`: the trace-list latency script (compared with its
+/// whitespace runs collapsed), or arithmetic over `_value`.
+///
+/// # Errors
+///
+/// Returns `400 illegal_argument_exception` naming any other script.
+pub(crate) fn recognize_metric_script(source: &str) -> Result<MetricScript, OpenSearchError> {
+    if source.split_whitespace().eq(TRACE_LIST_LATENCY_SCRIPT.split(' ')) {
+        return Ok(MetricScript::TraceListLatency);
+    }
+    recognize_arithmetic_script(source, &[VALUE_VARIABLE]).map(MetricScript::Arithmetic)
 }
 
 /// Recognizes an arithmetic script over `variables`: `_value` when `variables` holds
@@ -681,7 +739,7 @@ mod tests {
     use std::sync::Arc;
 
     use axum::http::StatusCode;
-    use datafusion::arrow::array::{AsArray, Int64Array, RecordBatch};
+    use datafusion::arrow::array::{ArrayRef, AsArray, Float64Array, Int64Array, RecordBatch};
     use datafusion::arrow::datatypes::{DataType, Field, Float64Type, Schema};
     use datafusion::datasource::MemTable;
     use datafusion::logical_expr::col;
@@ -1044,6 +1102,71 @@ mod tests {
             .expect("runs");
         let summed: Vec<Option<f64>> = batches[0].column(0).as_primitive::<Float64Type>().iter().collect();
         assert_eq!(summed, vec![Some(1564.0), None]);
+    }
+
+    /// The latency script as a multi-line text with indentation; recognition collapses
+    /// whitespace runs, so the layout is not part of the contract.
+    const LATENCY_SOURCE: &str = "\n                if (doc.containsKey('traceGroupFields.durationInNanos') && !doc['traceGroupFields.durationInNanos'].empty) {\n                  return Math.round(doc['traceGroupFields.durationInNanos'].value / 10000) / 100.0\n                }\n                return 0\n                ";
+
+    #[tokio::test]
+    async fn the_trace_list_latency_script_truncates_to_hundredths_of_a_millisecond() {
+        let script = recognize_metric_script(LATENCY_SOURCE).expect("the latency script is recognized");
+        assert!(matches!(script, MetricScript::TraceListLatency), "{script:?}");
+
+        // A metric aggregation hands the script its input as a double; a projection over the
+        // column hands it the stored integer. Both truncate alike.
+        let nanos_columns: [(DataType, ArrayRef); 2] = [
+            (
+                DataType::Int64,
+                Arc::new(Int64Array::from(vec![
+                    Some(152_175_000),
+                    Some(735_519_000),
+                    Some(508_628_000),
+                    Some(895_285_000),
+                    None,
+                ])),
+            ),
+            (
+                DataType::Float64,
+                Arc::new(Float64Array::from(vec![
+                    Some(152_175_000.0),
+                    Some(735_519_000.0),
+                    Some(508_628_000.0),
+                    Some(895_285_000.0),
+                    None,
+                ])),
+            ),
+        ];
+        for (data_type, nanos) in nanos_columns {
+            let schema = Arc::new(Schema::new(vec![Field::new("nanos", data_type.clone(), true)]));
+            let batch = RecordBatch::try_new(schema, vec![nanos]).expect("batch");
+            let batches = SessionContext::new()
+                .read_batch(batch)
+                .expect("frame")
+                .select(vec![script.lower_value_script(col("nanos")).alias("latency")])
+                .expect("projection")
+                .collect()
+                .await
+                .expect("runs");
+            let latencies: Vec<Option<f64>> = batches
+                .iter()
+                .flat_map(|batch| batch.column(0).as_primitive::<Float64Type>().iter().collect::<Vec<_>>())
+                .collect();
+            // floor(ns / 10^4) / 100: truncated, never rounded up; a span without a root reads 0.
+            assert_eq!(
+                latencies,
+                [Some(152.17), Some(735.51), Some(508.62), Some(895.28), Some(0.0)],
+                "{data_type}"
+            );
+        }
+
+        let arithmetic = recognize_metric_script("_value / 1000").expect("arithmetic");
+        assert!(matches!(arithmetic, MetricScript::Arithmetic(_)), "{arithmetic:?}");
+        let error = recognize_metric_script("return doc['traceGroupFields.durationInNanos'].value")
+            .expect_err("an edited latency script is no recognized form");
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status.as_u16(), 400);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
     }
 
     #[test]

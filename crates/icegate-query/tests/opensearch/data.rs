@@ -101,6 +101,39 @@ pub fn build_wal_log_row_at_minute<'a>(tenant: &'a str, minute: i64, severity_te
     }
 }
 
+/// The tenant the span fixtures search as.
+pub const TENANT_A: &str = "tenant-a";
+/// The other tenant of the span fixtures, whose rows a search as [`TENANT_A`] must never read.
+pub const TENANT_B: &str = "tenant-b";
+/// 2025-10-09T08:53:20Z in microseconds, the instant the span fixtures start from.
+pub const T0: i64 = 1_760_000_000_000_000;
+/// The Data Prepper span index the span fixtures are searched through.
+pub const SPAN_INDEX: &str = "otel-v1-apm-span";
+
+/// A span row of `tenant`: trace `trace_id`, span `span_id`, `start` and its end `duration` later
+/// (both in microseconds, the end also the ingestion time), plus `cells`.
+pub fn build_span_row<'a>(
+    tenant: &'a str,
+    trace_id: &'a [u8],
+    span_id: &'a [u8],
+    (start, duration): (i64, i64),
+    mut cells: Vec<(&'a str, Cell<'a>)>,
+) -> Row<'a> {
+    let mut row_cells = vec![
+        (COL_TRACE_ID, Cell::Bytes(trace_id)),
+        (COL_SPAN_ID, Cell::Bytes(span_id)),
+        (COL_TIMESTAMP, Cell::Micros(start)),
+        (COL_END_TIMESTAMP, Cell::Micros(start + duration)),
+        (COL_INGESTED_TIMESTAMP, Cell::Micros(start + duration)),
+        (COL_DURATION_MICROS, Cell::Long(duration)),
+    ];
+    row_cells.append(&mut cells);
+    Row {
+        tenant,
+        cells: row_cells,
+    }
+}
+
 /// Commit five logs of `tenant_id` as one append, by minute past [`TEN_O_CLOCK_MICROS`]:
 ///
 /// | minute | `service_name` | `severity_text` | `body`                          |

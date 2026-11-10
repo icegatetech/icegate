@@ -9,28 +9,24 @@ use std::sync::Arc;
 
 use iceberg::Catalog;
 use icegate_common::schema::{
-    COL_AGGREGATION_TEMPORALITY, COL_ATTRIBUTES, COL_BODY, COL_BUCKET_COUNTS, COL_DROPPED_ATTRIBUTES_COUNT,
-    COL_DURATION_MICROS, COL_END_TIMESTAMP, COL_EVENTS, COL_EXEMPLARS, COL_EXPLICIT_BOUNDS, COL_INGESTED_TIMESTAMP,
-    COL_KIND, COL_LOG_ATTRIBUTES, COL_METRIC_NAME, COL_METRIC_TYPE, COL_NAME, COL_NEGATIVE_BUCKET_COUNTS,
-    COL_NEGATIVE_OFFSET, COL_OBSERVED_TIMESTAMP, COL_PARENT_SPAN_ID, COL_POSITIVE_BUCKET_COUNTS, COL_POSITIVE_OFFSET,
-    COL_QUANTILE_VALUES, COL_RESOURCE_ATTRIBUTES, COL_SCALE, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ATTRIBUTES,
-    COL_SPAN_ID, COL_STATUS_CODE, COL_TIMESTAMP, COL_TRACE_ID, COL_TRACE_STATE, COL_VALUE_DOUBLE, COL_VALUE_INT,
-    QUANTILE_FIELD_QUANTILE, QUANTILE_FIELD_VALUE,
+    COL_AGGREGATION_TEMPORALITY, COL_ATTRIBUTES, COL_BODY, COL_BUCKET_COUNTS, COL_DROPPED_ATTRIBUTES_COUNT, COL_EVENTS,
+    COL_EXEMPLARS, COL_EXPLICIT_BOUNDS, COL_INGESTED_TIMESTAMP, COL_KIND, COL_LOG_ATTRIBUTES, COL_METRIC_NAME,
+    COL_METRIC_TYPE, COL_NAME, COL_NEGATIVE_BUCKET_COUNTS, COL_NEGATIVE_OFFSET, COL_OBSERVED_TIMESTAMP,
+    COL_PARENT_SPAN_ID, COL_POSITIVE_BUCKET_COUNTS, COL_POSITIVE_OFFSET, COL_QUANTILE_VALUES, COL_RESOURCE_ATTRIBUTES,
+    COL_SCALE, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ATTRIBUTES, COL_SPAN_ID, COL_STATUS_CODE, COL_TIMESTAMP,
+    COL_TRACE_ID, COL_TRACE_STATE, COL_VALUE_DOUBLE, COL_VALUE_INT, QUANTILE_FIELD_QUANTILE, QUANTILE_FIELD_VALUE,
 };
 use icegate_common::{LOGS_TABLE, METRICS_TABLE, SPANS_TABLE};
 use icegate_query::opensearch::OpenSearchConfig;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use super::data::{Cell, Row, RowWriteError, commit_rows, write_wal_segment};
+use super::data::{
+    Cell, Row, RowWriteError, SPAN_INDEX, T0, TENANT_A, TENANT_B, build_span_row, commit_rows, write_wal_segment,
+};
 use super::harness::TestServer;
 use super::requests::{send_ndjson, send_request};
 
-const TENANT_A: &str = "tenant-a";
-const TENANT_B: &str = "tenant-b";
-/// 2025-10-09T08:53:20Z.
-const T0: i64 = 1_760_000_000_000_000;
-const SPAN_INDEX: &str = "otel-v1-apm-span";
 const SPAN_SEARCH_PATH: &str = "/otel-v1-apm-span/_search";
 
 const TRACE_A: [u8; 16] = [0x0a; 16];
@@ -91,30 +87,6 @@ async fn fetch_search_error(server: &TestServer, body: &Value) -> Result<(Status
     Ok((status, answer["error"].clone()))
 }
 
-/// A span row: the required columns plus `cells`.
-fn build_span_row<'a>(
-    tenant: &'a str,
-    trace: &'a [u8],
-    span: &'a [u8],
-    start: i64,
-    duration: i64,
-    mut cells: Vec<(&'a str, Cell<'a>)>,
-) -> Row<'a> {
-    let mut row_cells = vec![
-        (COL_TRACE_ID, Cell::Bytes(trace)),
-        (COL_SPAN_ID, Cell::Bytes(span)),
-        (COL_TIMESTAMP, Cell::Micros(start)),
-        (COL_END_TIMESTAMP, Cell::Micros(start + duration)),
-        (COL_INGESTED_TIMESTAMP, Cell::Micros(start + duration)),
-        (COL_DURATION_MICROS, Cell::Long(duration)),
-    ];
-    row_cells.append(&mut cells);
-    Row {
-        tenant,
-        cells: row_cells,
-    }
-}
-
 /// Tenant A: trace A's root (`GET /checkout`, server, error, 152 175 µs) and its client child
 /// (status NULL, 50 000 µs), and trace B's lone span (kind NULL, 500 µs). Tenant B: a server
 /// root in trace A, in the same commit and therefore beside tenant A's rows.
@@ -127,8 +99,7 @@ async fn commit_three_spans(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteEr
                 TENANT_A,
                 &TRACE_A,
                 &ROOT_SPAN,
-                T0,
-                152_175,
+                (T0, 152_175),
                 vec![
                     (COL_NAME, Cell::Text("GET /checkout")),
                     (COL_SERVICE_NAME, Cell::Text("checkout")),
@@ -140,8 +111,7 @@ async fn commit_three_spans(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteEr
                 TENANT_A,
                 &TRACE_A,
                 &CHILD_SPAN,
-                T0 + 1_000,
-                50_000,
+                (T0 + 1_000, 50_000),
                 vec![
                     (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
                     (COL_NAME, Cell::Text("SELECT orders")),
@@ -153,16 +123,14 @@ async fn commit_three_spans(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteEr
                 TENANT_A,
                 &TRACE_B,
                 &OTHER_SPAN,
-                T0 + 2_000,
-                500,
+                (T0 + 2_000, 500),
                 vec![(COL_NAME, Cell::Text("cron"))],
             ),
             build_span_row(
                 TENANT_B,
                 &TRACE_A,
                 &TENANT_B_SPAN,
-                T0,
-                900,
+                (T0, 900),
                 vec![
                     (COL_NAME, Cell::Text("tenant-b-root")),
                     (COL_KIND, Cell::Int(2)),
@@ -504,8 +472,7 @@ async fn span_source_renders_nested_objects_as_the_contract_states() {
                 TENANT_A,
                 &TRACE_A,
                 &CHILD_SPAN,
-                T0,
-                152_175,
+                (T0, 152_175),
                 vec![
                     (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
                     (COL_NAME, Cell::Text("SELECT orders")),
@@ -524,8 +491,7 @@ async fn span_source_renders_nested_objects_as_the_contract_states() {
                 TENANT_B,
                 &TRACE_A,
                 &CHILD_SPAN,
-                T0,
-                900,
+                (T0, 900),
                 vec![
                     (COL_NAME, Cell::Text("tenant-b-child")),
                     (COL_SPAN_ATTRIBUTES, Cell::Map(&[("db.system", "postgresql")])),
@@ -941,8 +907,7 @@ fn build_recent_span_row<'a>(tenant: &'a str, span: &'a [u8], attributes: &'a [(
         tenant,
         &TRACE_A,
         span,
-        start,
-        1_000,
+        (start, 1_000),
         vec![(COL_SPAN_ATTRIBUTES, Cell::Map(attributes))],
     )
 }
@@ -1054,16 +1019,14 @@ async fn commit_error_spans(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteEr
                 TENANT_A,
                 &TRACE_A,
                 &ROOT_SPAN,
-                T0,
-                3_000,
+                (T0, 3_000),
                 vec![(COL_NAME, Cell::Text("error"))],
             ),
             build_span_row(
                 TENANT_A,
                 &TRACE_A,
                 &CHILD_SPAN,
-                T0 + 1_000,
-                1_000,
+                (T0 + 1_000, 1_000),
                 vec![
                     (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
                     (COL_NAME, Cell::Text("charge")),
@@ -1074,8 +1037,7 @@ async fn commit_error_spans(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteEr
                 TENANT_A,
                 &TRACE_A,
                 &OTHER_SPAN,
-                T0 + 2_000,
-                1_000,
+                (T0 + 2_000, 1_000),
                 vec![
                     (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
                     (COL_NAME, Cell::Text("cron")),
@@ -1085,8 +1047,7 @@ async fn commit_error_spans(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteEr
                 TENANT_B,
                 &TRACE_B,
                 &TENANT_B_SPAN,
-                T0,
-                1_000,
+                (T0, 1_000),
                 vec![(COL_NAME, Cell::Text("error"))],
             ),
         ],
@@ -1143,8 +1104,7 @@ async fn a_case_insensitive_term_on_kind_and_trace_state_matches_the_rendered_va
                 TENANT_A,
                 &TRACE_A,
                 &ROOT_SPAN,
-                T0,
-                1_000,
+                (T0, 1_000),
                 vec![
                     (COL_KIND, Cell::Int(2)),
                     (COL_TRACE_STATE, Cell::Text("Rojo=00f067aa0ba902b7")),
@@ -1154,16 +1114,14 @@ async fn a_case_insensitive_term_on_kind_and_trace_state_matches_the_rendered_va
                 TENANT_A,
                 &TRACE_A,
                 &CHILD_SPAN,
-                T0,
-                1_000,
+                (T0, 1_000),
                 vec![(COL_KIND, Cell::Int(3))],
             ),
             build_span_row(
                 TENANT_B,
                 &TRACE_A,
                 &TENANT_B_SPAN,
-                T0,
-                1_000,
+                (T0, 1_000),
                 vec![
                     (COL_KIND, Cell::Int(3)),
                     (COL_TRACE_STATE, Cell::Text("Rojo=00f067aa0ba902b7")),
@@ -1424,8 +1382,7 @@ async fn ss4o_traces_resolve_like_data_prepper_without_at_escaping() {
                 TENANT_A,
                 &TRACE_A,
                 &CHILD_SPAN,
-                T0,
-                50_000,
+                (T0, 50_000),
                 vec![
                     (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
                     (COL_NAME, Cell::Text("SELECT orders")),
@@ -1438,8 +1395,7 @@ async fn ss4o_traces_resolve_like_data_prepper_without_at_escaping() {
                 TENANT_B,
                 &TRACE_A,
                 &TENANT_B_SPAN,
-                T0,
-                50_000,
+                (T0, 50_000),
                 vec![
                     (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
                     (COL_NAME, Cell::Text("tenant-b-select")),
@@ -2371,16 +2327,14 @@ async fn a_root_outside_the_lookback_renders_the_fields_absent() {
                 TENANT_A,
                 &TRACE_A,
                 &ROOT_SPAN,
-                T0,
-                300_000_000,
+                (T0, 300_000_000),
                 vec![(COL_NAME, Cell::Text("GET /checkout"))],
             ),
             build_span_row(
                 TENANT_A,
                 &TRACE_A,
                 &LATE_CHILD_SPAN,
-                T0 + 120_000_000,
-                1_000,
+                (T0 + 120_000_000, 1_000),
                 vec![
                     (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
                     (COL_NAME, Cell::Text("late")),
@@ -2390,8 +2344,7 @@ async fn a_root_outside_the_lookback_renders_the_fields_absent() {
                 TENANT_A,
                 &TRACE_A,
                 &NEAR_CHILD_SPAN,
-                T0 + 30_000_000,
-                1_000,
+                (T0 + 30_000_000, 1_000),
                 vec![
                     (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
                     (COL_NAME, Cell::Text("near")),
@@ -2401,8 +2354,7 @@ async fn a_root_outside_the_lookback_renders_the_fields_absent() {
                 TENANT_A,
                 &TRACE_A,
                 &EDGE_CHILD_SPAN,
-                T0 + 60_000_000,
-                1_000,
+                (T0 + 60_000_000, 1_000),
                 vec![
                     (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
                     (COL_NAME, Cell::Text("edge")),
@@ -2412,8 +2364,7 @@ async fn a_root_outside_the_lookback_renders_the_fields_absent() {
                 TENANT_B,
                 &TRACE_A,
                 &TENANT_B_SPAN,
-                T0 + 100_000_000,
-                1_000,
+                (T0 + 100_000_000, 1_000),
                 vec![(COL_NAME, Cell::Text("tenant-b-root"))],
             ),
         ],
@@ -2464,24 +2415,21 @@ async fn commit_three_traces(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteE
                 TENANT_A,
                 &TRACE_C,
                 &TRACE_C_SPAN,
-                T0 + 3_000,
-                700,
+                (T0 + 3_000, 700),
                 vec![(COL_NAME, Cell::Text("batch"))],
             ),
             build_span_row(
                 TENANT_B,
                 &TRACE_B,
                 &TENANT_B_SPAN,
-                T0 + 1_500,
-                100,
+                (T0 + 1_500, 100),
                 vec![(COL_NAME, Cell::Text("tenant-b-cron"))],
             ),
             build_span_row(
                 TENANT_B,
                 &TRACE_C,
                 &TENANT_B_SPAN,
-                T0 + 2_500,
-                100,
+                (T0 + 2_500, 100),
                 vec![(COL_NAME, Cell::Text("tenant-b-batch"))],
             ),
         ],
@@ -2676,8 +2624,7 @@ async fn trace_group_fields_never_read_another_tenants_root_span_sharing_the_tra
                 TENANT_A,
                 &TRACE_S,
                 &CHILD_SPAN,
-                T0 + 1_000,
-                1_000,
+                (T0 + 1_000, 1_000),
                 vec![
                     (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
                     (COL_NAME, Cell::Text("tenant-a-child")),
@@ -2687,8 +2634,7 @@ async fn trace_group_fields_never_read_another_tenants_root_span_sharing_the_tra
                 TENANT_B,
                 &TRACE_S,
                 &ROOT_SPAN,
-                T0,
-                9_000,
+                (T0, 9_000),
                 vec![(COL_NAME, Cell::Text("tenant-b-root")), (COL_STATUS_CODE, Cell::Int(2))],
             ),
         ],
@@ -2705,8 +2651,7 @@ async fn trace_group_fields_never_read_another_tenants_root_span_sharing_the_tra
                 TENANT_A,
                 &TRACE_S,
                 &OTHER_SPAN,
-                T0 + 2_000,
-                1_000,
+                (T0 + 2_000, 1_000),
                 vec![
                     (COL_PARENT_SPAN_ID, Cell::Bytes(&ROOT_SPAN)),
                     (COL_NAME, Cell::Text("tenant-a-wal-child")),
@@ -2716,8 +2661,7 @@ async fn trace_group_fields_never_read_another_tenants_root_span_sharing_the_tra
                 TENANT_B,
                 &TRACE_S,
                 &TENANT_B_SPAN,
-                T0 + 500,
-                9_000,
+                (T0 + 500, 9_000),
                 vec![(COL_NAME, Cell::Text("tenant-b-wal-root"))],
             ),
         ],

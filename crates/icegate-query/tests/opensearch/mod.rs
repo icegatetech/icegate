@@ -8,6 +8,7 @@ mod discover;
 mod fields;
 mod grafana_logs;
 mod grafana_metrics;
+mod grafana_traces;
 mod harness;
 mod indices;
 mod listener;

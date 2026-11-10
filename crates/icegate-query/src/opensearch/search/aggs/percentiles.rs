@@ -31,7 +31,7 @@ use serde_json::{Map, Value, json};
 use super::metrics::{MetricSpec, NonFiniteRendering, Statistic};
 use super::parse::{
     IGNORED_EXECUTION_KEYS, MetricPath, expect_flag, expect_object, expect_string, read_lenient_number,
-    read_strict_number, read_value_script, report_missing_key, report_unsupported_key,
+    read_strict_number, read_value_script, report_missing_key, report_unsupported_key, resolve_metric_field,
 };
 use super::plan::{name_statistic_column, name_value_column};
 use crate::opensearch::error::OpenSearchError;
@@ -78,10 +78,12 @@ pub(crate) struct PercentileRanksSpec {
 ///
 /// # Errors
 ///
-/// `parsing_exception` for a body that is not an object, a missing `field`, an unknown key
-/// (named under `construct`), a malformed `script` member, a percent that is neither a JSON
-/// number nor a numeric string or lies outside `[0, 100]`, an empty or non-array `percents`, or a
-/// non-boolean `keyed`; `illegal_argument_exception` for a script outside the arithmetic grammar.
+/// `parsing_exception` for a body that is not an object, a missing `field` (without the
+/// trace-list latency script), an unknown key (named under `construct`), a malformed `script`
+/// member, a percent that is neither a JSON number nor a numeric string or lies outside
+/// `[0, 100]`, an empty or non-array `percents`, or a non-boolean `keyed`;
+/// `illegal_argument_exception` for a script that is neither arithmetic nor the latency script,
+/// and as [`resolve_metric_field`] states for a `missing` or `field` beside the latency script.
 pub(super) fn parse_percentiles(name: &str, value: &Value) -> Result<PercentilesSpec, OpenSearchError> {
     let body = expect_object(name, PERCENTILES, value)?;
     let mut field = None;
@@ -102,7 +104,7 @@ pub(super) fn parse_percentiles(name: &str, value: &Value) -> Result<Percentiles
     }
     Ok(PercentilesSpec {
         metric: MetricSpec {
-            field: field.ok_or_else(|| report_missing_key(PERCENTILES, name, "field"))?,
+            field: resolve_metric_field(PERCENTILES, name, field, missing, value_script.as_ref())?,
             missing,
             value_script,
         },

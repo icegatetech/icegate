@@ -26,8 +26,9 @@ use super::pipeline::{
 };
 use super::terms::{TermsSpec, parse_terms};
 use super::top_hits::{TopHitsSpec, parse_top_hits};
+use crate::opensearch::catalog::CrossRowField;
 use crate::opensearch::error::OpenSearchError;
-use crate::opensearch::script::{ArithmeticExpr, VALUE_VARIABLE, read_script_source, recognize_arithmetic_script};
+use crate::opensearch::script::{MetricScript, read_script_source, recognize_metric_script};
 use crate::opensearch::search::doc_id::{
     MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MILLISECOND, MICROS_PER_MINUTE, MICROS_PER_SECOND,
 };
@@ -617,12 +618,16 @@ pub(crate) fn parse_metric_path(text: &str) -> Result<MetricPath, OpenSearchErro
 
 /// A plain metric (`avg`, `sum`, `min`, `max`, `value_count`, `stats`, `cardinality`): `field`,
 /// plus `missing` and a value `script` when `accepts_value_inputs` (`avg`, `sum`, `min`, `max`).
+/// A metric running the trace-list latency script reads the field the script names, so it needs
+/// no `field`.
 ///
 /// # Errors
 ///
-/// `400 parsing_exception` for a body that is not an object, a missing `field`, a value of the
-/// wrong JSON type, a malformed `script` member, and an unknown key (named under `construct`);
-/// `400 illegal_argument_exception` for a script outside the arithmetic grammar.
+/// `400 parsing_exception` for a body that is not an object, a missing `field` (without the
+/// latency script), a value of the wrong JSON type, a malformed `script` member, and an unknown
+/// key (named under `construct`); `400 illegal_argument_exception` for a script that is neither
+/// arithmetic nor the latency script, and, with the latency script, for a `missing` or a `field`
+/// other than the one the script reads.
 fn parse_metric(
     name: &str,
     kind_name: &str,
@@ -643,21 +648,58 @@ fn parse_metric(
         }
     }
     Ok(MetricSpec {
-        field: field.ok_or_else(|| report_missing_key(kind_name, name, "field"))?,
+        field: resolve_metric_field(kind_name, name, field, missing, value_script.as_ref())?,
         missing,
         value_script,
     })
 }
 
-/// The value `script` of the metric aggregation `name`: arithmetic over `_value` and decimal
-/// literals.
+/// The value `script` of the metric aggregation `name`: the trace-list latency script, or
+/// arithmetic over `_value` and decimal literals.
 ///
 /// # Errors
 ///
 /// `400 parsing_exception` for a malformed `script` member; `400 illegal_argument_exception`
 /// naming any other script under `script`.
-pub(super) fn read_value_script(name: &str, value: &Value) -> Result<ArithmeticExpr, OpenSearchError> {
-    recognize_arithmetic_script(read_script_source(name, value)?, &[VALUE_VARIABLE])
+pub(super) fn read_value_script(name: &str, value: &Value) -> Result<MetricScript, OpenSearchError> {
+    recognize_metric_script(read_script_source(name, value)?)
+}
+
+/// The field the metric aggregation `name` of type `kind_name` reads: the `field` the body names,
+/// or, under the trace-list latency script, the root duration that script reads.
+///
+/// The latency script computes its value from `traceGroupFields.durationInNanos` alone and
+/// answers 0 for a span without a root; another `field` or a `missing` would make it answer a
+/// value the script does not compute, so both are refused rather than applied.
+///
+/// # Errors
+///
+/// `400 parsing_exception` for a missing `field` without the latency script; beside the latency
+/// script, `400 illegal_argument_exception` for a `missing` (`aggregation` and `key` metadata)
+/// and for a `field` other than the root duration (`aggregation` and `field` metadata).
+pub(super) fn resolve_metric_field(
+    kind_name: &str,
+    name: &str,
+    field: Option<String>,
+    missing: Option<f64>,
+    value_script: Option<&MetricScript>,
+) -> Result<String, OpenSearchError> {
+    let Some(MetricScript::TraceListLatency) = value_script else {
+        return field.ok_or_else(|| report_missing_key(kind_name, name, "field"));
+    };
+    let latency_field = CrossRowField::DurationInNanos.client_name();
+    if missing.is_some() {
+        return Err(OpenSearchError::reject_latency_script_missing(name));
+    }
+    match field {
+        Some(named_field) if named_field != latency_field => Err(OpenSearchError::reject_latency_script_field(
+            name,
+            &named_field,
+            latency_field,
+        )),
+        Some(named_field) => Ok(named_field),
+        None => Ok(latency_field.to_string()),
+    }
 }
 
 /// A `histogram`: `field`, `interval`, `min_doc_count` (absent means 0) and `extended_bounds`.
@@ -1022,6 +1064,7 @@ mod tests {
         MetricPath, classify_legacy_interval, parse_aggregations, parse_metric_path,
     };
     use crate::opensearch::error::{OpenSearchError, render_envelope};
+    use crate::opensearch::script::MetricScript;
     use crate::opensearch::search::request::SortOrder;
 
     /// The spec of the first top-level aggregation, which the test wrote as a `date_histogram`.
@@ -1720,5 +1763,74 @@ mod tests {
             let error = assert_refusal(refused_body, "parsing_exception").await;
             assert_eq!(error["construct"], construct);
         }
+    }
+
+    /// The trace-list latency script on one line.
+    const LATENCY_SOURCE: &str = "if (doc.containsKey('traceGroupFields.durationInNanos') && !doc['traceGroupFields.durationInNanos'].empty) { return Math.round(doc['traceGroupFields.durationInNanos'].value / 10000) / 100.0 } return 0";
+
+    #[test]
+    fn a_metric_running_the_latency_script_alone_reads_the_root_duration() {
+        let latency_metric = MetricSpec {
+            field: "traceGroupFields.durationInNanos".to_string(),
+            missing: None,
+            value_script: Some(MetricScript::TraceListLatency),
+        };
+        let script = json!({"source": LATENCY_SOURCE, "lang": "painless"});
+
+        let Ok(AggregationKind::Max(max_metric)) = parse_first_kind(&json!({"latency": {"max": {"script": script}}}))
+        else {
+            panic!("a max with the latency script parses to Max");
+        };
+        let Ok(AggregationKind::Max(named_max_metric)) = parse_first_kind(&json!({"latency": {"max": {
+            "field": "traceGroupFields.durationInNanos",
+            "script": script
+        }}})) else {
+            panic!("a max naming the field the latency script reads parses to Max");
+        };
+        let Ok(AggregationKind::ExtendedStats(extended_stats)) =
+            parse_first_kind(&json!({"latency": {"extended_stats": {"script": script}}}))
+        else {
+            panic!("an extended_stats with the latency script parses to ExtendedStats");
+        };
+        let Ok(AggregationKind::Percentiles(percentiles)) =
+            parse_first_kind(&json!({"latency": {"percentiles": {"script": script}}}))
+        else {
+            panic!("a percentiles with the latency script parses to Percentiles");
+        };
+
+        assert_eq!(max_metric, latency_metric);
+        assert_eq!(named_max_metric, latency_metric);
+        assert_eq!(extended_stats.metric, latency_metric);
+        assert_eq!(percentiles.metric, latency_metric);
+    }
+
+    #[tokio::test]
+    async fn the_latency_script_refuses_another_field_and_a_missing_while_arithmetic_needs_a_field() {
+        let script = json!({"source": LATENCY_SOURCE, "lang": "painless"});
+        let refused_fields = [
+            json!({"latency": {"max": {"field": "durationInNanos", "script": script}}}),
+            json!({"latency": {"percentiles": {"field": "durationInNanos", "script": script}}}),
+        ];
+        for refused_body in refused_fields {
+            let error = assert_refusal(refused_body, "illegal_argument_exception").await;
+            assert_eq!(error["aggregation"], "latency", "{error}");
+            assert_eq!(error["field"], "durationInNanos", "{error}");
+        }
+        let refused_missings = [
+            json!({"latency": {"max": {"missing": 0, "script": script}}}),
+            json!({"latency": {"extended_stats": {"missing": 0, "script": script}}}),
+        ];
+        for refused_body in refused_missings {
+            let error = assert_refusal(refused_body, "illegal_argument_exception").await;
+            assert_eq!(error["aggregation"], "latency", "{error}");
+            assert_eq!(error["key"], "missing", "{error}");
+        }
+
+        // Without the latency script a metric still needs its field.
+        assert_refusal(
+            json!({"scaled": {"max": {"script": "_value / 1000"}}}),
+            "parsing_exception",
+        )
+        .await;
     }
 }

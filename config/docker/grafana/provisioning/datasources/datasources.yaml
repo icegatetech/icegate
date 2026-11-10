@@ -75,11 +75,14 @@ datasources:
         query: '{trace_id="$${__span.traceId}"}'
     secureJsonData:
       httpHeaderValue1: demo
-  # The OpenSearch API of the stand's query service: one datasource reading the
-  # logs index, and one reading the spans index for metrics exploration.
+  # The OpenSearch API of the stand's query service: one datasource per index
+  # the stand serves to Grafana (logs; spans, for metrics exploration;
+  # otel-v1-apm-span, the span index of the traces datasource).
   # `version` and `versionLabel` state the version config/docker/query.yaml
-  # resolves; crates/icegate-query/tests/config_file.rs ties them to it, and the
-  # index and field names to the IceGate schema. `interval` stays unset.
+  # resolves; crates/icegate-query/tests/config_file.rs ties them to it, ties
+  # the logs and metrics-exploration datasources' index and field names to the
+  # IceGate schema, and pins the traces datasource's profile index and fields.
+  # `interval` stays unset.
   - name: OpenSearch (demo)
     uid: opensearch-demo
     type: grafana-opensearch-datasource
@@ -116,5 +119,31 @@ datasources:
       versionLabel: "OpenSearch 3.9.0"
       maxConcurrentShardRequests: 5
       pplEnabled: true
+    secureJsonData:
+      httpHeaderValue1: demo
+  # The trace-to-logs query is field-qualified: it names the trace_id and
+  # span_id columns of the logs index.
+  - name: OpenSearch traces (demo)
+    uid: opensearch-traces-demo
+    type: grafana-opensearch-datasource
+    access: proxy
+    url: http://query:9200
+    isDefault: false
+    editable: false
+    jsonData:
+      httpHeaderName1: X-Scope-OrgID
+      database: otel-v1-apm-span
+      timeField: startTime
+      logMessageField: ""
+      logLevelField: ""
+      flavor: opensearch
+      version: "3.9.0"
+      versionLabel: "OpenSearch 3.9.0"
+      maxConcurrentShardRequests: 5
+      pplEnabled: true
+      tracesToLogsV2:
+        datasourceUid: opensearch-demo
+        customQuery: true
+        query: 'trace_id:"$${__span.traceId}" AND span_id:"$${__span.spanId}"'
     secureJsonData:
       httpHeaderValue1: demo

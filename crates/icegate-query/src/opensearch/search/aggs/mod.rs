@@ -18,6 +18,7 @@ pub(crate) use distinct::plan_exact_distinct;
 pub(crate) use parse::{AggregationKind, AggregationTree, NamedAggregation, parse_aggregations};
 pub(crate) use percentiles::build_multi_quantile_udf;
 pub(crate) use plan::{AggregationScope, execute_aggregations, plan_aggregation_rows};
+pub(crate) use terms::{TermsOrder, TermsSpec};
 
 #[cfg(test)]
 mod test_support {

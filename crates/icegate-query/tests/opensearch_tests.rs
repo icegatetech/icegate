@@ -12,6 +12,7 @@
 //! - `fields`: `_field_caps`, `_mapping` and `_mapping/field`
 //! - `grafana_logs`: Grafana-logs-style `_msearch` logs query, logs volume and variables
 //! - `grafana_metrics`: metrics-editor-style aggregation and variable requests
+//! - `grafana_traces`: trace-list and trace-by-id style requests on the Data Prepper profile
 //! - `harness`: the listener over a temporary warehouse, and a reqwest client
 //! - `indices`: `_resolve/index` and `<index>/_settings`
 //! - `listener`: the listener's start-up

@@ -19,12 +19,12 @@ use serde_json::{Map, Number, Value, json};
 
 use super::parse::{
     AggregationKind, IGNORED_EXECUTION_KEYS, MetricPath, expect_object, expect_string, read_lenient_number,
-    read_strict_number, read_value_script, report_missing_key, report_unsupported_key,
+    read_strict_number, read_value_script, report_unsupported_key, resolve_metric_field,
 };
 use super::percentiles::{decode_quantiles, decode_rank_counts, render_percentile_ranks, render_percentiles};
 use super::plan::{FieldInput, MetricSlot};
 use crate::opensearch::error::OpenSearchError;
-use crate::opensearch::script::ArithmeticExpr;
+use crate::opensearch::script::MetricScript;
 use crate::opensearch::search::doc_id::MICROS_PER_MILLISECOND;
 use crate::opensearch::search::execute::convert_plan_error;
 use crate::opensearch::search::hits::{DateRenderFormat, render_date, validate_date_micros};
@@ -37,10 +37,10 @@ pub(crate) struct MetricSpec {
     /// The value a row without the field contributes; accepted where `value_script` is, as a JSON
     /// number or a numeric string.
     pub(crate) missing: Option<f64>,
-    /// A recognized arithmetic over `_value`, applied to each row's value after `missing` is
-    /// coalesced; set only on `avg`, `sum`, `min`, `max`, `extended_stats` and `percentiles`. A
-    /// statistic it makes non-finite renders `null` ([`NonFiniteRendering::Null`]).
-    pub(crate) value_script: Option<ArithmeticExpr>,
+    /// A recognized value script, applied to each row's value after `missing` is coalesced; set
+    /// only on `avg`, `sum`, `min`, `max`, `extended_stats` and `percentiles`. A statistic it
+    /// makes non-finite renders `null` ([`NonFiniteRendering::Null`]).
+    pub(crate) value_script: Option<MetricScript>,
 }
 
 /// The request type name of `extended_stats`.
@@ -64,10 +64,12 @@ pub(crate) struct ExtendedStatsSpec {
 ///
 /// # Errors
 ///
-/// `400 parsing_exception` for a body that is not an object, a missing `field`, an unknown key,
-/// a `missing` that is neither a JSON number nor a numeric string, a malformed `script` member,
-/// and a `sigma` that is not a JSON number or is negative; `400 illegal_argument_exception` for a
-/// script outside the arithmetic grammar.
+/// `400 parsing_exception` for a body that is not an object, a missing `field` (without the
+/// trace-list latency script), an unknown key, a `missing` that is neither a JSON number nor a
+/// numeric string, a malformed `script` member, and a `sigma` that is not a JSON number or is
+/// negative; `400 illegal_argument_exception` for a script that is neither arithmetic nor the
+/// latency script, and as [`resolve_metric_field`] states for a `missing` or `field` beside the
+/// latency script.
 pub(super) fn parse_extended_stats(name: &str, value: &Value) -> Result<ExtendedStatsSpec, OpenSearchError> {
     let body = expect_object(name, EXTENDED_STATS, value)?;
     let mut field = None;
@@ -91,7 +93,7 @@ pub(super) fn parse_extended_stats(name: &str, value: &Value) -> Result<Extended
     }
     Ok(ExtendedStatsSpec {
         metric: MetricSpec {
-            field: field.ok_or_else(|| report_missing_key(EXTENDED_STATS, name, "field"))?,
+            field: resolve_metric_field(EXTENDED_STATS, name, field, missing, value_script.as_ref())?,
             missing,
             value_script,
         },
@@ -497,7 +499,8 @@ pub(super) fn resolve_order_statistic(kind: MetricKind, path: &MetricPath) -> Re
 /// `sum` (an empty sum is 0). An extreme of a date field also renders `<key>_as_string` at
 /// millisecond precision. `percentiles` and `percentile_ranks` render `values` keyed by percent
 /// or value, or as an array when not keyed. `extended_stats` renders as [`render_extended_stats`]
-/// states.
+/// states. A `max` over the trace-list latency script renders 0, never `null`, for a bucket
+/// without a value.
 ///
 /// # Errors
 ///
@@ -526,7 +529,16 @@ pub(super) fn render_metric(
             object.insert("value".to_string(), render_sum(&read(Statistic::Sum)?, rendering)?);
         }
         MetricKind::Min => insert_extreme(&mut object, "value", &read(Statistic::Min)?, is_date, rendering)?,
-        MetricKind::Max => insert_extreme(&mut object, "value", &read(Statistic::Max)?, is_date, rendering)?,
+        MetricKind::Max => {
+            insert_extreme(&mut object, "value", &read(Statistic::Max)?, is_date, rendering)?;
+            // The latency of a trace list renders 0 for a bucket with no row: its value is
+            // never null.
+            if matches!(slot.spec.value_script, Some(MetricScript::TraceListLatency))
+                && object.get("value").is_none_or(Value::is_null)
+            {
+                object.insert("value".to_string(), render_float(Some(0.0), rendering)?);
+            }
+        }
         MetricKind::ValueCount => {
             object.insert("value".to_string(), Value::from(read_count(&read(Statistic::Count)?)?));
         }
@@ -624,7 +636,7 @@ pub(super) enum NonFiniteRendering {
 
 impl NonFiniteRendering {
     /// [`Self::Null`] for a metric with a value script, [`Self::Refused`] for one without.
-    pub(super) const fn from_value_script(value_script: Option<&ArithmeticExpr>) -> Self {
+    pub(super) const fn from_value_script(value_script: Option<&MetricScript>) -> Self {
         if value_script.is_some() {
             Self::Null
         } else {

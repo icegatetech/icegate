@@ -42,10 +42,10 @@ use tokio::sync::OnceCell;
 
 use self::cross_row::{AttachedTraceRoots, build_trace_root_table, join_trace_roots};
 pub(crate) use self::cross_row::{
-    CrossRowField, TraceRoots, lookup_page_trace_roots, lookup_trace_roots, select_candidate_traces,
+    CrossRowField, TraceRoots, TraceSelection, lookup_page_trace_roots, lookup_trace_roots, select_candidate_traces,
 };
 use self::data_prepper::DATA_PREPPER_TABLE;
-pub(crate) use self::data_prepper::TRACE_ID_FIELD;
+pub(crate) use self::data_prepper::{DATA_PREPPER_SPAN_INDEX, TRACE_ID_FIELD};
 pub(crate) use self::encoding::{
     EncodedField, ProfileTable, lower_derived_exists, lower_derived_range, lower_derived_term, lower_encoded_exists,
     lower_encoded_range, lower_encoded_term, render_derived_value, render_profile_document, render_profile_field,
