@@ -853,6 +853,73 @@ async fn top_hits_under_a_cut_terms_level_list_the_kept_buckets_hits() {
     server.shutdown().await;
 }
 
+/// The hits a request's `top_hits` can render, each one's surviving non-empty buckets times its
+/// `size` summed over every `top_hits`, are bounded by `search.max_result_window` before any hit
+/// is read. Tenant A has two severities (INFO three rows, ERROR two); tenant B's ERROR row opens
+/// no bucket of tenant A's answer.
+#[tokio::test]
+async fn top_hits_at_the_result_window_render_and_one_past_it_is_a_400_naming_the_aggregation() {
+    let mut config = OpenSearchConfig::default();
+    config.search.max_result_window = 4;
+    let (server, catalog) = TestServer::start_with_config(config).await;
+    commit_log_rows(&catalog, &build_top_hits_logs()).await.expect("commit logs");
+    let build_body = |newest_size: u64, latest_size: u64| {
+        json!({
+            "size": 0,
+            "aggs": {
+                "newest": {"top_hits": {"size": newest_size, "sort": [{"timestamp": "desc"}]}},
+                "severities": {
+                    "terms": {"field": "severity_text", "order": {"_key": "asc"}},
+                    "aggs": {"latest": {"top_hits": {
+                        "size": latest_size,
+                        "sort": [{"timestamp": "desc"}],
+                        "_source": {"includes": ["body"]}
+                    }}}
+                }
+            }
+        })
+    };
+
+    // Two buckets of two hits: exactly the window.
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_A,
+        "/logs/_search",
+        Some(&build_body(0, 2)),
+    )
+    .await
+    .expect("search request");
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let buckets = answer["aggregations"]["severities"]["buckets"]
+        .as_array()
+        .expect("terms buckets");
+    assert_eq!(buckets.len(), 2, "{answer}");
+    assert_eq!(buckets[0]["key"], json!("ERROR"));
+    assert_eq!(list_hit_bodies(&buckets[0]["latest"]), [json!("a4"), json!("a2")]);
+    assert_eq!(buckets[1]["key"], json!("INFO"));
+    assert_eq!(list_hit_bodies(&buckets[1]["latest"]), [json!("a5"), json!("a3")]);
+
+    // Two buckets of three hits (two past the window), and one top-level hit beside two buckets
+    // of two (one past it).
+    for (newest_size, latest_size) in [(0, 3), (1, 2)] {
+        let (status, answer) = send_request(
+            &server,
+            Method::POST,
+            TENANT_A,
+            "/logs/_search",
+            Some(&build_body(newest_size, latest_size)),
+        )
+        .await
+        .expect("search request");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{newest_size}/{latest_size}: {answer}");
+        assert_eq!(answer["error"]["type"], "illegal_argument_exception", "{answer}");
+        assert_eq!(answer["error"]["aggregation"], "latest", "{answer}");
+        assert_eq!(answer["error"]["limit"], 4, "{answer}");
+    }
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_top_hits_over_two_indices_and_an_extended_stats_over_a_keyword_are_400s_naming_them() {
     let (server, catalog) = TestServer::start().await;

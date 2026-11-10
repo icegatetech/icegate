@@ -271,13 +271,13 @@ No limit silently truncates rows: a size, bucket, memory or body limit is an err
 
 | Key | Breach |
 |---|---|
-| `opensearch.search.max_result_window` | 400 when `from + size` exceeds it; a `size` exactly at it with no `from` is accepted |
+| `opensearch.search.max_result_window` | 400 when `from + size` exceeds it; a `size` exactly at it with no `from` is accepted. The hits a search's `top_hits` can render, each one's `size` times its non-empty buckets summed over every `top_hits`, are bounded by it too: past it, a 400 naming the `top_hits` under `aggregation` and the window under `limit` |
 | `opensearch.search.max_buckets` | 400, as above |
 | `opensearch.ppl.max_result_rows` (optional) | when set, a PPL result above it is a 400 in the PPL envelope |
 | `opensearch.max_query_memory_bytes` | 400 naming the limit |
 | `opensearch.max_request_body_bytes` | 413 |
 | `opensearch.system_indices.max_snapshot_bytes` | 413; the tenant's system indices are unchanged |
-| `opensearch.system_indices.max_answer_bytes` | 400 naming the limit; an `_mget` or `_search` is refused whole, on a `_bulk` only the update item fails |
+| `opensearch.system_indices.max_answer_bytes` | 400 naming the limit, which `limit` carries; an `_mget` or `_search` is refused whole, on a `_bulk` only the update item fails. The answered items of an `_msearch` share the bound: an item past it on its own fails alone, and an item that fits it alone but not what the earlier answered items left fails alone with those items' bytes also under `used_bytes`; a later item that fits what is left is answered, and a refused item takes none of the bound |
 | `opensearch.system_indices.max_scroll_lifetime_secs` | 400 for a `scroll` keep-alive above it |
 | `opensearch.max_cross_row_traces` | a filter, sort or aggregation on a `traceGroup*` field over more traces, or `terms` on `traceId` with a larger `size`, is a 400 |
 | `engine.max_query_duration_secs` | 503 |

@@ -495,11 +495,15 @@ async fn msearch_items_past_the_result_window_fail_alone() {
     server.shutdown().await;
 }
 
-/// Each item answer is bounded by `max_answer_bytes` on its own. Every `.kibana` hit fits the
-/// bound, and so does one hit whose `type` a sort copies into `sort`, but two such hits pass it;
-/// one log body alone passes it. Each refused item has a control that differs from it only in
-/// answer size and answers 200, so the bound is the only cause of the refusal. Two fitting
-/// `.kibana` items together pass the bound, and both still answer 200.
+/// The answered items share `max_answer_bytes`. One log body alone passes the bound: the first
+/// item is refused by its own size, naming only the bound. Two `.kibana` hits whose `type` a sort
+/// copies into `sort` pass it too, so that item also names only the bound, although an item was
+/// answered before it. Each refused item has a control that differs from it only in answer size
+/// and answers 200, so the bound is the only cause of the refusal. A two-hit `.kibana` item
+/// without a sort fits the bound alone (its control is the same item in a request of its own), but
+/// not what the answered items before it left, so both such items fail alone, naming the bytes
+/// those items took, while the count after them still fits and answers 200. A refusal takes none
+/// of the bound.
 #[tokio::test]
 async fn msearch_items_past_max_answer_bytes_fail_alone() {
     let system_indices = SystemIndicesConfig {
@@ -556,21 +560,47 @@ async fn msearch_items_past_max_answer_bytes_fail_alone() {
 
     assert_eq!(status, StatusCode::OK, "{answer}");
     let responses = answer["responses"].as_array().expect("responses array");
-    assert_eq!(responses.len(), 7);
-    for refused_item in [&responses[0], &responses[2]] {
-        assert_eq!(refused_item["status"], 400, "{refused_item}");
+    let statuses: Vec<&Value> = responses.iter().map(|item| &item["status"]).collect();
+    assert_eq!(
+        statuses,
+        [
+            &json!(400),
+            &json!(200),
+            &json!(400),
+            &json!(200),
+            &json!(400),
+            &json!(400),
+            &json!(200)
+        ],
+        "{answer}"
+    );
+    for refused_item in [&responses[0], &responses[2], &responses[4], &responses[5]] {
         assert_eq!(
             refused_item["error"]["type"], "illegal_argument_exception",
             "{refused_item}"
         );
+        assert_eq!(refused_item["error"]["limit"], 6000, "{refused_item}");
     }
-    assert_eq!(responses[1]["status"], 200, "{}", responses[1]);
+    let read_answer_bytes = |item: &Value| serde_json::to_vec(item).expect("serialize an answered item").len();
+    for refused_item in [&responses[0], &responses[2]] {
+        assert!(
+            refused_item["error"].get("used_bytes").is_none(),
+            "the item passes the bound on its own: {refused_item}"
+        );
+    }
+    let answered_bytes = read_answer_bytes(&responses[1]) + read_answer_bytes(&responses[3]);
+    for refused_item in [&responses[4], &responses[5]] {
+        assert_eq!(
+            refused_item["error"]["used_bytes"],
+            json!(answered_bytes),
+            "{refused_item}"
+        );
+    }
     assert_eq!(
         responses[1]["hits"]["total"],
         json!({"value": 1, "relation": "eq"}),
         "the logs query is accepted once its answer is small"
     );
-    assert_eq!(responses[3]["status"], 200, "{}", responses[3]);
     assert_eq!(
         responses[3]["hits"]["hits"].as_array().map(Vec::len),
         Some(1),
@@ -578,19 +608,87 @@ async fn msearch_items_past_max_answer_bytes_fail_alone() {
         responses[3]
     );
     assert_eq!(responses[3]["hits"]["hits"][0]["sort"], json!([long_type]));
-    for fitting_item in [&responses[4], &responses[5]] {
-        assert_eq!(fitting_item["status"], 200, "{fitting_item}");
-        assert_eq!(fitting_item["hits"]["total"], json!({"value": 2, "relation": "eq"}));
-    }
-    assert!(
-        serde_json::to_vec(&[&responses[4], &responses[5]])
-            .expect("serialize the fitting items")
-            .len()
-            > 6000,
-        "the two fitting items together pass the bound"
-    );
-    assert_eq!(responses[6]["status"], 200);
     assert_eq!(responses[6]["hits"]["total"], json!({"value": 1, "relation": "eq"}));
+
+    let lone_item_body = concat!(r#"{"index":".kibana"}"#, "\n", "{}\n");
+    let (status, lone_answer) = send_ndjson(&server, TENANT_A, "/_msearch", lone_item_body.to_string())
+        .await
+        .expect("msearch request");
+    assert_eq!(status, StatusCode::OK, "{lone_answer}");
+    let lone_item = &lone_answer["responses"][0];
+    assert_eq!(
+        lone_item["status"], 200,
+        "the two-hit item fits the bound alone: {lone_item}"
+    );
+    assert_eq!(lone_item["hits"]["total"], json!({"value": 2, "relation": "eq"}));
+    server.shutdown().await;
+}
+
+/// `max_answer_bytes` bounds the answered items together. Each of the three identical log items
+/// fits the bound alone, but the first two leave less than a third needs, so the third fails
+/// alone, naming the bound and the bytes the first two took; the count after it still fits what is
+/// left and answers 200.
+#[tokio::test]
+async fn the_msearch_item_that_crosses_max_answer_bytes_fails_alone_and_later_fitting_items_answer() {
+    let system_indices = SystemIndicesConfig {
+        max_snapshot_bytes: 6000,
+        max_answer_bytes: 6000,
+        ..SystemIndicesConfig::default()
+    };
+    system_indices.validate().expect("valid answer bound");
+    let (server, catalog) = TestServer::start_with_config(OpenSearchConfig {
+        system_indices,
+        ..OpenSearchConfig::default()
+    })
+    .await;
+    let long_body = "x".repeat(2000);
+    commit_log_rows(&catalog, &[build_log_row_at_minute(TENANT_A, 5, "INFO", &long_body)])
+        .await
+        .expect("commit logs");
+    let body = concat!(
+        r#"{"index":"logs"}"#,
+        "\n",
+        "{}\n",
+        r#"{"index":"logs"}"#,
+        "\n",
+        "{}\n",
+        r#"{"index":"logs"}"#,
+        "\n",
+        "{}\n",
+        r#"{"index":"logs"}"#,
+        "\n",
+        r#"{"size":0}"#,
+        "\n",
+    );
+
+    let (status, answer) = send_ndjson(&server, TENANT_A, "/_msearch", body.to_string())
+        .await
+        .expect("msearch request");
+
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let responses = answer["responses"].as_array().expect("responses array");
+    let statuses: Vec<&Value> = responses.iter().map(|item| &item["status"]).collect();
+    assert_eq!(
+        statuses,
+        [&json!(200), &json!(200), &json!(400), &json!(200)],
+        "{answer}"
+    );
+    for answered_item in [&responses[0], &responses[1]] {
+        assert_eq!(
+            answered_item["hits"]["hits"][0]["_source"][COL_BODY],
+            json!(long_body),
+            "{answered_item}"
+        );
+    }
+    let first_two_bytes: usize = responses[..2]
+        .iter()
+        .map(|item| serde_json::to_vec(item).expect("serialize an item").len())
+        .sum();
+    let refusal = &responses[2]["error"];
+    assert_eq!(refusal["type"], "illegal_argument_exception", "{refusal}");
+    assert_eq!(refusal["limit"], 6000, "{refusal}");
+    assert_eq!(refusal["used_bytes"], json!(first_two_bytes), "{refusal}");
+    assert_eq!(responses[3]["hits"]["total"], json!({"value": 1, "relation": "eq"}));
     server.shutdown().await;
 }
 

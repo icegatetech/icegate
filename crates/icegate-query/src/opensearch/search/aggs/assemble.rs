@@ -4,7 +4,9 @@
 //! under the keys of its ancestors. Levels are selected top-down in preorder, and a level's
 //! candidates are read only under the parent buckets that survived, so a bucket under a parent
 //! that `size` or `min_doc_count` cut is never answered. A `terms` level ranks each parent's
-//! candidates by its order, then by key ascending, and keeps `size` of them. A `date_histogram`
+//! candidates by its order, then by key ascending, and keeps `size` of them; a level ordered by
+//! count or key arrives already cut to `size` per parent by its stage aggregate, its kept rows
+//! carrying the documents of every bucket the parent admits. A `date_histogram`
 //! and a `histogram` level answer their buckets in key order and, with `min_doc_count: 0`, the
 //! empty buckets between the first and the last key, widened to `extended_bounds`. A `range`,
 //! `date_range`, `filters` or `filter` level is keyed by bucket ordinal and answers every bucket
@@ -29,7 +31,7 @@ use super::parse::{DateHistogramSpec, HistogramSpec};
 use super::percentiles::select_quantile_element;
 use super::plan::{
     AggregationLayout, BucketLevel, DOC_COUNT_COLUMN, Granularity, LEVEL_MASK_COLUMN, LevelKind, OrderMetric,
-    list_granularity_levels, name_key_column, name_statistic_column,
+    list_granularity_levels, name_admitted_doc_count_column, name_key_column, name_statistic_column,
 };
 use super::terms::{RankedBucket, TermsSpec, compare_buckets};
 use crate::opensearch::error::OpenSearchError;
@@ -301,13 +303,36 @@ impl AggregateReader<'_> {
         let Some(row) = row else {
             return Ok(0);
         };
-        let counts = read_column(self.find_row_batch(row)?, DOC_COUNT_COLUMN)?
+        self.read_count(row, DOC_COUNT_COLUMN)
+    }
+
+    /// The documents of every bucket its parent admits, read beside the bucket whose aggregated
+    /// row is `row` at the `terms` level `level`, which its stage aggregate ranked
+    /// ([`name_admitted_doc_count_column`]).
+    ///
+    /// # Errors
+    ///
+    /// `500` for a row reference or a count the plans cannot have produced.
+    fn read_admitted_doc_count(&self, level: usize, row: RowRef) -> Result<u64, OpenSearchError> {
+        self.read_count(row, &name_admitted_doc_count_column(level))
+    }
+
+    /// The non-negative `Int64` count of `column` in the aggregated row `row`.
+    ///
+    /// # Errors
+    ///
+    /// `500` for a row reference, a column or a count the plans cannot have produced.
+    fn read_count(&self, row: RowRef, column: &str) -> Result<u64, OpenSearchError> {
+        let counts = read_column(self.find_row_batch(row)?, column)?
             .as_primitive_opt::<Int64Type>()
-            .ok_or_else(|| OpenSearchError::internal("the document count is not Int64"))?;
+            .ok_or_else(|| OpenSearchError::internal(format!("the count [{column}] is not Int64")))?;
         if row.row >= counts.len() || counts.is_null(row.row) {
-            return Err(OpenSearchError::internal("an aggregated row has no document count"));
+            return Err(OpenSearchError::internal(format!(
+                "an aggregated row has no count [{column}]"
+            )));
         }
-        u64::try_from(counts.value(row.row)).map_err(|_| OpenSearchError::internal("a negative document count"))
+        u64::try_from(counts.value(row.row))
+            .map_err(|_| OpenSearchError::internal(format!("a negative count [{column}]")))
     }
 
     /// The batch holding the aggregated row `row`.
@@ -359,7 +384,11 @@ pub(super) fn assemble_aggregations(
         let mut level_instances = HashMap::with_capacity(parent_paths.len());
         for parent_path in parent_paths {
             let level_candidates = candidates[level].remove(&parent_path).unwrap_or_default();
-            let instance = select_level(bucket_level, &parent_path, level_candidates, &reader, &mut budget)?;
+            let position = InstancePosition {
+                level,
+                parent_path: &parent_path,
+            };
+            let instance = select_level(bucket_level, position, level_candidates, &reader, &mut budget)?;
             level_instances.insert(parent_path, instance);
         }
         instances.push(level_instances);
@@ -585,15 +614,23 @@ pub(super) fn read_level_key(
     Ok(Some(key))
 }
 
-/// The buckets `level` answers under the parent bucket at `parent_path`, from that bucket's
-/// `candidates`.
+/// Where one level instance is selected: the level, and the parent bucket it is selected under.
+#[derive(Debug, Clone, Copy)]
+struct InstancePosition<'a> {
+    /// The layout index of the level the instance answers.
+    level: usize,
+    /// The key path of the parent bucket; empty at the top.
+    parent_path: &'a [BucketKey],
+}
+
+/// The buckets `level` answers at `position`, from the parent bucket's `candidates`.
 ///
 /// # Errors
 ///
 /// The errors of [`assemble_aggregations`] for one level instance.
 fn select_level(
     level: &BucketLevel<'_>,
-    parent_path: &[BucketKey],
+    position: InstancePosition<'_>,
     candidates: Vec<Candidate>,
     reader: &AggregateReader<'_>,
     budget: &mut BucketBudget,
@@ -603,7 +640,7 @@ fn select_level(
             let order_scope = TermsOrderScope {
                 order_metrics: &level.order_metrics,
                 is_ordered_by_a_distinct_count: level.is_ordered_by_a_distinct_count,
-                parent_path,
+                position,
             };
             select_terms(spec, order_scope, candidates, reader, budget)
         }
@@ -661,21 +698,25 @@ fn select_fixed_buckets(
     })
 }
 
-/// What a `terms` order reads under one parent bucket: the metric each criterion reads, and
-/// the parent's path, under which a candidate's distinct counts are looked up.
+/// What a `terms` order reads under one parent bucket: the metric each criterion reads, the
+/// level, whose admitted documents a level cut by its stage aggregate reads, and the parent
+/// bucket, under whose path a candidate's distinct counts are looked up.
 #[derive(Debug, Clone, Copy)]
 struct TermsOrderScope<'a> {
     /// The metric of each order criterion; `None` for `_count` and `_key`.
     order_metrics: &'a [Option<OrderMetric>],
     /// Whether a criterion reads a distinct count, so a candidate's path must be built.
     is_ordered_by_a_distinct_count: bool,
-    /// The path of the parent bucket.
-    parent_path: &'a [BucketKey],
+    /// The `terms` level ranked, and the parent bucket it is ranked under.
+    position: InstancePosition<'a>,
 }
 
 /// Rank a parent's `terms` candidates and keep `size` of them. Only keys present in the matching
 /// rows are candidates, so `min_doc_count: 0` adds no empty bucket. A distinct count an order
-/// reads is looked up by the candidate's path, which is built only when the order reads one.
+/// reads is looked up by the candidate's path, which is built only when the order reads one. A
+/// level ordered by count or key arrives cut to `size` by its stage aggregate, and its kept rows
+/// carry the documents every admitted bucket of the parent holds, which `sum_other_doc_count`
+/// reads instead of the candidates' own sum.
 ///
 /// # Errors
 ///
@@ -696,7 +737,7 @@ fn select_terms(
     for candidate in candidates.into_iter().filter(|candidate| candidate.doc_count >= minimum) {
         let order_values = if has_metric_order {
             let path = if order_scope.is_ordered_by_a_distinct_count {
-                extend_path(order_scope.parent_path, &candidate.key)
+                extend_path(order_scope.position.parent_path, &candidate.key)
             } else {
                 Vec::new()
             };
@@ -713,7 +754,15 @@ fn select_terms(
         };
         ranked_candidates.push((candidate, order_values));
     }
-    let admitted_doc_count: u64 = ranked_candidates.iter().map(|(candidate, _)| candidate.doc_count).sum();
+    let admitted_doc_count: u64 = if spec.is_ranked_by_count_or_key() {
+        ranked_candidates
+            .first()
+            .map(|(candidate, _)| reader.read_admitted_doc_count(order_scope.position.level, candidate.row))
+            .transpose()?
+            .unwrap_or(0)
+    } else {
+        ranked_candidates.iter().map(|(candidate, _)| candidate.doc_count).sum()
+    };
     let rank = |left: &(Candidate, Vec<Option<f64>>), right: &(Candidate, Vec<Option<f64>>)| {
         compare_buckets(
             spec,

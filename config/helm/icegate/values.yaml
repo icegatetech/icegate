@@ -298,7 +298,7 @@ query:
       cacheMaxBytes: 268435456
       # -- Largest decoded snapshot one tenant may hold, in bytes. A write past it is answered 413 and changes nothing.
       maxSnapshotBytes: 134217728
-      # -- Bytes of stored documents one answer may carry; at least maxSnapshotBytes. An _mget or _search past it is refused whole with 400, and _bulk update items past it fail one by one.
+      # -- Bytes of stored documents one answer may carry; at least maxSnapshotBytes. An _mget or _search past it is refused whole with 400, _bulk update items past it fail one by one, and the answered items of an _msearch share it: an item past what the earlier ones left fails alone.
       maxAnswerBytes: 268435456
     ## Limits of _search.
     search:

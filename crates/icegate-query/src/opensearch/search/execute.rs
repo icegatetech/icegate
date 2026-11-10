@@ -8,12 +8,16 @@
 //! ordered in SQL by the hash bits (computed by a UDF) and the keys after `_doc` (two-phase
 //! top-K). The main top-K computes no row hash. The tie fetches compute it in their ordering,
 //! and the fetch of the rows tied with the anchor also in its filter. Every fetch returns at
-//! most `from + size` rows, so an index yields at most three times that many candidates. Each
-//! candidate is hashed in Rust for its `_id`. The pages of several indices merge by the full
-//! key, and a tie goes to the index first in name order. Hits never come from a union that
-//! DataFusion coerces: each hit renders its `_source` from its own index's row. A hit's `sort`
-//! and `fields` values render with its candidate, because `fields` resolves names through the
-//! session; the rest of the answer is linear in the page, so it renders on the blocking pool.
+//! most `from + size` rows, so an index yields at most three times that many candidates. A
+//! candidate references its fetched batch and copies none of its values: its sort keys compare
+//! straight from the batch's sort columns. Only a sort with `_doc` hashes every candidate in
+//! Rust, on the blocking pool, since the key's hash bits order them; otherwise only the rows of
+//! the returned page are hashed, for their `_id`, when the page renders. The pages of several
+//! indices merge by the full key, and a tie goes to the index first in name order. Hits never
+//! come from a union that DataFusion coerces: each hit renders its `_source` from its own index's
+//! row. A hit's `sort` and `fields` values render with its candidate, because `fields` resolves
+//! names through the session; the rest of the answer, `_id`s included, is linear in the page, so
+//! it renders on the blocking pool.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -24,7 +28,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StringArray};
-use datafusion::arrow::datatypes::{ArrowNativeType, DataType, Int64Type, TimeUnit};
+use datafusion::arrow::datatypes::{ArrowNativeType, DataType, Float64Type, Int64Type, TimeUnit};
 use datafusion::error::DataFusionError;
 use datafusion::functions::core::expr_fn::coalesce;
 use datafusion::functions_aggregate::expr_fn::count;
@@ -109,8 +113,8 @@ pub(crate) async fn search_data_indices(
     context: &RequestContext,
     limits: &SearchLimitsConfig,
 ) -> Result<Value, OpenSearchError> {
-    let aggregation_tree = request.aggregations.as_ref().map(parse_aggregations).transpose()?;
-    prepare_cross_row_reads(session, entries, request, aggregation_tree.as_ref(), context.now).await?;
+    let aggregation_tree = request.aggregations.as_ref().map(parse_aggregations).transpose()?.map(Arc::new);
+    prepare_cross_row_reads(session, entries, request, aggregation_tree.as_deref(), context.now).await?;
     let aggregation_rows = match &aggregation_tree {
         Some(tree) => Some(plan_aggregation_rows(
             session,
@@ -129,9 +133,10 @@ pub(crate) async fn search_data_indices(
         session,
         entries,
         max_buckets: limits.max_buckets,
+        max_result_window: limits.max_result_window,
         now: context.now,
     };
-    let aggregations = execute_aggregations(rows, &tree, &scope).await?;
+    let aggregations = execute_aggregations(rows, tree, &scope).await?;
     let Value::Object(body) = &mut response else {
         return Err(OpenSearchError::internal("a search response is a JSON object"));
     };
@@ -494,15 +499,16 @@ async fn search_hits(
     // The work outlives the borrow of `request`, so it renders against its own copy.
     let rendering_request = request.clone();
     run_blocking_work("rendering data search hits", move || {
-        let mut page_hits = page_hits;
-        let hits: Vec<SearchHit<'_>> = page_hits.iter_mut().map(PageHit::take_search_hit).collect();
-        render_search_response(started_at.elapsed(), total, &hits, &rendering_request, &trace_roots)
+        render_page_hits(page_hits, |hits| {
+            render_search_response(started_at.elapsed(), total, hits, &rendering_request, &trace_roots)
+        })
     })
     .await
 }
 
-/// The hit of `candidate`: its index, row and id, its `sort` values when the request sorts, and
-/// its `fields` when the request asks for any.
+/// The hit of `candidate`: its index and row, its `sort` values when the request sorts, and its
+/// `fields` when the request asks for any. Its `_id` is encoded when the page renders
+/// ([`render_page_hits`]), so only the rows a page returns are hashed for one.
 ///
 /// # Errors
 ///
@@ -514,16 +520,57 @@ fn build_search_hit(
     field_requests: &FieldRequestPlan<'_>,
 ) -> Result<PageHit, OpenSearchError> {
     Ok(PageHit {
-        sort_values: (!sort.keys.is_empty()).then(|| render_sort_values(&candidate)).transpose()?,
+        sort_values: (!sort.keys.is_empty())
+            .then(|| render_sort_values(&candidate, &sort.keys))
+            .transpose()?,
         field_values: (!field_requests.requests.is_empty())
             .then(|| render_field_values(session, &candidate, field_requests))
             .transpose()?,
         index_name: candidate.entry.name().to_string(),
         profile_table: find_profile_table(candidate.entry),
+        is_span_keyed: is_span_keyed(candidate.entry.table()),
+        identity: candidate.identity,
         batch: candidate.batch,
         row: candidate.row,
-        document_id: candidate.document_id,
     })
+}
+
+/// Encode the `_id` of every hit of `page_hits`, then `render` the hits as the renderer reads
+/// them. A hit whose candidate was hashed for a `_doc` key reuses that hash; any other row is
+/// hashed here, so a search hashes only the rows its page returns.
+///
+/// # Errors
+///
+/// The errors of [`IdentityColumns::encode_document_id`] and of `render`.
+fn render_page_hits<T>(
+    mut page_hits: Vec<PageHit>,
+    render: impl FnOnce(&[SearchHit<'_>]) -> Result<T, OpenSearchError>,
+) -> Result<T, OpenSearchError> {
+    let mut encoder = CanonicalEncoder::new();
+    let mut document_ids = Vec::with_capacity(page_hits.len());
+    // The hits of one fetched batch are often adjacent, so its columns are found once per run.
+    let mut batch_columns: Option<(&RecordBatch, IdentityColumns<'_>)> = None;
+    for hit in &page_hits {
+        let is_same_batch = batch_columns
+            .as_ref()
+            .is_some_and(|(batch, _)| std::ptr::eq(*batch, hit.batch.as_ref()));
+        if !is_same_batch {
+            batch_columns = None;
+        }
+        let (_, columns) = batch_columns.get_or_insert_with(|| {
+            (
+                hit.batch.as_ref(),
+                IdentityColumns::from_batch(&hit.batch, hit.is_span_keyed),
+            )
+        });
+        document_ids.push(columns.encode_document_id(&mut encoder, &hit.batch, hit.row, hit.identity)?);
+    }
+    let hits: Vec<SearchHit<'_>> = page_hits
+        .iter_mut()
+        .zip(&document_ids)
+        .map(|(hit, document_id)| hit.take_search_hit(document_id))
+        .collect();
+    render(&hits)
 }
 
 /// The roots [`lookup_candidate_trace_roots`] answers for `candidates` when `source` renders a
@@ -567,14 +614,15 @@ async fn lookup_candidate_trace_roots(
 /// key order; later columns are ignored. Each hit is the one `_search` renders for the row under
 /// `request` (`_index`, `_id`, `_score`, `_source`, `fields`, `sort`), one per row, in batch then
 /// row order. The `traceGroup*` fields of a Data Prepper hit render from the roots of the hits'
-/// own traces.
+/// own traces. The hits render on the blocking pool, `_id`s included; the caller bounds how many
+/// rows `batches` holds.
 ///
 /// # Errors
 ///
 /// A 400 naming an index without a document-id rule; the sort and `fields` errors of `_search`;
 /// the errors of [`lookup_rendered_trace_roots`]; `500` for a `_doc` sort clause, a batch
 /// narrower than its table and sort columns, a row without a canonical encoding or a span key,
-/// and a value no JSON rendering exists for.
+/// a value no JSON rendering exists for, and a rendering that does not finish.
 pub(super) async fn render_index_rows_as_hits(
     session: &TenantSession,
     entry: &IndexEntry,
@@ -615,14 +663,20 @@ pub(super) async fn render_index_rows_as_hits(
         sort: &sort,
         anchor: None,
     };
-    let candidates = build_candidates(scope, batches, table_column_count, &sort_columns)?;
+    let fetched_batches = split_fetched_batches(&sort.keys, batches, table_column_count, &sort_columns)?;
+    // No key is `_doc`, so no row is hashed for its sort value.
+    let candidates = build_candidates(scope, fetched_batches, None)?;
     let trace_roots = lookup_rendered_trace_roots(session, &candidates, &request.source).await?;
-    let mut page_hits = candidates
+    let page_hits = candidates
         .into_iter()
         .map(|candidate| build_search_hit(session, candidate, &sort, &field_requests))
         .collect::<Result<Vec<PageHit>, OpenSearchError>>()?;
-    let hits: Vec<SearchHit<'_>> = page_hits.iter_mut().map(PageHit::take_search_hit).collect();
-    render_hits(&hits, request, &trace_roots)
+    // The work outlives the borrow of `request`, so it renders against its own copy.
+    let rendering_request = request.clone();
+    run_blocking_work("rendering index rows as hits", move || {
+        render_page_hits(page_hits, |hits| render_hits(hits, &rendering_request, &trace_roots))
+    })
+    .await
 }
 
 /// One hit of the returned page, owning what its rendering reads, so it moves to the blocking
@@ -632,12 +686,14 @@ struct PageHit {
     index_name: String,
     /// The field table of that index when it serves a non-native profile.
     profile_table: Option<&'static ProfileTable>,
+    /// Whether the index keys its rows by their span key instead of a timestamp and hash.
+    is_span_keyed: bool,
+    /// The row's microsecond and hash when a `_doc` key read them; `None` otherwise.
+    identity: Option<RowIdentity>,
     /// The table columns of the batch holding the row.
     batch: Arc<RecordBatch>,
     /// The row within `batch`.
     row: usize,
-    /// The row's `_id`.
-    document_id: String,
     /// The hit's `sort` values; `None` when the request does not sort.
     sort_values: Option<Vec<Value>>,
     /// The hit's `fields`; `None` when the request asks for none.
@@ -645,14 +701,15 @@ struct PageHit {
 }
 
 impl PageHit {
-    /// The hit as the renderer reads it, borrowing its index, row and id. Its `sort` and `fields`
-    /// values move out into the returned hit, so a second call yields neither.
-    fn take_search_hit(&mut self) -> SearchHit<'_> {
+    /// The hit as the renderer reads it, with `document_id` as its `_id`, borrowing its index and
+    /// row. Its `sort` and `fields` values move out into the returned hit, so a second call yields
+    /// neither.
+    fn take_search_hit<'h>(&'h mut self, document_id: &'h str) -> SearchHit<'h> {
         SearchHit {
             index: &self.index_name,
             batch: &self.batch,
             row: self.row,
-            document_id: &self.document_id,
+            document_id,
             sort_values: self.sort_values.take(),
             field_values: self.field_values.take(),
             profile_table: self.profile_table,
@@ -874,21 +931,278 @@ fn read_term_value(values: &[SortValue], term: OrderingTerm) -> Result<Cow<'_, S
         .read_part(term.part)
 }
 
-/// Whether `values` hold every bound value of `bound_terms`.
+/// A `_doc` key's value: the microsecond within the millisecond, then the low [`DOC_HASH_BITS`]
+/// row-hash bits, compared in that order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DocKey {
+    /// The microsecond within the millisecond, `0..1000`.
+    micros_in_millis: i64,
+    /// The low [`DOC_HASH_BITS`] bits of the row hash.
+    hash_low: u64,
+}
+
+/// What a row's `_id` and `_doc` value are computed from.
+#[derive(Debug, Clone, Copy)]
+struct RowIdentity {
+    /// The row's timestamp in epoch microseconds; `0` for a row without one.
+    timestamp_micros: i64,
+    /// The row's hash: canonical, or of the span key on span-keyed tables.
+    row_hash: u64,
+}
+
+impl RowIdentity {
+    /// The row's `_doc` key value.
+    const fn read_doc_key(self) -> DocKey {
+        DocKey {
+            micros_in_millis: self.timestamp_micros.rem_euclid(1_000),
+            hash_low: self.row_hash & DOC_HASH_MASK,
+        }
+    }
+}
+
+/// One sort-key value as the comparisons read it, borrowed from the array or scalar holding it,
+/// so comparing two rows copies no value.
+#[derive(Debug, Clone, Copy)]
+enum KeyValue<'v> {
+    /// A missing field value, which sorts after every present one in either direction.
+    Missing,
+    /// A long key's value.
+    Long(i64),
+    /// A double key's value, compared in IEEE `totalOrder`.
+    Double(f64),
+    /// A keyword key's value, compared by bytes.
+    Text(&'v str),
+    /// A hex id key's value, compared by bytes.
+    Bytes(&'v [u8]),
+    /// A `_doc` key's value.
+    Doc(DocKey),
+    /// `_score`: every row scores alike.
+    Score,
+}
+
+/// One row's value for each sort key, read in place.
+trait SortKeyRow {
+    /// How many sort-key values the row holds.
+    fn count_values(&self) -> usize;
+
+    /// The value of the key at `position`, which sorts as `kind`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `500` when the row holds no value of `kind` at `position`.
+    fn read_key_value(&self, position: usize, kind: SortKeyKind) -> Result<KeyValue<'_>, OpenSearchError>;
+}
+
+/// A `search_after` anchor, one value per sort key.
+impl SortKeyRow for [SortValue] {
+    fn count_values(&self) -> usize {
+        self.len()
+    }
+
+    fn read_key_value(&self, position: usize, kind: SortKeyKind) -> Result<KeyValue<'_>, OpenSearchError> {
+        let value = self
+            .get(position)
+            .ok_or_else(|| OpenSearchError::internal("a sort key was read past the row's values"))?;
+        match (kind, value) {
+            (SortKeyKind::Score, SortValue::Score) => Ok(KeyValue::Score),
+            (
+                SortKeyKind::Doc,
+                SortValue::Doc {
+                    micros_in_millis,
+                    hash_low,
+                },
+            ) => Ok(KeyValue::Doc(DocKey {
+                micros_in_millis: *micros_in_millis,
+                hash_low: *hash_low,
+            })),
+            (
+                SortKeyKind::Long | SortKeyKind::Double | SortKeyKind::Text | SortKeyKind::Hex(_),
+                SortValue::Field(scalar),
+            ) => read_scalar_key_value(scalar, kind),
+            (_, SortValue::Field(_) | SortValue::Doc { .. } | SortValue::Score) => Err(OpenSearchError::internal(
+                format!("a sort value of another kind was read for a [{}] key", kind.name()),
+            )),
+        }
+    }
+}
+
+/// The value of a key of `kind` held by `scalar`.
 ///
 /// # Errors
 ///
-/// Returns the errors of [`read_term_value`].
-fn has_bound_values(
-    values: &[SortValue],
-    bound_terms: &[(OrderingTerm, ScalarValue)],
+/// Returns `500` for a present value of another type than the key's.
+fn read_scalar_key_value(scalar: &ScalarValue, kind: SortKeyKind) -> Result<KeyValue<'_>, OpenSearchError> {
+    match (kind, scalar) {
+        (_, missing_value) if missing_value.is_null() => Ok(KeyValue::Missing),
+        (SortKeyKind::Long, ScalarValue::Int64(Some(value))) => Ok(KeyValue::Long(*value)),
+        (SortKeyKind::Double, ScalarValue::Float64(Some(value))) => Ok(KeyValue::Double(*value)),
+        (SortKeyKind::Text, ScalarValue::Utf8(Some(text))) => Ok(KeyValue::Text(text)),
+        (SortKeyKind::Hex(_), ScalarValue::FixedSizeBinary(_, Some(bytes))) => Ok(KeyValue::Bytes(bytes)),
+        (_, unexpected_value) => Err(OpenSearchError::internal(format!(
+            "a sort value of the type {} was read for a [{}] key",
+            unexpected_value.data_type(),
+            kind.name()
+        ))),
+    }
+}
+
+/// The value of a key of `kind` at `row` of `array`, a fetched sort column.
+///
+/// # Errors
+///
+/// Returns `500` for a column of another type than the key's, and for a `_doc` or `_score` key,
+/// whose values no column holds.
+fn read_array_key_value(array: &dyn Array, row: usize, kind: SortKeyKind) -> Result<KeyValue<'_>, OpenSearchError> {
+    if array.is_null(row) {
+        return Ok(KeyValue::Missing);
+    }
+    let value = match kind {
+        SortKeyKind::Long => array
+            .as_primitive_opt::<Int64Type>()
+            .map(|values| KeyValue::Long(values.value(row))),
+        SortKeyKind::Double => array
+            .as_primitive_opt::<Float64Type>()
+            .map(|values| KeyValue::Double(values.value(row))),
+        SortKeyKind::Text => array.as_string_opt::<i32>().map(|values| KeyValue::Text(values.value(row))),
+        SortKeyKind::Hex(_) => array
+            .as_fixed_size_binary_opt()
+            .map(|values| KeyValue::Bytes(values.value(row))),
+        SortKeyKind::Doc | SortKeyKind::Score => None,
+    };
+    value.ok_or_else(|| {
+        OpenSearchError::internal(format!(
+            "a sort column of the type {} was read for a [{}] key",
+            array.data_type(),
+            kind.name()
+        ))
+    })
+}
+
+/// The sort-key values of one fetched row, read in place from its batch's sort columns.
+#[derive(Debug, Clone, Copy)]
+struct ArraySortKeys<'c> {
+    /// Per sort key, its column in the fetched batch; `None` for `_doc` and `_score`, which no
+    /// column holds.
+    columns: &'c [Option<ArrayRef>],
+    /// The row within the columns.
+    row: usize,
+    /// The row's microsecond and hash, which a `_doc` key reads; `None` when no key is `_doc`.
+    identity: Option<RowIdentity>,
+}
+
+impl SortKeyRow for ArraySortKeys<'_> {
+    fn count_values(&self) -> usize {
+        self.columns.len()
+    }
+
+    fn read_key_value(&self, position: usize, kind: SortKeyKind) -> Result<KeyValue<'_>, OpenSearchError> {
+        match kind {
+            SortKeyKind::Score => Ok(KeyValue::Score),
+            SortKeyKind::Doc => self
+                .identity
+                .map(|identity| KeyValue::Doc(identity.read_doc_key()))
+                .ok_or_else(|| OpenSearchError::internal("a row sorted on _doc was not hashed")),
+            SortKeyKind::Long | SortKeyKind::Double | SortKeyKind::Text | SortKeyKind::Hex(_) => {
+                let column = self
+                    .columns
+                    .get(position)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| OpenSearchError::internal("a sort key other than _score has no sort column"))?;
+                read_array_key_value(column.as_ref(), self.row, kind)
+            }
+        }
+    }
+}
+
+impl ArraySortKeys<'_> {
+    /// The row's value for each of `keys`, copied out of the columns: the boundary of a two-phase
+    /// top-K, which the next fetch's predicate binds as literals.
+    ///
+    /// # Errors
+    ///
+    /// Returns `500` when a key has no column, a `_doc` key no identity, or a value cannot be read.
+    fn copy_sort_values(&self, keys: &[SortKey]) -> Result<Vec<SortValue>, OpenSearchError> {
+        keys.iter()
+            .enumerate()
+            .map(|(position, key)| match self.read_key_value(position, key.kind)? {
+                KeyValue::Score => Ok(SortValue::Score),
+                KeyValue::Doc(DocKey {
+                    micros_in_millis,
+                    hash_low,
+                }) => Ok(SortValue::Doc {
+                    micros_in_millis,
+                    hash_low,
+                }),
+                KeyValue::Missing
+                | KeyValue::Long(_)
+                | KeyValue::Double(_)
+                | KeyValue::Text(_)
+                | KeyValue::Bytes(_) => self.copy_field_value(position).map(SortValue::Field),
+            })
+            .collect()
+    }
+
+    /// The value of the field key at `position`, copied out of its column.
+    ///
+    /// # Errors
+    ///
+    /// Returns `500` when the key has no column or its value cannot be read.
+    fn copy_field_value(&self, position: usize) -> Result<ScalarValue, OpenSearchError> {
+        let column = self
+            .columns
+            .get(position)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| OpenSearchError::internal("a sort key other than _score has no sort column"))?;
+        ScalarValue::try_from_array(column.as_ref(), self.row).map_err(convert_plan_error)
+    }
+}
+
+/// Whether `left` and `right` hold equal values for every term of `terms`, a missing value equal
+/// to a missing one.
+///
+/// # Errors
+///
+/// Returns the errors of [`SortKeyRow::read_key_value`] and [`compare_term_values`], and `500` for
+/// a term naming a key `keys` lacks.
+fn has_equal_terms(
+    left: &impl SortKeyRow,
+    right: &impl SortKeyRow,
+    terms: &[OrderingTerm],
+    keys: &[SortKey],
 ) -> Result<bool, OpenSearchError> {
-    for (term, bound_value) in bound_terms {
-        if read_term_value(values, *term)?.as_ref() != bound_value {
+    for term in terms {
+        let key = keys
+            .get(term.key)
+            .ok_or_else(|| OpenSearchError::internal("an ordering term names a sort key the plan lacks"))?;
+        let ordering = compare_term_values(
+            left.read_key_value(term.key, key.kind)?,
+            right.read_key_value(term.key, key.kind)?,
+            term.part,
+        )?;
+        if ordering != Ordering::Equal {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Two values of one key compared on `part` of it, ascending.
+///
+/// # Errors
+///
+/// Returns the errors of [`compare_key_values`], and `500` for a `_doc` part of a value that is no
+/// `_doc` value.
+fn compare_term_values(left: KeyValue<'_>, right: KeyValue<'_>, part: KeyPart) -> Result<Ordering, OpenSearchError> {
+    match (part, left, right) {
+        (KeyPart::FieldValue, _, _) => compare_key_values(left, right, SortOrder::Asc),
+        (KeyPart::DocMicros, KeyValue::Doc(left), KeyValue::Doc(right)) => {
+            Ok(left.micros_in_millis.cmp(&right.micros_in_millis))
+        }
+        (KeyPart::DocHash, KeyValue::Doc(left), KeyValue::Doc(right)) => Ok(left.hash_low.cmp(&right.hash_low)),
+        (KeyPart::DocMicros | KeyPart::DocHash, _, _) => Err(OpenSearchError::internal(
+            "a _doc ordering part was read from a value of another kind",
+        )),
+    }
 }
 
 /// The kind a resolved field sorts as in one index.
@@ -1338,7 +1652,9 @@ struct BranchScope<'a> {
     anchor: Option<&'a [SortValue]>,
 }
 
-/// One row a page may return, with what ordering and rendering it need.
+/// One row a page may return, with what ordering and rendering it need. It references its
+/// fetched batch and copies none of its values: sort keys compare straight from the batch's sort
+/// columns.
 struct Candidate<'a> {
     /// The index the row was read from.
     entry: &'a IndexEntry,
@@ -1346,16 +1662,24 @@ struct Candidate<'a> {
     position: usize,
     /// The row's table columns (no sort columns), shared by the rows of one fetched batch.
     batch: Arc<RecordBatch>,
-    /// The row within `batch`.
+    /// Per sort key, its column in the fetched batch, shared by the rows of that batch; `None`
+    /// for `_doc` and `_score`, which no column holds.
+    sort_columns: Arc<[Option<ArrayRef>]>,
+    /// The row within `batch` and `sort_columns`.
     row: usize,
-    /// The row's `_id`.
-    document_id: String,
-    /// The row's timestamp in epoch microseconds; `0` for a row without one.
-    timestamp_micros: i64,
-    /// The row's hash: canonical, or of the span key on span-keyed tables.
-    row_hash: u64,
-    /// The row's value for each sort key.
-    keys: Vec<SortValue>,
+    /// The row's microsecond and hash, which a `_doc` key reads; `None` when no key is `_doc`.
+    identity: Option<RowIdentity>,
+}
+
+impl Candidate<'_> {
+    /// The row's sort-key values, read in place.
+    fn read_sort_keys(&self) -> ArraySortKeys<'_> {
+        ArraySortKeys {
+            columns: &self.sort_columns,
+            row: self.row,
+            identity: self.identity,
+        }
+    }
 }
 
 /// One index's share of a search.
@@ -1459,7 +1783,7 @@ async fn select_candidates<'a>(
             .and(ordering.build_after_predicate(&bind_terms(&tie_terms, anchor)?)?);
         for candidate in fetch_rows(scope, matching_plan, Some(filter), &tie_terms, window).await? {
             // SQL kept only the rows after the anchor; the full comparison confirms each.
-            if compare_sort_values(&candidate.keys, anchor, &scope.sort.keys)? == Ordering::Greater {
+            if compare_sort_values(&candidate.read_sort_keys(), anchor, &scope.sort.keys)? == Ordering::Greater {
                 candidates.push(candidate);
             }
         }
@@ -1467,11 +1791,21 @@ async fn select_candidates<'a>(
     let mut selected_candidates = fetch_rows(scope, matching_plan, after_filter.clone(), &prefix_terms, window).await?;
     if !tie_terms.is_empty() && selected_candidates.len() == window {
         // Two-phase top-K: the rows tied with the last one on the prefix terms make way for the
-        // first `window` of all such rows in the order of the remaining terms.
-        let boundary = bind_terms(&prefix_terms, &selected_candidates[window - 1].keys)?;
+        // first `window` of all such rows in the order of the remaining terms. The last row is
+        // itself tied with itself, so the tie fetch answers it again.
+        let boundary_candidate = selected_candidates
+            .pop()
+            .ok_or_else(|| OpenSearchError::internal("a full fetch holds no last row"))?;
+        let boundary_keys = boundary_candidate.read_sort_keys();
+        let boundary = bind_terms(&prefix_terms, &boundary_keys.copy_sort_values(&scope.sort.keys)?)?;
         let mut candidates_before_boundary = Vec::with_capacity(window);
         for candidate in selected_candidates {
-            if !has_bound_values(&candidate.keys, &boundary)? {
+            if !has_equal_terms(
+                &candidate.read_sort_keys(),
+                &boundary_keys,
+                &prefix_terms,
+                &scope.sort.keys,
+            )? {
                 candidates_before_boundary.push(candidate);
             }
         }
@@ -1651,30 +1985,115 @@ fn push_sort_column(projection: &mut Vec<Expr>, expr: &Expr) -> usize {
     position
 }
 
-/// Where a fetched batch holds what a candidate reads, found once per batch, and the encoder
-/// every row of a fetch is hashed with.
-struct CandidateColumns<'a> {
-    /// The canonical encoder, reused across the rows of a fetch.
-    encoder: &'a mut CanonicalEncoder,
+/// Where a batch of an index's table columns holds what its rows' `_id` and `_doc` value read,
+/// found once per batch.
+struct IdentityColumns<'b> {
     /// The names of the table columns, in schema order, which the canonical hash encodes.
-    column_names: Vec<&'a str>,
+    column_names: Vec<&'b str>,
     /// The position of the timestamp column, if the table has one.
     timestamp_index: Option<usize>,
     /// The position of the trace-id column, if the table has one.
     trace_id_index: Option<usize>,
     /// The position of the span-id column, if the table has one.
     span_id_index: Option<usize>,
-    /// Per sort key, the position of its value among the projected columns; `None` for a key
-    /// without an SQL expression (`_score`).
-    sort_columns: &'a [Option<usize>],
+    /// Whether the rows are keyed by `trace_id`‖`span_id` instead of a timestamp and hash.
+    is_span_keyed: bool,
+}
+
+impl<'b> IdentityColumns<'b> {
+    /// The identity columns of `rows`, a batch of an index's table columns; `is_span_keyed` tells
+    /// whether the index keys its rows by their span key.
+    fn from_batch(rows: &'b RecordBatch, is_span_keyed: bool) -> Self {
+        let schema = rows.schema_ref();
+        Self {
+            column_names: schema.fields().iter().map(|field| field.name().as_str()).collect(),
+            timestamp_index: schema.index_of(COL_TIMESTAMP).ok(),
+            trace_id_index: schema.index_of(COL_TRACE_ID).ok(),
+            span_id_index: schema.index_of(COL_SPAN_ID).ok(),
+            is_span_keyed,
+        }
+    }
+
+    /// The microsecond and hash of `rows[row]`: the span key's hash on span-keyed tables, the
+    /// canonical row's otherwise, hashed with `encoder`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `500` when the row has no canonical encoding or a span-keyed row has no span key.
+    fn read_identity(
+        &self,
+        encoder: &mut CanonicalEncoder,
+        rows: &RecordBatch,
+        row: usize,
+    ) -> Result<RowIdentity, OpenSearchError> {
+        let timestamp_micros = self.timestamp_index.map_or(0, |index| {
+            read_document_timestamp_micros(rows.column(index).as_ref(), row)
+        });
+        let row_hash = if self.is_span_keyed {
+            let (trace_id, span_id) = self.read_span_key(rows, row)?;
+            hash_span_key(trace_id, span_id)
+        } else {
+            hash_canonical_row(encoder, &self.column_names, rows, row)?
+        };
+        Ok(RowIdentity {
+            timestamp_micros,
+            row_hash,
+        })
+    }
+
+    /// The `_id` of `rows[row]`: its span key on span-keyed tables, its microsecond and hash
+    /// otherwise, from `identity` when the row was already hashed.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::read_identity`].
+    fn encode_document_id(
+        &self,
+        encoder: &mut CanonicalEncoder,
+        rows: &RecordBatch,
+        row: usize,
+        identity: Option<RowIdentity>,
+    ) -> Result<String, OpenSearchError> {
+        if self.is_span_keyed {
+            let (trace_id, span_id) = self.read_span_key(rows, row)?;
+            return Ok(encode_span_document_id(trace_id, span_id));
+        }
+        let identity = match identity {
+            Some(identity) => identity,
+            None => self.read_identity(encoder, rows, row)?,
+        };
+        Ok(encode_document_id(identity.timestamp_micros, identity.row_hash))
+    }
+
+    /// The trace id and span id of `rows[row]`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`read_fixed_bytes`].
+    fn read_span_key<'r>(&self, rows: &'r RecordBatch, row: usize) -> Result<(&'r [u8], &'r [u8]), OpenSearchError> {
+        Ok((
+            read_fixed_bytes(rows, COL_TRACE_ID, self.trace_id_index, row)?,
+            read_fixed_bytes(rows, COL_SPAN_ID, self.span_id_index, row)?,
+        ))
+    }
+}
+
+/// One fetched batch, split into what its candidates read.
+struct FetchedBatch {
+    /// The table columns.
+    rows: Arc<RecordBatch>,
+    /// Per sort key, its column; `None` for `_doc` and `_score`, which no column holds.
+    sort_columns: Arc<[Option<ArrayRef>]>,
 }
 
 /// Fetch the first `limit` rows of `matching_plan` that also pass `filter`, ordered by `terms`.
+/// When a sort key is `_doc`, every fetched row is hashed for it on the blocking pool.
 ///
 /// # Errors
 ///
-/// Returns planning or execution failures, and the errors of [`BranchOrdering::build_sorted_projection`],
-/// [`verify_sort_columns`] and [`build_candidate`].
+/// Returns planning or execution failures, and the errors of
+/// [`BranchOrdering::build_sorted_projection`], [`split_fetched_batches`],
+/// [`read_candidate_identities`] and [`build_candidates`].
 async fn fetch_rows<'a>(
     scope: BranchScope<'a>,
     matching_plan: &LogicalPlanBuilder,
@@ -1699,44 +2118,117 @@ async fn fetch_rows<'a>(
         .and_then(LogicalPlanBuilder::build)
         .map_err(convert_plan_error)?;
     let batches = scope.session.collect(plan).await?;
-    build_candidates(scope, &batches, table_column_count, &sort_columns)
+    let fetched_batches = split_fetched_batches(&scope.sort.keys, &batches, table_column_count, &sort_columns)?;
+    let identities = read_candidate_identities(scope, &fetched_batches).await?;
+    build_candidates(scope, fetched_batches, identities)
 }
 
-/// The candidate of every row of `batches`, in batch then row order: the first
-/// `table_column_count` columns of each batch are the index's table columns, and the value of
-/// each sort key sits at its position in `sort_columns`.
+/// Each of `batches` split into its table columns, the first `table_column_count`, and per sort
+/// key the column at its position in `sort_columns`; a `_doc` key reads no column.
 ///
 /// # Errors
 ///
-/// Returns the errors of [`verify_sort_columns`] and [`build_candidate`], and `500` when a batch
-/// has fewer columns than `table_column_count`.
-fn build_candidates<'a>(
-    scope: BranchScope<'a>,
+/// Returns the errors of [`verify_sort_columns`], and `500` when a batch has fewer columns than
+/// `table_column_count`.
+fn split_fetched_batches(
+    keys: &[SortKey],
     batches: &[RecordBatch],
     table_column_count: usize,
     sort_columns: &[Option<usize>],
-) -> Result<Vec<Candidate<'a>>, OpenSearchError> {
+) -> Result<Vec<FetchedBatch>, OpenSearchError> {
     let table_indices: Vec<usize> = (0..table_column_count).collect();
-    let mut encoder = CanonicalEncoder::new();
-    let mut candidates = Vec::with_capacity(batches.iter().map(RecordBatch::num_rows).sum());
-    for batch in batches {
-        verify_sort_columns(batch, &scope.sort.keys, sort_columns)?;
-        let rows = Arc::new(
-            batch
+    batches
+        .iter()
+        .map(|batch| {
+            verify_sort_columns(batch, keys, sort_columns)?;
+            let rows = batch
                 .project(&table_indices)
-                .map_err(|error| convert_plan_error(error.into()))?,
-        );
-        let schema = rows.schema();
-        let mut columns = CandidateColumns {
-            encoder: &mut encoder,
-            column_names: schema.fields().iter().map(|field| field.name().as_str()).collect(),
-            timestamp_index: schema.index_of(COL_TIMESTAMP).ok(),
-            trace_id_index: schema.index_of(COL_TRACE_ID).ok(),
-            span_id_index: schema.index_of(COL_SPAN_ID).ok(),
-            sort_columns,
-        };
-        for row in 0..batch.num_rows() {
-            candidates.push(build_candidate(scope, &rows, batch, &mut columns, row)?);
+                .map_err(|error| convert_plan_error(error.into()))?;
+            let key_columns = keys
+                .iter()
+                .zip(sort_columns)
+                .map(|(key, column)| match key.kind {
+                    SortKeyKind::Doc | SortKeyKind::Score => None,
+                    SortKeyKind::Long | SortKeyKind::Double | SortKeyKind::Text | SortKeyKind::Hex(_) => {
+                        column.map(|column| Arc::clone(batch.column(column)))
+                    }
+                })
+                .collect();
+            Ok(FetchedBatch {
+                rows: Arc::new(rows),
+                sort_columns: key_columns,
+            })
+        })
+        .collect()
+}
+
+/// The identity of every row of `fetched_batches`, in batch then row order, when a sort key of
+/// `scope` is `_doc`, whose value is the row's microsecond and hash bits; `None` otherwise, so a
+/// sort without `_doc` hashes no candidate. Hashing reads every column of every row, MAP
+/// attributes included, so it runs on the blocking pool.
+///
+/// # Errors
+///
+/// The errors of [`IdentityColumns::read_identity`], and `500` when the hashing does not finish.
+async fn read_candidate_identities(
+    scope: BranchScope<'_>,
+    fetched_batches: &[FetchedBatch],
+) -> Result<Option<Vec<RowIdentity>>, OpenSearchError> {
+    if !scope.sort.keys.iter().any(|key| key.kind == SortKeyKind::Doc) {
+        return Ok(None);
+    }
+    let is_span_keyed = is_span_keyed(scope.entry.table());
+    let batches: Vec<Arc<RecordBatch>> = fetched_batches
+        .iter()
+        .map(|fetched_batch| Arc::clone(&fetched_batch.rows))
+        .collect();
+    run_blocking_work("hashing candidate rows", move || {
+        let mut encoder = CanonicalEncoder::new();
+        let mut identities = Vec::with_capacity(batches.iter().map(|rows| rows.num_rows()).sum());
+        for rows in &batches {
+            let columns = IdentityColumns::from_batch(rows, is_span_keyed);
+            for row in 0..rows.num_rows() {
+                identities.push(columns.read_identity(&mut encoder, rows, row)?);
+            }
+        }
+        Ok(identities)
+    })
+    .await
+    .map(Some)
+}
+
+/// The candidate of every row of `fetched_batches`, in batch then row order, each carrying its
+/// identity from `identities` (in the same order) when the sort read one.
+///
+/// # Errors
+///
+/// Returns `500` when `identities` holds fewer identities than the batches hold rows.
+fn build_candidates(
+    scope: BranchScope<'_>,
+    fetched_batches: Vec<FetchedBatch>,
+    identities: Option<Vec<RowIdentity>>,
+) -> Result<Vec<Candidate<'_>>, OpenSearchError> {
+    let mut identities = identities.map(Vec::into_iter);
+    let mut candidates =
+        Vec::with_capacity(fetched_batches.iter().map(|fetched_batch| fetched_batch.rows.num_rows()).sum());
+    for fetched_batch in fetched_batches {
+        for row in 0..fetched_batch.rows.num_rows() {
+            let identity = identities
+                .as_mut()
+                .map(|remaining| {
+                    remaining
+                        .next()
+                        .ok_or_else(|| OpenSearchError::internal("a fetched row was not hashed"))
+                })
+                .transpose()?;
+            candidates.push(Candidate {
+                entry: scope.entry,
+                position: scope.position,
+                batch: Arc::clone(&fetched_batch.rows),
+                sort_columns: Arc::clone(&fetched_batch.sort_columns),
+                row,
+                identity,
+            });
         }
     }
     Ok(candidates)
@@ -1764,69 +2256,6 @@ fn verify_sort_columns(
         }
     }
     Ok(())
-}
-
-/// The candidate of `projected[row]`: its id, its hash and its sort-key values.
-///
-/// # Errors
-///
-/// Returns `500` when the row has no canonical encoding, a span-keyed row has no span key, a sort
-/// key other than `_score` has no sort column, or a sort value cannot be read.
-fn build_candidate<'a>(
-    scope: BranchScope<'a>,
-    rows: &Arc<RecordBatch>,
-    projected: &RecordBatch,
-    columns: &mut CandidateColumns<'_>,
-    row: usize,
-) -> Result<Candidate<'a>, OpenSearchError> {
-    let timestamp_micros = columns.timestamp_index.map_or(0, |index| {
-        read_document_timestamp_micros(rows.column(index).as_ref(), row)
-    });
-    let (row_hash, document_id) = if is_span_keyed(scope.entry.table()) {
-        let trace_id = read_fixed_bytes(rows, COL_TRACE_ID, columns.trace_id_index, row)?;
-        let span_id = read_fixed_bytes(rows, COL_SPAN_ID, columns.span_id_index, row)?;
-        (
-            hash_span_key(trace_id, span_id),
-            encode_span_document_id(trace_id, span_id),
-        )
-    } else {
-        let row_hash = hash_canonical_row(columns.encoder, &columns.column_names, rows, row)?;
-        (row_hash, encode_document_id(timestamp_micros, row_hash))
-    };
-    let keys = scope
-        .sort
-        .keys
-        .iter()
-        .zip(columns.sort_columns)
-        .map(|(key, column)| match (key.kind, column) {
-            (SortKeyKind::Score, _) => Ok(SortValue::Score),
-            (SortKeyKind::Doc, Some(_)) => Ok(SortValue::Doc {
-                micros_in_millis: timestamp_micros.rem_euclid(1_000),
-                hash_low: row_hash & DOC_HASH_MASK,
-            }),
-            (SortKeyKind::Long | SortKeyKind::Double | SortKeyKind::Text | SortKeyKind::Hex(_), Some(column)) => {
-                ScalarValue::try_from_array(projected.column(*column).as_ref(), row)
-                    .map(SortValue::Field)
-                    .map_err(convert_plan_error)
-            }
-            (
-                SortKeyKind::Long | SortKeyKind::Double | SortKeyKind::Text | SortKeyKind::Hex(_) | SortKeyKind::Doc,
-                None,
-            ) => Err(OpenSearchError::internal(
-                "a sort key other than _score has no sort column",
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Candidate {
-        entry: scope.entry,
-        position: scope.position,
-        batch: Arc::clone(rows),
-        row,
-        document_id,
-        timestamp_micros,
-        row_hash,
-        keys,
-    })
 }
 
 /// The bytes of the span-key column `column`, at `column_index`, at `row`.
@@ -1861,65 +2290,67 @@ const fn apply_order(ordering: Ordering, order: SortOrder) -> Ordering {
     }
 }
 
-/// Two present sort values compared: doubles in IEEE `totalOrder`, others by their natural order.
+/// Two values of one key compared in `order`: doubles in IEEE `totalOrder`, keywords and ids by
+/// bytes, others by their natural order; a missing value sorts after every present one in either
+/// direction.
 ///
 /// # Errors
 ///
-/// Returns `500` for two values of types without a common order.
-fn compare_scalars(left: &ScalarValue, right: &ScalarValue) -> Result<Ordering, OpenSearchError> {
-    match (left, right) {
-        (ScalarValue::Float64(Some(left)), ScalarValue::Float64(Some(right))) => Ok(left.total_cmp(right)),
-        _ => left.partial_cmp(right).ok_or_else(|| {
-            OpenSearchError::internal(format!(
-                "sort values of the types {} and {} have no common order",
-                left.data_type(),
-                right.data_type()
-            ))
-        }),
-    }
+/// Returns `500` for two present values of different kinds.
+fn compare_key_values(left: KeyValue<'_>, right: KeyValue<'_>, order: SortOrder) -> Result<Ordering, OpenSearchError> {
+    let ordering = match (left, right) {
+        (KeyValue::Missing, KeyValue::Missing) | (KeyValue::Score, KeyValue::Score) => return Ok(Ordering::Equal),
+        (KeyValue::Missing, _) => return Ok(Ordering::Greater),
+        (_, KeyValue::Missing) => return Ok(Ordering::Less),
+        (KeyValue::Long(left), KeyValue::Long(right)) => left.cmp(&right),
+        (KeyValue::Double(left), KeyValue::Double(right)) => left.total_cmp(&right),
+        (KeyValue::Text(left), KeyValue::Text(right)) => left.cmp(right),
+        (KeyValue::Bytes(left), KeyValue::Bytes(right)) => left.cmp(right),
+        (KeyValue::Doc(left), KeyValue::Doc(right)) => left.cmp(&right),
+        (
+            KeyValue::Long(_)
+            | KeyValue::Double(_)
+            | KeyValue::Text(_)
+            | KeyValue::Bytes(_)
+            | KeyValue::Doc(_)
+            | KeyValue::Score,
+            _,
+        ) => {
+            return Err(OpenSearchError::internal(
+                "sort values of different kinds were compared",
+            ));
+        }
+    };
+    Ok(apply_order(ordering, order))
 }
 
-/// Compare two key tuples in sort order; a missing value sorts after every present one.
+/// Compare two rows in sort order, key by key; each value is read as its key's kind, so neither
+/// row's values are copied.
 ///
 /// # Errors
 ///
-/// Returns `500` for tuples of another length than `keys`, or holding values of different kinds
-/// or of types without a common order. [`verify_sort_columns`] and the anchor's parsing by key
-/// kind rule these out before any comparison.
-fn compare_sort_values(left: &[SortValue], right: &[SortValue], keys: &[SortKey]) -> Result<Ordering, OpenSearchError> {
-    if left.len() != keys.len() || right.len() != keys.len() {
+/// Returns `500` for rows of another length than `keys`, or holding a value of another kind than
+/// its key's. [`verify_sort_columns`] and the anchor's parsing by key kind rule these out before
+/// any comparison.
+fn compare_sort_values<L, R>(left: &L, right: &R, keys: &[SortKey]) -> Result<Ordering, OpenSearchError>
+where
+    L: SortKeyRow + ?Sized,
+    R: SortKeyRow + ?Sized,
+{
+    if left.count_values() != keys.len() || right.count_values() != keys.len() {
         return Err(OpenSearchError::internal(format!(
             "sort tuples of {} and {} values were compared over {} keys",
-            left.len(),
-            right.len(),
+            left.count_values(),
+            right.count_values(),
             keys.len()
         )));
     }
-    for ((left, right), key) in left.iter().zip(right).zip(keys) {
-        let ordering = match (left, right) {
-            (SortValue::Field(left), SortValue::Field(right)) => match (left.is_null(), right.is_null()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => Ordering::Greater,
-                (false, true) => Ordering::Less,
-                (false, false) => apply_order(compare_scalars(left, right)?, key.order),
-            },
-            (
-                SortValue::Doc {
-                    micros_in_millis: left_micros,
-                    hash_low: left_hash,
-                },
-                SortValue::Doc {
-                    micros_in_millis: right_micros,
-                    hash_low: right_hash,
-                },
-            ) => apply_order((left_micros, left_hash).cmp(&(right_micros, right_hash)), key.order),
-            (SortValue::Score, SortValue::Score) => Ordering::Equal,
-            (SortValue::Field(_) | SortValue::Doc { .. } | SortValue::Score, _) => {
-                return Err(OpenSearchError::internal(
-                    "sort values of different kinds were compared",
-                ));
-            }
-        };
+    for (position, key) in keys.iter().enumerate() {
+        let ordering = compare_key_values(
+            left.read_key_value(position, key.kind)?,
+            right.read_key_value(position, key.kind)?,
+            key.order,
+        )?;
         if ordering != Ordering::Equal {
             return Ok(ordering);
         }
@@ -1935,33 +2366,39 @@ fn compare_sort_values(left: &[SortValue], right: &[SortValue], keys: &[SortKey]
 /// order, and the caller drops them with the request.
 fn sort_candidates(candidates: &mut [Candidate<'_>], keys: &[SortKey]) -> Result<(), OpenSearchError> {
     let mut comparison_error = None;
-    candidates.sort_by(|left, right| match compare_sort_values(&left.keys, &right.keys, keys) {
-        Ok(ordering) => ordering.then(left.position.cmp(&right.position)),
-        Err(error) => {
-            comparison_error.get_or_insert(error);
-            Ordering::Equal
+    candidates.sort_by(|left, right| {
+        match compare_sort_values(&left.read_sort_keys(), &right.read_sort_keys(), keys) {
+            Ok(ordering) => ordering.then(left.position.cmp(&right.position)),
+            Err(error) => {
+                comparison_error.get_or_insert(error);
+                Ordering::Equal
+            }
         }
     });
     comparison_error.map_or(Ok(()), Err)
 }
 
-/// The `sort` array of a hit: dates as epoch milliseconds, `_doc` as its sort value, `_score`
-/// as `1.0`, a missing value as `null`.
+/// The `sort` array of a page hit over `keys`: dates as epoch milliseconds, `_doc` as its sort
+/// value, `_score` as `1.0`, a missing value as `null`. Only a returned hit renders its values,
+/// copied out of its fetched columns here.
 ///
 /// # Errors
 ///
-/// Returns the errors of [`render_sort_scalar`].
-fn render_sort_values(candidate: &Candidate<'_>) -> Result<Vec<Value>, OpenSearchError> {
-    candidate
-        .keys
-        .iter()
-        .map(|key| match key {
-            SortValue::Field(value) => render_sort_scalar(value),
-            SortValue::Doc { .. } => Ok(json!(encode_doc_sort_value(
-                candidate.timestamp_micros,
-                candidate.row_hash
-            ))),
-            SortValue::Score => Ok(json!(1.0)),
+/// Returns the errors of [`render_sort_scalar`], and `500` when a field key has no column or a
+/// `_doc` key no identity.
+fn render_sort_values(candidate: &Candidate<'_>, keys: &[SortKey]) -> Result<Vec<Value>, OpenSearchError> {
+    let sort_keys = candidate.read_sort_keys();
+    keys.iter()
+        .enumerate()
+        .map(|(position, key)| match key.kind {
+            SortKeyKind::Score => Ok(json!(1.0)),
+            SortKeyKind::Doc => candidate
+                .identity
+                .map(|identity| json!(encode_doc_sort_value(identity.timestamp_micros, identity.row_hash)))
+                .ok_or_else(|| OpenSearchError::internal("a hit sorted on _doc was not hashed")),
+            SortKeyKind::Long | SortKeyKind::Double | SortKeyKind::Text | SortKeyKind::Hex(_) => {
+                render_sort_scalar(&sort_keys.copy_field_value(position)?)
+            }
         })
         .collect()
 }
@@ -2339,7 +2776,7 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::{
-        AsArray, FixedSizeBinaryArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+        ArrayRef, AsArray, FixedSizeBinaryArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
     };
     use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema};
     use datafusion::datasource::MemTable;
@@ -2351,8 +2788,9 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     use super::{
-        BranchOrdering, OrderingTerm, SortKey, SortKeyKind, SortValue, bind_terms, compare_sort_values,
-        list_prefix_terms, list_tie_terms, read_fixed_bytes, verify_sort_columns,
+        ArraySortKeys, BranchOrdering, OrderingTerm, RowIdentity, SortKey, SortKeyKind, SortValue, bind_terms,
+        compare_sort_values, has_equal_terms, list_prefix_terms, list_tie_terms, read_fixed_bytes, read_term_value,
+        verify_sort_columns,
     };
     use crate::opensearch::error::{OpenSearchError, render_envelope};
     use crate::opensearch::search::request::SortOrder;
@@ -2572,6 +3010,93 @@ mod tests {
         }
     }
 
+    /// Fetched rows compared in place from their sort columns order exactly as the values they
+    /// hold do, against each other and against an anchor's values; two rows are tied on the prefix
+    /// terms exactly when their values there are equal; and a row's values copied out of its
+    /// columns are its own. Missing values, `-0.0`, `+0.0` and `NaN` are among the values.
+    #[test]
+    fn rows_read_in_place_from_their_sort_columns_compare_like_the_values_they_hold() {
+        let mut generator = StdRng::seed_from_u64(0x0A77_A5C0);
+        let mut tied_pairs = 0;
+        let mut untied_pairs = 0;
+        for _ in 0..20 {
+            let keys = generate_keys(&mut generator);
+            let rows: Vec<Vec<SortValue>> = (0..30).map(|_| generate_row(&mut generator, &keys)).collect();
+            let batch = build_rows_batch(&rows, &keys);
+            let read_column = |name: &str| Some(Arc::clone(batch.column_by_name(name).expect("a generated column")));
+            let columns: Vec<Option<ArrayRef>> = keys
+                .iter()
+                .map(|key| match key.kind {
+                    SortKeyKind::Long => read_column(FIELD_COLUMNS[0]),
+                    SortKeyKind::Text => read_column(FIELD_COLUMNS[1]),
+                    SortKeyKind::Double => read_column(FIELD_COLUMNS[2]),
+                    SortKeyKind::Doc => None,
+                    SortKeyKind::Hex(_) | SortKeyKind::Score => unreachable!("the generated keys are fields and _doc"),
+                })
+                .collect();
+            // A generated `_doc` value is a microsecond below 1000 and hash bits below 2^43, so an
+            // identity of exactly those values yields it back.
+            let column_rows: Vec<ArraySortKeys<'_>> = rows
+                .iter()
+                .enumerate()
+                .map(|(row, values)| ArraySortKeys {
+                    columns: &columns,
+                    row,
+                    identity: find_value(values, &keys, SortKeyKind::Doc).map(|value| match value {
+                        SortValue::Doc {
+                            micros_in_millis,
+                            hash_low,
+                        } => RowIdentity {
+                            timestamp_micros: *micros_in_millis,
+                            row_hash: *hash_low,
+                        },
+                        other => unreachable!("a _doc key holds {other:?}"),
+                    }),
+                })
+                .collect();
+            let prefix_terms = list_prefix_terms(&keys);
+            for (left, left_values) in column_rows.iter().zip(&rows) {
+                let copied_values = left.copy_sort_values(&keys).expect("copy the row's values");
+                assert_eq!(
+                    compare_generated_rows(&copied_values, left_values, &keys),
+                    Ordering::Equal,
+                    "{copied_values:?} {left_values:?}"
+                );
+                for (right, right_values) in column_rows.iter().zip(&rows) {
+                    let expected = compare_generated_rows(left_values, right_values, &keys);
+                    assert_eq!(
+                        compare_sort_values(left, right, &keys).expect("rows of one fetch compare"),
+                        expected,
+                        "{left_values:?} {right_values:?} {keys:?}"
+                    );
+                    assert_eq!(
+                        compare_sort_values(left, right_values.as_slice(), &keys).expect("a row and an anchor compare"),
+                        expected,
+                        "{left_values:?} {right_values:?} {keys:?}"
+                    );
+                    let bound_terms = bind_terms(&prefix_terms, right_values).expect("bind the prefix terms");
+                    let is_tied = bound_terms.iter().all(|(term, bound_value)| {
+                        read_term_value(left_values, *term).expect("a prefix term value").as_ref() == bound_value
+                    });
+                    assert_eq!(
+                        has_equal_terms(left, right, &prefix_terms, &keys).expect("compare the prefix terms"),
+                        is_tied,
+                        "{left_values:?} {right_values:?} {keys:?}"
+                    );
+                    if is_tied {
+                        tied_pairs += 1;
+                    } else {
+                        untied_pairs += 1;
+                    }
+                }
+            }
+        }
+        // The seed reaches rows tied on the prefix terms, other than a row with itself, and rows
+        // that are not.
+        assert!(tied_pairs > 20 * 30, "{tied_pairs}");
+        assert!(untied_pairs > 0, "{untied_pairs}");
+    }
+
     /// The SQL the fetches are built from agrees with the Rust order over the whole key: sorted
     /// by the prefix terms then the tie terms (the row-hash bits of `_doc` included) and limited
     /// to `k` rows, a plan answers rows equal, key for key, to the first `k` rows of the Rust
@@ -2701,7 +3226,7 @@ mod tests {
             ("a tuple shorter than the keys", Vec::new(), vec![long_value.clone()]),
         ];
         for (case, left, right) in cases {
-            let error = compare_sort_values(&left, &right, &keys).expect_err(case);
+            let error = compare_sort_values(left.as_slice(), right.as_slice(), &keys).expect_err(case);
             assert_internal_error(error, case).await;
         }
 

@@ -7,9 +7,11 @@
 //! buckets and unnests every membership list, so a row of two `filters` buckets is a candidate
 //! hit of both. It keeps the rows of the non-empty buckets the response renders (a semi-join
 //! against their key paths), numbers them by `row_number()` over those keys in `sort` order and
-//! cuts at `size`: a bucket that `size` or `min_doc_count` dropped costs the window nothing. The
-//! kept rows render through the `_search` hits renderer, and each bucket takes the hits whose
-//! key path is its own.
+//! cuts at `size`: a bucket that `size` or `min_doc_count` dropped costs the window nothing.
+//! Before any branch runs, the hits the request can render (each `top_hits`'s `size` times its
+//! non-empty buckets, summed over the request) are bounded by `search.max_result_window`, the
+//! window a `_search` page is bounded by. The kept rows render through the `_search` hits renderer
+//! on the blocking pool, and each bucket takes the hits whose key path is its own.
 
 use std::collections::HashMap;
 
@@ -178,13 +180,20 @@ struct HitsContext<'c, 'l> {
 /// Run the branch of every `top_hits` of `layout` over `rows` (the matching rows, which carry the
 /// searched index's table columns under [`name_hit_column`] whenever the tree holds a
 /// `top_hits`), keep the buckets `assembled` renders, and render each kept row as `_search`
-/// renders it. A `size: 0` and a search of no index read nothing.
+/// renders it, on the blocking pool. A `size: 0` and a search of no index read nothing.
+///
+/// Before any branch runs, the hits the request can render are bounded: each `top_hits` renders up
+/// to its `size` hits in every non-empty bucket the response answers (the one top-level bucket
+/// when it has a matching row), and the hits of every `top_hits` together stay within
+/// `scope.max_result_window`, the window a `_search` page is bounded by.
 ///
 /// # Errors
 ///
-/// The sort and `fields` errors of `_search`; the branch's planning and execution errors, the
-/// session's memory limit among them; `500` for more than one searched index, which
-/// `plan_aggregation_rows` refuses first, and for a branch whose rows and hits disagree.
+/// [`OpenSearchError::top_hits_window_exceeded`] naming the first `top_hits`, in preorder, whose
+/// hits pass the window; the sort and `fields` errors of `_search`; the branch's planning and
+/// execution errors, the session's memory limit among them; `500` for more than one searched
+/// index, which `plan_aggregation_rows` refuses first, and for a branch whose rows and hits
+/// disagree.
 pub(super) async fn collect_top_hits(
     rows: &LogicalPlan,
     layout: &AggregationLayout<'_>,
@@ -202,6 +211,7 @@ pub(super) async fn collect_top_hits(
             ));
         }
     };
+    check_top_hits_window(layout, assembled, scope.max_result_window)?;
     let context = HitsContext {
         layout,
         inputs,
@@ -249,6 +259,44 @@ pub(super) async fn collect_top_hits(
         results.insert(top_hits_index, by_bucket);
     }
     Ok(results)
+}
+
+/// Refuse the `top_hits` of `layout` when the hits they can render pass `max_result_window`: each
+/// renders up to its `size` hits in every non-empty bucket `assembled` answers at its granularity,
+/// and the hits of every `top_hits` count together.
+///
+/// # Errors
+///
+/// [`OpenSearchError::top_hits_window_exceeded`] naming the first `top_hits`, in preorder, whose
+/// hits pass the window; `500` for a top-level document count the plans cannot have produced.
+fn check_top_hits_window(
+    layout: &AggregationLayout<'_>,
+    assembled: &AssembledAggregations,
+    max_result_window: usize,
+) -> Result<(), OpenSearchError> {
+    let mut hit_count: usize = 0;
+    for slot in &layout.top_hits {
+        let bucket_count = match slot.granularity {
+            Granularity::Top => usize::from(assembled.create_reader().read_doc_count(assembled.top_row)? > 0),
+            Granularity::Level(level) => count_surviving_buckets(assembled, level),
+        };
+        hit_count = hit_count.saturating_add(bucket_count.saturating_mul(slot.spec.request.size));
+        if hit_count > max_result_window {
+            return Err(OpenSearchError::top_hits_window_exceeded(slot.name, max_result_window));
+        }
+    }
+    Ok(())
+}
+
+/// How many non-empty buckets the response renders at `level`: the buckets whose hits a `top_hits`
+/// at that level lists ([`list_surviving_bucket_paths`]).
+fn count_surviving_buckets(assembled: &AssembledAggregations, level: usize) -> usize {
+    assembled.instances.get(level).map_or(0, |instances| {
+        instances
+            .values()
+            .map(|instance| instance.buckets.iter().filter(|bucket| bucket.doc_count > 0).count())
+            .sum()
+    })
 }
 
 /// The table columns the rows plan carries for hits, in scan order, by their own names.

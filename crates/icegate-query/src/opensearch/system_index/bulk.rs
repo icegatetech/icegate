@@ -606,46 +606,112 @@ pub(crate) fn serialize_bounded_answer(
     answer: &impl Serialize,
     max_answer_bytes: usize,
 ) -> Result<Vec<u8>, OpenSearchError> {
-    let mut buffer = BoundedBuffer::new(max_answer_bytes);
-    let serialization = serde_json::to_writer(&mut buffer, answer);
+    let buffer = write_bounded_answer(answer, BoundedBuffer::new(max_answer_bytes, max_answer_bytes))?;
     if buffer.has_refused_write {
         return Err(OpenSearchError::answer_too_large(max_answer_bytes));
     }
-    serialization.map_err(|error| OpenSearchError::internal(format!("serializing an answer: {error}")))?;
     Ok(buffer.bytes)
 }
 
-/// The buffer of one answer, which refuses the write that would pass its bound and remembers that it
-/// did, so a caller recognizes a breach from this state and not from the text of an [`io::Error`].
-/// Nothing is reserved up front: a small answer allocates for its own size, not for the bound.
+/// Serialize `answer` as JSON into at most `share_bytes`, the part of `max_answer_bytes` left to it
+/// by the other answers that share the bound.
+///
+/// An answer past `share_bytes` is still counted, without keeping its bytes, up to
+/// `max_answer_bytes`, so the refusal names its cause: the answer's own size, or the bytes the
+/// other answers took. The counting past the share is paid only by an answer already refused.
+///
+/// # Errors
+///
+/// Returns `400` `answer_too_large` when the answer would pass `max_answer_bytes` on its own, and
+/// what `build_share_refusal` builds when it fits `max_answer_bytes` but not `share_bytes`, so no
+/// client reads part of one; `500` for any other failure, which no answer can cause: its map keys
+/// are strings.
+pub(crate) fn serialize_shared_answer(
+    answer: &impl Serialize,
+    share_bytes: usize,
+    max_answer_bytes: usize,
+    build_share_refusal: impl FnOnce() -> OpenSearchError,
+) -> Result<Vec<u8>, OpenSearchError> {
+    let buffer = write_bounded_answer(
+        answer,
+        BoundedBuffer::new(share_bytes.min(max_answer_bytes), max_answer_bytes),
+    )?;
+    if buffer.has_refused_write {
+        return Err(OpenSearchError::answer_too_large(max_answer_bytes));
+    }
+    if buffer.has_passed_kept_bytes() {
+        return Err(build_share_refusal());
+    }
+    Ok(buffer.bytes)
+}
+
+/// Serialize `answer` as JSON into `buffer`, which a caller then reads for a breach of its bounds.
+///
+/// # Errors
+///
+/// Returns `500` when the serialization fails other than by the buffer's refusal, which no answer
+/// can cause: its map keys are strings.
+fn write_bounded_answer(answer: &impl Serialize, mut buffer: BoundedBuffer) -> Result<BoundedBuffer, OpenSearchError> {
+    let serialization = serde_json::to_writer(&mut buffer, answer);
+    if !buffer.has_refused_write {
+        serialization.map_err(|error| OpenSearchError::internal(format!("serializing an answer: {error}")))?;
+    }
+    Ok(buffer)
+}
+
+/// The buffer of one answer, which keeps the bytes written while they stay within `max_kept_bytes`,
+/// counts them up to `max_written_bytes`, and refuses the write that would pass that, remembering
+/// that it did, so a caller recognizes a breach from this state and not from the text of an
+/// [`io::Error`]. Nothing is reserved up front: a small answer allocates for its own size, not for
+/// the bound.
 struct BoundedBuffer {
-    /// The bytes accepted so far, never more than `max_bytes`.
+    /// The bytes written, while they are within `max_kept_bytes`; empty once they pass it.
     bytes: Vec<u8>,
-    /// The most bytes `bytes` may hold.
-    max_bytes: usize,
+    /// The most bytes `bytes` keeps; never more than `max_written_bytes`.
+    max_kept_bytes: usize,
+    /// The bytes written so far, kept or not; never more than `max_written_bytes`.
+    written_bytes: usize,
+    /// The most bytes the writes may bring `written_bytes` to.
+    max_written_bytes: usize,
     /// Whether a write was refused.
     has_refused_write: bool,
 }
 
 impl BoundedBuffer {
-    /// An empty buffer holding at most `max_bytes`.
-    const fn new(max_bytes: usize) -> Self {
+    /// An empty buffer keeping at most `max_kept_bytes` and taking at most `max_written_bytes`;
+    /// `max_kept_bytes` is at most `max_written_bytes`.
+    const fn new(max_kept_bytes: usize, max_written_bytes: usize) -> Self {
         Self {
             bytes: Vec::new(),
-            max_bytes,
+            max_kept_bytes,
+            written_bytes: 0,
+            max_written_bytes,
             has_refused_write: false,
         }
+    }
+
+    /// Whether the bytes written passed `max_kept_bytes`, so `bytes` no longer holds them.
+    const fn has_passed_kept_bytes(&self) -> bool {
+        self.written_bytes > self.max_kept_bytes
     }
 }
 
 impl io::Write for BoundedBuffer {
-    /// Take all of `chunk`, or none of it when it would pass the bound.
+    /// Take all of `chunk`, or none of it when it would pass `max_written_bytes`; keep it only
+    /// while the bytes written stay within `max_kept_bytes`.
     fn write(&mut self, chunk: &[u8]) -> io::Result<usize> {
-        if chunk.len() > self.max_bytes - self.bytes.len() {
+        if chunk.len() > self.max_written_bytes - self.written_bytes {
             self.has_refused_write = true;
             return Err(io::ErrorKind::FileTooLarge.into());
         }
-        self.bytes.extend_from_slice(chunk);
+        self.written_bytes += chunk.len();
+        if self.has_passed_kept_bytes() {
+            // The answer is refused once it passes what it may keep, so its bytes are released
+            // at once rather than held while the rest is counted.
+            self.bytes = Vec::new();
+        } else {
+            self.bytes.extend_from_slice(chunk);
+        }
         Ok(chunk.len())
     }
 
@@ -1205,8 +1271,8 @@ mod tests {
 
     #[test]
     fn a_bounded_buffer_takes_a_write_ending_at_its_bound_and_refuses_one_byte_more() {
-        let mut filled_buffer = BoundedBuffer::new(4);
-        let mut overrun_buffer = BoundedBuffer::new(4);
+        let mut filled_buffer = BoundedBuffer::new(4, 4);
+        let mut overrun_buffer = BoundedBuffer::new(4, 4);
 
         filled_buffer.write_all(b"ab").expect("below the bound");
         filled_buffer.write_all(b"cd").expect("ending at the bound");
@@ -1225,6 +1291,57 @@ mod tests {
             (overrun_buffer.bytes.as_slice(), overrun_buffer.has_refused_write),
             (&b""[..], true)
         );
+    }
+
+    #[test]
+    fn a_bounded_buffer_counts_past_what_it_keeps_and_refuses_past_what_it_takes() {
+        let mut buffer = BoundedBuffer::new(2, 4);
+
+        buffer.write_all(b"ab").expect("ending at the kept bound");
+        assert_eq!(
+            (buffer.bytes.as_slice(), buffer.has_passed_kept_bytes()),
+            (&b"ab"[..], false)
+        );
+        buffer.write_all(b"c").expect("past the kept bound, within the taken one");
+        assert_eq!(
+            (buffer.bytes.as_slice(), buffer.has_passed_kept_bytes()),
+            (&b""[..], true)
+        );
+        buffer.write_all(b"d").expect("ending at the taken bound");
+        assert!(!buffer.has_refused_write);
+        buffer.write_all(b"e").expect_err("one byte past the taken bound");
+
+        assert_eq!((buffer.written_bytes, buffer.has_refused_write), (4, true));
+    }
+
+    /// The answer `"abcd"` is 6 bytes. Within its share it is answered; past its share but within
+    /// the bound it gets the share's refusal; past the bound on its own it gets `answer_too_large`,
+    /// whatever its share.
+    #[tokio::test]
+    async fn a_shared_answer_is_refused_by_its_own_size_or_by_the_share_the_others_left() {
+        let answer = json!("abcd");
+        let build_share_refusal = || OpenSearchError::msearch_answer_too_large(6, 1);
+
+        let within_share = serialize_shared_answer(&answer, 6, 6, build_share_refusal).expect("within its share");
+        let past_share = serialize_shared_answer(&answer, 5, 6, build_share_refusal).expect_err("past its share");
+        let past_bound = serialize_shared_answer(&answer, 5, 5, build_share_refusal).expect_err("past the bound");
+
+        assert_eq!(within_share, b"\"abcd\"");
+        let (status, past_share) = render_envelope(past_share).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            (&past_share["error"]["limit"], &past_share["error"]["used_bytes"]),
+            (&json!(6), &json!(1)),
+            "{past_share}"
+        );
+        let (status, past_bound) = render_envelope(past_bound).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            past_bound["error"]["type"], "illegal_argument_exception",
+            "{past_bound}"
+        );
+        assert_eq!(past_bound["error"]["limit"], 5, "{past_bound}");
+        assert!(past_bound["error"].get("used_bytes").is_none(), "{past_bound}");
     }
 
     /// No request can reach this: `apply` answers each item with its own outcome. Were it reached,

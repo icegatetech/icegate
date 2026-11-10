@@ -11,8 +11,9 @@
 //! read: its item has no target to run against, and answering the others would hide a malformed
 //! request. Items run one after another in request order: a request then holds one item's result
 //! at a time, whatever the number of items. Each item's answer is serialized on the blocking pool
-//! as soon as it is built, within `max_answer_bytes` as a `_search` answer is, so an item past
-//! the bound fails alone.
+//! as soon as it is built, within what the earlier answered items left of `max_answer_bytes`, so
+//! the answered items together stay within the bound and an item past what is left fails alone,
+//! while a later item that fits what is left is still answered.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,7 +35,7 @@ use crate::opensearch::extract::{
     EndpointParameters, ExpandWildcards, Parameters, PathParameters, RequestBody, deserialize_flag,
 };
 use crate::opensearch::state::OpenSearchState;
-use crate::opensearch::system_index::bulk::{build_json_response, serialize_bounded_answer};
+use crate::opensearch::system_index::bulk::{build_json_response, serialize_shared_answer};
 use crate::opensearch::system_index::run_blocking_work;
 use crate::opensearch::system_index::search::search_system_indices;
 
@@ -294,8 +295,13 @@ pub(crate) async fn run_multi_search_on_index(
 /// Parse the items, run each in request order and assemble their answers. An item whose header
 /// names no index reads `fallback_expression`.
 ///
-/// Each item answer is bounded by `max_answer_bytes` on its own, as a `_search` answer is; the
-/// assembled answer holds every item answer and is not bounded as a whole.
+/// The answered items share `max_answer_bytes`: each item is serialized within what the earlier
+/// answered items left of it, and one past that fails alone, so the answered items together hold
+/// at most the bound. An item past the bound on its own is refused with `answer_too_large`; one
+/// that fits the bound alone but not what is left, with `msearch_answer_too_large`. A refused item
+/// takes none of the bound: its envelope follows from the request, not from the data, so a later
+/// item that fits what is left is still answered. The refusals and the envelope around the items
+/// (`took`, the brackets and separators) come on top of the bound.
 ///
 /// # Errors
 ///
@@ -330,16 +336,23 @@ async fn answer_multi_search(
         expand_wildcards: None,
         scroll: None,
     };
-    let item_defaults = ItemDefaults {
+    let item_settings = ItemSettings {
         index: fallback_expression,
         parameters: &item_parameters,
-        max_answer_bytes: state.max_answer_bytes,
+        limits: state.search_limits,
     };
     let session = state.catalog.open_session(&context.tenant).await?;
+    let mut answer_budget = AnswerBudget {
+        max_answer_bytes: state.max_answer_bytes,
+        used_bytes: 0,
+    };
     let mut item_answers = Vec::with_capacity(items.len());
     for item in items {
-        let item_answer = match run_item(state.search_limits, &session, context, &item_defaults, item).await {
-            Ok(item_answer) => item_answer,
+        let item_answer = match run_item(&session, context, &item_settings, answer_budget, item).await {
+            Ok(item_answer) => {
+                answer_budget.charge_item_answer(item_answer.len());
+                item_answer
+            }
             Err(error) => render_item_error(error).await?,
         };
         item_answers.push(item_answer);
@@ -348,44 +361,73 @@ async fn answer_multi_search(
     Ok(assemble_multi_search_answer(took, &item_answers))
 }
 
-/// What every item of one `_msearch` request falls back to.
-struct ItemDefaults<'a> {
+/// What every item of one `_msearch` request runs with.
+struct ItemSettings<'a> {
     /// The index an item whose header names none reads: the path's, or every visible index.
     index: &'a IndexExpression,
     /// The URL parameters every item body is parsed with.
     parameters: &'a SearchParameters,
-    /// The bound of one item's serialized answer.
+    /// The search limits every item runs under, as a `_search` does.
+    limits: SearchLimitsConfig,
+}
+
+/// The share of `max_answer_bytes` the answered items of one `_msearch` request have taken so far.
+#[derive(Debug, Clone, Copy)]
+struct AnswerBudget {
+    /// The bound of the answered items together.
     max_answer_bytes: usize,
+    /// The bytes the earlier answered items took; a refused item takes none.
+    used_bytes: usize,
+}
+
+impl AnswerBudget {
+    /// The most bytes the next item answer may take: none once the earlier ones reached the bound.
+    const fn compute_remaining_bytes(self) -> usize {
+        self.max_answer_bytes.saturating_sub(self.used_bytes)
+    }
+
+    /// The refusal of an item answer that fits `max_answer_bytes` on its own but not
+    /// [`compute_remaining_bytes`](Self::compute_remaining_bytes): it names the bytes the earlier
+    /// answered items took.
+    fn build_share_refusal(self) -> OpenSearchError {
+        OpenSearchError::msearch_answer_too_large(self.max_answer_bytes, self.used_bytes)
+    }
+
+    /// Count an answered item of `answer_bytes` against the bound.
+    const fn charge_item_answer(&mut self, answer_bytes: usize) {
+        self.used_bytes = self.used_bytes.saturating_add(answer_bytes);
+    }
 }
 
 /// Run one item exactly as `_search` runs a request on the same indices, and serialize its answer
 /// as the item: the search answer's own keys, then `status: 200`.
 ///
 /// A system search and the serialization of either answer run on the blocking pool, because each
-/// is linear in the snapshot or the page. `limits` is taken by value: it is a small `Copy` type.
+/// is linear in the snapshot or the page. `answer_budget` is taken by value: it is a small `Copy`
+/// type, moved into the serialization.
 ///
 /// # Errors
 ///
 /// The errors `_search` answers for the same request: those of [`parse_search_request`],
 /// [`TenantSession::resolve_target`], [`check_result_window`],
-/// [`search_data_indices`] and [`search_system_indices`], and `400 illegal_argument_exception`
-/// for an item answer past `max_answer_bytes`.
+/// [`search_data_indices`] and [`search_system_indices`], and the refusals of
+/// [`serialize_item_answer`] for an item answer past what is left of the bound.
 async fn run_item(
-    limits: SearchLimitsConfig,
     session: &TenantSession,
     context: &RequestContext,
-    defaults: &ItemDefaults<'_>,
+    settings: &ItemSettings<'_>,
+    answer_budget: AnswerBudget,
     item: MultiSearchItem,
 ) -> Result<Bytes, OpenSearchError> {
-    let request = parse_search_request(&item.body, defaults.parameters)?;
-    let expression = item.header.index.as_ref().unwrap_or(defaults.index);
-    let max_answer_bytes = defaults.max_answer_bytes;
+    let request = parse_search_request(&item.body, settings.parameters)?;
+    let expression = item.header.index.as_ref().unwrap_or(settings.index);
+    let limits = settings.limits;
     let item_answer = match session.resolve_target(expression, item.header.options).await? {
         IndexTarget::Data(entries) => {
             check_result_window(&request, limits)?;
             let answer = search_data_indices(session, &entries, &request, context, &limits).await?;
             run_blocking_work("serializing an msearch data item", move || {
-                serialize_item_answer(answer, max_answer_bytes)
+                serialize_item_answer(answer, answer_budget)
             })
             .await?
         }
@@ -397,7 +439,7 @@ async fn run_item(
             let context = context.clone();
             run_blocking_work("searching system indices for an msearch item", move || {
                 let answer = search_system_indices(&snapshot, &names, &request, &context)?;
-                serialize_item_answer(answer, max_answer_bytes)
+                serialize_item_answer(answer, answer_budget)
             })
             .await?
         }
@@ -405,19 +447,25 @@ async fn run_item(
     Ok(Bytes::from(item_answer))
 }
 
-/// Serialize a search answer as one item within `max_answer_bytes`: its own keys, then
+/// Serialize a search answer as one item within what `answer_budget` has left: its own keys, then
 /// `status: 200`. The answer is taken by value, so it drops where it is serialized.
 ///
 /// # Errors
 ///
-/// The errors of [`serialize_bounded_answer`]; `500` when `answer` is not a JSON object, which no
-/// search answer is.
-fn serialize_item_answer(mut answer: Value, max_answer_bytes: usize) -> Result<Vec<u8>, OpenSearchError> {
+/// The errors of [`serialize_shared_answer`]: `answer_too_large` when the item would pass
+/// `max_answer_bytes` on its own, and [`AnswerBudget::build_share_refusal`] when it would pass only
+/// what is left; `500` when `answer` is not a JSON object, which no search answer is.
+fn serialize_item_answer(mut answer: Value, answer_budget: AnswerBudget) -> Result<Vec<u8>, OpenSearchError> {
     let Value::Object(object) = &mut answer else {
         return Err(OpenSearchError::internal("a search answer is not a JSON object"));
     };
     object.insert("status".to_string(), Value::from(StatusCode::OK.as_u16()));
-    serialize_bounded_answer(&answer, max_answer_bytes)
+    serialize_shared_answer(
+        &answer,
+        answer_budget.compute_remaining_bytes(),
+        answer_budget.max_answer_bytes,
+        || answer_budget.build_share_refusal(),
+    )
 }
 
 /// The envelope `_search` would answer for `error`, as one item: `{error, status}`.

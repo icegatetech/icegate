@@ -270,6 +270,22 @@ impl OpenSearchError {
         .with_metadata("limit", limit)
     }
 
+    /// The hits the `top_hits` aggregations of one search would render passing
+    /// `search.max_result_window` (`400`, `illegal_argument_exception`): a `top_hits` renders up to
+    /// its `size` hits in every non-empty bucket the response answers, and the hits of every
+    /// `top_hits` of the search count together. `aggregation` carries the request's name for the
+    /// `top_hits` whose hits pass the window and `limit` the window.
+    pub(crate) fn top_hits_window_exceeded(aggregation: &str, limit: usize) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!(
+                "the [top_hits] aggregations would render more hits than search.max_result_window ({limit}) \
+                 allows; [{aggregation}] passes it"
+            ),
+        )
+        .with_metadata("limit", limit)
+    }
+
     /// A `terms` aggregation on the trace id of the span profile asking for more traces than
     /// `opensearch.max_cross_row_traces` (`400`, `illegal_argument_exception`); `aggregation`
     /// carries the request's name for it and `limit` the most traces one search may ask for.
@@ -817,12 +833,28 @@ impl OpenSearchError {
         )
     }
 
-    /// An answer would pass `max_answer_bytes` (`400`), which a request avoids by asking for less.
-    /// An `_mget` or a `_search` is refused whole; on a `_bulk` only the update item fails.
+    /// An answer would pass `max_answer_bytes` (`400`), which a request avoids by asking for less;
+    /// `limit` carries the bound in bytes. An `_mget` or a `_search` is refused whole; on a `_bulk`
+    /// only the update item fails, and on an `_msearch` only the item.
     pub(crate) fn answer_too_large(max_answer_bytes: usize) -> Self {
         Self::illegal_argument(format!(
             "the answer would pass opensearch.system_indices.max_answer_bytes ({max_answer_bytes} bytes)"
         ))
+        .with_metadata("limit", max_answer_bytes)
+    }
+
+    /// An `_msearch` item answer would pass what is left of `max_answer_bytes` once the earlier
+    /// answered items took `used_bytes` of it (`400`); only that item fails. It is
+    /// [`answer_too_large`](Self::answer_too_large) plus `used_bytes`, and it is answered only for
+    /// an item that fits `max_answer_bytes` on its own: an item past the bound by its own size gets
+    /// `answer_too_large`, whatever the earlier items took.
+    pub(crate) fn msearch_answer_too_large(max_answer_bytes: usize, used_bytes: usize) -> Self {
+        Self::illegal_argument(format!(
+            "the answer would pass opensearch.system_indices.max_answer_bytes ({max_answer_bytes} bytes), \
+             of which the earlier answered _msearch items took {used_bytes} bytes"
+        ))
+        .with_metadata("limit", max_answer_bytes)
+        .with_metadata("used_bytes", used_bytes)
     }
 
     /// No route serves `method` on `path`: a `400` `illegal_argument_exception` in the envelope,
@@ -1086,6 +1118,21 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("1024"), "{reason}");
+        assert_eq!(body["error"]["limit"], 1024);
+        assert!(body["error"].get("used_bytes").is_none(), "{body}");
+
+        let (status, body) = render_envelope(OpenSearchError::msearch_answer_too_large(1024, 700)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        let reason = body["error"]["reason"].as_str().expect("the reason is a string");
+        assert!(
+            reason.contains("opensearch.system_indices.max_answer_bytes"),
+            "{reason}"
+        );
+        assert_eq!(body["error"]["limit"], 1024);
+        assert_eq!(body["error"]["used_bytes"], 700);
+        assert_eq!(body["error"]["root_cause"][0]["used_bytes"], 700);
     }
 
     #[tokio::test]

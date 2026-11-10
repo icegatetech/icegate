@@ -277,7 +277,8 @@ pub struct SystemIndicesConfig {
     pub max_snapshot_bytes: usize,
     /// The bytes of stored documents one answer may carry; at least `max_snapshot_bytes`, so an
     /// answer naming each stored document once fits. An `_mget` or a `_search` past it is refused
-    /// whole with `400`, and `_bulk` update items past it fail one by one.
+    /// whole with `400`, `_bulk` update items past it fail one by one, and the answered items of an
+    /// `_msearch` share it: an item past what the earlier ones left fails alone.
     pub max_answer_bytes: usize,
 }
 

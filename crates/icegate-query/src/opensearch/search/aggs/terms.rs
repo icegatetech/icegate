@@ -46,6 +46,17 @@ pub(crate) struct TermsSpec {
     pub(crate) min_doc_count: u64,
 }
 
+impl TermsSpec {
+    /// Whether every criterion of the order reads only a bucket's count or key. Such a level is
+    /// ranked and cut to `size` in its stage aggregate, and assembly reads its admitted documents
+    /// from there; a level ordered by a metric is ranked in assembly from every bucket.
+    pub(super) fn is_ranked_by_count_or_key(&self) -> bool {
+        self.order
+            .iter()
+            .all(|criterion| matches!(criterion, TermsOrder::Count(_) | TermsOrder::Key(_)))
+    }
+}
+
 /// One ranking criterion of a `terms` level.
 #[derive(Debug)]
 pub(crate) enum TermsOrder {

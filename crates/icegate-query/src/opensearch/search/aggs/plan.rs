@@ -20,15 +20,19 @@
 //! the matching rows once more per counted metric; the counts of one granularity are joined on
 //! its keys.
 //!
-//! Selection reads the collected rows in Rust (`assemble`): a level's buckets are read only
-//! under the surviving buckets of its parent, which is the semi-join to the surviving ancestors,
-//! and a `terms` level is ranked per parent bucket by its order, then by key ascending, which is
-//! the `row_number()` of a window partitioned by the parent keys. The rows are in memory once
-//! collected; a window, a union and a join chain per level over them would buy no other answer.
-//! `render` writes the response.
+//! A `terms` level ordered by count or key is ranked in its stage: a `row_number()` partitioned by
+//! the parent keys, in the level's order then by key ascending, cuts it to `size` buckets per
+//! parent bucket, and a windowed sum carries the documents of every bucket the parent admits, which
+//! `sum_other_doc_count` reads. The rows collected for such a level are then bounded by its `size`
+//! times its parent buckets, not by the cardinality of its keys. Selection reads the collected
+//! rows in Rust (`assemble`), on the blocking pool: a level's buckets are read only under the
+//! surviving buckets of its parent, which is the semi-join to the surviving ancestors, and a
+//! `terms` level ordered by a metric is ranked there per parent bucket, by its order, then by key
+//! ascending. `render` writes the response, on the blocking pool too.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
@@ -36,7 +40,12 @@ use datafusion::common::{Column, DFSchema, ScalarValue};
 use datafusion::functions::expr_fn::{coalesce, floor};
 use datafusion::functions_aggregate::expr_fn::count;
 use datafusion::functions_aggregate::grouping::grouping_udaf;
-use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, cast, col, grouping_set, lit, when};
+use datafusion::functions_aggregate::sum::sum_udaf;
+use datafusion::functions_window::expr_fn::row_number;
+use datafusion::logical_expr::expr::WindowFunction;
+use datafusion::logical_expr::{
+    Aggregate, Expr, ExprFunctionExt, LogicalPlan, LogicalPlanBuilder, cast, col, grouping_set, lit, not, when,
+};
 use futures::future::try_join_all;
 use serde_json::{Map, Value, json};
 
@@ -66,6 +75,8 @@ use crate::opensearch::catalog::{EncodedField, FieldType, FieldValue, IndexEntry
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::search::doc_id::MICROS_PER_MILLISECOND;
 use crate::opensearch::search::execute::convert_plan_error;
+use crate::opensearch::search::request::SortOrder;
+use crate::opensearch::system_index::run_blocking_work;
 use crate::query_dsl::ast::Query;
 use crate::query_dsl::lower::{LoweringScope, lower_query};
 
@@ -96,6 +107,25 @@ pub(super) fn name_statistic_column(metric: usize, statistic: Statistic) -> Stri
     format!("__metric_{metric}_{}", statistic.read_column_suffix())
 }
 
+/// The column of a stage's output carrying, beside each kept row of the `terms` level at layout
+/// index `level` that is ranked in the plan, the documents of every bucket its parent admits
+/// ([`TermsSpec::is_ranked_by_count_or_key`]).
+pub(super) fn name_admitted_doc_count_column(level: usize) -> String {
+    format!("__admitted_doc_count_{level}")
+}
+
+/// The column marking the rows that are admitted buckets of the ranked `terms` level at `level`;
+/// dropped before the stage's output.
+fn name_admitted_bucket_column(level: usize) -> String {
+    format!("__admitted_bucket_{level}")
+}
+
+/// The column of a bucket's rank under its parent at the ranked `terms` level at `level`; dropped
+/// before the stage's output.
+fn name_bucket_rank_column(level: usize) -> String {
+    format!("__bucket_rank_{level}")
+}
+
 /// The rows-plan column holding whether a row matches the `filter` / `filters` bucket query at
 /// `ordinal` of [`AggregationLayout::bucket_queries`].
 pub(super) fn name_bucket_filter_column(ordinal: usize) -> String {
@@ -120,6 +150,8 @@ pub(crate) struct AggregationScope<'a> {
     pub(crate) entries: &'a [&'a IndexEntry],
     /// The most buckets the request may answer, every level of every aggregation counted.
     pub(crate) max_buckets: usize,
+    /// The most hits the request's `top_hits` may render together: `search.max_result_window`.
+    pub(crate) max_result_window: usize,
     /// The request's `now`, taken once per request, which `date_range` bounds resolve
     /// against.
     pub(crate) now: DateTime<Utc>,
@@ -1024,11 +1056,125 @@ pub(super) fn plan_stage(
     let aggregate = relation
         .aggregate(vec![grouping_set(sets)], aggregates)
         .map_err(convert_plan_error)?;
+    let members: Vec<(Granularity, i32)> = members.iter().copied().zip(masks).collect();
     Ok(StagePlan {
-        plan: build_with_member_quantiles(aggregate, &digests)?,
-        members: members.iter().copied().zip(masks).collect(),
+        plan: cut_ranked_terms_levels(build_with_member_quantiles(aggregate, &digests)?, layout, &members)?,
+        members,
         has_grouping_sets: true,
     })
+}
+
+/// `grouped_rows`, a stage aggregate's output, with each `terms` level among `members` that ranks
+/// by count or key ([`TermsSpec::is_ranked_by_count_or_key`]) cut to its `size` under every parent
+/// bucket, so assembly reads at most `size` rows of such a level per parent bucket, whatever the
+/// cardinality of its keys. A row is an admitted bucket of the level when its key path holds no
+/// NULL and its document count reaches `min_doc_count`, the buckets assembly admits; the admitted
+/// buckets of one parent are numbered by `row_number()` in the level's order and then by key
+/// ascending, the order assembly ranks them by, so the rows kept are the buckets it keeps. Each
+/// kept row carries the documents of every admitted bucket of its parent
+/// ([`name_admitted_doc_count_column`]), which `sum_other_doc_count` reads. Rows of the other
+/// granularities pass unchanged; without such a level `grouped_rows` is returned as it is.
+///
+/// # Errors
+///
+/// `500` when DataFusion refuses the projection, a window or the filter.
+fn cut_ranked_terms_levels(
+    grouped_rows: LogicalPlan,
+    layout: &AggregationLayout<'_>,
+    members: &[(Granularity, i32)],
+) -> Result<LogicalPlan, OpenSearchError> {
+    let ranked_levels: Vec<(usize, &TermsSpec, i32)> = members
+        .iter()
+        .filter_map(|&(granularity, mask)| match granularity {
+            Granularity::Level(level) => match &layout.levels[level].kind {
+                LevelKind::Terms { spec } => spec.is_ranked_by_count_or_key().then_some((level, *spec, mask)),
+                LevelKind::DateHistogram { .. }
+                | LevelKind::Histogram { .. }
+                | LevelKind::Range { .. }
+                | LevelKind::DateRange { .. }
+                | LevelKind::Filters { .. }
+                | LevelKind::Filter { .. } => None,
+            },
+            Granularity::Top => None,
+        })
+        .collect();
+    if ranked_levels.is_empty() {
+        return Ok(grouped_rows);
+    }
+    // The analyzer that resolves `grouping()` drops DataFusion's internal grouping-id column, so
+    // no projection may name it (see `build_with_member_quantiles`).
+    let output_columns: Vec<Expr> = grouped_rows
+        .schema()
+        .columns()
+        .into_iter()
+        .filter(|column| column.name != Aggregate::INTERNAL_GROUPING_ID)
+        .map(Expr::Column)
+        .collect();
+    let mut flagged_columns = output_columns.clone();
+    let mut cut_columns = output_columns;
+    let mut windows = Vec::with_capacity(2 * ranked_levels.len());
+    let mut is_kept = lit(true);
+    for (level, spec, mask) in ranked_levels {
+        let path = &layout.levels[level].path;
+        let is_level_row = col(LEVEL_MASK_COLUMN).eq(lit(mask));
+        let minimum = i64::try_from(spec.min_doc_count.max(1)).unwrap_or(i64::MAX);
+        let is_admitted = path.iter().fold(
+            is_level_row.clone().and(col(DOC_COUNT_COLUMN).gt_eq(lit(minimum))),
+            |is_admitted, path_level| is_admitted.and(col(name_key_column(*path_level)).is_not_null()),
+        );
+        flagged_columns.push(is_admitted.alias(name_admitted_bucket_column(level)));
+        // The flag leads the partition, so the rows of other granularities never share a
+        // partition with the level's buckets.
+        let partition: Vec<Expr> = std::iter::once(col(name_admitted_bucket_column(level)))
+            .chain(path[..path.len() - 1].iter().map(|parent| col(name_key_column(*parent))))
+            .collect();
+        let key = col(name_key_column(level));
+        let mut order = spec
+            .order
+            .iter()
+            .map(|criterion| match criterion {
+                TermsOrder::Count(direction) => Ok(col(DOC_COUNT_COLUMN).sort(*direction == SortOrder::Asc, false)),
+                TermsOrder::Key(direction) => Ok(key.clone().sort(*direction == SortOrder::Asc, false)),
+                TermsOrder::Metric { .. } => Err(OpenSearchError::internal(
+                    "a terms level ordered by a metric was ranked in its stage aggregate",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        order.push(key.sort(true, false));
+        windows.push(
+            row_number()
+                .partition_by(partition.clone())
+                .order_by(order)
+                .build()
+                .map_err(convert_plan_error)?
+                .alias(name_bucket_rank_column(level)),
+        );
+        windows.push(
+            Expr::from(WindowFunction::new(sum_udaf(), vec![col(DOC_COUNT_COLUMN)]))
+                .partition_by(partition)
+                .build()
+                .map_err(convert_plan_error)?
+                .alias(name_admitted_doc_count_column(level)),
+        );
+        let kept_buckets = u64::try_from(spec.size).unwrap_or(u64::MAX);
+        is_kept = is_kept.and(not(is_level_row).or(
+            col(name_admitted_bucket_column(level)).and(col(name_bucket_rank_column(level)).lt_eq(lit(kept_buckets))),
+        ));
+        cut_columns.push(col(name_admitted_doc_count_column(level)));
+    }
+    // Each window gets a node of its own, so no node mixes partitions or orders.
+    windows
+        .into_iter()
+        .try_fold(
+            LogicalPlanBuilder::from(grouped_rows)
+                .project(flagged_columns)
+                .map_err(convert_plan_error)?,
+            |ranked_rows, window| ranked_rows.window(vec![window]),
+        )
+        .and_then(|ranked_rows| ranked_rows.filter(is_kept))
+        .and_then(|kept_rows| kept_rows.project(cut_columns))
+        .and_then(LogicalPlanBuilder::build)
+        .map_err(convert_plan_error)
 }
 
 /// `aggregate`, followed by the per-member `quantiles` columns of every shared digest. Without
@@ -1100,7 +1246,8 @@ pub(super) fn compute_level_mask(grouped_levels: &[usize], path: &[usize]) -> Re
 /// plans share its memory pool and its limit. A `top_hits` runs after assembly, over the buckets
 /// the response renders ([`collect_top_hits`]); `rows` then also carries the searched index's
 /// table columns. The pipelines of `tree`, which [`plan_aggregation_rows`] validated, run last,
-/// over the rendered tree ([`apply_pipelines`]).
+/// over the rendered tree ([`apply_pipelines`]). Assembly, the `top_hits` rendering, the
+/// aggregations' rendering and the pipelines run on the blocking pool.
 ///
 /// # Errors
 ///
@@ -1108,14 +1255,15 @@ pub(super) fn compute_level_mask(grouped_levels: &[usize], path: &[usize]) -> Re
 /// `400 too_many_buckets_exception` past `scope.max_buckets`; `400 illegal_argument_exception`
 /// naming a `histogram` whose bucket index for a value or a bound lies past the `i64` range;
 /// the session's execution errors,
-/// the memory limit among them; the errors of [`collect_top_hits`]; the value errors of
-/// [`apply_pipelines`]; `500` when planning fails.
+/// the memory limit among them; the errors of [`collect_top_hits`], the `top_hits` hits past
+/// `scope.max_result_window` among them; the value errors of [`apply_pipelines`]; `500` when
+/// planning fails or blocking work does not finish.
 pub(crate) async fn execute_aggregations(
     rows: LogicalPlan,
-    tree: &AggregationTree,
+    tree: Arc<AggregationTree>,
     scope: &AggregationScope<'_>,
 ) -> Result<Map<String, Value>, OpenSearchError> {
-    let layout = AggregationLayout::new(tree, scope.now)?;
+    let layout = AggregationLayout::new(&tree, scope.now)?;
     let inputs = resolve_plan_inputs(&layout, rows.schema())?;
     // Only a tree holding a `top_hits` reads the matching rows again, after assembly. Cloning a
     // plan copies its root node; its inputs are shared.
@@ -1145,14 +1293,29 @@ pub(crate) async fn execute_aggregations(
         },
     ));
     let (outputs, distinct_outputs) = futures::try_join!(stage_outputs, distinct_outputs)?;
-    let assembled = assemble_aggregations(&layout, outputs, &distinct_outputs, scope.max_buckets)?;
+    // Assembly and rendering read every collected row and answered bucket, so they run on the
+    // blocking pool. Blocking work borrows nothing from this task and a layout borrows its tree,
+    // so each closure lays out its own `Arc` of the tree; the plan inputs are owned and move into
+    // the rendering.
+    let now = scope.now;
+    let max_buckets = scope.max_buckets;
+    let assembly_tree = Arc::clone(&tree);
+    let assembled = run_blocking_work("assembling aggregation buckets", move || {
+        let layout = AggregationLayout::new(&assembly_tree, now)?;
+        assemble_aggregations(&layout, outputs, &distinct_outputs, max_buckets)
+    })
+    .await?;
     let top_hits_results = match hit_rows {
         Some(hit_rows) => collect_top_hits(&hit_rows, &layout, &inputs, &assembled, scope).await?,
         None => TopHitsResults::default(),
     };
-    let mut aggregations = render_aggregations(&layout, &inputs, &assembled, top_hits_results)?;
-    apply_pipelines(&tree.aggregations, &mut aggregations)?;
-    Ok(aggregations)
+    run_blocking_work("rendering aggregations", move || {
+        let layout = AggregationLayout::new(&tree, now)?;
+        let mut aggregations = render_aggregations(&layout, &inputs, &assembled, top_hits_results)?;
+        apply_pipelines(&tree.aggregations, &mut aggregations)?;
+        Ok(aggregations)
+    })
+    .await
 }
 
 /// One field the aggregations read, resolved in every searched index.
@@ -1567,9 +1730,10 @@ mod tests {
             session: &session,
             entries: &[],
             max_buckets,
+            max_result_window: SearchLimitsConfig::default().max_result_window,
             now: read_request_now(),
         };
-        execute_aggregations(rows, &tree, &scope).await.map(Value::Object)
+        execute_aggregations(rows, Arc::new(tree), &scope).await.map(Value::Object)
     }
 
     async fn aggregate_rows(rows: RecordBatch, aggregations: Value) -> Value {
@@ -1676,9 +1840,10 @@ mod tests {
             session: &session,
             entries: &[entry],
             max_buckets: read_default_max_buckets(),
+            max_result_window: SearchLimitsConfig::default().max_result_window,
             now,
         };
-        let answer = execute_aggregations(rows, &tree, &scope)
+        let answer = execute_aggregations(rows, Arc::new(tree), &scope)
             .await
             .expect("the aggregations answer");
 
@@ -2619,9 +2784,10 @@ mod tests {
             session: &session,
             entries: &[entry],
             max_buckets: read_default_max_buckets(),
+            max_result_window: SearchLimitsConfig::default().max_result_window,
             now,
         };
-        let answer = execute_aggregations(rows, &tree, &scope)
+        let answer = execute_aggregations(rows, Arc::new(tree), &scope)
             .await
             .expect("the aggregations answer");
 
@@ -2760,6 +2926,7 @@ mod tests {
             session: &session,
             entries: &[],
             max_buckets: read_default_max_buckets(),
+            max_result_window: SearchLimitsConfig::default().max_result_window,
             now: read_request_now(),
         };
         let mut random = StdRng::seed_from_u64(20_261_011);
@@ -2820,7 +2987,7 @@ mod tests {
                     parse_aggregations(&json!({"ranked": {"terms": {"field": "k", "size": size, "order": order}}}))
                         .expect("a terms");
 
-                let answer = execute_aggregations(scan_rows(rows), &tree, &scope)
+                let answer = execute_aggregations(scan_rows(rows), Arc::new(tree), &scope)
                     .await
                     .expect("the aggregations answer");
 
@@ -3256,6 +3423,99 @@ mod bucket_tree_tests {
                 ([true, true, false], vec![0b001; 5]),
                 ([false, false, true], vec![0b110; 2]),
             ])
+        );
+    }
+
+    /// A `terms` level ordered by count or key reaches assembly cut to its `size` under each parent
+    /// bucket, every parent counted, so assembly reads rows bounded by the request and not by the
+    /// keys' cardinality; the answer stays the ranking's, `sum_other_doc_count` included.
+    #[tokio::test]
+    async fn count_and_key_ordered_terms_levels_reach_assembly_cut_to_size_per_parent() {
+        let aggregations = json!({
+            "services": {
+                "terms": {"field": "service_name", "size": 1},
+                "aggs": {"severities": {"terms": {"field": "severity_text", "size": 1, "order": {"_key": "asc"}}}}
+            }
+        });
+        let tree = parse_aggregations(&aggregations).expect("parse the aggregations");
+        let layout = AggregationLayout::new(&tree, read_request_now()).expect("lay out the aggregations");
+        let rows = scan_test_rows(&build_hourly_rows());
+        let inputs = resolve_plan_inputs(&layout, rows.schema()).expect("resolve the inputs");
+        let mut plans = plan_aggregations(rows, &layout, &inputs).expect("plan the aggregate");
+        assert_eq!(plans.stages.len(), 1);
+        let stage = plans.stages.remove(0);
+        let batches = SessionContext::new()
+            .execute_logical_plan(stage.plan)
+            .await
+            .expect("plan the execution")
+            .collect()
+            .await
+            .expect("execute the aggregate");
+
+        // The key paths of the rows of each level, by the level's mask.
+        let mut paths_by_level: BTreeMap<usize, Vec<Vec<String>>> = BTreeMap::new();
+        for batch in &batches {
+            let masks = batch
+                .column_by_name(LEVEL_MASK_COLUMN)
+                .expect("the mask column")
+                .as_primitive::<Int32Type>();
+            let keys: Vec<&StringArray> = (0..2)
+                .map(|level| {
+                    batch
+                        .column_by_name(&name_key_column(level))
+                        .expect("a key column")
+                        .as_string::<i32>()
+                })
+                .collect();
+            for row in 0..batch.num_rows() {
+                let (level, _) = stage
+                    .members
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (_, mask))| *mask == masks.value(row))
+                    .expect("a member's mask");
+                let path = keys[..=level].iter().map(|key| key.value(row).to_string()).collect();
+                paths_by_level.entry(level).or_default().push(path);
+            }
+        }
+        for paths in paths_by_level.values_mut() {
+            paths.sort();
+        }
+        // Services: api 3, web 2, db 1. Severities by key: api ERROR and INFO, web ERROR and INFO,
+        // db INFO; the first of each parent is kept, every parent counted.
+        assert_eq!(
+            paths_by_level,
+            BTreeMap::from([
+                (0, vec![vec!["api".to_string()]]),
+                (
+                    1,
+                    vec![
+                        vec!["api".to_string(), "ERROR".to_string()],
+                        vec!["db".to_string(), "INFO".to_string()],
+                        vec!["web".to_string(), "ERROR".to_string()],
+                    ]
+                ),
+            ])
+        );
+
+        let answer = run_aggregations(&build_hourly_rows(), aggregations)
+            .await
+            .expect("aggregate the rows");
+        assert_eq!(
+            answer,
+            json!({"services": {
+                "doc_count_error_upper_bound": 0,
+                "sum_other_doc_count": 3,
+                "buckets": [{
+                    "key": "api",
+                    "doc_count": 3,
+                    "severities": {
+                        "doc_count_error_upper_bound": 0,
+                        "sum_other_doc_count": 2,
+                        "buckets": [{"key": "ERROR", "doc_count": 1}]
+                    }
+                }]
+            }})
         );
     }
 

@@ -1224,6 +1224,100 @@ async fn identical_rows_share_id_and_doc() {
     server.shutdown().await;
 }
 
+/// Only the rows of the returned page are hashed for their `_id`, unless a `_doc` key hashes every
+/// candidate. A page past `from` under a field sort carries the `_id`s a `_doc` sort gives the same
+/// rows, the `ids` query finds each row by its `_id`, and a span hit carries its natural key. Tenant
+/// B's row in the same file shares an instant and a body with one of tenant A's.
+#[tokio::test]
+async fn a_page_past_from_carries_the_ids_a_doc_sort_gives_its_rows_and_the_ids_query_finds() {
+    let (server, catalog) = TestServer::start().await;
+    commit_rows(
+        &catalog,
+        LOGS_TABLE,
+        &[
+            build_log_row(TENANT_A, T0 + 1_000, "first", "INFO"),
+            build_log_row(TENANT_A, T0 + 2_000, "second", "INFO"),
+            build_log_row(TENANT_B, T0 + 2_000, "second", "INFO"),
+            build_log_row(TENANT_A, T0 + 3_000, "third", "ERROR"),
+        ],
+    )
+    .await
+    .expect("commit logs");
+    commit_rows(
+        &catalog,
+        SPANS_TABLE,
+        &[build_span_row(TENANT_A, T0 + 4_000, &TRACE_ID, "checkout")],
+    )
+    .await
+    .expect("commit spans");
+
+    // One row per millisecond, so the `timestamp` sort orders them without a tie.
+    let (status, field_page) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({"from": 1, "size": 2, "sort": [{"timestamp": "asc"}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{field_page}");
+    let field_hits = read_hit_identities(&field_page, COL_BODY).expect("hit identities");
+    let (status, doc_page) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs/_search",
+        &json!({"sort": build_time_doc_sort("asc")}),
+    )
+    .await;
+    assert_eq!(status, 200, "{doc_page}");
+    let doc_hits = read_hit_identities(&doc_page, COL_BODY).expect("hit identities");
+    assert_eq!(
+        doc_hits.iter().map(|(body, _, _)| body.as_str()).collect::<Vec<_>>(),
+        ["first", "second", "third"]
+    );
+    assert_eq!(
+        field_hits
+            .iter()
+            .map(|(body, id, _)| (body.as_str(), id.as_str()))
+            .collect::<Vec<_>>(),
+        doc_hits[1..]
+            .iter()
+            .map(|(body, id, _)| (body.as_str(), id.as_str()))
+            .collect::<Vec<_>>(),
+        "the page's ids are the ids the _doc sort gives the same rows"
+    );
+    for (body, id, _) in &field_hits {
+        assert_eq!(id.len(), 32, "{id}");
+        let (status, found) = post_json(
+            &server,
+            Some(TENANT_A),
+            "/logs/_search",
+            &json!({"query": {"ids": {"values": [id]}}}),
+        )
+        .await;
+        assert_eq!(status, 200, "{found}");
+        assert_eq!(
+            read_sorted_source_texts(&found, COL_BODY).expect("sorted source texts"),
+            vec![body.as_str()]
+        );
+    }
+
+    // The span is the fourth row of the two indices in time order.
+    let (status, span_page) = post_json(
+        &server,
+        Some(TENANT_A),
+        "/logs,spans/_search",
+        &json!({"from": 3, "size": 1, "sort": [{"timestamp": "asc"}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{span_page}");
+    assert_eq!(span_page["hits"]["hits"][0]["_index"], "spans", "{span_page}");
+    assert_eq!(
+        span_page["hits"]["hits"][0]["_id"],
+        "0123456789abcdeffedcba9876543210aabbccdd00112233"
+    );
+    server.shutdown().await;
+}
+
 /// A `spans` row of `tenant` at `micros` with the stated natural key and `name`.
 fn build_span_row<'a>(tenant: &'a str, micros: i64, trace_id: &'a [u8], name: &'a str) -> Row<'a> {
     Row {
