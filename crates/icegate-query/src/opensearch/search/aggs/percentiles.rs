@@ -31,7 +31,7 @@ use serde_json::{Map, Value, json};
 use super::metrics::{MetricSpec, NonFiniteRendering, Statistic};
 use super::parse::{
     IGNORED_EXECUTION_KEYS, MetricPath, expect_flag, expect_object, expect_string, read_lenient_number,
-    read_strict_number, read_value_script, report_missing_key, report_unsupported_key, resolve_metric_field,
+    read_strict_number, read_value_script, report_missing_key, report_unsupported_key, resolve_metric_spec,
 };
 use super::plan::{name_statistic_column, name_value_column};
 use crate::opensearch::error::OpenSearchError;
@@ -78,12 +78,12 @@ pub(crate) struct PercentileRanksSpec {
 ///
 /// # Errors
 ///
-/// `parsing_exception` for a body that is not an object, a missing `field` (without the
-/// trace-list latency script), an unknown key (named under `construct`), a malformed `script`
-/// member, a percent that is neither a JSON number nor a numeric string or lies outside
-/// `[0, 100]`, an empty or non-array `percents`, or a non-boolean `keyed`;
-/// `illegal_argument_exception` for a script that is neither arithmetic nor the latency script,
-/// and as [`resolve_metric_field`] states for a `missing` or `field` beside the latency script.
+/// `parsing_exception` for a body that is not an object, a missing `field` (without a trace-list
+/// script), an unknown key (named under `construct`), a malformed `script` member, a percent
+/// that is neither a JSON number nor a numeric string or lies outside `[0, 100]`, an empty or
+/// non-array `percents`, or a non-boolean `keyed`; `illegal_argument_exception` for a script
+/// that is neither arithmetic nor a trace-list script, and as [`resolve_metric_spec`] states for
+/// a `missing` or `field` beside a trace-list script.
 pub(super) fn parse_percentiles(name: &str, value: &Value) -> Result<PercentilesSpec, OpenSearchError> {
     let body = expect_object(name, PERCENTILES, value)?;
     let mut field = None;
@@ -103,11 +103,7 @@ pub(super) fn parse_percentiles(name: &str, value: &Value) -> Result<Percentiles
         }
     }
     Ok(PercentilesSpec {
-        metric: MetricSpec {
-            field: resolve_metric_field(PERCENTILES, name, field, missing, value_script.as_ref())?,
-            missing,
-            value_script,
-        },
+        metric: resolve_metric_spec(PERCENTILES, name, field, missing, value_script)?,
         percents: percents.unwrap_or_else(|| DEFAULT_PERCENTS.to_vec()),
         is_keyed,
     })
@@ -149,6 +145,7 @@ pub(super) fn parse_percentile_ranks(name: &str, value: &Value) -> Result<Percen
     Ok(PercentileRanksSpec {
         metric: MetricSpec {
             field: field.ok_or_else(|| report_missing_key(PERCENTILE_RANKS, name, "field"))?,
+            fallback_field: None,
             missing: None,
             value_script: None,
         },
@@ -914,6 +911,7 @@ mod tests {
     fn build_metric_spec(field: &str) -> MetricSpec {
         MetricSpec {
             field: field.to_owned(),
+            fallback_field: None,
             missing: None,
             value_script: None,
         }

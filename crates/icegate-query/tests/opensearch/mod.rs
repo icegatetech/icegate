@@ -13,6 +13,7 @@ mod harness;
 mod indices;
 mod listener;
 mod msearch;
+mod osd_traces;
 mod ppl;
 mod ppl_clients;
 mod ppl_endpoints;

@@ -300,43 +300,54 @@ impl OpenSearchError {
         .with_metadata("limit", limit)
     }
 
-    /// The error rejecting a metric aggregation running the trace-list latency script that also
-    /// names `field`, a field other than `latency_field`, the root duration the script reads
-    /// (`400`, `illegal_argument_exception`): the script would run over a value it does not
-    /// compute. `aggregation` carries the request's name for it and `field` the field it named.
-    pub(crate) fn latency_script_field_mismatch(aggregation: &str, field: &str, latency_field: &str) -> Self {
+    /// The error rejecting a metric aggregation running the trace-list `script` (the name a
+    /// refusal gives it) that also names `field`, a field other than `script_field`, the root
+    /// field the script reads (`400`, `illegal_argument_exception`): the script would run over a
+    /// value it does not compute. `aggregation` carries the request's name for it and `field` the
+    /// field it named.
+    pub(crate) fn trace_script_field_mismatch(
+        aggregation: &str,
+        script: &str,
+        field: &str,
+        script_field: &str,
+    ) -> Self {
         Self::unsupported_aggregation(
             aggregation,
-            format!("the latency script of [{aggregation}] reads [{latency_field}], not the field [{field}]"),
+            format!("the {script} script of [{aggregation}] reads [{script_field}], not the field [{field}]"),
         )
         .with_metadata("field", field)
     }
 
-    /// The error rejecting a metric aggregation running the trace-list latency script that also
-    /// names a `missing` (`400`, `illegal_argument_exception`): the script answers 0 for a span
-    /// without a root, and a `missing` would replace that answer. `aggregation` carries the
-    /// request's name for it and `key` is `missing`.
-    pub(crate) fn latency_script_with_missing(aggregation: &str) -> Self {
+    /// The error rejecting a metric aggregation running the trace-list `script` (the name a
+    /// refusal gives it) that also names a `missing` (`400`, `illegal_argument_exception`): the
+    /// script itself decides what a span without a root answers, and a `missing` would replace
+    /// that answer. `aggregation` carries the request's name for it and `key` is `missing`.
+    pub(crate) fn trace_script_with_missing(aggregation: &str, script: &str) -> Self {
         Self::unsupported_aggregation(
             aggregation,
             format!(
-                "[missing] of [{aggregation}] does not apply to the latency script, which answers 0 for a span \
-                 without a root"
+                "[missing] of [{aggregation}] does not apply to the {script} script, which decides itself what a \
+                 span without a root answers"
             ),
         )
         .with_metadata("key", "missing")
     }
 
-    /// The error rejecting a search running the trace-list latency script of `aggregation` that
-    /// also reads `index`, an index outside the profile of `span_index`, whose spans carry no root
-    /// fields (`400`, `illegal_argument_exception`). `aggregation` carries the request's name for
-    /// it and `index` the other index.
-    pub(crate) fn latency_script_on_foreign_index(aggregation: &str, index: &str, span_index: &str) -> Self {
+    /// The error rejecting a search running the trace-list `script` (the name a refusal gives it)
+    /// of `aggregation` that also reads `index`, an index outside the profile of `span_index`,
+    /// whose spans carry no root fields (`400`, `illegal_argument_exception`). `aggregation`
+    /// carries the request's name for it and `index` the other index.
+    pub(crate) fn trace_script_on_foreign_index(
+        aggregation: &str,
+        script: &str,
+        index: &str,
+        span_index: &str,
+    ) -> Self {
         Self::unsupported_aggregation(
             aggregation,
             format!(
-                "the latency script of aggregation [{aggregation}] reads traceGroupFields of [{span_index}], and the \
-                 search also reads [{index}]"
+                "the {script} script of aggregation [{aggregation}] reads traceGroupFields of [{span_index}], and \
+                 the search also reads [{index}]"
             ),
         )
         .with_metadata("index", index)

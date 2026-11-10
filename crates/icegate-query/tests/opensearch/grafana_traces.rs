@@ -110,7 +110,7 @@ fn build_trace_rows() -> Vec<Row<'static>> {
 }
 
 /// The rows of [`build_trace_rows`], in one commit.
-async fn commit_trace_rows(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteError> {
+pub(super) async fn commit_trace_rows(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteError> {
     commit_rows(catalog, SPANS_TABLE, &build_trace_rows()).await
 }
 
@@ -132,7 +132,7 @@ async fn fetch_msearch_item(server: &TestServer, body: &Value) -> Result<Value, 
 }
 
 /// [`fetch_msearch_item`] for an item that must answer `200`.
-async fn search_span_index(server: &TestServer, body: &Value) -> Result<Value, Box<dyn Error>> {
+pub(super) async fn search_span_index(server: &TestServer, body: &Value) -> Result<Value, Box<dyn Error>> {
     let item = fetch_msearch_item(server, body).await?;
     if item["status"] != 200 {
         return Err(format!("the _msearch item answered {item}").into());

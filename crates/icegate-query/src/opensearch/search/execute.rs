@@ -185,7 +185,7 @@ fn probe_aggregation_reads(aggregations: &[NamedAggregation], scope: &LoweringSc
             // A `top_hits` plans its sort only when its hits are collected, after the rows plan,
             // so the probe resolves it here.
             AggregationKind::TopHits(spec) => probe_sort_fields(&spec.request.sort, scope),
-            // Each of these reads at most one field, which planning the rows resolves.
+            // Planning the rows resolves every field these read (`AggregationKind::read_fields`).
             AggregationKind::DateHistogram(_)
             | AggregationKind::Terms(_)
             | AggregationKind::Histogram(_)
@@ -307,46 +307,19 @@ fn is_sort_free_of_cross_row(sort: &[SortClause]) -> bool {
         .any(|clause| matches!(clause, SortClause::Field { field, .. } if CrossRowField::find_by_name(field).is_some()))
 }
 
-/// The name of the first aggregation of `aggregations`, parents before their children, whose
-/// metric runs the trace-list latency script.
-fn find_trace_list_latency(aggregations: &[NamedAggregation]) -> Option<&str> {
+/// The first aggregation of `aggregations`, parents before their children, whose metric runs a
+/// trace-list script (one that reads a trace's root): its name and its script.
+fn find_trace_list_script(aggregations: &[NamedAggregation]) -> Option<(&str, &MetricScript)> {
     aggregations.iter().find_map(|aggregation| {
-        let script = match &aggregation.kind {
-            AggregationKind::Avg(spec)
-            | AggregationKind::Sum(spec)
-            | AggregationKind::Min(spec)
-            | AggregationKind::Max(spec) => spec.value_script.as_ref(),
-            AggregationKind::ExtendedStats(spec) => spec.metric.value_script.as_ref(),
-            AggregationKind::Percentiles(spec) => spec.metric.value_script.as_ref(),
-            // No other kind takes a value script.
-            AggregationKind::DateHistogram(_)
-            | AggregationKind::Terms(_)
-            | AggregationKind::Histogram(_)
-            | AggregationKind::ValueCount(_)
-            | AggregationKind::Stats(_)
-            | AggregationKind::Cardinality(_)
-            | AggregationKind::PercentileRanks(_)
-            | AggregationKind::Range(_)
-            | AggregationKind::DateRange(_)
-            | AggregationKind::Filter(_)
-            | AggregationKind::Filters(_)
-            | AggregationKind::TopHits(_)
-            | AggregationKind::CumulativeSum(_)
-            | AggregationKind::Derivative(_)
-            | AggregationKind::SerialDiff(_)
-            | AggregationKind::MovingFn(_)
-            | AggregationKind::MovingAvg(_)
-            | AggregationKind::BucketScript(_)
-            | AggregationKind::AvgBucket(_)
-            | AggregationKind::SumBucket(_)
-            | AggregationKind::MinBucket(_)
-            | AggregationKind::MaxBucket(_) => None,
-        };
-        if matches!(script, Some(MetricScript::TraceListLatency { .. })) {
-            Some(aggregation.name.as_str())
-        } else {
-            find_trace_list_latency(&aggregation.children)
-        }
+        let script = aggregation
+            .kind
+            .read_metric_spec()
+            .and_then(|spec| spec.value_script.as_ref())
+            .filter(|script| !matches!(script, MetricScript::Arithmetic(_)));
+        script.map_or_else(
+            || find_trace_list_script(&aggregation.children),
+            |script| Some((aggregation.name.as_str(), script)),
+        )
     })
 }
 
@@ -362,8 +335,8 @@ fn find_trace_list_latency(aggregations: &[NamedAggregation]) -> Option<&str> {
 ///
 /// # Errors
 ///
-/// Returns a 400 for the trace-list latency script in a search that also reads an index outside
-/// the Data Prepper profile, for a `terms` on `traceId` larger than `max_cross_row_traces` and for
+/// Returns a 400 for a trace-list script in a search that also reads an index outside the Data
+/// Prepper profile, for a `terms` on `traceId` larger than `max_cross_row_traces` and for
 /// more candidate traces than that limit outside a trace list, the lowering errors of the
 /// request's query (of its other `must` and `filter` clauses outside a trace list), and the
 /// lookups' errors.
@@ -375,12 +348,13 @@ async fn prepare_cross_row_reads(
     now: DateTime<Utc>,
 ) -> Result<(), OpenSearchError> {
     let settings = session.settings();
-    // The latency script reads a root's duration, which only the Data Prepper profile computes.
-    if let Some(name) = tree.and_then(|tree| find_trace_list_latency(&tree.aggregations))
+    // A trace-list script reads a root field, which only the Data Prepper profile computes.
+    if let Some((name, script)) = tree.and_then(|tree| find_trace_list_script(&tree.aggregations))
         && let Some(entry) = entries.iter().find(|entry| entry.profile() != Profile::DataPrepper)
     {
-        return Err(OpenSearchError::latency_script_on_foreign_index(
+        return Err(OpenSearchError::trace_script_on_foreign_index(
             name,
+            script.describe_script(),
             entry.name(),
             DATA_PREPPER_SPAN_INDEX,
         ));

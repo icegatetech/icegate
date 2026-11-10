@@ -10,10 +10,11 @@
 //! `+ - * / %`, unary minus and parentheses, at most [`MAX_SCRIPT_DEPTH`] levels deep (nesting and
 //! chained operators alike) and at most [`MAX_SCRIPT_LENGTH`] bytes long; it is evaluated in IEEE
 //! double precision, so `_value / 1000` over `1500` is `1.5` and `x / 0` is infinite, which
-//! renders `null`. A metric value script may also be the trace-list latency script, in its form
-//! with a trailing `return 0` or without it, each recognized verbatim (whitespace runs aside) and
-//! computed natively from the root span's duration. Every
-//! other script is refused with a 400 whose `script` names it.
+//! renders `null`. A metric value script may also be one of the trace-list scripts, each
+//! recognized verbatim (whitespace runs aside) and computed natively: the latency script, in its
+//! form with a trailing `return 0` or without it, from the root span's duration, and the
+//! last-updated script from the root span's end time, else the span's own. Every other script is
+//! refused with a 400 whose `script` names it.
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::functions::expr_fn::{coalesce, floor};
@@ -294,6 +295,11 @@ const TRACE_LIST_LATENCY_SCRIPT_WITH_DEFAULT: &str = "if (doc.containsKey('trace
 /// value. It is whitespace-collapsed like [`TRACE_LIST_LATENCY_SCRIPT_WITH_DEFAULT`].
 const TRACE_LIST_LATENCY_SCRIPT_WITHOUT_DEFAULT: &str = "if (doc.containsKey('traceGroupFields.durationInNanos') && !doc['traceGroupFields.durationInNanos'].empty) { return Math.round(doc['traceGroupFields.durationInNanos'].value / 10000) / 100.0 }";
 
+/// The trace-list last-updated script with its whitespace runs collapsed to one space. It reads
+/// the root span's end time when the span's trace has a stored root, else the span's own end
+/// time.
+const TRACE_LIST_LAST_UPDATED_SCRIPT: &str = "if (doc.containsKey('traceGroupFields.endTime') && !doc['traceGroupFields.endTime'].empty) { return doc['traceGroupFields.endTime'].value; } if (doc.containsKey('endTime') && !doc['endTime'].empty) { return doc['endTime'].value; }";
+
 /// The divisor of the latency script's integer division: nanoseconds to hundredths of a
 /// millisecond.
 const LATENCY_NANOS_PER_HUNDREDTH: f64 = 10_000.0;
@@ -314,18 +320,38 @@ pub(crate) enum MetricScript {
         /// no value (it does not).
         is_zero_when_absent: bool,
     },
+    /// The trace-list last-updated time of a span: its root's end time when its trace has a
+    /// stored root, else its own end time. The metric reads both fields and answers the first
+    /// present one as a date, so the script itself computes nothing more. Only the Data Prepper
+    /// span index answers it: a search that also reads another index is refused.
+    TraceLastUpdated,
 }
 
 impl MetricScript {
+    /// The name a refusal gives the script.
+    pub(crate) const fn describe_script(&self) -> &'static str {
+        match self {
+            Self::Arithmetic(_) => "arithmetic",
+            Self::TraceListLatency { .. } => "latency",
+            Self::TraceLastUpdated => "last-updated",
+        }
+    }
+
     /// The script applied to each row's `value` inside the aggregate.
     ///
     /// The latency script answers a `Float64` whether `value` is an integer or a double: a
     /// metric aggregation hands it a double, and `floor` truncates the quotient to hundredths as
     /// the script's integer division does (durations are never negative, so truncating is
-    /// flooring).
+    /// flooring). The form with a default answers 0 where the root duration is absent (NULL); the
+    /// form without one answers NULL there, so a bucket holding only such spans has no value.
+    ///
+    /// The last-updated script answers `value` as it is: its metric reads the root's end time
+    /// with the span's own end time standing in for an absent one, which is the script's whole
+    /// computation.
     pub(crate) fn lower_value_script(&self, value: Expr) -> Expr {
         match self {
             Self::Arithmetic(arithmetic) => arithmetic.lower_value_script(value),
+            Self::TraceLastUpdated => value,
             Self::TraceListLatency { is_zero_when_absent } => {
                 let latency = floor(cast(value, DataType::Float64) / lit(LATENCY_NANOS_PER_HUNDREDTH))
                     / lit(HUNDREDTHS_PER_MILLISECOND);
@@ -339,19 +365,32 @@ impl MetricScript {
     }
 }
 
-/// Recognize a metric value `script`: the trace-list latency script in either form (compared
-/// with its whitespace runs collapsed), or arithmetic over `_value`.
+/// Recognize a metric value `script`: the trace-list latency script in either form or the
+/// trace-list last-updated script (each compared with its whitespace runs collapsed), or
+/// arithmetic over `_value`.
 ///
 /// # Errors
 ///
 /// Returns `400 illegal_argument_exception` naming any other script.
 pub(crate) fn recognize_metric_script(source: &str) -> Result<MetricScript, OpenSearchError> {
-    for (latency_script, is_zero_when_absent) in [
-        (TRACE_LIST_LATENCY_SCRIPT_WITH_DEFAULT, true),
-        (TRACE_LIST_LATENCY_SCRIPT_WITHOUT_DEFAULT, false),
-    ] {
-        if source.split_whitespace().eq(latency_script.split(' ')) {
-            return Ok(MetricScript::TraceListLatency { is_zero_when_absent });
+    let trace_list_scripts = [
+        (
+            TRACE_LIST_LATENCY_SCRIPT_WITH_DEFAULT,
+            MetricScript::TraceListLatency {
+                is_zero_when_absent: true,
+            },
+        ),
+        (
+            TRACE_LIST_LATENCY_SCRIPT_WITHOUT_DEFAULT,
+            MetricScript::TraceListLatency {
+                is_zero_when_absent: false,
+            },
+        ),
+        (TRACE_LIST_LAST_UPDATED_SCRIPT, MetricScript::TraceLastUpdated),
+    ];
+    for (trace_list_script, recognized) in trace_list_scripts {
+        if source.split_whitespace().eq(trace_list_script.split(' ')) {
+            return Ok(recognized);
         }
     }
     recognize_arithmetic_script(source, &[VALUE_VARIABLE]).map(MetricScript::Arithmetic)
@@ -1234,6 +1273,24 @@ mod tests {
         let (status, body) = render_envelope(error).await;
         assert_eq!(status.as_u16(), 400);
         assert_eq!(body["error"]["type"], "illegal_argument_exception");
+    }
+
+    /// OSD 3.9's last-updated script, with the whitespace it is sent with.
+    const LAST_UPDATED_SOURCE: &str = "\n                  if (doc.containsKey('traceGroupFields.endTime') && !doc['traceGroupFields.endTime'].empty) {\n                    return doc['traceGroupFields.endTime'].value;\n                  }\n                  if (doc.containsKey('endTime') && !doc['endTime'].empty) {\n                    return doc['endTime'].value;\n                  }\n                ";
+
+    #[tokio::test]
+    async fn the_trace_last_updated_script_is_recognized_and_an_edited_one_refused() {
+        assert_eq!(
+            recognize_metric_script(LAST_UPDATED_SOURCE).expect("recognized"),
+            MetricScript::TraceLastUpdated
+        );
+
+        let edited = LAST_UPDATED_SOURCE.replace("return doc['endTime']", "return doc['startTime']");
+        let error = recognize_metric_script(&edited).expect_err("an edited last-updated script is no recognized form");
+        let (status, body) = render_envelope(error).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        assert_eq!(body["error"]["script"], edited.as_str(), "{body}");
     }
 
     #[test]

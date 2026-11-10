@@ -661,7 +661,16 @@ pub(super) fn resolve_plan_inputs(
     let metric_inputs = layout
         .metrics
         .iter()
-        .map(|slot| plan_metric_input(slot.kind, slot.spec, read_row_field(rows, &slot.spec.field, slot.name)?))
+        .map(|slot| {
+            let field = read_row_field(rows, &slot.spec.field, slot.name)?;
+            let fallback_field = slot
+                .spec
+                .fallback_field
+                .as_deref()
+                .map(|fallback_field| read_row_field(rows, fallback_field, slot.name))
+                .transpose()?;
+            plan_metric_input(slot.kind, slot.spec, field, fallback_field)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(PlanInputs {
         level_keys,
@@ -1422,8 +1431,8 @@ pub(crate) fn plan_aggregation_rows(
         .map_err(convert_plan_error)
 }
 
-/// The distinct fields the aggregations of `tree` read, each checked against every aggregation
-/// that reads it; `filter` and `filters` read none. An encoded id whose stored column admits NULL
+/// The distinct fields the aggregations of `tree` read ([`AggregationKind::read_fields`]), each
+/// checked against every aggregation that reads it; `filter` and `filters` read none. An encoded id whose stored column admits NULL
 /// is refused with [`OpenSearchError::unordered_missing_id`]: its missing value renders `""`,
 /// which no bucket or count over the stored bytes reads.
 fn resolve_aggregation_fields(
@@ -1433,27 +1442,26 @@ fn resolve_aggregation_fields(
 ) -> Result<Vec<AggregationField>, OpenSearchError> {
     let mut fields: Vec<AggregationField> = Vec::new();
     for aggregation in list_aggregations(tree) {
-        let Some(name) = aggregation.kind.field() else {
-            continue;
-        };
-        let resolved: Vec<Option<ResolvedField>> =
-            entries.iter().map(|entry| session.resolve_field(entry, name)).collect();
-        check_field_for_aggregation(aggregation, name, entries, &resolved)?;
-        for (entry, field) in entries.iter().zip(&resolved) {
-            if let Some(field) = field
-                && session.is_nullable_encoded_id(entry, field)?
-            {
-                return Err(OpenSearchError::unordered_missing_id(name, entry.name(), "aggregation"));
+        for name in aggregation.kind.read_fields() {
+            let resolved: Vec<Option<ResolvedField>> =
+                entries.iter().map(|entry| session.resolve_field(entry, name)).collect();
+            check_field_for_aggregation(aggregation, name, entries, &resolved)?;
+            for (entry, field) in entries.iter().zip(&resolved) {
+                if let Some(field) = field
+                    && session.is_nullable_encoded_id(entry, field)?
+                {
+                    return Err(OpenSearchError::unordered_missing_id(name, entry.name(), "aggregation"));
+                }
             }
-        }
-        if fields.iter().all(|field| field.name != name)
-            && let Some(data_type) = choose_row_data_type(aggregation, &resolved)
-        {
-            fields.push(AggregationField {
-                name: name.to_string(),
-                data_type,
-                values: resolved.into_iter().map(|field| field.map(|field| field.value)).collect(),
-            });
+            if fields.iter().all(|field| field.name != name)
+                && let Some(data_type) = choose_row_data_type(aggregation, &resolved)
+            {
+                fields.push(AggregationField {
+                    name: name.to_string(),
+                    data_type,
+                    values: resolved.into_iter().map(|field| field.map(|field| field.value)).collect(),
+                });
+            }
         }
     }
     Ok(fields)

@@ -26,7 +26,7 @@ use super::pipeline::{
 };
 use super::terms::{TermsSpec, parse_terms};
 use super::top_hits::{TopHitsSpec, parse_top_hits};
-use crate::opensearch::catalog::CrossRowField;
+use crate::opensearch::catalog::{CrossRowField, SPAN_END_TIME_FIELD};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::script::{MetricScript, read_script_source, recognize_metric_script};
 use crate::opensearch::search::doc_id::{
@@ -142,19 +142,62 @@ impl AggregationKind {
             Self::DateHistogram(spec) => Some(&spec.field),
             Self::Terms(spec) => Some(&spec.field),
             Self::Histogram(spec) => Some(&spec.field),
+            Self::Range(spec) => Some(&spec.field),
+            Self::DateRange(spec) => Some(&spec.field),
+            Self::Avg(_)
+            | Self::Sum(_)
+            | Self::Min(_)
+            | Self::Max(_)
+            | Self::ValueCount(_)
+            | Self::Stats(_)
+            | Self::Cardinality(_)
+            | Self::Percentiles(_)
+            | Self::PercentileRanks(_)
+            | Self::ExtendedStats(_)
+            | Self::Filters(_)
+            | Self::Filter(_)
+            | Self::TopHits(_)
+            | Self::CumulativeSum(_)
+            | Self::Derivative(_)
+            | Self::SerialDiff(_)
+            | Self::MovingFn(_)
+            | Self::MovingAvg(_)
+            | Self::BucketScript(_)
+            | Self::AvgBucket(_)
+            | Self::SumBucket(_)
+            | Self::MinBucket(_)
+            | Self::MaxBucket(_) => self.read_metric_spec().map(|spec| spec.field.as_str()),
+        }
+    }
+
+    /// Every field the aggregation reads from a row: [`Self::field`], then the metric's
+    /// [`MetricSpec::fallback_field`]. Whatever projects or resolves the fields of an aggregation
+    /// reads them from here, so a fallback field is never left out of the rows.
+    pub(crate) fn read_fields(&self) -> impl Iterator<Item = &str> {
+        let fallback_field = self.read_metric_spec().and_then(|spec| spec.fallback_field.as_deref());
+        self.field().into_iter().chain(fallback_field)
+    }
+
+    /// The spec of a metric aggregation; `None` for a bucket aggregation, `top_hits` and the
+    /// pipelines.
+    pub(crate) const fn read_metric_spec(&self) -> Option<&MetricSpec> {
+        match self {
             Self::Avg(spec)
             | Self::Sum(spec)
             | Self::Min(spec)
             | Self::Max(spec)
             | Self::ValueCount(spec)
             | Self::Stats(spec)
-            | Self::Cardinality(spec) => Some(&spec.field),
+            | Self::Cardinality(spec) => Some(spec),
             Self::Percentiles(PercentilesSpec { metric, .. })
             | Self::PercentileRanks(PercentileRanksSpec { metric, .. })
-            | Self::ExtendedStats(ExtendedStatsSpec { metric, .. }) => Some(&metric.field),
-            Self::Range(spec) => Some(&spec.field),
-            Self::DateRange(spec) => Some(&spec.field),
-            Self::Filters(_)
+            | Self::ExtendedStats(ExtendedStatsSpec { metric, .. }) => Some(metric),
+            Self::DateHistogram(_)
+            | Self::Terms(_)
+            | Self::Histogram(_)
+            | Self::Range(_)
+            | Self::DateRange(_)
+            | Self::Filters(_)
             | Self::Filter(_)
             | Self::TopHits(_)
             | Self::CumulativeSum(_)
@@ -618,16 +661,16 @@ pub(crate) fn parse_metric_path(text: &str) -> Result<MetricPath, OpenSearchErro
 
 /// A plain metric (`avg`, `sum`, `min`, `max`, `value_count`, `stats`, `cardinality`): `field`,
 /// plus `missing` and a value `script` when `accepts_value_inputs` (`avg`, `sum`, `min`, `max`).
-/// A metric running the trace-list latency script reads the field the script names, so it needs
-/// no `field`.
+/// A metric running a trace-list script reads the fields the script names, so it needs no
+/// `field`.
 ///
 /// # Errors
 ///
-/// `400 parsing_exception` for a body that is not an object, a missing `field` (without the
-/// latency script), a value of the wrong JSON type, a malformed `script` member, and an unknown
-/// key (named under `construct`); `400 illegal_argument_exception` for a script that is neither
-/// arithmetic nor the latency script, and, with the latency script, for a `missing` or a `field`
-/// other than the one the script reads.
+/// `400 parsing_exception` for a body that is not an object, a missing `field` (without a
+/// trace-list script), a value of the wrong JSON type, a malformed `script` member, and an
+/// unknown key (named under `construct`); `400 illegal_argument_exception` for a script that is
+/// neither arithmetic nor a trace-list script, and as [`resolve_metric_spec`] states for a
+/// `missing` or `field` beside a trace-list script.
 fn parse_metric(
     name: &str,
     kind_name: &str,
@@ -647,15 +690,11 @@ fn parse_metric(
             unknown => return Err(report_unsupported_key(kind_name, name, unknown)),
         }
     }
-    Ok(MetricSpec {
-        field: resolve_metric_field(kind_name, name, field, missing, value_script.as_ref())?,
-        missing,
-        value_script,
-    })
+    resolve_metric_spec(kind_name, name, field, missing, value_script)
 }
 
-/// The value `script` of the metric aggregation `name`: the trace-list latency script, or
-/// arithmetic over `_value` and decimal literals.
+/// The value `script` of the metric aggregation `name`: a trace-list script (the latency script
+/// in either form or the last-updated script), or arithmetic over `_value` and decimal literals.
 ///
 /// # Errors
 ///
@@ -665,41 +704,65 @@ pub(super) fn read_value_script(name: &str, value: &Value) -> Result<MetricScrip
     recognize_metric_script(read_script_source(name, value)?)
 }
 
-/// The field the metric aggregation `name` of type `kind_name` reads: the `field` the body names,
-/// or, under the trace-list latency script, the root duration that script reads.
+/// The spec of the metric aggregation `name` of type `kind_name`: the `field` the body names, or,
+/// under a trace-list script, the root field that script reads, with the span's own end time as
+/// the fallback field of the last-updated script.
 ///
-/// The latency script computes its value from `traceGroupFields.durationInNanos` alone and
-/// answers 0 for a span without a root; another `field` or a `missing` would make it answer a
-/// value the script does not compute, so both are refused rather than applied.
+/// A trace-list script computes its value from the fields it reads alone and decides itself what
+/// a span without a root answers; another `field` or a `missing` would make it answer a value the
+/// script does not compute, so both are refused rather than applied.
 ///
 /// # Errors
 ///
-/// `400 parsing_exception` for a missing `field` without the latency script; beside the latency
+/// `400 parsing_exception` for a missing `field` without a trace-list script; beside a trace-list
 /// script, `400 illegal_argument_exception` for a `missing` (`aggregation` and `key` metadata)
-/// and for a `field` other than the root duration (`aggregation` and `field` metadata).
-pub(super) fn resolve_metric_field(
+/// and for a `field` other than the root field the script reads (`aggregation` and `field`
+/// metadata).
+pub(super) fn resolve_metric_spec(
     kind_name: &str,
     name: &str,
     field: Option<String>,
     missing: Option<f64>,
-    value_script: Option<&MetricScript>,
-) -> Result<String, OpenSearchError> {
-    let Some(MetricScript::TraceListLatency { .. }) = value_script else {
-        return field.ok_or_else(|| report_missing_key(kind_name, name, "field"));
+    value_script: Option<MetricScript>,
+) -> Result<MetricSpec, OpenSearchError> {
+    let (script, script_field, fallback_field) = match &value_script {
+        Some(script @ MetricScript::TraceListLatency { .. }) => {
+            (script, CrossRowField::DurationInNanos.client_name(), None)
+        }
+        Some(script @ MetricScript::TraceLastUpdated) => {
+            (script, CrossRowField::EndTime.client_name(), Some(SPAN_END_TIME_FIELD))
+        }
+        Some(MetricScript::Arithmetic(_)) | None => {
+            return Ok(MetricSpec {
+                field: field.ok_or_else(|| report_missing_key(kind_name, name, "field"))?,
+                fallback_field: None,
+                missing,
+                value_script,
+            });
+        }
     };
-    let latency_field = CrossRowField::DurationInNanos.client_name();
     if missing.is_some() {
-        return Err(OpenSearchError::latency_script_with_missing(name));
-    }
-    match field {
-        Some(named_field) if named_field != latency_field => Err(OpenSearchError::latency_script_field_mismatch(
+        return Err(OpenSearchError::trace_script_with_missing(
             name,
-            &named_field,
-            latency_field,
-        )),
-        Some(named_field) => Ok(named_field),
-        None => Ok(latency_field.to_string()),
+            script.describe_script(),
+        ));
     }
+    if let Some(named_field) = field
+        && named_field != script_field
+    {
+        return Err(OpenSearchError::trace_script_field_mismatch(
+            name,
+            script.describe_script(),
+            &named_field,
+            script_field,
+        ));
+    }
+    Ok(MetricSpec {
+        field: script_field.to_string(),
+        fallback_field: fallback_field.map(str::to_string),
+        missing,
+        value_script,
+    })
 }
 
 /// A `histogram`: `field`, `interval`, `min_doc_count` (absent means 0) and `extended_bounds`.
@@ -1504,6 +1567,7 @@ mod tests {
             numeric_missing,
             MetricSpec {
                 field: "duration_micros".to_string(),
+                fallback_field: None,
                 missing: Some(0.0),
                 value_script: None
             }
@@ -1517,6 +1581,7 @@ mod tests {
             textual_missing,
             MetricSpec {
                 field: "duration_micros".to_string(),
+                fallback_field: None,
                 missing: Some(1.5),
                 value_script: None
             }
@@ -1772,6 +1837,7 @@ mod tests {
     fn a_metric_running_the_latency_script_alone_reads_the_root_duration() {
         let latency_metric = MetricSpec {
             field: "traceGroupFields.durationInNanos".to_string(),
+            fallback_field: None,
             missing: None,
             value_script: Some(MetricScript::TraceListLatency {
                 is_zero_when_absent: true,
@@ -1804,6 +1870,47 @@ mod tests {
         assert_eq!(named_max_metric, latency_metric);
         assert_eq!(extended_stats.metric, latency_metric);
         assert_eq!(percentiles.metric, latency_metric);
+    }
+
+    /// The trace-list last-updated script on one line.
+    const LAST_UPDATED_SOURCE: &str = "if (doc.containsKey('traceGroupFields.endTime') && !doc['traceGroupFields.endTime'].empty) { return doc['traceGroupFields.endTime'].value; } if (doc.containsKey('endTime') && !doc['endTime'].empty) { return doc['endTime'].value; }";
+
+    #[tokio::test]
+    async fn the_last_updated_script_reads_the_root_end_time_then_the_span_end_time_and_refuses_a_field_or_missing() {
+        let script = json!({"source": LAST_UPDATED_SOURCE, "lang": "painless"});
+        let Ok(AggregationKind::Max(metric)) = parse_first_kind(&json!({"last_updated": {"max": {"script": script}}}))
+        else {
+            panic!("a max with the last-updated script parses to Max");
+        };
+        assert_eq!(
+            metric,
+            MetricSpec {
+                field: "traceGroupFields.endTime".to_string(),
+                fallback_field: Some("endTime".to_string()),
+                missing: None,
+                value_script: Some(MetricScript::TraceLastUpdated),
+            }
+        );
+        let kind = AggregationKind::Max(metric);
+        assert_eq!(
+            kind.read_fields().collect::<Vec<_>>(),
+            ["traceGroupFields.endTime", "endTime"]
+        );
+
+        let error = assert_refusal(
+            json!({"last_updated": {"max": {"field": "endTime", "script": script}}}),
+            "illegal_argument_exception",
+        )
+        .await;
+        assert_eq!(error["aggregation"], "last_updated", "{error}");
+        assert_eq!(error["field"], "endTime", "{error}");
+        let error = assert_refusal(
+            json!({"last_updated": {"max": {"missing": 0, "script": script}}}),
+            "illegal_argument_exception",
+        )
+        .await;
+        assert_eq!(error["aggregation"], "last_updated", "{error}");
+        assert_eq!(error["key"], "missing", "{error}");
     }
 
     #[tokio::test]

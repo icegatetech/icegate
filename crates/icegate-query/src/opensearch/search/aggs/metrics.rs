@@ -19,7 +19,7 @@ use serde_json::{Map, Number, Value, json};
 
 use super::parse::{
     AggregationKind, IGNORED_EXECUTION_KEYS, MetricPath, expect_object, expect_string, read_lenient_number,
-    read_strict_number, read_value_script, report_unsupported_key, resolve_metric_field,
+    read_strict_number, read_value_script, report_unsupported_key, resolve_metric_spec,
 };
 use super::percentiles::{decode_quantiles, decode_rank_counts, render_percentile_ranks, render_percentiles};
 use super::plan::{FieldInput, MetricSlot};
@@ -34,6 +34,9 @@ use crate::opensearch::search::hits::{DateRenderFormat, render_date, validate_da
 pub(crate) struct MetricSpec {
     /// The field whose values the metric reads.
     pub(crate) field: String,
+    /// The field whose value stands in for an absent `field` on the same row; set only for the
+    /// trace-list last-updated script, whose span without a root reads its own end time.
+    pub(crate) fallback_field: Option<String>,
     /// The value a row without the field contributes; accepted where `value_script` is, as a JSON
     /// number or a numeric string.
     pub(crate) missing: Option<f64>,
@@ -64,12 +67,12 @@ pub(crate) struct ExtendedStatsSpec {
 ///
 /// # Errors
 ///
-/// `400 parsing_exception` for a body that is not an object, a missing `field` (without the
-/// trace-list latency script), an unknown key, a `missing` that is neither a JSON number nor a
-/// numeric string, a malformed `script` member, and a `sigma` that is not a JSON number or is
-/// negative; `400 illegal_argument_exception` for a script that is neither arithmetic nor the
-/// latency script, and as [`resolve_metric_field`] states for a `missing` or `field` beside the
-/// latency script.
+/// `400 parsing_exception` for a body that is not an object, a missing `field` (without a
+/// trace-list script), an unknown key, a `missing` that is neither a JSON number nor a numeric
+/// string, a malformed `script` member, and a `sigma` that is not a JSON number or is negative;
+/// `400 illegal_argument_exception` for a script that is neither arithmetic nor a trace-list
+/// script, and as [`resolve_metric_spec`] states for a `missing` or `field` beside a trace-list
+/// script.
 pub(super) fn parse_extended_stats(name: &str, value: &Value) -> Result<ExtendedStatsSpec, OpenSearchError> {
     let body = expect_object(name, EXTENDED_STATS, value)?;
     let mut field = None;
@@ -92,11 +95,7 @@ pub(super) fn parse_extended_stats(name: &str, value: &Value) -> Result<Extended
         )));
     }
     Ok(ExtendedStatsSpec {
-        metric: MetricSpec {
-            field: resolve_metric_field(EXTENDED_STATS, name, field, missing, value_script.as_ref())?,
-            missing,
-            value_script,
-        },
+        metric: resolve_metric_spec(EXTENDED_STATS, name, field, missing, value_script)?,
         sigma,
     })
 }
@@ -371,23 +370,41 @@ pub(super) fn plan_statistic(statistic: Statistic, value: Expr) -> Result<Expr, 
     }
 }
 
-/// What `kind` reads from each row of the rows-plan column `field`, `spec.missing` standing in
-/// for an absent value and `spec.value_script` applied after it.
+/// What `kind` reads from each row of the rows-plan column `field`, the column `fallback_field`
+/// (the column of `spec.fallback_field`) standing in where `field` is NULL, then `spec.missing`
+/// standing in for a value still absent, and `spec.value_script` applied after it.
 ///
 /// The rows plan holds every field in the Arrow type its field type maps to, and a field no
 /// searched index maps as a NULL column; `plan_aggregation_rows` has already refused a mapped
 /// field the metric cannot read. Every column but a date is therefore read as a double, the NULL
-/// column included.
+/// column included. A date is read as epoch milliseconds and renders as a date; only the
+/// last-updated script, whose answer is a date itself, runs over one.
 ///
 /// # Errors
 ///
-/// `400 illegal_argument_exception` for a value script over a date field; `500` when the
-/// epoch-millisecond expression of a date fails to build.
+/// `400 illegal_argument_exception` for any other value script over a date field; `500` for a
+/// fallback column of another Arrow type than `field`, which the trace-list script refusal of a
+/// search outside the Data Prepper profile rules out, and when the epoch-millisecond expression
+/// of a date fails to build.
 pub(super) fn plan_metric_input(
     kind: MetricKind,
     spec: &MetricSpec,
     field: FieldInput,
+    fallback_field: Option<FieldInput>,
 ) -> Result<MetricInput, OpenSearchError> {
+    let field = match fallback_field {
+        None => field,
+        Some(fallback) if fallback.data_type == field.data_type => FieldInput {
+            expr: coalesce(vec![field.expr, fallback.expr]),
+            data_type: field.data_type,
+        },
+        Some(fallback) => {
+            return Err(OpenSearchError::internal(format!(
+                "the fallback field of [{}] is a {} column, and the field a {} column",
+                spec.field, fallback.data_type, field.data_type
+            )));
+        }
+    };
     if matches!(kind, MetricKind::ValueCount | MetricKind::Cardinality) {
         return Ok(MetricInput {
             value: field.expr,
@@ -405,9 +422,10 @@ pub(super) fn plan_metric_input(
         None => value,
     };
     // A date has no `_value` arithmetic: its extremes render as dates, which a scaled value is not.
+    // The last-updated script answers a date, so it alone runs over one.
     let value = match &spec.value_script {
         None => value,
-        Some(_) if is_date => {
+        Some(MetricScript::Arithmetic(_) | MetricScript::TraceListLatency { .. }) if is_date => {
             return Err(OpenSearchError::illegal_argument(format!(
                 "a value script runs only over numeric fields, and [{}] is a date",
                 spec.field
@@ -499,8 +517,8 @@ pub(super) fn resolve_order_statistic(kind: MetricKind, path: &MetricPath) -> Re
 /// `sum` (an empty sum is 0). An extreme of a date field also renders `<key>_as_string` at
 /// millisecond precision. `percentiles` and `percentile_ranks` render `values` keyed by percent
 /// or value, or as an array when not keyed. `extended_stats` renders as [`render_extended_stats`]
-/// states. A `max` over the trace-list latency script renders 0, never `null`, for a bucket
-/// without a value.
+/// states. A `max` over the trace-list latency script ending in a default renders 0, never
+/// `null`, for a bucket without a value; the form without a default renders `null` there.
 ///
 /// # Errors
 ///
@@ -766,6 +784,7 @@ mod tests {
         ExtendedStatsSpec {
             metric: MetricSpec {
                 field: "duration_micros".to_owned(),
+                fallback_field: None,
                 missing: None,
                 value_script: None,
             },
@@ -848,6 +867,7 @@ mod tests {
 
         let spec = MetricSpec {
             field: "duration_micros".to_owned(),
+            fallback_field: None,
             missing: None,
             value_script: None,
         };
@@ -991,6 +1011,7 @@ mod tests {
             ExtendedStatsSpec {
                 metric: MetricSpec {
                     field: "duration_micros".to_owned(),
+                    fallback_field: None,
                     missing: Some(250.0),
                     value_script: None,
                 },

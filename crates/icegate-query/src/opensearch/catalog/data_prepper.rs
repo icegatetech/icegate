@@ -25,6 +25,10 @@ pub(crate) const DATA_PREPPER_SPAN_ALIAS: &str = "otel-v1-apm-span";
 /// The trace id field: the key of a trace list's buckets and of a trace-by-id lookup.
 pub(crate) const TRACE_ID_FIELD: &str = "traceId";
 
+/// The span's own end time field: what the trace-list last-updated script reads for a span whose
+/// trace has no stored root.
+pub(crate) const SPAN_END_TIME_FIELD: &str = "endTime";
+
 /// The span duration field, in nanoseconds: the name the derived duration's refusals report.
 pub(super) const DURATION_IN_NANOS_FIELD: &str = "durationInNanos";
 
@@ -39,7 +43,7 @@ pub(super) const SPAN_FIELDS: [(&str, ProfileFieldSource); 24] = [
     ("kind", ProfileFieldSource::SpanKind(COL_KIND)),
     ("serviceName", ProfileFieldSource::Column(COL_SERVICE_NAME)),
     ("startTime", ProfileFieldSource::Time(COL_TIMESTAMP)),
-    ("endTime", ProfileFieldSource::Time(COL_END_TIMESTAMP)),
+    (SPAN_END_TIME_FIELD, ProfileFieldSource::Time(COL_END_TIMESTAMP)),
     (DURATION_IN_NANOS_FIELD, ProfileFieldSource::DurationInNanos),
     ("status", ProfileFieldSource::Object),
     ("status.code", ProfileFieldSource::StatusCode(COL_STATUS_CODE)),
