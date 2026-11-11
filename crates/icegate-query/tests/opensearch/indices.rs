@@ -35,9 +35,9 @@ async fn resolve_index_lists_the_telemetry_indices_sorted_and_open() {
                 build_open_index("operations"),
                 {"name": "otel-v1-apm-span-000001", "aliases": ["otel-v1-apm-span"], "attributes": ["open"]},
                 build_open_index("spans"),
-                build_open_index("ss4o_logs-icegate-default"),
-                build_open_index("ss4o_metrics-icegate-default"),
-                build_open_index("ss4o_traces-icegate-default")
+                build_open_index("ss4o_logs-tenant-a"),
+                build_open_index("ss4o_metrics-tenant-a"),
+                build_open_index("ss4o_traces-tenant-a")
             ],
             "aliases": [{"name": "otel-v1-apm-span", "indices": ["otel-v1-apm-span-000001"]}],
             "data_streams": []

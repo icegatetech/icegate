@@ -191,7 +191,7 @@ impl IndexCatalog {
                     "namespace `{ICEGATE_NAMESPACE}` not found in catalog `{catalog_name}`"
                 ))
             })?;
-        let indices = IndexSet::from_table_names(namespace.table_names());
+        let indices = IndexSet::from_table_names(namespace.table_names(), tenant);
         let tables = open_index_tables(namespace.as_ref(), &indices).await;
         Ok(TenantSession {
             context,

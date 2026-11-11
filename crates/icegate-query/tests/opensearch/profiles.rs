@@ -1263,9 +1263,9 @@ async fn a_case_insensitive_term_on_kind_and_trace_state_matches_the_rendered_va
     server.shutdown().await;
 }
 
-const SS4O_LOGS: &str = "ss4o_logs-icegate-default";
-const SS4O_TRACES: &str = "ss4o_traces-icegate-default";
-const SS4O_METRICS: &str = "ss4o_metrics-icegate-default";
+const SS4O_LOGS: &str = "ss4o_logs-tenant-a";
+const SS4O_TRACES: &str = "ss4o_traces-tenant-a";
+const SS4O_METRICS: &str = "ss4o_metrics-tenant-a";
 const LOG_TRACE: [u8; 16] = [0x0c; 16];
 
 /// Search `index` as tenant A with `query` and return the status and the answer.
@@ -1353,6 +1353,114 @@ pub(super) fn build_metric_row_at<'a>(
         tenant,
         cells: row_cells,
     }
+}
+
+/// The ss4o index names `_cat/indices` lists for `tenant`, in name order.
+async fn list_ss4o_index_names(server: &TestServer, tenant: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let (status, rows) = send_request(server, Method::GET, tenant, "/_cat/indices?format=json&h=index", None).await?;
+    if status != StatusCode::OK {
+        return Err(format!("_cat/indices answered {status}: {rows}").into());
+    }
+    Ok(rows
+        .as_array()
+        .ok_or_else(|| format!("no rows in {rows}"))?
+        .iter()
+        .filter_map(|row| row["index"].as_str())
+        .filter(|name| name.starts_with("ss4o"))
+        .map(str::to_string)
+        .collect())
+}
+
+/// Each tenant sees the ss4o indices under its own name, and only those: no index keeps the
+/// former `icegate-default` name, and one tenant's names are unknown to another.
+#[tokio::test]
+async fn ss4o_indices_are_named_for_the_requesting_tenant() {
+    let (server, _catalog) = TestServer::start().await;
+
+    let names_seen_by_a = list_ss4o_index_names(&server, TENANT_A).await.expect("tenant A listing");
+    let names_seen_by_b = list_ss4o_index_names(&server, TENANT_B).await.expect("tenant B listing");
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        TENANT_B,
+        "/ss4o_logs-tenant-a/_search",
+        Some(&json!({"query": {"match_all": {}}})),
+    )
+    .await
+    .expect("search request");
+
+    assert_eq!(
+        names_seen_by_a,
+        ["ss4o_logs-tenant-a", "ss4o_metrics-tenant-a", "ss4o_traces-tenant-a"]
+    );
+    assert_eq!(
+        names_seen_by_b,
+        ["ss4o_logs-tenant-b", "ss4o_metrics-tenant-b", "ss4o_traces-tenant-b"]
+    );
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    assert_eq!(answer["error"]["type"], "index_not_found_exception");
+    assert_eq!(answer["error"]["index"], "ss4o_logs-tenant-a");
+    server.shutdown().await;
+}
+
+/// A tenant id holding upper case and `:` names its ss4o indices lower-cased with `_` for `:`,
+/// and the index reads that tenant's rows only.
+#[tokio::test]
+async fn a_tenant_with_upper_case_and_colons_gets_a_lower_case_underscored_index_name() {
+    const UPPER_CASE_TENANT: &str = "Org:Acme";
+    let (server, catalog) = TestServer::start().await;
+    commit_rows(
+        &catalog,
+        LOGS_TABLE,
+        &[
+            build_log_row(UPPER_CASE_TENANT, T0, "acme log", "INFO", vec![]),
+            build_log_row(TENANT_A, T0, "tenant a log", "INFO", vec![]),
+        ],
+    )
+    .await
+    .expect("commit logs");
+
+    let names = list_ss4o_index_names(&server, UPPER_CASE_TENANT).await.expect("listing");
+    let (status, answer) = send_request(
+        &server,
+        Method::POST,
+        UPPER_CASE_TENANT,
+        "/ss4o_logs-org_acme/_search",
+        Some(&json!({"query": {"match_all": {}}})),
+    )
+    .await
+    .expect("search request");
+
+    assert_eq!(
+        names,
+        ["ss4o_logs-org_acme", "ss4o_metrics-org_acme", "ss4o_traces-org_acme"]
+    );
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(read_sorted_source_texts(&answer, "body").expect("bodies"), ["acme log"]);
+    assert_eq!(answer["hits"]["hits"][0]["_index"], "ss4o_logs-org_acme");
+    server.shutdown().await;
+}
+
+/// The `icegate-default` names the ss4o indices carried before they named the tenant are unknown
+/// indices, refused like any other.
+#[tokio::test]
+async fn the_former_icegate_default_names_are_unknown_indices() {
+    let (server, _catalog) = TestServer::start().await;
+
+    for former_name in [
+        "ss4o_logs-icegate-default",
+        "ss4o_traces-icegate-default",
+        "ss4o_metrics-icegate-default",
+    ] {
+        let (status, answer) = search_tenant_a_index(&server, former_name, json!({"match_all": {}}))
+            .await
+            .expect("search request");
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{former_name}: {answer}");
+        assert_eq!(answer["error"]["type"], "index_not_found_exception");
+        assert_eq!(answer["error"]["index"], former_name);
+    }
+    server.shutdown().await;
 }
 
 /// Each ss4o logs field reads its source: aliases filter like their targets, a resource path to

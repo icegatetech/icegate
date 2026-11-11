@@ -180,7 +180,7 @@ successful JSON response; an error envelope is never filtered.
 |---|---|---|
 | `logs`, `spans`, `events`, `metrics`, `operations` | the table of the same name | native: the schema's columns under their own names |
 | `otel-v1-apm-span-000001`, aliased `otel-v1-apm-span` | `spans` | Data Prepper span documents (hex ids, nested `status`, `traceGroup*`; `src/opensearch/catalog/data_prepper.rs`) |
-| `ss4o_logs-icegate-default`, `ss4o_traces-icegate-default`, `ss4o_metrics-icegate-default` | `logs`, `spans`, `metrics` | ss4o field names (`src/opensearch/catalog/ss4o.rs`) |
+| `ss4o_logs-<tenant>`, `ss4o_traces-<tenant>`, `ss4o_metrics-<tenant>`, `<tenant>` the requesting tenant as `build_ss4o_index_name` writes it | `logs`, `spans`, `metrics` | ss4o field names (`src/opensearch/catalog/ss4o.rs`) |
 | any other table the tenant's catalog lists | the table of the same name | native; resolved by its exact name only, never by a wildcard |
 | names starting with `.` | — | system indices, held per tenant on object storage |
 
@@ -214,7 +214,7 @@ hidden indices is on, and offers `timestamp` as the time field of a pattern over
   filter keys offer them (`grafana field pickers and ad-hoc filter keys list dotted map keys`).
 - `_mapping` lists a native table's properties in its schema column order, and a map's keys in
   stored-key byte order; a profile index lists its fields in the profile's declared order.
-- `ss4o_metrics-icegate-default` serves a histogram's `buckets` as a `nested` field of
+- `ss4o_metrics-<tenant>` serves a histogram's `buckets` as a `nested` field of
   `{min, max, count}` objects, derived from `explicit_bounds` and `bucket_counts`
   (`src/opensearch/catalog/histogram.rs` states the open ends), and `time` as another name of
   `@timestamp`. A query leaf on `buckets` or a member path outside a nested context matches
@@ -274,7 +274,7 @@ These hold for a search over data indices; a search over system indices is docum
   Grafana's metrics editor panels with `bucket_script` and `moving_avg` render
   (`metrics editor bucket_script and moving_avg panels render`).
 - `nested` runs at the top level of a request, over a field every searched index declares
-  `nested` (today `buckets` of `ss4o_metrics-icegate-default`); its `doc_count` counts the objects
+  `nested` (today `buckets` of `ss4o_metrics-<tenant>`); its `doc_count` counts the objects
   of the matching rows, and inside it only `filter` and `sum`, `min`, `max`, `value_count` and
   `avg` run, over the objects' members. Any other placement, path, kind, field or query is a 400
   naming it (`src/opensearch/search/aggs/parse.rs` and `NestedObjectScope` in

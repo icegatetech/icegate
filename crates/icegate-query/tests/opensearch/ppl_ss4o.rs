@@ -23,9 +23,9 @@ use super::ppl::{
 };
 use super::profiles::{build_log_row, build_metric_row};
 
-const SS4O_LOGS: &str = "ss4o_logs-icegate-default";
-const SS4O_TRACES: &str = "ss4o_traces-icegate-default";
-const SS4O_METRICS: &str = "ss4o_metrics-icegate-default";
+const SS4O_LOGS: &str = "ss4o_logs-acme";
+const SS4O_TRACES: &str = "ss4o_traces-acme";
+const SS4O_METRICS: &str = "ss4o_metrics-acme";
 
 /// The query OSD 3.9's "View associated logs" sends for trace [`TRACE_HEX`].
 const ASSOCIATED_LOGS_QUERY: &str = "source = ss4o_logs-*,opensearch_dashboards_sample_data_otel_logs* | where traceId='5b8efff798038103d269b633813fc60c'";
@@ -338,9 +338,9 @@ async fn a_source_reaching_logs_through_two_profiles_is_refused_naming_it() {
     let (server, catalog) = TestServer::start().await;
     seed_trace_logs(&catalog).await;
 
-    let answer = run_query(&server, "source=logs,ss4o_logs-icegate-default").await;
+    let answer = run_query(&server, "source=logs,ss4o_logs-acme").await;
 
-    assert_semantic_refusal_naming(&answer, "logs,ss4o_logs-icegate-default");
+    assert_semantic_refusal_naming(&answer, "logs,ss4o_logs-acme");
     server.shutdown().await;
 }
 

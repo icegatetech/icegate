@@ -3,11 +3,11 @@
 
 use std::collections::BTreeMap;
 
-use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE};
+use icegate_common::{EVENTS_TABLE, LOGS_TABLE, METRICS_TABLE, OPERATIONS_TABLE, SPANS_TABLE, TenantId};
 
 use super::data_prepper::{DATA_PREPPER_SPAN_ALIAS, DATA_PREPPER_SPAN_INDEX};
 use super::expression::{ExpressionPart, IndexExpression, Selection, has_wildcard};
-use super::ss4o::{SS4O_LOGS_INDEX, SS4O_METRICS_INDEX, SS4O_TRACES_INDEX};
+use super::ss4o::{Ss4oSignal, build_ss4o_index_name};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::extract::ExpandWildcards;
 use crate::opensearch::glob::matches_glob;
@@ -73,10 +73,29 @@ impl Profile {
     }
 }
 
+/// The concrete name of a profile index: fixed, or built per tenant.
+#[derive(Debug, Clone, Copy)]
+enum ProfileIndexName {
+    /// The same name for every tenant.
+    Fixed(&'static str),
+    /// The tenant's ss4o index of the signal (see [`build_ss4o_index_name`]).
+    Ss4o(Ss4oSignal),
+}
+
+impl ProfileIndexName {
+    /// The concrete index name `tenant` sees.
+    fn build_index_name(self, tenant: &TenantId) -> String {
+        match self {
+            Self::Fixed(name) => name.to_string(),
+            Self::Ss4o(signal) => build_ss4o_index_name(signal, tenant),
+        }
+    }
+}
+
 /// One index a non-native profile serves.
 struct ProfileIndex {
     /// The concrete index name.
-    name: &'static str,
+    name: ProfileIndexName,
     /// The other names that select the index, in name order.
     alias_names: &'static [&'static str],
     /// The table the index reads.
@@ -89,25 +108,25 @@ struct ProfileIndex {
 /// wildcard-visible through its name and each of its aliases.
 const PROFILE_INDICES: [ProfileIndex; 4] = [
     ProfileIndex {
-        name: DATA_PREPPER_SPAN_INDEX,
+        name: ProfileIndexName::Fixed(DATA_PREPPER_SPAN_INDEX),
         alias_names: &[DATA_PREPPER_SPAN_ALIAS],
         table: SPANS_TABLE,
         profile: Profile::DataPrepper,
     },
     ProfileIndex {
-        name: SS4O_LOGS_INDEX,
+        name: ProfileIndexName::Ss4o(Ss4oSignal::Logs),
         alias_names: &[],
         table: LOGS_TABLE,
         profile: Profile::Ss4o,
     },
     ProfileIndex {
-        name: SS4O_TRACES_INDEX,
+        name: ProfileIndexName::Ss4o(Ss4oSignal::Traces),
         alias_names: &[],
         table: SPANS_TABLE,
         profile: Profile::Ss4o,
     },
     ProfileIndex {
-        name: SS4O_METRICS_INDEX,
+        name: ProfileIndexName::Ss4o(Ss4oSignal::Metrics),
         alias_names: &[],
         table: METRICS_TABLE,
         profile: Profile::Ss4o,
@@ -200,11 +219,12 @@ pub(crate) struct IndexSet {
 }
 
 impl IndexSet {
-    /// Build the set from the table names a tenant-scoped catalog lists. Telemetry tables are
-    /// wildcard-visible, and each one also yields the indices of the non-native profiles that read
-    /// it; every other table resolves only by its exact name. A dot-prefixed table name is
-    /// dropped: dot-prefixed names are system indices, never data.
-    pub(crate) fn from_table_names(names: impl IntoIterator<Item = String>) -> Self {
+    /// Build the set `tenant` sees from the table names its tenant-scoped catalog lists. Telemetry
+    /// tables are wildcard-visible, and each one also yields the indices of the non-native profiles
+    /// that read it, under the names `tenant` sees them by; every other table resolves only by its
+    /// exact name. A dot-prefixed table name is dropped: dot-prefixed names are system indices,
+    /// never data.
+    pub(crate) fn from_table_names(names: impl IntoIterator<Item = String>, tenant: &TenantId) -> Self {
         let mut entries: Vec<IndexEntry> = Vec::new();
         for name in names.into_iter().filter(|name| !name.starts_with('.')) {
             entries.extend(
@@ -212,7 +232,7 @@ impl IndexSet {
                     .iter()
                     .filter(|profile_index| profile_index.table == name)
                     .map(|profile_index| IndexEntry {
-                        name: profile_index.name.to_string(),
+                        name: profile_index.name.build_index_name(tenant),
                         table: name.clone(),
                         profile: profile_index.profile,
                         alias_names: profile_index.alias_names,
@@ -456,6 +476,7 @@ mod tests {
 
     use super::*;
     use crate::opensearch::error::render_envelope;
+    use crate::test_support::build_tenant;
 
     /// The five telemetry tables, two exact-name tables a tenant may also read, and a view.
     fn build_index_set() -> IndexSet {
@@ -471,6 +492,7 @@ mod tests {
                 "marks",
             ]
             .map(str::to_string),
+            &build_tenant("tenant-a"),
         )
     }
 
@@ -501,9 +523,9 @@ mod tests {
             "operations",
             "otel-v1-apm-span-000001",
             "spans",
-            "ss4o_logs-icegate-default",
-            "ss4o_metrics-icegate-default",
-            "ss4o_traces-icegate-default",
+            "ss4o_logs-tenant-a",
+            "ss4o_metrics-tenant-a",
+            "ss4o_traces-tenant-a",
         ];
         assert_eq!(resolve_names("*", build_search_options()), visible_names);
         assert_eq!(resolve_names("_all", build_search_options()), visible_names);
@@ -695,7 +717,8 @@ mod tests {
     /// surface as a data index, by name or by wildcard: by name it is the missing-index `404`.
     #[tokio::test]
     async fn dot_prefixed_table_names_are_not_data_indices() {
-        let index_set = IndexSet::from_table_names([".kibana".to_string(), "logs".to_string()]);
+        let index_set =
+            IndexSet::from_table_names([".kibana".to_string(), "logs".to_string()], &build_tenant("tenant-a"));
 
         // The listing, not `resolve`: `*` reaches `logs` through two profiles, which only a read
         // refuses, and this test is about which names a wildcard selects.
@@ -714,7 +737,7 @@ mod tests {
 
         assert_eq!(
             wildcard_entries.iter().map(|entry| entry.name()).collect::<Vec<_>>(),
-            ["logs", "ss4o_logs-icegate-default"]
+            ["logs", "ss4o_logs-tenant-a"]
         );
         let (status, body) = render_envelope(exact_name_error).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -788,7 +811,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_expression_mixing_system_and_data_indices_is_refused_naming_the_system_indices() {
-        let index_set = IndexSet::from_table_names(["logs".to_string(), "spans".to_string()]);
+        let index_set =
+            IndexSet::from_table_names(["logs".to_string(), "spans".to_string()], &build_tenant("tenant-a"));
         let options = build_options(None, false);
         let resolve_sides = |expression_text: &str| {
             let expression = IndexExpression::parse(expression_text).expect("a valid expression");

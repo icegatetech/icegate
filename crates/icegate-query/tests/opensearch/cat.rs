@@ -124,9 +124,9 @@ async fn cat_indices_without_an_expression_lists_exact_name_tables_and_a_view_co
             {"index": "prices_effective", "docs.count": null},
             {"index": "prices_effective_by_time_of_day", "docs.count": null},
             {"index": "spans", "docs.count": "0"},
-            {"index": "ss4o_logs-icegate-default", "docs.count": "0"},
-            {"index": "ss4o_metrics-icegate-default", "docs.count": "0"},
-            {"index": "ss4o_traces-icegate-default", "docs.count": "0"}
+            {"index": "ss4o_logs-tenant-a", "docs.count": "0"},
+            {"index": "ss4o_metrics-tenant-a", "docs.count": "0"},
+            {"index": "ss4o_traces-tenant-a", "docs.count": "0"}
         ])
     );
     server.shutdown().await;

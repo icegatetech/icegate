@@ -2318,7 +2318,7 @@ async fn search_without_an_index_in_the_path_reaches_the_handler_on_get_and_post
 }
 
 /// The test catalog holds data tables and no system index, so the empty expression selects every
-/// wildcard-visible data index, `logs` and `ss4o_logs-icegate-default` among them: one table
+/// wildcard-visible data index, `logs` and `ss4o_logs-tenant-a` among them: one table
 /// reached through two profiles without naming either index, which a search refuses rather than
 /// read its rows twice. The refusal names the first such table in name order.
 #[tokio::test]

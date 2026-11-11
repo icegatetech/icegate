@@ -16,8 +16,8 @@ use super::harness::TestServer;
 use super::profiles::build_metric_row_at;
 use super::requests::send_request;
 
-const SS4O_METRICS_SEARCH_PATH: &str = "/ss4o_metrics-icegate-default/_search";
-const SS4O_METRICS: &str = "ss4o_metrics-icegate-default";
+const SS4O_METRICS_SEARCH_PATH: &str = "/ss4o_metrics-tenant-a/_search";
+const SS4O_METRICS: &str = "ss4o_metrics-tenant-a";
 /// The histogram metric of [`commit_bin_count_metrics`].
 const HISTOGRAM_METRIC: &str = "http.server.duration";
 /// The sum metric of [`commit_bin_count_metrics`], which has no buckets.

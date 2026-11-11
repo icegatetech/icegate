@@ -371,7 +371,7 @@ async fn field_caps_reports_exactly_the_id_index_and_source_metadata_fields() {
 }
 
 /// Without an index in the path, `_field_caps` (by GET and by POST) and `_mapping` select every
-/// wildcard-visible index, `logs` and `ss4o_logs-icegate-default` among them: one table reached
+/// wildcard-visible index, `logs` and `ss4o_logs-tenant-a` among them: one table reached
 /// through two profiles without naming either index, which each endpoint refuses, naming the
 /// first such table in name order and its profiles.
 #[tokio::test]

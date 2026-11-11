@@ -11,18 +11,58 @@ use icegate_common::schema::{
     COL_SCOPE_ATTRIBUTES, COL_SERVICE_NAME, COL_SEVERITY_TEXT, COL_SPAN_ID, COL_START_TIMESTAMP, COL_SUM,
     COL_TIMESTAMP, COL_TRACE_ID, COL_UNIT, COL_VALUE_DOUBLE, COL_VALUE_INT, COL_ZERO_COUNT,
 };
-use icegate_common::{LOGS_TABLE, METRICS_TABLE, SPANS_TABLE};
+use icegate_common::{LOGS_TABLE, METRICS_TABLE, SPANS_TABLE, TenantId};
 
 use super::data_prepper::SPAN_FIELDS;
 use super::encoding::{AttributeKeys, ProfileFieldSource, ProfileTable};
 use super::native::METRIC_VALUE_FIELD;
 
-/// The ss4o logs index over `logs`.
-pub(super) const SS4O_LOGS_INDEX: &str = "ss4o_logs-icegate-default";
-/// The ss4o traces index over `spans`.
-pub(super) const SS4O_TRACES_INDEX: &str = "ss4o_traces-icegate-default";
-/// The ss4o metrics index over `metrics`.
-pub(super) const SS4O_METRICS_INDEX: &str = "ss4o_metrics-icegate-default";
+/// The signal an ss4o index carries: one index per signal and tenant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Ss4oSignal {
+    /// The logs index, over `logs`.
+    Logs,
+    /// The traces index, over `spans`.
+    Traces,
+    /// The metrics index, over `metrics`.
+    Metrics,
+}
+
+impl Ss4oSignal {
+    /// The part of the index name before the tenant.
+    const fn name_prefix(self) -> &'static str {
+        match self {
+            Self::Logs => "ss4o_logs-",
+            Self::Traces => "ss4o_traces-",
+            Self::Metrics => "ss4o_metrics-",
+        }
+    }
+}
+
+/// The name of the `signal` ss4o index of `tenant`: the signal's prefix and the tenant as
+/// [`normalize_tenant_for_index_name`] writes it, so each tenant sees the index under its own name.
+pub(super) fn build_ss4o_index_name(signal: Ss4oSignal, tenant: &TenantId) -> String {
+    let prefix = signal.name_prefix();
+    let tenant_text: &str = tenant.as_ref();
+    let mut name = String::with_capacity(prefix.len() + tenant_text.len());
+    name.push_str(prefix);
+    name.extend(normalize_tenant_for_index_name(tenant_text));
+    name
+}
+
+/// `tenant` as an index name may carry it: ASCII upper case lowered and every `:` replaced by
+/// `_`, because an index name is lower case and a `:` in one names a remote cluster. A tenant id
+/// is ASCII alphanumerics, `-`, `_` and `:` ([`TenantId::is_valid`]), so the result is always a
+/// valid index-name part. Two tenants that differ only by case or by `:` against `_` share index
+/// names, which mixes nothing: a request only ever sees its own tenant's indices.
+///
+/// Yields characters rather than a `String` so a caller writes them into the name it is building.
+fn normalize_tenant_for_index_name(tenant: &str) -> impl Iterator<Item = char> + '_ {
+    tenant.chars().map(|character| match character {
+        ':' => '_',
+        other => other.to_ascii_lowercase(),
+    })
+}
 
 /// The fields of the ss4o logs index, in `_mapping` order.
 const SS4O_LOG_FIELDS: [(&str, ProfileFieldSource); 16] = [
@@ -143,5 +183,32 @@ pub(crate) fn find_ss4o_table(table: &str) -> Option<&'static ProfileTable> {
         SPANS_TABLE => Some(&SS4O_TRACES_TABLE),
         METRICS_TABLE => Some(&SS4O_METRICS_TABLE),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::build_tenant;
+
+    #[test]
+    fn a_tenant_is_lower_cased_with_underscores_for_colons_in_an_index_name() {
+        for (tenant, expected_part) in [("Org:Acme", "org_acme"), ("demo", "demo"), ("a-b_c", "a-b_c")] {
+            assert_eq!(
+                normalize_tenant_for_index_name(tenant).collect::<String>(),
+                expected_part,
+                "{tenant}"
+            );
+        }
+        let tenant = build_tenant("Org:Acme");
+        assert_eq!(build_ss4o_index_name(Ss4oSignal::Logs, &tenant), "ss4o_logs-org_acme");
+        assert_eq!(
+            build_ss4o_index_name(Ss4oSignal::Traces, &tenant),
+            "ss4o_traces-org_acme"
+        );
+        assert_eq!(
+            build_ss4o_index_name(Ss4oSignal::Metrics, &tenant),
+            "ss4o_metrics-org_acme"
+        );
     }
 }

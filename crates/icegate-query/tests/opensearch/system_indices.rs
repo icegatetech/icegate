@@ -713,9 +713,9 @@ async fn resolve_and_cat_indices_list_a_system_index_only_when_hidden_indices_ar
             "operations",
             "otel-v1-apm-span-000001",
             "spans",
-            "ss4o_logs-icegate-default",
-            "ss4o_metrics-icegate-default",
-            "ss4o_traces-icegate-default"
+            "ss4o_logs-tenant-a",
+            "ss4o_metrics-tenant-a",
+            "ss4o_traces-tenant-a"
         ]
     );
     assert_eq!(
@@ -732,9 +732,9 @@ async fn resolve_and_cat_indices_list_a_system_index_only_when_hidden_indices_ar
             "operations",
             "otel-v1-apm-span-000001",
             "spans",
-            "ss4o_logs-icegate-default",
-            "ss4o_metrics-icegate-default",
-            "ss4o_traces-icegate-default"
+            "ss4o_logs-tenant-a",
+            "ss4o_metrics-tenant-a",
+            "ss4o_traces-tenant-a"
         ]
     );
     assert_eq!(
