@@ -8,6 +8,18 @@ x-logging: &fluentd-logging
     fluentd-retry-wait: "1s"
     tag: "docker.{{.Name}}"
 
+# One otelgen process emits one signal (and one metric type), so each signal
+# the `load` profile feeds into ingest is its own service built on this base.
+x-otelgen: &otelgen
+  image: ghcr.io/krzko/otelgen:v0.5.2
+  depends_on:
+    ingest-probe:
+      condition: service_healthy
+  restart: unless-stopped
+  profiles:
+    - load
+  logging: *fluentd-logging
+
 # TODO(med): make a base compose for basic components and an overlay compose for profile components
 
 services:
@@ -337,15 +349,23 @@ services:
     logging: *fluentd-logging
 
   otelgen:
-    image: ghcr.io/krzko/otelgen:v0.5.2
+    <<: *otelgen
     command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "logs", "multi", "--workers", "10", "--duration", "0"]
-    depends_on:
-      ingest-probe:
-        condition: service_healthy
-    restart: unless-stopped
-    profiles:
-      - load
-    logging: *fluentd-logging
+
+  otelgen-traces:
+    <<: *otelgen
+    # v0.5.2's help lists more scenarios, but only these two run; the others log
+    # "unknown scenario" for every trace. `traces multi` exits after
+    # --number-traces regardless of --duration, so the count stands in for "forever".
+    command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "--duration", "0", "traces", "multi", "--number-traces", "1000000000", "--scenarios", "microservices", "--scenarios", "basic"]
+
+  otelgen-metrics:
+    <<: *otelgen
+    command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "--duration", "0", "metrics", "sum"]
+
+  otelgen-histogram:
+    <<: *otelgen
+    command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "--duration", "0", "metrics", "histogram"]
 
   prometheus:
     image: prom/prometheus:v3.9.1

@@ -2,8 +2,8 @@
 # collector sends: `X-Scope-OrgID: demo` in otel-collector/config.yaml, on the
 # logs of every service that uses the fluentd driver. In single mode a header
 # naming any other tenant is rejected, so `default` here would 400 every batch.
-# `otelgen` (profile `load`) sends no header at all and therefore also lands in
-# `demo`; view its data through the "Loki (demo)" / "Tempo (demo)" datasources.
+# The `otelgen*` services (profile `load`) send no header at all and therefore
+# also land in `demo`; view their data through the "(demo)" datasources.
 tenant: !single
   id: demo
 
