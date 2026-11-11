@@ -27,7 +27,9 @@ const SS4O_LOGS: &str = "ss4o_logs-icegate-default";
 const SS4O_TRACES: &str = "ss4o_traces-icegate-default";
 const SS4O_METRICS: &str = "ss4o_metrics-icegate-default";
 
-/// The query OSD 3.9's "View associated logs" sends for trace [`TRACE_HEX`].
+/// The query OSD 3.9's "View associated logs" sends for trace [`TRACE_HEX`], pinned by the
+/// end-to-end case `view associated logs lists the logs of the trace`
+/// (`scripts/opensearch-e2e/osd.spec.ts`).
 const ASSOCIATED_LOGS_QUERY: &str = "source = ss4o_logs-*,opensearch_dashboards_sample_data_otel_logs* | where traceId='5b8efff798038103d269b633813fc60c'";
 
 const TRACE_HEX: &str = "5b8efff798038103d269b633813fc60c";

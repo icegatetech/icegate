@@ -1165,7 +1165,9 @@ mod tests {
     /// whitespace runs, so the layout is not part of the contract.
     const LATENCY_SOURCE: &str = "\n                if (doc.containsKey('traceGroupFields.durationInNanos') && !doc['traceGroupFields.durationInNanos'].empty) {\n                  return Math.round(doc['traceGroupFields.durationInNanos'].value / 10000) / 100.0\n                }\n                return 0\n                ";
 
-    /// OSD 3.9's form of the latency script: the same text without the trailing default.
+    /// OSD 3.9's form of the latency script: the same text without the trailing default, sent by
+    /// its Traces table (end-to-end case
+    /// `trace analytics traces table shows each trace with its latency, errors and group`).
     const LATENCY_SOURCE_WITHOUT_DEFAULT: &str = "\n                if (doc.containsKey('traceGroupFields.durationInNanos') && !doc['traceGroupFields.durationInNanos'].empty) {\n                  return Math.round(doc['traceGroupFields.durationInNanos'].value / 10000) / 100.0\n                }\n                ";
 
     #[tokio::test]
@@ -1275,7 +1277,9 @@ mod tests {
         assert_eq!(body["error"]["type"], "illegal_argument_exception");
     }
 
-    /// OSD 3.9's last-updated script, with the whitespace it is sent with.
+    /// OSD 3.9's last-updated script, with the whitespace it is sent with, sent by its Traces
+    /// table (end-to-end case
+    /// `trace analytics traces table shows each trace with its latency, errors and group`).
     const LAST_UPDATED_SOURCE: &str = "\n                  if (doc.containsKey('traceGroupFields.endTime') && !doc['traceGroupFields.endTime'].empty) {\n                    return doc['traceGroupFields.endTime'].value;\n                  }\n                  if (doc.containsKey('endTime') && !doc['endTime'].empty) {\n                    return doc['endTime'].value;\n                  }\n                ";
 
     #[tokio::test]

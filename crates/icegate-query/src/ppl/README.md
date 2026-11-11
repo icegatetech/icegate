@@ -75,7 +75,9 @@ open, non-hidden indices. A name that matches nothing is a 404 `INDEX_NOT_FOUND`
 that matches nothing is skipped while another part matches, so only an expression that matches
 nothing as a whole is that 404: OSD's associated-logs source
 `ss4o_logs-*,opensearch_dashboards_sample_data_otel_logs*` reads the ss4o logs index
-(`osd_associated_logs_query_lists_the_logs_of_one_trace` in `tests/opensearch/ppl_ss4o.rs`).
+(`osd_associated_logs_query_lists_the_logs_of_one_trace` in `tests/opensearch/ppl_ss4o.rs` pins
+the answer; `view associated logs lists the logs of the trace` in
+`scripts/opensearch-e2e/osd.spec.ts` pins that OSD sends that source).
 Names are case-sensitive.
 
 A source on system indices is a 400, and so is a source on the Data Prepper span index
@@ -604,6 +606,8 @@ The end-to-end cases that pin how the PPL clients use this endpoint
 `workbench runs a ppl query, explains it and downloads csv`, `workbench lists the index tree`,
 `discover ppl renders documents and a histogram without highlight`,
 `observability logs renders events and the count chart`,
+`observability logs runs a hand-written ppl over ss4o logs`,
+`view associated logs lists the logs of the trace`,
 `a ppl error shows its reason in the workbench`,
 `grafana renders a ppl logs query and a ppl time series`,
 `template variables from a lucene find query feed lucene and ppl panels`,

@@ -1,5 +1,8 @@
 //! The requests `OpenSearch` Dashboards 3.9's Traces table sends to `otel-v1-apm-span`, over real
-//! HTTP, against the rows of the Grafana trace fixture. Every expected value is stated here.
+//! HTTP, against the rows of the Grafana trace fixture. Every expected value is stated here. That
+//! the Traces table sends them is pinned by an end-to-end case of
+//! `scripts/opensearch-e2e/osd.spec.ts`:
+//! `trace analytics traces table shows each trace with its latency, errors and group`.
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;

@@ -268,9 +268,12 @@ These hold for a search over data indices; a search over system indices is docum
   and OpenSearch Dashboards 3.9's two Traces-table scripts: the latency script without that
   `return 0`, which answers null for a trace without a stored root span, and the last-updated
   script, which answers the root span's end time, else the span's own, as raw epoch milliseconds
-  (`value` without `value_as_string`). OpenSearch Dashboards 3.9's Traces-table request answers
-  in full (`tests/opensearch/osd_traces.rs`); above `opensearch.max_cross_row_traces` traces in its
-  time range it is a 400 `illegal_argument_exception` naming `index` and `limit`.
+  (`value` without `value_as_string`). OpenSearch Dashboards 3.9 sends these two scripts and
+  renders their answers in its Traces table
+  (`trace analytics traces table shows each trace with its latency, errors and group`). Its
+  Traces-table request answers in full (`tests/opensearch/osd_traces.rs`); above
+  `opensearch.max_cross_row_traces` traces in its time range it is a 400
+  `illegal_argument_exception` naming `index` and `limit`.
   Grafana's metrics editor panels with `bucket_script` and `moving_avg` render
   (`metrics editor bucket_script and moving_avg panels render`).
 - `nested` runs at the top level of a request, over a field every searched index declares
@@ -279,7 +282,9 @@ These hold for a search over data indices; a search over system indices is docum
   `avg` run, over the objects' members. Any other placement, path, kind, field or query is a 400
   naming it (`src/opensearch/search/aggs/parse.rs` and `NestedObjectScope` in
   `src/query_dsl/lower.rs` state the rules); `reverse_nested` is a 400. OpenSearch Dashboards
-  3.9's Metrics bin-count request answers in full (`tests/opensearch/osd_metrics.rs`).
+  3.9's Metrics bin-count request answers in full (`tests/opensearch/osd_metrics.rs`), and its
+  Metrics page plots a histogram's bins from those answers
+  (`observability metrics plots the bins of a histogram metric`).
 
 ### `_cat` endpoints
 
@@ -338,6 +343,11 @@ cannot see the deployed Dashboards and does not compare versions with it.
   listener and `opensearch.customHeaders` carrying `x-scope-orgid`. With `x-scope-orgid` left out
   of `opensearch.requestHeadersWhitelist`, a header a browser sends cannot switch the tenant
   (`a browser-sent x-scope-orgid cannot switch the tenant`).
+  Trace Analytics in Data Prepper mode reads the span index through its `otel-v1-apm-span-*`
+  pattern: its span views (`trace analytics lists the seeded spans in every span view`) and a
+  trace's detail page (`trace analytics trace detail shows overview, services and spans`). The
+  Metrics page lists only indices matching `ss4o_metrics-*-*`, which `ss4o_metrics-icegate-default`
+  does (`observability metrics plots the bins of a histogram metric`).
   `config/docker/opensearch-dashboards/opensearch_dashboards.yml` is the stand's configuration.
 - **Grafana**: one OpenSearch datasource per index whose `database` the panels read, each
   sending `x-scope-orgid` and stating `opensearch.version` as its `version`;

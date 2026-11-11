@@ -1,6 +1,8 @@
 //! The `nested` aggregation over the histogram buckets of the ss4o metrics index, as OSD 3.9's
 //! Metrics page sends it, and its refusals. Every row is written with explicit values and every
-//! expected count is stated here.
+//! expected count is stated here. That the Metrics page sends it is pinned by an end-to-end case of
+//! `scripts/opensearch-e2e/osd.spec.ts`:
+//! `observability metrics plots the bins of a histogram metric`.
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;

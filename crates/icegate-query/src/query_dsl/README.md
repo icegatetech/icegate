@@ -120,6 +120,10 @@ The end-to-end cases that pin it (`scripts/opensearch-e2e/osd.spec.ts` and `graf
 `discover filters on a dotted map key through a filter pill`,
 `discover filters on a key that is both a leaf and a prefix`,
 `a vertical bar visualization renders its buckets on a dashboard`,
+`trace analytics lists the seeded spans in every span view`,
+`trace analytics traces table shows each trace with its latency, errors and group`,
+`trace analytics trace detail shows overview, services and spans`,
+`observability metrics plots the bins of a histogram metric`,
 `grafana renders a lucene logs query with its logs volume`,
 `template variables from a lucene find query feed lucene and ppl panels` and
 `ad-hoc filters apply to lucene and ppl panels`.
