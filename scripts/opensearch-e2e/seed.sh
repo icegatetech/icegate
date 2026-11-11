@@ -50,7 +50,8 @@ readonly TENANT=demo
 readonly READY_TIMEOUT_SECS=180
 readonly COMMIT_TIMEOUT_SECS=300
 readonly EXPECTED_LOGS=6
-readonly EXPECTED_SPANS=4
+readonly EXPECTED_SPANS=7
+readonly EXPECTED_METRICS=2
 readonly seed_dir="${repo_root}/scripts/opensearch-e2e/.stand"
 
 # A minute boundary two minutes back. Every seeded time lies in the first six seconds after it,
@@ -99,15 +100,17 @@ wait_for_answer "ingest's OTLP/HTTP listener" -sS -o /dev/null "${INGEST_URL}/v1
 
 logs_before="$(docs_count logs)"
 spans_before="$(docs_count spans)"
-if [[ "${logs_before}" != 0 || "${spans_before}" != 0 ]]; then
-  echo "seed.sh: the stand already holds logs or spans for ${TENANT} (logs=${logs_before}, spans=${spans_before});" \
-    "the cases assert exact counts." >&2
+metrics_before="$(docs_count metrics)"
+if [[ "${logs_before}" != 0 || "${spans_before}" != 0 || "${metrics_before}" != 0 ]]; then
+  echo "seed.sh: the stand already holds logs, spans or metrics for ${TENANT}" \
+    "(logs=${logs_before}, spans=${spans_before}, metrics=${metrics_before}); the cases assert exact counts." >&2
   echo "Reset it first: docker compose -f config/docker/docker-compose.yml -f config/docker/docker-compose.e2e.yml down -v" >&2
   exit 1
 fi
 
 # Six logs of one service. The first carries both `http` and `http.method`: a key that is both a
-# leaf and a prefix of another key. Trace and span ids tie logs to the spans below.
+# leaf and a prefix of another key. Trace and span ids tie every log to a span below: two logs to
+# trace A, one to trace B, two to trace C and one to trace D.
 post_otlp /v1/logs <<JSON
 {"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"e2e-checkout"}}]},
  "scopeLogs":[{"scope":{"name":"e2e-seed"},"logRecords":[
@@ -118,20 +121,26 @@ post_otlp /v1/logs <<JSON
    "attributes":[{"key":"http.method","value":{"stringValue":"POST"}},{"key":"http.route","value":{"stringValue":"/payments"}}],
    "traceId":"5b8efff798038103d269b633813fc60c","spanId":"eee19b7ec3c1b175"},
   {"timeUnixNano":"$(at 2000)","severityNumber":13,"severityText":"WARN","body":{"stringValue":"inventory low"},
-   "attributes":[{"key":"http.method","value":{"stringValue":"GET"}},{"key":"http.route","value":{"stringValue":"/inventory"}}]},
+   "attributes":[{"key":"http.method","value":{"stringValue":"GET"}},{"key":"http.route","value":{"stringValue":"/inventory"}}],
+   "traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"53995c3f42cd8ad8"},
   {"timeUnixNano":"$(at 3000)","severityNumber":17,"severityText":"ERROR","body":{"stringValue":"payment declined"},
    "attributes":[{"key":"http.method","value":{"stringValue":"POST"}},{"key":"http.route","value":{"stringValue":"/payments"}}],
    "traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"b7ad6b7169203331"},
   {"timeUnixNano":"$(at 4000)","severityNumber":17,"severityText":"ERROR","body":{"stringValue":"card expired"},
-   "attributes":[{"key":"http.method","value":{"stringValue":"POST"}}]},
+   "attributes":[{"key":"http.method","value":{"stringValue":"POST"}}],
+   "traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"6e0c63257de34c92"},
   {"timeUnixNano":"$(at 5000)","severityNumber":9,"severityText":"INFO","body":{"stringValue":"order shipped"},
-   "attributes":[{"key":"http.method","value":{"stringValue":"GET"}}]}
+   "attributes":[{"key":"http.method","value":{"stringValue":"GET"}}],
+   "traceId":"d4cb0f6b1c8e4f2a9b7c3e5f6a8d9e01","spanId":"7a2190356b5c4e1f"}
  ]}]}]}
 JSON
 
-# Two traces of two spans each. Trace A (5b8e...): root `GET /checkout`, 152175 us, and a child
+# Four traces, seven spans. Trace A (5b8e...): root `GET /checkout`, 152175 us, and a child
 # carrying a link to trace B's root. Trace B (0af7...): root `POST /refund`, 735519 us, and a
-# failing child (status code 2) with a `retry` event that has no error attribute.
+# failing child (status code 2) with a `retry` event that has no error attribute. Trace C
+# (4bf9...): a failing root `POST /orders` (status code 2), 250000 us, and a child
+# `reserve stock` of a second service, `e2e-inventory`, 100000 us. Trace D (d4cb...): one span
+# `ship order`, 300000 us, whose parent is not stored, so the trace has no root.
 post_otlp /v1/traces <<JSON
 {"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"e2e-checkout"}}]},
  "scopeSpans":[{"scope":{"name":"e2e-seed"},"spans":[
@@ -145,15 +154,40 @@ post_otlp /v1/traces <<JSON
   {"traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"00f067aa0ba902b7","parentSpanId":"b7ad6b7169203331",
    "name":"charge card","kind":3,"startTimeUnixNano":"$(at 3100)","endTimeUnixNano":"$(at 3600)",
    "status":{"code":2,"message":"card declined"},
-   "events":[{"timeUnixNano":"$(at 3200)","name":"retry","attributes":[{"key":"attempt","value":{"stringValue":"2"}}]}]}
+   "events":[{"timeUnixNano":"$(at 3200)","name":"retry","attributes":[{"key":"attempt","value":{"stringValue":"2"}}]}]},
+  {"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"53995c3f42cd8ad8","name":"POST /orders","kind":2,
+   "startTimeUnixNano":"$(at 2000)","endTimeUnixNano":"$(( $(at 2000) + 250000000 ))",
+   "status":{"code":2,"message":"order rejected"}},
+  {"traceId":"d4cb0f6b1c8e4f2a9b7c3e5f6a8d9e01","spanId":"7a2190356b5c4e1f","parentSpanId":"9f8e7d6c5b4a3921",
+   "name":"ship order","kind":1,"startTimeUnixNano":"$(at 5000)","endTimeUnixNano":"$(at 5300)","status":{}}
+ ]}]},
+ {"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"e2e-inventory"}}]},
+ "scopeSpans":[{"scope":{"name":"e2e-seed"},"spans":[
+  {"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"6e0c63257de34c92","parentSpanId":"53995c3f42cd8ad8",
+   "name":"reserve stock","kind":2,"startTimeUnixNano":"$(at 2050)","endTimeUnixNano":"$(at 2150)","status":{}}
+ ]}]}]}
+JSON
+
+# One histogram metric of two delta data points with the same bounds 10, 100 and 1000, so four
+# buckets: the first holds 1 + 0 values, the second 2 + 1, the third 3 + 1, the fourth 0 + 2.
+post_otlp /v1/metrics <<JSON
+{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"e2e-checkout"}}]},
+ "scopeMetrics":[{"scope":{"name":"e2e-seed"},"metrics":[
+  {"name":"e2e.checkout.duration","unit":"ms","histogram":{"aggregationTemporality":1,"dataPoints":[
+   {"startTimeUnixNano":"$(at 0)","timeUnixNano":"$(at 500)","count":"6","sum":1015,
+    "bucketCounts":["1","2","3","0"],"explicitBounds":[10,100,1000]},
+   {"startTimeUnixNano":"$(at 500)","timeUnixNano":"$(at 1500)","count":"4","sum":4520,
+    "bucketCounts":["0","1","1","2"],"explicitBounds":[10,100,1000]}
+  ]}}
  ]}]}]}
 JSON
 
 deadline=$(( $(date +%s) + COMMIT_TIMEOUT_SECS ))
-until [[ "$(docs_count logs)" == "${EXPECTED_LOGS}" && "$(docs_count spans)" == "${EXPECTED_SPANS}" ]]; do
+until [[ "$(docs_count logs)" == "${EXPECTED_LOGS}" && "$(docs_count spans)" == "${EXPECTED_SPANS}" \
+  && "$(docs_count metrics)" == "${EXPECTED_METRICS}" ]]; do
   if (( $(date +%s) >= deadline )); then
-    echo "seed.sh: after ${COMMIT_TIMEOUT_SECS}s IceGate reports logs=$(docs_count logs) spans=$(docs_count spans)," \
-      "expected ${EXPECTED_LOGS} and ${EXPECTED_SPANS} committed" >&2
+    echo "seed.sh: after ${COMMIT_TIMEOUT_SECS}s IceGate reports logs=$(docs_count logs) spans=$(docs_count spans)" \
+      "metrics=$(docs_count metrics), expected ${EXPECTED_LOGS}, ${EXPECTED_SPANS} and ${EXPECTED_METRICS} committed" >&2
     exit 1
   fi
   sleep 2
@@ -161,4 +195,4 @@ done
 
 mkdir -p "${seed_dir}"
 printf '{"baseMs": %d}\n' "$(( base_secs * 1000 ))" > "${seed_dir}/seed.json"
-echo "seed.sh: seeded ${EXPECTED_LOGS} logs and ${EXPECTED_SPANS} spans at base $(( base_secs * 1000 )) ms"
+echo "seed.sh: seeded ${EXPECTED_LOGS} logs, ${EXPECTED_SPANS} spans and ${EXPECTED_METRICS} metric data points at base $(( base_secs * 1000 )) ms"

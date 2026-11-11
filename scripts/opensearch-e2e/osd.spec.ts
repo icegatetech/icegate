@@ -5,8 +5,23 @@
  * citation (`grep -rn '<old name>'`).
  *
  * Inputs are the rows seed.sh writes and the actions below; every expected value is derived by
- * hand from those rows: six logs (3 INFO, 1 WARN, 2 ERROR; `http.method` POST on three of
- * them, GET on three; `http` only on "order accepted") and four spans.
+ * hand from those rows: six logs of `e2e-checkout` (3 INFO, 1 WARN, 2 ERROR; `http.method` POST
+ * on three of them, GET on three; `http` only on "order accepted"), four traces of seven spans and
+ * one histogram metric of two data points. The traces, with times in ms after the seed's base:
+ *
+ * | trace | span               | id                 | parent    | kind     | start | duration | status |
+ * |-------|--------------------|--------------------|-----------|----------|-------|----------|--------|
+ * | A     | `GET /checkout`    | `eee19b7ec3c1b174` | -         | SERVER   | 0     | 152.175  | unset  |
+ * | A     | `authorize payment`| `eee19b7ec3c1b175` | A root    | CLIENT   | 1000  | 100      | ok     |
+ * | B     | `POST /refund`     | `b7ad6b7169203331` | -         | SERVER   | 3000  | 735.519  | unset  |
+ * | B     | `charge card`      | `00f067aa0ba902b7` | B root    | CLIENT   | 3100  | 500      | error  |
+ * | C     | `POST /orders`     | `53995c3f42cd8ad8` | -         | SERVER   | 2000  | 250      | error  |
+ * | C     | `reserve stock`    | `6e0c63257de34c92` | C root    | SERVER   | 2050  | 100      | unset  |
+ * | D     | `ship order`       | `7a2190356b5c4e1f` | not stored| INTERNAL | 5000  | 300      | unset  |
+ *
+ * Every span is of `e2e-checkout` except `reserve stock`, of `e2e-inventory`. The logs of trace A
+ * are "order accepted" and "payment authorized", of B "payment declined", of C "inventory low" and
+ * "card expired", of D "order shipped".
  */
 import { test, expect, type Page, type APIRequestContext } from '@playwright/test';
 import {
@@ -30,6 +45,25 @@ const ALL_BODIES = [
   'card expired',
   'order shipped',
 ];
+
+const TRACE_A = '5b8efff798038103d269b633813fc60c';
+const TRACE_B = '0af7651916cd43dd8448eb211c80319c';
+const TRACE_C = '4bf92f3577b34da6a3ce929d0e0e4736';
+const TRACE_D = 'd4cb0f6b1c8e4f2a9b7c3e5f6a8d9e01';
+const ROOT_SPAN_A = 'eee19b7ec3c1b174';
+const CHILD_SPAN_A = 'eee19b7ec3c1b175';
+const ROOT_SPAN_B = 'b7ad6b7169203331';
+const CHILD_SPAN_B = '00f067aa0ba902b7';
+const ROOT_SPAN_C = '53995c3f42cd8ad8';
+const CHILD_SPAN_C = '6e0c63257de34c92';
+const SPAN_D = '7a2190356b5c4e1f';
+/** The Traces page of Trace Analytics. */
+const TRACES_PAGE = '/app/observability-traces#/traces';
+/** The OSD server route every Trace Analytics page sends its `_search` bodies through. */
+const TRACE_ANALYTICS_QUERY_ROUTE = '/api/observability/trace_analytics/query';
+/** The ss4o metrics index IceGate names after the stand's tenant. */
+const SS4O_METRICS_INDEX = 'ss4o_metrics-demo';
+const HISTOGRAM_METRIC = 'e2e.checkout.duration';
 
 let seed: Seed;
 let osdVersion: string;
@@ -664,23 +698,25 @@ test('discover ppl renders documents and a histogram without highlight', async (
   }
 });
 
-test('observability logs renders events and the count chart', async ({ page }) => {
-  const pplAnswer = (matches: (body: { query: string; format: string }) => boolean) =>
-    page
-      .waitForResponse(
-        (response) =>
-          response.url().includes('/api/ppl/search') &&
-          response.request().method() === 'POST' &&
-          matches(response.request().postDataJSON()),
-        { timeout: 60_000 }
-      )
-      .then((response) => response.json());
-  const events = pplAnswer((body) => body.format === 'jdbc' && /^source\s*=\s*logs\b/.test(body.query) && !body.query.includes('stats'));
-  const counts = pplAnswer((body) => body.format === 'viz' && body.query.includes('count()'));
+/** A PPL query the Logs explorer sent through OSD's PPL route, and OSD's answer to it. */
+type PplSearch = { request: { query: string; format: string }; answer: any };
 
-  await page.goto('/app/observability-logs#/explorer');
-  await page.getByTestId('searchAutocompleteTextArea').fill('source = logs');
-  // The last 24 hours, set through the quick select form: it holds every seeded row.
+/** The first PPL query the Logs explorer sends whose request body satisfies `matches`. */
+function waitForPplSearch(page: Page, matches: (body: { query: string; format: string }) => boolean): Promise<PplSearch> {
+  return page
+    .waitForResponse(
+      (response) =>
+        response.url().includes('/api/ppl/search') &&
+        response.request().method() === 'POST' &&
+        matches(response.request().postDataJSON()),
+      { timeout: 60_000 }
+    )
+    .then(async (response) => ({ request: response.request().postDataJSON(), answer: await response.json() }));
+}
+
+/** Sets the Logs explorer's range to the last 24 hours through the quick select form and runs. */
+async function runLogsExplorerOverLastDay(page: Page): Promise<void> {
+  // The last 24 hours hold every seeded row.
   await page.getByTestId('superDatePickerToggleQuickMenuButton').click();
   const quickSelect = page.getByRole('group', { name: 'Quick select a time range' });
   await quickSelect.getByRole('combobox', { name: 'Time tense' }).selectOption('Last');
@@ -688,19 +724,32 @@ test('observability logs renders events and the count chart', async ({ page }) =
   await quickSelect.getByRole('combobox', { name: 'Time unit' }).selectOption('hours');
   await quickSelect.getByRole('button', { name: 'Apply', exact: true }).click();
   await page.getByTestId('superDatePickerApplyTimeButton').click();
+}
 
-  expect((await events).datarows).toHaveLength(6);
-  const series: number[] = (await counts).data['count()'];
+test('observability logs renders events and the count chart', async ({ page }) => {
+  const events = waitForPplSearch(
+    page,
+    (body) => body.format === 'jdbc' && /^source\s*=\s*logs\b/.test(body.query) && !body.query.includes('stats')
+  );
+  const counts = waitForPplSearch(page, (body) => body.format === 'viz' && body.query.includes('count()'));
+
+  await page.goto('/app/observability-logs#/explorer');
+  await page.getByTestId('searchAutocompleteTextArea').fill('source = logs');
+  await runLogsExplorerOverLastDay(page);
+
+  expect((await events).answer.datarows).toHaveLength(6);
+  const series: number[] = (await counts).answer.data['count()'];
   expect(series.reduce((total, count) => total + count, 0)).toBe(6);
   await expect(page.getByTestId('eventExplorer__flyout')).toHaveCount(6);
 
   // A `where` on a dotted map key: three of the six logs carry `http.method` POST.
-  const filtered = pplAnswer(
+  const filtered = waitForPplSearch(
+    page,
     (body) => body.format === 'jdbc' && body.query.includes('log_attributes.http.method') && !body.query.includes('stats')
   );
   await page.getByTestId('searchAutocompleteTextArea').fill("source = logs | where `log_attributes.http.method` = 'POST'");
   await page.getByTestId('superDatePickerApplyTimeButton').click();
-  expect((await filtered).datarows).toHaveLength(3);
+  expect((await filtered).answer.datarows).toHaveLength(3);
   await expect(page.getByTestId('eventExplorer__flyout')).toHaveCount(3);
   for (const body of ['payment authorized', 'payment declined', 'card expired']) {
     await expect(page.getByText(body).first()).toBeVisible();
@@ -735,4 +784,308 @@ test('a browser-sent x-scope-orgid cannot switch the tenant', async ({ page, req
   });
   expect(pattern.status()).toBe(200);
   expect((await pattern.json()).attributes.title).toBe('logs');
+});
+
+/**
+ * Opens Trace Analytics in Data Prepper mode over the last 24 hours, with `tableType` as the
+ * table the Traces page starts on. The page keeps these in session storage, which a new test page
+ * starts without; the values are written only where absent, so a choice made on the page holds
+ * across the page's own navigations.
+ */
+async function presetTraceAnalytics(page: Page, tableType: 'all_spans' | 'traces'): Promise<void> {
+  await page.addInitScript((entries: Record<string, string>) => {
+    try {
+      for (const [key, value] of Object.entries(entries)) {
+        if (window.sessionStorage.getItem(key) === null) {
+          window.sessionStorage.setItem(key, value);
+        }
+      }
+    } catch {
+      // A document without an origin (about:blank) has no session storage; the page has none to set.
+    }
+  }, {
+    TraceAnalyticsMode: 'data_prepper',
+    TraceAnalyticsStartTime: 'now-24h',
+    TraceAnalyticsEndTime: 'now',
+    TraceAnalyticsTraceTableType: tableType,
+  });
+}
+
+/** OSD's answer to the first Trace Analytics `_search` body that satisfies `matches`. */
+function waitForTraceAnalyticsAnswer(page: Page, matches: (body: any) => boolean): Promise<any> {
+  return page
+    .waitForResponse(
+      (response) => {
+        if (!response.url().includes(TRACE_ANALYTICS_QUERY_ROUTE) || response.request().method() !== 'POST') {
+          return false;
+        }
+        try {
+          return matches(response.request().postDataJSON());
+        } catch {
+          return false;
+        }
+      },
+      { timeout: 60_000 }
+    )
+    .then((response) => response.json());
+}
+
+type SpanView = 'All Spans' | 'Root Spans' | 'Service Entry Spans';
+
+/**
+ * The span view a Trace Analytics body lists: the span table's body carries `_source.includes`,
+ * and Root and Service Entry add one `term` filter each. `undefined` for every other body.
+ */
+function readSpanView(body: any): SpanView | undefined {
+  if (body?._source?.includes === undefined) {
+    return undefined;
+  }
+  const terms = (body.query?.bool?.filter ?? []).map((clause: any) => clause.term).filter((term: any) => term !== undefined);
+  if (terms.some((term: any) => term.parentSpanId === '')) {
+    return 'Root Spans';
+  }
+  if (terms.some((term: any) => term.kind === 'SPAN_KIND_SERVER')) {
+    return 'Service Entry Spans';
+  }
+  return 'All Spans';
+}
+
+/** Whether a Trace Analytics body selects the spans of one trace through a `term` on `traceId`. */
+function isTracePayloadOf(body: any, traceId: string): boolean {
+  return (body?.query?.bool?.must ?? []).some((clause: any) => clause.term?.traceId === traceId);
+}
+
+const ALL_SPAN_IDS = [ROOT_SPAN_A, CHILD_SPAN_A, ROOT_SPAN_B, CHILD_SPAN_B, ROOT_SPAN_C, CHILD_SPAN_C, SPAN_D];
+
+/**
+ * Asserts the span table answer and grid of one view: the span ids in the order the page asks
+ * for (end time, descending), the total in the view selector, each id in the grid (a root's id
+ * also shows as its child's parent), and no id the view excludes (no excluded span is the parent
+ * of a listed one, so its id appears nowhere).
+ */
+async function expectSpanView(page: Page, answer: any, view: SpanView, spanIds: string[]): Promise<void> {
+  expect(answer.hits.hits.map((hit: any) => hit._source.spanId)).toEqual(spanIds);
+  expect(answer.hits.total.value).toBe(spanIds.length);
+  await expect(page.getByTestId('trace-table-mode-selector')).toContainText(`${view} (${spanIds.length})`);
+  const grid = page.getByRole('grid');
+  for (const spanId of ALL_SPAN_IDS) {
+    const cells = grid.getByText(spanId, { exact: true });
+    if (spanIds.includes(spanId)) {
+      await expect(cells.first(), spanId).toBeVisible();
+    } else {
+      await expect(cells, spanId).toHaveCount(0);
+    }
+  }
+}
+
+test('trace analytics lists the seeded spans in every span view', async ({ page }) => {
+  await presetTraceAnalytics(page, 'all_spans');
+  const allSpans = waitForTraceAnalyticsAnswer(page, (body) => readSpanView(body) === 'All Spans');
+  await page.goto(TRACES_PAGE);
+  // End times, ms after the base: D 5300, B's root 3735.519, B's child 3600, C's root 2250,
+  // C's child 2150, A's child 1100, A's root 152.175.
+  await expectSpanView(page, await allSpans, 'All Spans', [
+    SPAN_D,
+    ROOT_SPAN_B,
+    CHILD_SPAN_B,
+    ROOT_SPAN_C,
+    CHILD_SPAN_C,
+    CHILD_SPAN_A,
+    ROOT_SPAN_A,
+  ]);
+
+  // Roots have an empty parentSpanId: D's span names a parent that is not stored, so it is none.
+  // Service entry spans are the SERVER spans: the three roots and C's child.
+  const views: Array<[SpanView, string[]]> = [
+    ['Root Spans', [ROOT_SPAN_B, ROOT_SPAN_C, ROOT_SPAN_A]],
+    ['Service Entry Spans', [ROOT_SPAN_B, ROOT_SPAN_C, CHILD_SPAN_C, ROOT_SPAN_A]],
+  ];
+  for (const [view, spanIds] of views) {
+    const answer = waitForTraceAnalyticsAnswer(page, (body) => readSpanView(body) === view);
+    await page.getByTestId('trace-table-mode-selector').click();
+    await page.getByRole('option').filter({ hasText: new RegExp(`^${view}`) }).click();
+    await expectSpanView(page, await answer, view, spanIds);
+  }
+});
+
+test('trace analytics traces table shows each trace with its latency, errors and group', async ({ page }) => {
+  await presetTraceAnalytics(page, 'traces');
+  const traces = waitForTraceAnalyticsAnswer(page, (body) => body?.aggs?.traces?.aggs?.last_updated !== undefined);
+  await page.goto(TRACES_PAGE);
+
+  const answer = await traces;
+  expect(answer.aggregations.unique_traces.value).toBe(4);
+  // Latency: floor(root duration in ns / 10^4) / 100 ms, null without a stored root. Errors: the
+  // trace's spans when its root's status code is 2, so both of C's. Last updated: the root's end
+  // time, else the span's own, in epoch ms; the page orders by it, descending.
+  expect(
+    answer.aggregations.traces.buckets.map((bucket: any) => ({
+      key: bucket.key,
+      spans: bucket.doc_count,
+      latency: bucket.latency.value,
+      group: bucket.trace_group.buckets.map((group: any) => group.key),
+      errors: bucket.error_count.doc_count,
+      lastUpdated: bucket.last_updated.value,
+    }))
+  ).toEqual([
+    { key: TRACE_D, spans: 1, latency: null, group: [], errors: 0, lastUpdated: seed.baseMs + 5300 },
+    { key: TRACE_B, spans: 2, latency: 735.51, group: ['POST /refund'], errors: 0, lastUpdated: seed.baseMs + 3735 },
+    { key: TRACE_C, spans: 2, latency: 250, group: ['POST /orders'], errors: 2, lastUpdated: seed.baseMs + 2250 },
+    { key: TRACE_A, spans: 2, latency: 152.17, group: ['GET /checkout'], errors: 0, lastUpdated: seed.baseMs + 152 },
+  ]);
+
+  await expect(page.getByTestId('trace-table-mode-selector')).toContainText('Traces (4)');
+  const grid = page.getByRole('grid');
+  await expect(grid.getByRole('link')).toHaveText([TRACE_D, TRACE_B, TRACE_C, TRACE_A]);
+  for (const text of ['POST /refund', 'POST /orders', 'GET /checkout', '735.51', '250', '152.17']) {
+    await expect(grid.getByText(text, { exact: true }), text).toHaveCount(1);
+  }
+  // The Errors column says whether a trace has errors: only C does.
+  await expect(grid.getByText('Yes', { exact: true })).toHaveCount(1);
+  await expect(grid.getByText('No', { exact: true })).toHaveCount(3);
+});
+
+test('trace analytics trace detail shows overview, services and spans', async ({ page }) => {
+  await presetTraceAnalytics(page, 'traces');
+  await page.goto(TRACES_PAGE);
+  const payload = waitForTraceAnalyticsAnswer(page, (body) => isTracePayloadOf(body, TRACE_C));
+  await page.getByRole('grid').getByRole('link', { name: TRACE_C, exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`#/traces\\?datasourceId=&traceId=${TRACE_C}$`));
+
+  const spans = (await payload).hits.hits.map((hit: any) => [hit._source.spanId, hit._source.serviceName]);
+  expect(spans.sort()).toEqual([
+    [ROOT_SPAN_C, 'e2e-checkout'],
+    [CHILD_SPAN_C, 'e2e-inventory'],
+  ]);
+
+  // The overview reads the earliest span, C's root: its group, its 250 ms duration and its
+  // status code 2.
+  const overview = page.locator('.euiPanel').filter({ has: page.getByText('Overview', { exact: true }) }).last();
+  await expect(overview).toContainText(TRACE_C);
+  await expect(overview).toContainText('POST /orders');
+  await expect(overview).toContainText('250.00 ms');
+  await expect(overview).toContainText(/Errors\s*Yes/);
+
+  // Time per service is each service's share of the spans' summed durations: 250 ms of 350 for
+  // e2e-checkout, 100 ms of 350 for e2e-inventory.
+  const services = page.locator('.euiPanel').filter({ hasText: 'Time spent by service' }).last();
+  await expect(services).toContainText('e2e-checkout');
+  await expect(services).toContainText('71.43%');
+  await expect(services).toContainText('e2e-inventory');
+  await expect(services).toContainText('28.57%');
+
+  await expect(page.getByTestId('span-gantt-chart-panel')).toContainText('Spans (2)');
+});
+
+test('view associated logs lists the logs of the trace', async ({ page }) => {
+  await presetTraceAnalytics(page, 'all_spans');
+  const payload = waitForTraceAnalyticsAnswer(page, (body) => isTracePayloadOf(body, TRACE_C));
+  await page.goto(`${TRACES_PAGE}?datasourceId=&traceId=${TRACE_C}`);
+  await payload;
+
+  const logs = waitForPplSearch(
+    page,
+    (body) => body.format === 'jdbc' && body.query.includes(`traceId='${TRACE_C}'`) && !body.query.includes('stats')
+  );
+  // The button is disabled while the trace's spans load; it reads them when clicked. Its link
+  // wrapper carries the same name, so the button is found inside it.
+  const viewLogs = page
+    .getByTestId('trace-view-logs-redirection-btn')
+    .getByRole('button', { name: 'View associated logs' });
+  await expect(viewLogs).toBeEnabled();
+  await viewLogs.click();
+
+  const { answer } = await logs;
+  const columns: string[] = answer.schema.map((column: { name: string }) => column.name);
+  const rows: unknown[][] = answer.datarows;
+  expect(rows.map((row) => row[columns.indexOf('traceId')])).toEqual([TRACE_C, TRACE_C]);
+  expect(rows.map((row) => row[columns.indexOf('body')]).sort()).toEqual(['card expired', 'inventory low']);
+  await expect(page.getByTestId('eventExplorer__flyout')).toHaveCount(2);
+  for (const body of ['card expired', 'inventory low']) {
+    await expect(page.getByText(body).first()).toBeVisible();
+  }
+});
+
+/** The `[serviceName, count]` rows of a `stats count() by serviceName` answer in either format. */
+function readServiceCounts(search: PplSearch): Array<[unknown, unknown]> {
+  if (search.request.format === 'viz') {
+    const services: unknown[] = search.answer.data.serviceName;
+    return services.map((service, index) => [service, search.answer.data['count()'][index]]);
+  }
+  const columns: string[] = search.answer.schema.map((column: { name: string }) => column.name);
+  return search.answer.datarows.map((row: unknown[]) => [row[columns.indexOf('serviceName')], row[columns.indexOf('count()')]]);
+}
+
+test('observability logs runs a hand-written ppl over ss4o logs', async ({ page }) => {
+  const stats = waitForPplSearch(page, (body) => body.query.includes('stats count() by serviceName'));
+
+  await page.goto('/app/observability-logs#/explorer');
+  await page.getByTestId('searchAutocompleteTextArea').fill('source = ss4o_logs-* | stats count() by serviceName');
+  await runLogsExplorerOverLastDay(page);
+
+  // All six logs are of e2e-checkout.
+  expect(readServiceCounts(await stats)).toEqual([['e2e-checkout', 6]]);
+  await expect(page.getByText('e2e-checkout').filter({ visible: true }).first()).toBeVisible();
+});
+
+test('observability metrics plots the bins of a histogram metric', async ({ page }) => {
+  // One answer per bin, keyed as the page labels the bin: `<min> - <max>`. A later answer for the
+  // same bin replaces an earlier one; a failed request keeps its status, so a timeout shows it.
+  const bins = new Map<string, unknown>();
+  page.on('response', async (response) => {
+    if (!response.url().includes('/api/observability/metrics/otel/aggregatedBinCount')) {
+      return;
+    }
+    const request = response.request().postDataJSON();
+    if (request?.documentName !== HISTOGRAM_METRIC) {
+      return;
+    }
+    const answer = await response.json().catch(() => null);
+    bins.set(
+      `${request.min} - ${request.max}`,
+      response.status() === 200 ? answer?.nested_buckets?.bucket_range?.bucket_count?.value : `status ${response.status()}`
+    );
+  });
+  const metricsPath = `/api/observability/metrics/otel/${SS4O_METRICS_INDEX}`;
+  const names = page
+    .waitForResponse((response) => new URL(response.url()).pathname.startsWith(`${metricsPath}/documentNames`), { timeout: 60_000 })
+    .then((response) => response.json());
+
+  await page.goto('/app/observability-metrics#/');
+  await page.getByTestId('metricsDataSourcePicker').getByTestId('comboBoxSearchInput').click();
+  await page.getByRole('option', { name: 'OpenTelemetry', exact: true }).click();
+  await page.getByTestId('metricsIndexPicker').getByTestId('comboBoxSearchInput').click();
+  await page.getByRole('option', { name: SS4O_METRICS_INDEX, exact: true }).click();
+
+  // The page lists histogram metrics only; the seed's one metric has two data points.
+  expect((await names).aggregations.distinct_names.buckets).toEqual([{ key: HISTOGRAM_METRIC, doc_count: 2 }]);
+  const available = page.getByTestId('metricsListItems_availableMetrics');
+  await expect(available).toHaveCount(1);
+
+  const sample = page
+    .waitForResponse((response) => new URL(response.url()).pathname.startsWith(`${metricsPath}/${HISTOGRAM_METRIC}`), {
+      timeout: 60_000,
+    })
+    .then((response) => response.json());
+  await available.filter({ hasText: HISTOGRAM_METRIC }).getByRole('button').click();
+
+  // The bins are the sample data point's buckets: the bounds 10, 100 and 1000, and the open
+  // ends at minus and plus the largest float, as Data Prepper writes an unbounded bucket.
+  const sampleBuckets: Array<{ min: number; max: number }> = (await sample).hits[0]._source.buckets;
+  expect(sampleBuckets.map((bucket) => [bucket.min, bucket.max])).toEqual([
+    [-3.4028234663852886e38, 10],
+    [10, 100],
+    [100, 1000],
+    [1000, 3.4028234663852886e38],
+  ]);
+  // Each bin sums its bucket's count over both data points: 1 + 0, 2 + 1, 3 + 1 and 0 + 2.
+  await expect
+    .poll(() => Object.fromEntries(bins), { message: 'the bin counts the page plots', timeout: 60_000 })
+    .toEqual({
+      '-3.4028234663852886e+38 - 10': 1,
+      '10 - 100': 3,
+      '100 - 1000': 4,
+      '1000 - 3.4028234663852886e+38': 2,
+    });
+  await expect(page.locator('.js-plotly-plot').first()).toBeVisible();
 });

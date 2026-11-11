@@ -12,7 +12,7 @@ client-shaped requests; they make no claim about a client.
 
 | Project | File | Client |
 |---|---|---|
-| `osd` | `osd.spec.ts` | OpenSearch Dashboards: boot and migration, saved objects, index patterns, Discover, a dashboard, Query Workbench, Discover PPL, Observability Logs, the tenant header |
+| `osd` | `osd.spec.ts` | OpenSearch Dashboards: boot and migration, saved objects, index patterns, Discover, a dashboard, Query Workbench, Discover PPL, Observability Logs (also PPL over the ss4o logs), the tenant header, Trace Analytics (the span views, the Traces table, a trace's detail page and its associated logs), Observability Metrics (a histogram's bins) |
 | `grafana` | `grafana.spec.ts` | Grafana with the OpenSearch datasource plugin, through the stand's three OpenSearch datasources: health, Lucene and PPL logs, variables, ad-hoc filters, the metrics editor, traces, trace-to-logs |
 | `versions` | `versions.spec.ts` | The version IceGate reports: an OSD upgrade, a strict-mode OSD, a refused pre-release version, Grafana at another canonical version. Each case resets the stand and starts the variant it needs, so the project runs alone and last: `npx playwright test --project=versions` |
 
@@ -80,9 +80,10 @@ copy first and fails naming both files.
 
 ## The seed
 
-`seed.sh` writes six logs and two traces of two spans through ingest's OTLP/HTTP endpoint under
-the stand's tenant, then waits, bounded by `COMMIT_TIMEOUT_SECS` in `seed.sh`, until IceGate's
-`_cat/indices` reports them committed. Every value a case asserts on is stated in `seed.sh`; the
+`seed.sh` writes six logs, four traces of seven spans (one trace without its root span) and one
+histogram metric of two data points through ingest's OTLP/HTTP endpoint under the stand's tenant,
+then waits, bounded by `COMMIT_TIMEOUT_SECS` in `seed.sh`, until IceGate's `_cat/indices` reports
+them committed. Every value a case asserts on is stated in `seed.sh`; the
 cases state their expected values literally, derived by hand from those rows.
 
 The seeded times are offsets from a minute boundary two minutes before the seed runs, recorded

@@ -6,9 +6,11 @@
  *
  * Inputs are the rows seed.sh writes, the dashboards created below and the Explore queries; every
  * expected value is derived by hand from the seeded rows: six logs (3 INFO, 1 WARN, 2 ERROR) and
- * two traces. Trace A (5b8e...) has the root `GET /checkout` lasting 152175 us and the child
- * `authorize payment`, which links to trace B; trace B (0af7...) has the root `POST /refund`
- * lasting 735519 us and the failing child `charge card`.
+ * four traces of seven spans. Trace A (5b8e...) has the root `GET /checkout` lasting 152175 us and
+ * the child `authorize payment` (100000 us), which links to trace B; trace B (0af7...) has the
+ * root `POST /refund` lasting 735519 us and the failing child `charge card` (500000 us); trace C
+ * (4bf9...) has the failing root `POST /orders` lasting 250000 us and the child `reserve stock`
+ * (100000 us); trace D (d4cb...) has one span (300000 us) whose parent is not stored.
  */
 import { test, expect } from '@grafana/plugin-e2e';
 import type { APIRequestContext, Page } from '@playwright/test';
@@ -32,6 +34,8 @@ const SPANS_UID = 'opensearch-spans-demo';
 const TRACES_UID = 'opensearch-traces-demo';
 const TRACE_A = '5b8efff798038103d269b633813fc60c';
 const TRACE_B = '0af7651916cd43dd8448eb211c80319c';
+const TRACE_C = '4bf92f3577b34da6a3ce929d0e0e4736';
+const TRACE_D = 'd4cb0f6b1c8e4f2a9b7c3e5f6a8d9e01';
 const ROOT_SPAN_A = 'eee19b7ec3c1b174';
 const CHILD_SPAN_A = 'eee19b7ec3c1b175';
 
@@ -389,11 +393,12 @@ test('metrics editor bucket_script and moving_avg panels render', async ({ page 
   const movingAverage = frames.find((frame) => JSON.stringify(frame.schema).includes('Moving Average'));
   expect(bucketScript, JSON.stringify(frames.map((frame) => frame.schema))).toBeDefined();
   expect(movingAverage, JSON.stringify(frames.map((frame) => frame.schema))).toBeDefined();
-  // Every span starts in the first four seconds after one minute boundary, so one 1h bucket holds all four:
-  // avg(duration_micros) = (152175 + 100000 + 735519 + 500000) / 4 = 371923.5, max = 735519.
+  // Every span starts in the first six seconds after one minute boundary, so one 1h bucket holds all seven:
+  // avg(duration_micros) = (152175 + 100000 + 735519 + 500000 + 250000 + 100000 + 300000) / 7
+  // = 2137694 / 7, max = 735519.
   const ratios = ((bucketScript as Frame).data?.values?.[1] ?? []).filter((value) => value !== null) as number[];
   expect(ratios).toHaveLength(1);
-  expect(ratios[0]).toBeCloseTo(371923.5 / 735519, 9);
+  expect(ratios[0]).toBeCloseTo(2137694 / 7 / 735519, 9);
   await expect(page.getByTestId('data-testid Panel status error')).toHaveCount(0);
 });
 
@@ -492,10 +497,14 @@ test('the grafana trace list shows no null latency or error count', async ({ pag
     .map((row) => [row['Trace Id'], row['Trace Group'], row['Latency (ms)'], row['Error Count']])
     .sort((left, right) => String(left[0]).localeCompare(String(right[0])));
   // Latency: floor(root duration in ns / 10^4) / 100 ms; the error count counts a trace's spans
-  // when its root's status code is 2, and both seeded roots are unset.
+  // when its root's status code is 2: trace C's root failed, so both its spans count, and the
+  // roots of A and B are unset. Trace D has no stored root: no group, and the latency script's
+  // own default, 0, rather than null.
   expect(rows).toEqual([
     [TRACE_B, 'POST /refund', 735.51, 0],
+    [TRACE_C, 'POST /orders', 250, 2],
     [TRACE_A, 'GET /checkout', 152.17, 0],
+    [TRACE_D, '', 0, 0],
   ]);
 });
 
