@@ -256,8 +256,15 @@ These hold for a search over data indices; a search over system indices is docum
   memory-pressure shedding, the query deadline and a system-index write it could not confirm (its
   outcome is unknown), the conditions a retry can clear.
 - Scripts are recognized forms, not a script language: `src/opensearch/script.rs` lists the
-  forms it evaluates (arithmetic, `MovingFunctions.*`, the trace-list latency script and the
+  forms it evaluates (arithmetic, `MovingFunctions.*`, the trace-list scripts and the
   saved-object counter update), and any other script is a 400 `illegal_argument_exception`.
+  The trace-list scripts are the latency script in Grafana's form, which ends in `return 0`,
+  and OpenSearch Dashboards 3.9's two Traces-table scripts: the latency script without that
+  `return 0`, which answers null for a trace without a stored root span, and the last-updated
+  script, which answers the root span's end time, else the span's own, as raw epoch milliseconds
+  (`value` without `value_as_string`). OpenSearch Dashboards 3.9's Traces-table request answers
+  in full (`tests/opensearch/osd_traces.rs`); above `opensearch.max_cross_row_traces` traces in its
+  time range it is a 400 `illegal_argument_exception` naming `index` and `limit`.
   Grafana's metrics editor panels with `bucket_script` and `moving_avg` render
   (`metrics editor bucket_script and moving_avg panels render`).
 
@@ -325,8 +332,8 @@ cannot see the deployed Dashboards and does not compare versions with it.
   Open a trace by id on the datasource of the span index (its `database` is the alias
   `otel-v1-apm-span`) with a query of the form
   `traceId:<32 lowercase hex digits>` (`grafana opens a trace by id through the traceId input form`).
-  On the span index the trace-list latency script answers 0, never null, for a trace without
-  a root span, and Grafana's trace list shows no null latency or error count
+  On the span index Grafana's form of the latency script answers 0, never null, for a trace
+  without a root span, and Grafana's trace list shows no null latency or error count
   (`the grafana trace list shows no null latency or error count`). A span's `events` are its
   stored events only, none is synthesized from its status code, and Grafana shows no error flag
   on a failing span (`a failing span shows no error flag and a span with links renders`). The
