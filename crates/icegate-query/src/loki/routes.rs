@@ -42,6 +42,7 @@ pub fn routes(state: LokiState, runtime: &QueryRuntime) -> Router {
         QueryTenantRejectionRecorder::new(std::sync::Arc::clone(&runtime.metrics)),
         PROTOCOL_LOKI,
         LOKI_SHED_BYPASS,
+        None,
     );
     let pressure = runtime.pressure.clone();
     Router::new()

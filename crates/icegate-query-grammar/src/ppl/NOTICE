@@ -1,0 +1,24 @@
+OpenSearch
+Copyright OpenSearch Contributors
+
+This product includes software developed by
+Elasticsearch (http://www.elastic.co).
+Copyright 2009-2018 Elasticsearch
+
+This product includes software developed by The Apache Software
+Foundation (http://www.apache.org/).
+
+This product includes software developed by
+Joda.org (http://www.joda.org/).
+
+This product includes software developed by
+Kraken (https://github.com/thekrakken/java-grok).
+
+This project is based on the Apache 2.0-licensed elasticsearch-sql project (https://github.com/NLPchina/elasticsearch-sql):
+
+Copyright 2014 omershelef
+Copyright 2015-2016 Eliran
+Copyright 2015 jheimbouch
+Copyright 2016 allwefantasy
+Copyright 2016 Razma Tazz
+Copyright 2017 leonlu

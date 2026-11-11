@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use datafusion::{
     catalog::CatalogProvider,
-    execution::{SessionStateBuilder, object_store::ObjectStoreUrl},
+    execution::{
+        SessionStateBuilder, memory_pool::FairSpillPool, object_store::ObjectStoreUrl, runtime_env::RuntimeEnvBuilder,
+    },
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_tracing::{InstrumentationOptions, instrument_with_debug_spans};
@@ -225,15 +227,43 @@ impl QueryEngine {
     ///
     /// Uses the background-refreshed catalog provider when available.
     /// Falls back to a synchronous rebuild if the cache is cold or too
-    /// stale (older than `max_age`).
+    /// stale (older than `max_age`). The session's memory pool is unbounded.
     ///
     /// # Errors
     ///
     /// Returns an error if the catalog provider cannot be created
     #[tracing::instrument(skip(self))]
     pub async fn create_session(&self) -> Result<SessionContext> {
-        // Build session config from engine config.
-        //
+        self.build_session(SessionStateBuilder::new()).await
+    }
+
+    /// Create the session [`Self::create_session`] creates, with every query it runs
+    /// drawing from one memory pool of `limit_bytes`.
+    ///
+    /// The pool is a `FairSpillPool`, and the runtime keeps the default disk manager, so
+    /// spilling to temporary files stays enabled: a sort larger than the pool completes
+    /// (`a_session_with_a_memory_limit_spills_a_sort_larger_than_its_pool`). A
+    /// reservation the pool cannot grant fails the query with
+    /// `DataFusionError::ResourcesExhausted`, possibly wrapped in context; callers find it
+    /// with `DataFusionError::find_root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime environment or the catalog provider cannot be
+    /// created
+    #[tracing::instrument(skip(self))]
+    pub async fn create_session_with_memory_limit(&self, limit_bytes: usize) -> Result<SessionContext> {
+        let runtime_env = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(FairSpillPool::new(limit_bytes)))
+            .build_arc()?;
+        self.build_session(SessionStateBuilder::new().with_runtime_env(runtime_env))
+            .await
+    }
+
+    /// Finish `state_builder` with the engine's configuration, instrumentation, WAL
+    /// store and catalog provider. A builder without a runtime environment gets
+    /// DataFusion's default one, whose memory pool is unbounded.
+    async fn build_session(&self, state_builder: SessionStateBuilder) -> Result<SessionContext> {
         // `information_schema` is enabled here once, on the session config,
         // rather than via a per-request `SET datafusion.catalog.information_schema`
         // statement: it lets Flight SQL BI tools introspect via `SHOW TABLES`
@@ -248,14 +278,12 @@ impl QueryEngine {
         let options = InstrumentationOptions::builder().record_metrics(true).build();
         let instrument_rule = instrument_with_debug_spans!(options: options);
 
-        // Build session state with the instrumentation rule
-        let session_state = SessionStateBuilder::new()
+        let session_state = state_builder
             .with_config(session_config)
             .with_default_features()
             .with_physical_optimizer_rule(instrument_rule)
             .build();
 
-        // Create SessionContext
         let session_ctx = SessionContext::new_with_state(session_state);
 
         // Register the WAL object store with this session's RuntimeEnv.
@@ -341,5 +369,161 @@ impl std::fmt::Debug for QueryEngine {
             .field("refresh_interval", &self.refresh_interval)
             .field("max_age", &self.max_age)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{Array, Int64Array};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::error::DataFusionError;
+    use datafusion::execution::memory_pool::{FairSpillPool, MemoryLimit};
+    use icegate_common::{CatalogBackend, CatalogConfig, IoHandle, catalog::CatalogBuilder};
+    use icegate_queue::ParquetQueueReader;
+    use object_store::ObjectStore;
+    use tokio_util::sync::CancellationToken;
+
+    use super::QueryEngine;
+    use crate::engine::QueryEngineConfig;
+
+    /// Rows the refused and the unbounded sorts order: several batches, and few enough to
+    /// sort in memory when the pool is unbounded.
+    const SORTED_ROW_COUNT: i64 = 100_000;
+
+    /// A pool below the merge headroom an external sort reserves before it sorts its
+    /// first batch (the session's `sort_spill_reservation_bytes`; the test asserts the
+    /// relation), so the refusal does not depend on how many rows the sort receives.
+    const SMALL_POOL_BYTES: usize = 1024 * 1024;
+
+    /// A pool above the sort's merge headroom, so the sort starts, and below the values
+    /// it orders, so it can only finish by spilling (the test asserts both relations).
+    const SPILLING_POOL_BYTES: usize = 16 * 1024 * 1024;
+
+    /// Rows the spilling sort orders: their `Int64` values alone outgrow
+    /// [`SPILLING_POOL_BYTES`].
+    const SPILLED_ROW_COUNT: i64 = 4_000_000;
+
+    /// Builds an engine over an empty in-memory catalog; the returned directory owns
+    /// the warehouse and must outlive the engine.
+    async fn build_engine() -> (Arc<QueryEngine>, tempfile::TempDir) {
+        let warehouse = tempfile::tempdir().expect("create the warehouse directory");
+        let catalog_config = CatalogConfig {
+            backend: CatalogBackend::Memory,
+            warehouse: warehouse.path().to_str().expect("utf-8 warehouse path").to_string(),
+            properties: HashMap::default(),
+            cache: None,
+        };
+        let catalog = CatalogBuilder::from_config(&catalog_config, &IoHandle::noop(), CancellationToken::new())
+            .await
+            .expect("build the in-memory catalog");
+        let wal_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let wal_reader =
+            Arc::new(ParquetQueueReader::new("", Arc::clone(&wal_store), 8192).expect("build the WAL reader"));
+        let engine = QueryEngine::new(catalog, QueryEngineConfig::default(), wal_store, wal_reader);
+        (Arc::new(engine), warehouse)
+    }
+
+    /// A query ordering the values `1..=row_count` from the largest down.
+    fn build_descending_sort_sql(row_count: i64) -> String {
+        format!("SELECT value FROM generate_series(1, {row_count}) ORDER BY value DESC")
+    }
+
+    /// Counts the rows of `batches` and reads the first value of the `value` column.
+    fn read_row_count_and_first_value(batches: &[RecordBatch]) -> (usize, i64) {
+        let row_count = batches.iter().map(RecordBatch::num_rows).sum();
+        let first_batch = batches.iter().find(|batch| batch.num_rows() > 0).expect("a non-empty batch");
+        let values = first_batch
+            .column_by_name("value")
+            .expect("the sorted column is named value")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("generate_series yields Int64 values");
+        (row_count, values.value(0))
+    }
+
+    #[tokio::test]
+    async fn a_session_with_a_memory_limit_refuses_a_sort_beyond_it() {
+        let (engine, _warehouse) = build_engine().await;
+        let session = engine
+            .create_session_with_memory_limit(SMALL_POOL_BYTES)
+            .await
+            .expect("create the limited session");
+
+        let pool = Arc::clone(&session.runtime_env().memory_pool);
+        assert!(
+            pool.is::<FairSpillPool>(),
+            "the limited session must use a fair spill pool"
+        );
+        assert!(matches!(pool.memory_limit(), MemoryLimit::Finite(1_048_576)));
+        let merge_headroom = session.state().config().options().execution.sort_spill_reservation_bytes;
+        assert!(
+            merge_headroom > SMALL_POOL_BYTES,
+            "the sort must reserve more than the pool holds before its first batch, reserves {merge_headroom}"
+        );
+
+        let error = session
+            .sql(&build_descending_sort_sql(SORTED_ROW_COUNT))
+            .await
+            .expect("plan the sort")
+            .collect()
+            .await
+            .expect_err("the sort must not fit in the pool");
+        assert!(
+            matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "the refusal must be the pool's, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_keeps_the_unlimited_pool_of_the_other_protocols() {
+        let (engine, _warehouse) = build_engine().await;
+        let session = engine.create_session().await.expect("create the session");
+
+        assert!(matches!(
+            session.runtime_env().memory_pool.memory_limit(),
+            MemoryLimit::Infinite
+        ));
+
+        let batches = session
+            .sql(&build_descending_sort_sql(SORTED_ROW_COUNT))
+            .await
+            .expect("plan the sort")
+            .collect()
+            .await
+            .expect("an unbounded pool sorts every row");
+        assert_eq!(read_row_count_and_first_value(&batches), (100_000, 100_000));
+    }
+
+    #[tokio::test]
+    async fn a_session_with_a_memory_limit_spills_a_sort_larger_than_its_pool() {
+        let (engine, _warehouse) = build_engine().await;
+        let session = engine
+            .create_session_with_memory_limit(SPILLING_POOL_BYTES)
+            .await
+            .expect("create the limited session");
+
+        let merge_headroom = session.state().config().options().execution.sort_spill_reservation_bytes;
+        assert!(
+            merge_headroom < SPILLING_POOL_BYTES,
+            "the pool must grant the sort's merge headroom of {merge_headroom}"
+        );
+        let sorted_value_bytes =
+            usize::try_from(SPILLED_ROW_COUNT).expect("the row count fits usize") * size_of::<i64>();
+        assert!(
+            sorted_value_bytes > SPILLING_POOL_BYTES,
+            "the sorted values must outgrow the pool, hold {sorted_value_bytes}"
+        );
+
+        let batches = session
+            .sql(&build_descending_sort_sql(SPILLED_ROW_COUNT))
+            .await
+            .expect("plan the sort")
+            .collect()
+            .await
+            .expect("the sort must spill instead of failing");
+        assert_eq!(read_row_count_and_first_value(&batches), (4_000_000, 4_000_000));
     }
 }

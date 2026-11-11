@@ -65,7 +65,10 @@ pub use reader::{
     ListedSegment, ParquetQueueReader, QueueReader, RecordBatchStream, RowGroupPlanEntry, SegmentFile, SegmentsPlan,
 };
 pub use segment::SegmentId;
-pub use writer::{CommittedOffsetsByTopic, NoopQueueWriterEvents, QueueWriter, QueueWriterEvents, WriteBatchOutcome};
+pub use writer::{
+    CommittedOffsetsByTopic, NoopQueueWriterEvents, QueueWriter, QueueWriterEvents, WriteBatchOutcome,
+    build_wal_writer_properties,
+};
 
 /// WAL footer key for per-row-group opaque payloads.
 ///

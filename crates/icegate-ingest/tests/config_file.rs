@@ -228,6 +228,9 @@ const STAND_DATASOURCES_DOCUMENT: &str = concat!(
 /// direction.
 const STAND_QUERY_URL_PREFIX: &str = "http://query:";
 
+/// The stand's `OpenSearch` datasources address the query service on its `OpenSearch` port.
+const STAND_OPENSEARCH_URL: &str = "http://query:9200";
+
 /// The parts of the stand's datasource provisioning this test reads: where each
 /// datasource reads from, and the tenant header it sends. Grafana splits a header
 /// across two blocks — the name is public configuration, the value is a secret —
@@ -312,7 +315,10 @@ fn assert_datasource_reads_tenant(datasource: &Datasource, written_tenant: &str)
 ///
 /// The rule asserted here is "every datasource addressing the stand's query
 /// service sends the tenant header, carrying the tenant this stand writes to".
-/// `Prometheus` and `Jaeger` address services of their own and are not in scope.
+/// It covers every port of that service the datasources address: Loki, Tempo,
+/// and the three `OpenSearch` datasources on `STAND_OPENSEARCH_URL`, which the test
+/// counts so that losing one fails here. `Prometheus` and `Jaeger` address
+/// services of their own and are not in scope.
 #[test]
 fn every_stand_datasource_reads_the_tenant_the_stand_writes() {
     let config = IngestConfig::from_file(STAND_INGEST_DOCUMENT).expect("the stand document must load and validate");
@@ -324,7 +330,16 @@ fn every_stand_datasource_reads_the_tenant_the_stand_writes() {
     let document: DatasourcesDocument =
         load_config_file(Path::new(STAND_DATASOURCES_DOCUMENT)).expect("the stand datasource document must load");
 
-    for datasource in &select_icegate_readers(document, STAND_QUERY_URL_PREFIX) {
+    let icegate_readers = select_icegate_readers(document, STAND_QUERY_URL_PREFIX);
+    let opensearch_reader_count = icegate_readers
+        .iter()
+        .filter(|datasource| datasource.url.as_deref() == Some(STAND_OPENSEARCH_URL))
+        .count();
+    assert_eq!(
+        opensearch_reader_count, 3,
+        "the stand provisions the logs, the metrics-exploration and the traces OpenSearch datasource"
+    );
+    for datasource in &icegate_readers {
         assert_datasource_reads_tenant(datasource, written_tenant);
     }
 }

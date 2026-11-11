@@ -31,6 +31,54 @@ use crate::{
     segment::{SegmentId, parse_segment_offset, topic_prefix},
 };
 
+/// Builds the Parquet [`WriterProperties`] [`QueueWriter`] writes a WAL segment with, so a
+/// segment written elsewhere (a test fixture, a tool) is encoded the way the queue encodes it.
+///
+/// The properties write `PARQUET_2_0` with page-level statistics, compress with
+/// `config.write.compression` and cap a row group at `config.common.max_row_group_size` rows.
+/// Every column of `column_encodings` is written in its encoding with the dictionary disabled,
+/// and every column of `bloom_filter_columns` carries a bloom filter sized for
+/// `max_row_group_size` distinct values, the most one row group can hold.
+/// `key_value_metadata` goes into the file footer unchanged; `None` writes none.
+#[must_use]
+pub fn build_wal_writer_properties(
+    config: &QueueConfig,
+    bloom_filter_columns: &[&str],
+    column_encodings: &[ColumnEncoding],
+    key_value_metadata: Option<Vec<KeyValue>>,
+) -> WriterProperties {
+    let max_row_group_size = config.common.max_row_group_size;
+    let mut builder = WriterProperties::builder()
+        .set_writer_version(WriterVersion::PARQUET_2_0)
+        .set_compression(config.write.compression.to_parquet_compression())
+        .set_max_row_group_row_count(Some(max_row_group_size))
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_key_value_metadata(key_value_metadata);
+
+    // The dictionary is disabled on every column with an explicit encoding,
+    // so the configured encoding is the one written. Pinned by the query
+    // crate's OpenSearch search test
+    // `a_trace_id_term_reads_a_bloom_filtered_delta_encoded_wal_segment_and_never_another_tenants_row`,
+    // which reads a segment built here and asserts format version 2 and
+    // DELTA_BYTE_ARRAY ids with no dictionary.
+    for &(column, encoding) in column_encodings {
+        let path = ColumnPath::from(column);
+        builder = builder
+            .set_column_dictionary_enabled(path.clone(), false)
+            .set_column_encoding(path, encoding);
+    }
+
+    let ndv = u64::try_from(max_row_group_size).unwrap_or(u64::MAX);
+    for column in bloom_filter_columns {
+        let path = ColumnPath::from(*column);
+        builder = builder
+            .set_column_bloom_filter_enabled(path.clone(), true)
+            .set_column_bloom_filter_ndv(path, ndv);
+    }
+
+    builder.build()
+}
+
 /// Offsets a caller knows to be consumed downstream, one per topic.
 ///
 /// Named after the key, not just the value: a caller that resolves these offsets
@@ -397,7 +445,7 @@ impl QueueWriter {
 
         // Convert to Parquet bytes — each batch becomes a row group
         let row_group_count = row_groups.len();
-        let writer_properties = self.writer_properties(topic, &row_groups)?;
+        let writer_properties = self.build_segment_properties(topic, &row_groups)?;
         let span = tracing::Span::current();
         let parquet_bytes = tokio::task::spawn_blocking(move || {
             span.in_scope(|| Self::batches_to_parquet(writer_properties, &row_groups))
@@ -464,16 +512,12 @@ impl QueueWriter {
         Ok(Bytes::from(buffer))
     }
 
-    /// Creates Parquet writer properties from config.
-    ///
-    /// `topic` selects the per-topic bloom-filter column list (see
-    /// [`Self::with_bloom_filter_columns`]); the WAL writer itself
-    /// stays topic-agnostic. The bloom-filter NDV is set to
-    /// `max_row_group_size`, which is the upper bound on distinct
-    /// values within a single row group and right-sizes the filter
-    /// without over-allocating.
-    fn writer_properties(&self, topic: &Topic, row_groups: &[PreparedWalRowGroup]) -> Result<WriterProperties> {
-        let compression = self.config.write.compression.to_parquet_compression();
+    /// Builds the Parquet writer properties of one segment of `topic`: the
+    /// properties of [`build_wal_writer_properties`] with the topic's bloom-filter
+    /// columns (see [`Self::with_bloom_filter_columns`]) and column encodings (see
+    /// [`Self::with_column_encodings`]), and the per-row-group metadata of
+    /// `row_groups` in the footer. The writer itself stays topic-agnostic.
+    fn build_segment_properties(&self, topic: &Topic, row_groups: &[PreparedWalRowGroup]) -> Result<WriterProperties> {
         let metadata_entries = row_groups
             .iter()
             .enumerate()
@@ -493,43 +537,12 @@ impl QueueWriter {
             }])
         };
 
-        let max_row_group_size = self.config.common.max_row_group_size;
-        // PARQUET_2_0 enables DELTA / BYTE_STREAM_SPLIT encodings used by
-        // `column_encodings`; it is also accepted by every reader IceGate
-        // supports (DataFusion, Trino, modern Spark/Athena).
-        let mut builder = WriterProperties::builder()
-            .set_writer_version(WriterVersion::PARQUET_2_0)
-            .set_compression(compression)
-            .set_max_row_group_row_count(Some(max_row_group_size))
-            .set_statistics_enabled(EnabledStatistics::Page)
-            .set_key_value_metadata(key_value_metadata);
-
-        // Dictionary is force-disabled on every column with an explicit
-        // encoding override: parquet-rs treats `set_column_encoding` as a
-        // fallback that only fires after the dictionary page exceeds
-        // 1 MiB, which never happens for our row-group sizes — so without
-        // disabling dictionary the configured encoding (DELTA_*,
-        // BYTE_STREAM_SPLIT) would never run.
-        if let Some(encodings) = self.column_encodings.get(topic) {
-            for &(col, encoding) in *encodings {
-                let path = ColumnPath::from(col);
-                builder = builder
-                    .set_column_dictionary_enabled(path.clone(), false)
-                    .set_column_encoding(path, encoding);
-            }
-        }
-
-        if let Some(bloom_columns) = self.bloom_filter_columns.get(topic) {
-            let ndv = u64::try_from(max_row_group_size).unwrap_or(u64::MAX);
-            for col in *bloom_columns {
-                let path = ColumnPath::from(*col);
-                builder = builder
-                    .set_column_bloom_filter_enabled(path.clone(), true)
-                    .set_column_bloom_filter_ndv(path, ndv);
-            }
-        }
-
-        Ok(builder.build())
+        Ok(build_wal_writer_properties(
+            &self.config,
+            self.bloom_filter_columns.get(topic).copied().unwrap_or_default(),
+            self.column_encodings.get(topic).copied().unwrap_or_default(),
+            key_value_metadata,
+        ))
     }
 
     /// Claims the next available offset for a topic.

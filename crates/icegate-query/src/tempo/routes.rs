@@ -62,6 +62,7 @@ pub fn routes(state: TempoState, runtime: &QueryRuntime) -> Router {
         QueryTenantRejectionRecorder::new(std::sync::Arc::clone(&runtime.metrics)),
         PROTOCOL_TEMPO,
         TEMPO_SHED_BYPASS,
+        None,
     );
     let pressure = runtime.pressure.clone();
     Router::new()

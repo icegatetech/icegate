@@ -58,6 +58,11 @@ spec:
               containerPort: {{ .Values.query.flightSql.port }}
               protocol: TCP
             {{- end }}
+            {{- if .Values.query.opensearch.enabled }}
+            - name: opensearch
+              containerPort: {{ .Values.query.opensearch.port }}
+              protocol: TCP
+            {{- end }}
             {{- /* Declared unconditionally: the operational listener runs
                    whatever query.metrics.enabled says, because the probes hit
                    /health on it. */}}

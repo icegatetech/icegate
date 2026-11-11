@@ -1,0 +1,65 @@
+# Overrides of the end-to-end suite (scripts/opensearch-e2e; its README explains each one).
+#
+#   docker compose -f config/docker/docker-compose.yml -f config/docker/docker-compose.e2e.yml up -d
+#
+# Container logs go to the default json-file driver instead of the bundled collector: the
+# collector writes every service's logs into `demo`, the tenant seed.sh writes and the cases
+# count exactly, and `docker compose logs` must work when a CI run fails. The Dashboards variants
+# gated behind the `upgrade` and `strict` profiles (opensearch-dashboards-3-8,
+# opensearch-dashboards-strict), which versions.spec.ts starts, reset their logging the same way;
+# every other service gated behind a profile keeps the base file's logging, and the suite starts
+# none of them.
+services:
+  rustfs:
+    logging: !reset null
+  rustfs-init:
+    logging: !reset null
+  migrate:
+    logging: !reset null
+  maintain:
+    logging: !reset null
+  query:
+    logging: !reset null
+    # versions.spec.ts mounts a copy of query.yaml in which it set `opensearch.version`; unset,
+    # this is the stand's own document. Compose merges volumes by target, so this entry replaces
+    # the base file's mount of the same path. Pinned by "a strict osd rejects icegate at 3.8.0 and
+    # migrates after icegate restarts at 3.9.0" and "grafana provisioned with 3.10.0 offers the
+    # metric aggregations" (scripts/opensearch-e2e/versions.spec.ts).
+    volumes:
+      - ${ICEGATE_E2E_QUERY_CONFIG:-./query.yaml}:/etc/icegate/query.yaml:ro
+    # The `metrics.port` of query.yaml on an ephemeral host port: versions.spec.ts reads the
+    # listener's request counter there and resolves the host port with `docker compose port`.
+    # Compose cannot read query.yaml, so this is a copy of that port; versions.spec.ts asserts it
+    # equals query.yaml `metrics.port`.
+    ports:
+      - "9091"
+  ingest:
+    logging: !reset null
+  grafana:
+    logging: !reset null
+    # versions.spec.ts mounts a copy of the provisioning directory whose OpenSearch datasources
+    # state another version; unset, this is the stand's own directory.
+    volumes:
+      - ${GRAFANA_E2E_PROVISIONING:-./grafana/provisioning}:/etc/grafana/provisioning:ro
+  opensearch-dashboards:
+    logging: !reset null
+  # The previous Dashboards minor, for the upgrade case. It takes the stand's Dashboards place
+  # (same port and config file) and never runs beside it.
+  opensearch-dashboards-3-8:
+    extends:
+      file: docker-compose.yml
+      service: opensearch-dashboards
+    image: opensearchproject/opensearch-dashboards:3.8.0
+    logging: !reset null
+    profiles: [upgrade]
+  # The stand's Dashboards with version mismatches enforced, for the strict-mode case. The image's
+  # entrypoint passes these arguments on to the Dashboards command line. Pinned by "a strict osd
+  # rejects icegate at 3.8.0 and migrates after icegate restarts at 3.9.0"
+  # (scripts/opensearch-e2e/versions.spec.ts).
+  opensearch-dashboards-strict:
+    extends:
+      file: docker-compose.yml
+      service: opensearch-dashboards
+    command: ["opensearch-dashboards", "--opensearch.ignoreVersionMismatch=false"]
+    logging: !reset null
+    profiles: [strict]

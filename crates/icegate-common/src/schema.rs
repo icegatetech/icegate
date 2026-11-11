@@ -321,12 +321,12 @@ pub fn spans_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 20,
-                "dropped_events_count",
+                COL_DROPPED_EVENTS_COUNT,
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
                 21,
-                "dropped_links_count",
+                COL_DROPPED_LINKS_COUNT,
                 Type::Primitive(PrimitiveType::Int),
             )),
             // Nested events (NO trace_id/span_id — inherits from parent span).
@@ -1477,41 +1477,42 @@ pub fn metrics_schema() -> Result<Schema> {
     let quantile_struct = Type::Struct(StructType::new(vec![
         Arc::new(NestedField::required(
             36,
-            "quantile",
+            QUANTILE_FIELD_QUANTILE,
             Type::Primitive(PrimitiveType::Double),
         )),
         Arc::new(NestedField::required(
             37,
-            "value",
+            QUANTILE_FIELD_VALUE,
             Type::Primitive(PrimitiveType::Double),
         )),
     ]));
 
-    // Exemplar struct for histogram/gauge/sum metrics
+    // Exemplar struct for histogram/gauge/sum metrics; its members share the names of the
+    // point columns they mirror.
     let exemplar_struct = Type::Struct(StructType::new(vec![
         Arc::new(NestedField::optional(
             38,
-            "timestamp",
+            COL_TIMESTAMP,
             Type::Primitive(PrimitiveType::Timestamp),
         )),
         Arc::new(NestedField::optional(
             39,
-            "value_double",
+            COL_VALUE_DOUBLE,
             Type::Primitive(PrimitiveType::Double),
         )),
         Arc::new(NestedField::optional(
             40,
-            "value_int",
+            COL_VALUE_INT,
             Type::Primitive(PrimitiveType::Long),
         )),
         Arc::new(NestedField::optional(
             41,
-            "span_id",
+            COL_SPAN_ID,
             Type::Primitive(PrimitiveType::Fixed(8)),
         )),
         Arc::new(NestedField::optional(
             42,
-            "trace_id",
+            COL_TRACE_ID,
             Type::Primitive(PrimitiveType::Fixed(16)),
         )),
         Arc::new(NestedField::required(43, COL_ATTRIBUTES, exemplar_attributes_map)),
@@ -1533,7 +1534,7 @@ pub fn metrics_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 3,
-                "service_instance_id",
+                COL_SERVICE_INSTANCE_ID,
                 Type::Primitive(PrimitiveType::String),
             )),
             // Timestamp fields
@@ -1555,33 +1556,33 @@ pub fn metrics_schema() -> Result<Schema> {
             // Metric identification
             Arc::new(NestedField::required(
                 7,
-                "metric_name",
+                COL_METRIC_NAME,
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::required(
                 8,
-                "metric_type",
+                COL_METRIC_TYPE,
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
                 9,
-                "description",
+                COL_DESCRIPTION,
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
                 10,
-                "unit",
+                COL_UNIT,
                 Type::Primitive(PrimitiveType::String),
             )),
             // Metric metadata
             Arc::new(NestedField::optional(
                 11,
-                "aggregation_temporality",
+                COL_AGGREGATION_TEMPORALITY,
                 Type::Primitive(PrimitiveType::String),
             )),
             Arc::new(NestedField::optional(
                 12,
-                "is_monotonic",
+                COL_IS_MONOTONIC,
                 Type::Primitive(PrimitiveType::Boolean),
             )),
             // Data-point attributes (OTLP `<X>DataPoint.attributes`). Renamed
@@ -1600,7 +1601,7 @@ pub fn metrics_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 15,
-                "value_int",
+                COL_VALUE_INT,
                 Type::Primitive(PrimitiveType::Long),
             )),
             // Common histogram fields (for histogram, exponential_histogram, and summary)
@@ -1611,7 +1612,7 @@ pub fn metrics_schema() -> Result<Schema> {
             // Standard histogram fields
             Arc::new(NestedField::optional(
                 20,
-                "bucket_counts",
+                COL_BUCKET_COUNTS,
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     44,
                     Type::Primitive(PrimitiveType::Long),
@@ -1620,7 +1621,7 @@ pub fn metrics_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 21,
-                "explicit_bounds",
+                COL_EXPLICIT_BOUNDS,
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     45,
                     Type::Primitive(PrimitiveType::Double),
@@ -1628,7 +1629,11 @@ pub fn metrics_schema() -> Result<Schema> {
                 )))),
             )),
             // Exponential histogram fields
-            Arc::new(NestedField::optional(22, "scale", Type::Primitive(PrimitiveType::Int))),
+            Arc::new(NestedField::optional(
+                22,
+                COL_SCALE,
+                Type::Primitive(PrimitiveType::Int),
+            )),
             Arc::new(NestedField::optional(
                 23,
                 "zero_count",
@@ -1641,12 +1646,12 @@ pub fn metrics_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 25,
-                "positive_offset",
+                COL_POSITIVE_OFFSET,
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
                 26,
-                "positive_bucket_counts",
+                COL_POSITIVE_BUCKET_COUNTS,
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     46,
                     Type::Primitive(PrimitiveType::Long),
@@ -1655,12 +1660,12 @@ pub fn metrics_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 27,
-                "negative_offset",
+                COL_NEGATIVE_OFFSET,
                 Type::Primitive(PrimitiveType::Int),
             )),
             Arc::new(NestedField::optional(
                 28,
-                "negative_bucket_counts",
+                COL_NEGATIVE_BUCKET_COUNTS,
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     47,
                     Type::Primitive(PrimitiveType::Long),
@@ -1670,7 +1675,7 @@ pub fn metrics_schema() -> Result<Schema> {
             // Summary fields
             Arc::new(NestedField::optional(
                 29,
-                "quantile_values",
+                COL_QUANTILE_VALUES,
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     48,
                     quantile_struct,
@@ -1685,7 +1690,7 @@ pub fn metrics_schema() -> Result<Schema> {
             )),
             Arc::new(NestedField::optional(
                 31,
-                "exemplars",
+                COL_EXEMPLARS,
                 Type::List(ListType::new(Arc::new(NestedField::list_element(
                     49,
                     exemplar_struct,
@@ -1749,30 +1754,33 @@ pub fn metrics_partition_spec(schema: &Schema) -> Result<PartitionSpec> {
 /// - `service_instance_id` (ascending)
 /// - `timestamp` (descending) - recent-first ordering
 pub fn metrics_sort_order(schema: &Schema) -> Result<SortOrder> {
-    let metric_name_id_field = schema.field_by_name("metric_name").ok_or_else(|| {
+    let metric_name_id_field = schema.field_by_name(COL_METRIC_NAME).ok_or_else(|| {
         Error::new(
             ErrorKind::DataInvalid,
             "field 'metric_name' not found in metrics schema",
         )
     })?;
 
-    let service_name_field = schema.field_by_name("service_name").ok_or_else(|| {
+    let service_name_field = schema.field_by_name(COL_SERVICE_NAME).ok_or_else(|| {
         Error::new(
             ErrorKind::DataInvalid,
-            "field 'service_name' not found in metrics schema",
+            format!("field '{COL_SERVICE_NAME}' not found in metrics schema"),
         )
     })?;
 
-    let service_instance_id_field = schema.field_by_name("service_instance_id").ok_or_else(|| {
+    let service_instance_id_field = schema.field_by_name(COL_SERVICE_INSTANCE_ID).ok_or_else(|| {
         Error::new(
             ErrorKind::DataInvalid,
-            "field 'service_instance_id' not found in metrics schema",
+            format!("field '{COL_SERVICE_INSTANCE_ID}' not found in metrics schema"),
         )
     })?;
 
-    let timestamp_field = schema
-        .field_by_name("timestamp")
-        .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "field 'timestamp' not found in metrics schema"))?;
+    let timestamp_field = schema.field_by_name(COL_TIMESTAMP).ok_or_else(|| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("field '{COL_TIMESTAMP}' not found in metrics schema"),
+        )
+    })?;
 
     let sort_order = SortOrder::builder()
         .with_order_id(4)
@@ -1853,6 +1861,9 @@ pub const COL_SEVERITY_TEXT: &str = "severity_text";
 pub const COL_SERVICE_NAME: &str = "service_name";
 /// Operations — deployment environment of the resource that produced the operation.
 pub const COL_ENVIRONMENT: &str = "environment";
+/// Metrics — service instance column, promoted from the [`SERVICE_INSTANCE_ID_ATTRIBUTE_KEY`]
+/// resource attribute.
+pub const COL_SERVICE_INSTANCE_ID: &str = "service_instance_id";
 /// W3C Trace Context trace identifier (`FIXED_LEN_BYTE_ARRAY(16)`).
 pub const COL_TRACE_ID: &str = "trace_id";
 /// W3C Trace Context span identifier (`FIXED_LEN_BYTE_ARRAY(8)`).
@@ -1884,6 +1895,10 @@ pub const COL_ATTRIBUTES: &str = "attributes";
 /// Spans — OTLP-reported count of attributes dropped before export (`INT`).
 /// Present on the span itself and inside the `events` / `links` structs.
 pub const COL_DROPPED_ATTRIBUTES_COUNT: &str = "dropped_attributes_count";
+/// Spans — OTLP-reported count of events dropped before export (`INT`).
+pub const COL_DROPPED_EVENTS_COUNT: &str = "dropped_events_count";
+/// Spans — OTLP-reported count of links dropped before export (`INT`).
+pub const COL_DROPPED_LINKS_COUNT: &str = "dropped_links_count";
 /// Spans/metrics — OTLP `flags` bitmask (`INT`).
 ///
 /// The bits differ per table: on spans (the span itself and the `links`
@@ -1905,6 +1920,8 @@ pub const COL_COUNT: &str = "count";
 pub const COL_ZERO_COUNT: &str = "zero_count";
 /// Metrics — point value as `DOUBLE`.
 pub const COL_VALUE_DOUBLE: &str = "value_double";
+/// Metrics — point value as `BIGINT`; [`COL_VALUE_DOUBLE`] holds the other kind.
+pub const COL_VALUE_INT: &str = "value_int";
 /// Metrics — histogram/summary sum (`DOUBLE`).
 pub const COL_SUM: &str = "sum";
 /// Metrics — histogram min (`DOUBLE`).
@@ -1913,6 +1930,61 @@ pub const COL_MIN: &str = "min";
 pub const COL_MAX: &str = "max";
 /// Metrics — exponential-histogram zero threshold (`DOUBLE`).
 pub const COL_ZERO_THRESHOLD: &str = "zero_threshold";
+/// Metrics — metric name (`STRING`).
+pub const COL_METRIC_NAME: &str = "metric_name";
+/// Metrics — metric type (`STRING`).
+///
+/// One of [`METRIC_TYPE_GAUGE`], [`METRIC_TYPE_SUM`], [`METRIC_TYPE_HISTOGRAM`],
+/// [`METRIC_TYPE_EXPONENTIAL_HISTOGRAM`] and [`METRIC_TYPE_SUMMARY`].
+pub const COL_METRIC_TYPE: &str = "metric_type";
+/// Metrics — metric description (`STRING`).
+pub const COL_DESCRIPTION: &str = "description";
+/// Metrics — metric unit (`STRING`).
+pub const COL_UNIT: &str = "unit";
+/// Metrics — aggregation temporality (`STRING`).
+///
+/// [`AGGREGATION_TEMPORALITY_DELTA`], [`AGGREGATION_TEMPORALITY_CUMULATIVE`], or NULL for a
+/// metric type without one.
+pub const COL_AGGREGATION_TEMPORALITY: &str = "aggregation_temporality";
+/// Metrics — whether a sum is monotonic (`BOOLEAN`).
+pub const COL_IS_MONOTONIC: &str = "is_monotonic";
+/// Metrics — exponential-histogram scale (`INT`).
+pub const COL_SCALE: &str = "scale";
+/// Metrics — exponential-histogram positive bucket offset (`INT`).
+pub const COL_POSITIVE_OFFSET: &str = "positive_offset";
+/// Metrics — exponential-histogram negative bucket offset (`INT`).
+pub const COL_NEGATIVE_OFFSET: &str = "negative_offset";
+/// Metrics — histogram bucket counts (`List<BIGINT>`).
+pub const COL_BUCKET_COUNTS: &str = "bucket_counts";
+/// Metrics — histogram explicit bounds (`List<DOUBLE>`).
+pub const COL_EXPLICIT_BOUNDS: &str = "explicit_bounds";
+/// Metrics — exponential-histogram positive bucket counts (`List<BIGINT>`).
+pub const COL_POSITIVE_BUCKET_COUNTS: &str = "positive_bucket_counts";
+/// Metrics — exponential-histogram negative bucket counts (`List<BIGINT>`).
+pub const COL_NEGATIVE_BUCKET_COUNTS: &str = "negative_bucket_counts";
+/// Metrics — summary quantiles (`List<Struct>`), each element
+/// `{QUANTILE_FIELD_QUANTILE, QUANTILE_FIELD_VALUE}`.
+pub const COL_QUANTILE_VALUES: &str = "quantile_values";
+/// Metrics — exemplars (`List<Struct>`).
+pub const COL_EXEMPLARS: &str = "exemplars";
+/// Metrics — the quantile member of a `quantile_values` element (`DOUBLE`).
+pub const QUANTILE_FIELD_QUANTILE: &str = "quantile";
+/// Metrics — the value member of a `quantile_values` element (`DOUBLE`).
+pub const QUANTILE_FIELD_VALUE: &str = "value";
+/// Metrics — the [`COL_METRIC_TYPE`] of an `OTel` gauge.
+pub const METRIC_TYPE_GAUGE: &str = "gauge";
+/// Metrics — the [`COL_METRIC_TYPE`] of an `OTel` sum.
+pub const METRIC_TYPE_SUM: &str = "sum";
+/// Metrics — the [`COL_METRIC_TYPE`] of an `OTel` explicit-bucket histogram.
+pub const METRIC_TYPE_HISTOGRAM: &str = "histogram";
+/// Metrics — the [`COL_METRIC_TYPE`] of an `OTel` exponential histogram.
+pub const METRIC_TYPE_EXPONENTIAL_HISTOGRAM: &str = "exponential_histogram";
+/// Metrics — the [`COL_METRIC_TYPE`] of an `OTel` summary.
+pub const METRIC_TYPE_SUMMARY: &str = "summary";
+/// Metrics — the [`COL_AGGREGATION_TEMPORALITY`] of a delta point.
+pub const AGGREGATION_TEMPORALITY_DELTA: &str = "DELTA";
+/// Metrics — the [`COL_AGGREGATION_TEMPORALITY`] of a cumulative point.
+pub const AGGREGATION_TEMPORALITY_CUMULATIVE: &str = "CUMULATIVE";
 /// Grafana-compatible alias for [`COL_SEVERITY_TEXT`].
 pub const LEVEL_ALIAS: &str = "level";
 
@@ -2105,6 +2177,60 @@ pub const TRACEQL_INTRINSIC_TAGS: &[&str] = &[
     "trace:rootName",
     "trace:rootService",
 ];
+
+/// OTLP resource attribute naming the service, in the dotted form it arrives on the wire.
+pub const SERVICE_NAME_ATTRIBUTE_KEY: &str = "service.name";
+/// OTLP resource attribute naming the service instance, in the dotted form it arrives on the
+/// wire.
+pub const SERVICE_INSTANCE_ID_ATTRIBUTE_KEY: &str = "service.instance.id";
+
+/// A resource attribute that ingest moves out of a table's resource map into a column of its own.
+///
+/// The key is absent from the stored map of such a table, so a reader resolves a resource path
+/// naming it to [`Self::column`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromotedResourceKey {
+    /// The attribute key as sent on the wire, dotted.
+    pub attribute_key: &'static str,
+    /// The column that holds the attribute's value.
+    pub column: &'static str,
+}
+
+/// Promoted resource keys of the logs table.
+const LOGS_PROMOTED_RESOURCE_KEYS: &[PromotedResourceKey] = &[PromotedResourceKey {
+    attribute_key: SERVICE_NAME_ATTRIBUTE_KEY,
+    column: COL_SERVICE_NAME,
+}];
+
+/// Promoted resource keys of the metrics table.
+const METRICS_PROMOTED_RESOURCE_KEYS: &[PromotedResourceKey] = &[
+    PromotedResourceKey {
+        attribute_key: SERVICE_NAME_ATTRIBUTE_KEY,
+        column: COL_SERVICE_NAME,
+    },
+    PromotedResourceKey {
+        attribute_key: SERVICE_INSTANCE_ID_ATTRIBUTE_KEY,
+        column: COL_SERVICE_INSTANCE_ID,
+    },
+];
+
+/// The resource attributes `table` promotes to columns.
+///
+/// This is the single list for both sides: ingest drops each listed key from the table's
+/// resource map, so a reader resolves a resource path naming one of them to
+/// [`PromotedResourceKey::column`].
+///
+/// Only logs and metrics promote keys. The list is empty for every other table: spans and events
+/// keep every resource attribute in their resource map, and operations and prices have no
+/// resource map.
+#[must_use]
+pub fn promoted_resource_keys(table: &str) -> &'static [PromotedResourceKey] {
+    match table {
+        crate::LOGS_TABLE => LOGS_PROMOTED_RESOURCE_KEYS,
+        crate::METRICS_TABLE => METRICS_PROMOTED_RESOURCE_KEYS,
+        _ => &[],
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2805,5 +2931,141 @@ mod tests {
                 "{table} must not carry a merged `attributes` column"
             );
         }
+    }
+
+    /// The expected pairs are literals: the map is the single list ingest drops from the resource
+    /// map and a reader resolves a resource path with, so a renamed key or column must fail here
+    /// rather than move both sides at once.
+    #[test]
+    fn promoted_resource_keys_name_the_service_identity_columns_of_logs_and_metrics_only() {
+        let pairs = |table: &str| {
+            promoted_resource_keys(table)
+                .iter()
+                .map(|promoted_key| (promoted_key.attribute_key, promoted_key.column))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(pairs(crate::LOGS_TABLE), vec![("service.name", "service_name")]);
+        assert_eq!(
+            pairs(crate::METRICS_TABLE),
+            vec![
+                ("service.name", "service_name"),
+                ("service.instance.id", "service_instance_id")
+            ]
+        );
+        for table in [
+            crate::SPANS_TABLE,
+            crate::OPERATIONS_TABLE,
+            crate::EVENTS_TABLE,
+            crate::PRICES_TABLE,
+        ] {
+            assert!(pairs(table).is_empty(), "{table} promotes no resource key");
+        }
+    }
+
+    /// Field discovery prunes MAP keys to a tenant from partition data alone, and `_cat/indices`
+    /// counts a tenant's rows and bytes from the data files planned for its partition. Both are
+    /// exact only while every table carrying `tenant_id` identity-partitions it.
+    #[test]
+    fn every_table_carrying_tenant_id_identity_partitions_it() {
+        type SpecBuilder = fn(&Schema) -> Result<PartitionSpec>;
+        let tables: [(&str, Result<Schema>, SpecBuilder); 6] = [
+            ("logs", logs_schema(), logs_partition_spec),
+            ("spans", spans_schema(), spans_partition_spec),
+            ("events", events_schema(), events_partition_spec),
+            ("metrics", metrics_schema(), metrics_partition_spec),
+            ("operations", operations_schema(), operations_partition_spec),
+            ("prices", prices_schema(), prices_partition_spec),
+        ];
+        let mut tenant_scoped_tables = Vec::new();
+        for (table, table_schema, build_spec) in tables {
+            let table_schema = table_schema.expect("schema");
+            let Some(tenant_field) = table_schema.field_by_name("tenant_id") else {
+                continue;
+            };
+            let spec = build_spec(&table_schema).expect("partition spec");
+            assert!(
+                spec.fields()
+                    .iter()
+                    .any(|field| field.source_id == tenant_field.id && field.transform == Transform::Identity),
+                "{table} carries tenant_id without an identity partition on it"
+            );
+            tenant_scoped_tables.push(table);
+        }
+        assert_eq!(
+            tenant_scoped_tables,
+            ["logs", "spans", "events", "metrics", "operations"]
+        );
+    }
+
+    /// Every metrics column constant names a column of the metrics schema, spelled as written
+    /// here; the quantile members name the members of the `quantile_values` element struct, and
+    /// the exemplar struct names its members with the point-column constants they mirror.
+    #[test]
+    fn every_metrics_column_constant_names_a_column_of_the_metrics_schema() {
+        let schema = metrics_schema().expect("metrics schema");
+        let constants = [
+            (COL_METRIC_NAME, "metric_name"),
+            (COL_METRIC_TYPE, "metric_type"),
+            (COL_DESCRIPTION, "description"),
+            (COL_UNIT, "unit"),
+            (COL_AGGREGATION_TEMPORALITY, "aggregation_temporality"),
+            (COL_IS_MONOTONIC, "is_monotonic"),
+            (COL_SCALE, "scale"),
+            (COL_POSITIVE_OFFSET, "positive_offset"),
+            (COL_NEGATIVE_OFFSET, "negative_offset"),
+            (COL_BUCKET_COUNTS, "bucket_counts"),
+            (COL_EXPLICIT_BOUNDS, "explicit_bounds"),
+            (COL_POSITIVE_BUCKET_COUNTS, "positive_bucket_counts"),
+            (COL_NEGATIVE_BUCKET_COUNTS, "negative_bucket_counts"),
+            (COL_QUANTILE_VALUES, "quantile_values"),
+            (COL_EXEMPLARS, "exemplars"),
+        ];
+        for (constant, spelled_name) in constants {
+            assert_eq!(constant, spelled_name);
+            assert!(schema.field_by_name(constant).is_some(), "metrics lacks `{constant}`");
+        }
+
+        let quantiles = schema.field_by_name(COL_QUANTILE_VALUES).expect("quantile_values");
+        let Type::List(list) = quantiles.field_type.as_ref() else {
+            panic!("quantile_values is a list");
+        };
+        let Type::Struct(element) = list.element_field.field_type.as_ref() else {
+            panic!("quantile_values holds structs");
+        };
+        let members: Vec<&str> = element.fields().iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(members, [QUANTILE_FIELD_QUANTILE, QUANTILE_FIELD_VALUE]);
+        assert_eq!((QUANTILE_FIELD_QUANTILE, QUANTILE_FIELD_VALUE), ("quantile", "value"));
+
+        let exemplars = schema.field_by_name(COL_EXEMPLARS).expect("exemplars");
+        let Type::List(list) = exemplars.field_type.as_ref() else {
+            panic!("exemplars is a list");
+        };
+        let Type::Struct(element) = list.element_field.field_type.as_ref() else {
+            panic!("exemplars holds structs");
+        };
+        let members: Vec<&str> = element.fields().iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(
+            members,
+            [
+                COL_TIMESTAMP,
+                COL_VALUE_DOUBLE,
+                COL_VALUE_INT,
+                COL_SPAN_ID,
+                COL_TRACE_ID,
+                COL_ATTRIBUTES
+            ]
+        );
+        assert_eq!(
+            members,
+            [
+                "timestamp",
+                "value_double",
+                "value_int",
+                "span_id",
+                "trace_id",
+                "attributes"
+            ]
+        );
     }
 }

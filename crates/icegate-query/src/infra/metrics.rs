@@ -18,14 +18,17 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 
 /// The `protocol` label of the Flight SQL read surface.
 ///
-/// The three constants below are the single source of that label: all three
-/// surfaces resolve the tenant through the same policy, and a label spelled at
-/// the call site would drift from the one the dashboards are keyed on.
+/// The constants below are the single source of that label: every surface resolves the tenant
+/// through the same policy, and a label spelled at the call site would drift from the one the
+/// dashboards are keyed on.
 pub const PROTOCOL_FLIGHT_SQL: &str = "flight_sql";
 /// The `protocol` label of the Loki read surface.
 pub const PROTOCOL_LOKI: &str = "loki";
 /// The `protocol` label of the Tempo read surface.
 pub const PROTOCOL_TEMPO: &str = "tempo";
+/// The `protocol` label of the `OpenSearch` read surface. The same value is its `surface` label
+/// of memory shedding and its `api` label of the request metrics.
+pub const PROTOCOL_OPENSEARCH: &str = "opensearch";
 
 /// Histogram bucket boundaries (in seconds) for fast sub-phases like parse,
 /// plan, and format, which typically complete in low milliseconds.
@@ -68,7 +71,7 @@ const ROWS_BOUNDARIES: &[f64] = &[
 /// Follows the same `new(&Meter)` / `new_disabled()` pattern used by
 /// `icegate-ingest` metrics. When disabled, all recording methods are
 /// short-circuited.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct QueryMetrics {
     enabled: bool,
     requests_total: Counter<u64>,
@@ -83,6 +86,7 @@ pub struct QueryMetrics {
     errors_total: Counter<u64>,
     active_queries: UpDownCounter<i64>,
     tenant_rejections_total: Counter<u64>,
+    map_key_enumerations_total: Counter<u64>,
 
     // Per-source scan metrics
     wal_scan_rows: Histogram<f64>,
@@ -116,6 +120,7 @@ impl QueryMetrics {
             errors_total: meter.u64_counter("icegate_query_errors").build(),
             active_queries: meter.i64_up_down_counter("icegate_query_active_queries").build(),
             tenant_rejections_total: meter.u64_counter("icegate_query_tenant_rejections").build(),
+            map_key_enumerations_total: meter.u64_counter("icegate_query_opensearch_map_key_enumerations").build(),
             wal_scan_rows: meter.f64_histogram("icegate_query_wal_scan_rows").build(),
             wal_scan_bytes: meter.f64_histogram("icegate_query_wal_scan_bytes").build(),
             wal_scan_compressed_bytes: meter.f64_histogram("icegate_query_wal_scan_compressed_bytes").build(),
@@ -187,6 +192,10 @@ impl QueryMetrics {
             .u64_counter("icegate_query_tenant_rejections")
             .with_description("Requests refused because they carried no usable tenant")
             .build();
+        let map_key_enumerations_total = meter
+            .u64_counter("icegate_query_opensearch_map_key_enumerations")
+            .with_description("OpenSearch MAP-key enumerations that scanned table metadata (cache misses)")
+            .build();
 
         let wal_scan_rows = meter
             .f64_histogram("icegate_query_wal_scan_rows")
@@ -233,6 +242,7 @@ impl QueryMetrics {
             errors_total,
             active_queries,
             tenant_rejections_total,
+            map_key_enumerations_total,
             wal_scan_rows,
             wal_scan_bytes,
             wal_scan_compressed_bytes,
@@ -409,6 +419,15 @@ impl QueryMetrics {
             ],
         );
     }
+
+    /// Count one MAP-key enumeration of `table` that scanned table metadata, a lookup the
+    /// enumeration cache could not answer.
+    pub fn add_map_key_enumeration(&self, table: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        self.map_key_enumerations_total.add(1, &[KeyValue::new("table", table)]);
+    }
 }
 
 /// Writes a refused tenant resolution into `icegate_query_tenant_rejections`.
@@ -436,7 +455,7 @@ impl QueryTenantRejectionRecorder {
 
 impl TenantRejectionRecorder for QueryTenantRejectionRecorder {
     /// `protocol` is one of [`PROTOCOL_FLIGHT_SQL`], [`PROTOCOL_LOKI`],
-    /// [`PROTOCOL_TEMPO`]; `reason` comes from
+    /// [`PROTOCOL_TEMPO`], [`PROTOCOL_OPENSEARCH`]; `reason` comes from
     /// [`TenantRejection::reason`](icegate_common::TenantRejection::reason) and
     /// from nowhere else, since a hand-written string here would drift from the
     /// variants the resolver returns.
@@ -592,8 +611,8 @@ mod tests {
     use opentelemetry::metrics::MeterProvider as _;
 
     use super::{
-        PROTOCOL_FLIGHT_SQL, PROTOCOL_LOKI, PROTOCOL_TEMPO, QueryMetrics, QueryTenantRejectionRecorder,
-        TenantRejectionRecorder,
+        PROTOCOL_FLIGHT_SQL, PROTOCOL_LOKI, PROTOCOL_OPENSEARCH, PROTOCOL_TEMPO, QueryMetrics,
+        QueryTenantRejectionRecorder, TenantRejectionRecorder,
         test_support::{build_meter_provider, find_counter_total},
     };
 
@@ -619,6 +638,7 @@ mod tests {
                 TenantRejection::DuplicateHeader,
                 "duplicate_header",
             ),
+            (PROTOCOL_OPENSEARCH, "opensearch", TenantRejection::Missing, "missing"),
         ];
         for (protocol, _, rejection, _) in cases {
             recorder.add_tenant_rejection(protocol, rejection.reason());

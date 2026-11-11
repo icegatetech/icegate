@@ -1,0 +1,9 @@
+# The stand's OpenSearch Dashboards serves one tenant. IceGate reads the tenant of a request from
+# x-scope-orgid, so this file is the one place that chooses it: the custom header names the
+# stand's tenant, `demo`, the tenant config/docker/ingest.yaml writes. Keep x-scope-orgid out of
+# requestHeadersWhitelist. crates/icegate-query/tests/config_file.rs pins both settings.
+server.host: "0.0.0.0"
+opensearch.hosts: ["http://query:9200"]
+opensearch.customHeaders:
+  x-scope-orgid: demo
+opensearch.requestHeadersWhitelist: ["authorization"]

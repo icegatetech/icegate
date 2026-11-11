@@ -1,0 +1,1618 @@
+//! The `OpenSearch` error envelope.
+//!
+//! Every failure the listener answers is rendered here: handler errors, middleware refusals
+//! (shed, deadline, tenant) and unmatched routes, so a client never reads a bare string or an
+//! empty body. The shape is
+//! `{"error": {"root_cause": [{type, reason, <metadata>}], type, reason, <metadata>}, "status": N}`,
+//! where the metadata keys (for example the missing `index`) are present only on errors that carry
+//! them; a `503` adds `details` beside `reason` and a `Retry-After` header. An error that wraps a
+//! shard-level failure renders that failure as its root cause instead of repeating its own keys.
+//!
+//! `503` is reserved for the conditions a client should retry: memory-pressure shedding, the
+//! query deadline and system-index write contention. A limit a request can avoid by asking for
+//! less is a `400`, or a `413` for a body or a snapshot that is too large.
+
+use std::collections::BTreeMap;
+
+use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use icegate_common::SHED_RETRY_AFTER_SECS;
+use icegate_common::schema::COL_TIMESTAMP;
+use serde_json::{Map, Value, json};
+
+use crate::error::QueryError;
+
+/// Content type of every envelope.
+const CONTENT_TYPE_JSON: &str = "application/json; charset=UTF-8";
+
+/// What kind of error an [`OpenSearchError`] is, so a caller maps errors by kind and never by
+/// their reason text. Each variant is one class of error. A decorating constructor, one that
+/// returns another constructor's error with its own reason or extra keys, keeps that base kind
+/// (for example `unsupported_construct`, `answer_too_large` and `invalid_request_key`) unless a
+/// caller must tell it apart. `memory_limit_exceeded`, `no_handler` and
+/// `too_many_cross_row_traces` are such exceptions: each decorates `illegal_argument` and carries
+/// its own kind. A search-phase failure that wraps
+/// another error as its root cause (`query_shard`, `result_window_too_large`,
+/// `too_many_buckets`) carries its own kind, whatever the cause's kind is. A new class of error
+/// adds its variant, and every exhaustive match over the kinds (the PPL mapping) stops compiling
+/// until it maps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenSearchErrorKind {
+    /// [`OpenSearchError::illegal_argument`].
+    IllegalArgument,
+    /// [`OpenSearchError::parsing`].
+    Parsing,
+    /// [`OpenSearchError::memory_pressure`].
+    MemoryPressure,
+    /// [`OpenSearchError::deadline_exceeded`].
+    DeadlineExceeded,
+    /// [`OpenSearchError::internal`].
+    Internal,
+    /// [`OpenSearchError::no_handler`].
+    NoHandler,
+    /// [`OpenSearchError::index_not_found`].
+    IndexNotFound {
+        /// The index or expression the request named.
+        index: String,
+    },
+    /// [`OpenSearchError::payload_too_large`].
+    PayloadTooLarge,
+    /// [`OpenSearchError::resource_already_exists`].
+    ResourceAlreadyExists,
+    /// [`OpenSearchError::cluster_block`].
+    ClusterBlock,
+    /// [`OpenSearchError::write_contention`].
+    WriteContention,
+    /// [`OpenSearchError::snapshot_too_large`].
+    SnapshotTooLarge,
+    /// [`OpenSearchError::version_conflict`].
+    VersionConflict,
+    /// [`OpenSearchError::document_missing`].
+    DocumentMissing,
+    /// [`OpenSearchError::query_shard`].
+    QueryShard,
+    /// [`OpenSearchError::search_context_missing`].
+    SearchContextMissing,
+    /// [`OpenSearchError::result_window_too_large`].
+    ResultWindowTooLarge,
+    /// [`OpenSearchError::too_many_buckets`].
+    TooManyBuckets,
+    /// [`OpenSearchError::aggregation_execution`].
+    AggregationExecution,
+    /// [`OpenSearchError::memory_limit_exceeded`].
+    MemoryLimitExceeded {
+        /// The per-query memory limit in bytes.
+        limit_bytes: usize,
+    },
+    /// A plugin resource IceGate does not hold, such as an ML config (404 `status_exception`).
+    StatusNotFound,
+    /// [`OpenSearchError::too_many_cross_row_traces`].
+    TooManyCrossRowTraces,
+}
+
+/// An error answered in the `OpenSearch` envelope.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OpenSearchError {
+    /// What kind of error this is; see [`OpenSearchErrorKind`].
+    kind: OpenSearchErrorKind,
+    /// HTTP status of the answer, repeated as the envelope's `status`.
+    status: StatusCode,
+    /// The envelope's `type`, on the error and, unless `root_cause` replaces it, on its root cause.
+    error_type: &'static str,
+    /// The envelope's `reason`, on the error and, unless `root_cause` replaces it, on its root
+    /// cause.
+    reason: String,
+    /// Keys rendered beside `type` and `reason` on the error and, unless `root_cause` replaces
+    /// it, on its root cause. This map and `root_cause` are boxed so that every
+    /// `Result<_, OpenSearchError>` stays small (clippy `result_large_err`), and the allocation
+    /// lands on the failing path.
+    metadata: Box<Map<String, Value>>,
+    /// The cause rendered as `root_cause[0]` in place of this error's own, for an error that
+    /// wraps a shard-level failure.
+    root_cause: Option<Box<Map<String, Value>>>,
+}
+
+impl OpenSearchError {
+    /// An error of `kind` and `error_type` answered with `status`.
+    fn new(kind: OpenSearchErrorKind, status: StatusCode, error_type: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            kind,
+            status,
+            error_type,
+            reason: reason.into(),
+            metadata: Box::default(),
+            root_cause: None,
+        }
+    }
+
+    /// A well-formed request that asks for something invalid, names no usable tenant or carries
+    /// an unknown parameter: `400`, `illegal_argument_exception`.
+    pub(crate) fn illegal_argument(reason: impl Into<String>) -> Self {
+        Self::new(
+            OpenSearchErrorKind::IllegalArgument,
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            reason,
+        )
+    }
+
+    /// The 400 a query gets when the listener's per-query memory pool cannot grant a
+    /// reservation even after spilling: `illegal_argument_exception` naming the limit
+    /// and the configuration key that sets it, with `limit` carrying the limit in bytes
+    /// for a client.
+    pub(crate) fn memory_limit_exceeded(limit_bytes: usize) -> Self {
+        Self {
+            kind: OpenSearchErrorKind::MemoryLimitExceeded { limit_bytes },
+            ..Self::illegal_argument(format!(
+                "the query needs more memory than the per-query limit of [{limit_bytes}] bytes \
+                 (opensearch.max_query_memory_bytes)"
+            ))
+        }
+        .with_metadata("limit", limit_bytes)
+    }
+
+    /// The process sheds load under memory pressure: `503`, `memory_pressure_exception`,
+    /// retryable.
+    pub(crate) fn memory_pressure() -> Self {
+        Self::new(
+            OpenSearchErrorKind::MemoryPressure,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "memory_pressure_exception",
+            "service under memory pressure, retry later",
+        )
+    }
+
+    /// The request outlived `engine.max_query_duration_secs`: `503`,
+    /// `query_deadline_exceeded_exception`, retryable.
+    pub(crate) fn deadline_exceeded() -> Self {
+        Self::new(
+            OpenSearchErrorKind::DeadlineExceeded,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "query_deadline_exceeded_exception",
+            "query exceeded engine.max_query_duration_secs",
+        )
+    }
+
+    /// A failure inside IceGate that the request could not have avoided: `500`, `exception`.
+    pub(crate) fn internal(reason: impl Into<String>) -> Self {
+        Self::new(
+            OpenSearchErrorKind::Internal,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "exception",
+            reason,
+        )
+    }
+
+    /// A request body or query the parser refuses, an unsupported construct or an unknown body
+    /// key included (`400`).
+    pub(crate) fn parsing(reason: impl Into<String>) -> Self {
+        Self::new(
+            OpenSearchErrorKind::Parsing,
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            reason,
+        )
+    }
+
+    /// A query construct IceGate does not evaluate (`400`, `parsing_exception`), which `construct`
+    /// carries for a client.
+    pub(crate) fn unsupported_construct(construct: &str, reason: impl Into<String>) -> Self {
+        Self::parsing(reason).with_metadata("construct", construct)
+    }
+
+    /// An aggregation of the request this listener refuses to answer, such as a nesting it does
+    /// not plan (`400`, `illegal_argument_exception`); `aggregation` carries the request's name
+    /// for it.
+    pub(crate) fn unsupported_aggregation(aggregation: &str, reason: impl Into<String>) -> Self {
+        Self::illegal_argument(reason).with_metadata("aggregation", aggregation)
+    }
+
+    /// A script IceGate does not run (`400`, `illegal_argument_exception`): `script` carries the
+    /// source as the request wrote it, so a client can tell which of its scripts is refused.
+    pub(crate) fn unsupported_script(script: &str, reason: impl Into<String>) -> Self {
+        Self::illegal_argument(reason).with_metadata("script", script)
+    }
+
+    /// A pipeline aggregation whose placement, `buckets_path` or dependencies cannot be answered
+    /// (`400`, `aggregation_execution_exception`); `aggregation` carries the request's name for
+    /// the pipeline.
+    pub(crate) fn invalid_pipeline(aggregation: &str, reason: &str) -> Self {
+        Self::aggregation_execution(reason).with_metadata("aggregation", aggregation)
+    }
+
+    /// A field an aggregation cannot read in one index (`400`, `illegal_argument_exception`):
+    /// `field`, its `field_type`, the `index` mapping it so, the `aggregation` and its
+    /// `aggregation_type` are carried for a client.
+    pub(crate) fn unsupported_aggregation_field(
+        field: &str,
+        field_type: &str,
+        index: &str,
+        aggregation: &str,
+        aggregation_type: &str,
+    ) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!(
+                "field [{field}] of type [{field_type}] in [{index}] is not supported for aggregation \
+                 [{aggregation_type}] [{aggregation}]"
+            ),
+        )
+        .with_metadata("aggregation_type", aggregation_type)
+        .with_metadata("field", field)
+        .with_metadata("field_type", field_type)
+        .with_metadata("index", index)
+    }
+
+    /// An aggregation of `aggregation_type` placed where it does not run: any kind but `filter`
+    /// and the `sum`, `min`, `max`, `value_count` and `avg` metrics inside a `nested`
+    /// aggregation, and a `nested` below another aggregation (`400`, `illegal_argument_exception`);
+    /// `aggregation` carries the request's name for it and `aggregation_type` its type.
+    pub(crate) fn misplaced_aggregation(aggregation: &str, aggregation_type: &str, reason: &str) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!("aggregation [{aggregation}] of type [{aggregation_type}] {reason}"),
+        )
+        .with_metadata("aggregation_type", aggregation_type)
+    }
+
+    /// A `nested` aggregation whose `path` is no nested field of `index` (`400`,
+    /// `illegal_argument_exception`); `aggregation`, `path` and `index` are carried for a client.
+    pub(crate) fn undeclared_nested_path(aggregation: &str, path: &str, index: &str) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!("[nested] aggregation [{aggregation}] reads [{path}], which is no nested field of [{index}]"),
+        )
+        .with_metadata("path", path)
+        .with_metadata("index", index)
+    }
+
+    /// A field read inside a `nested` aggregation that is no member of the objects at `path`
+    /// (`400`, `illegal_argument_exception`); `field` and `path` are carried for a client.
+    pub(crate) fn field_outside_nested_path(field: &str, path: &str) -> Self {
+        Self::illegal_argument(format!(
+            "field [{field}] is no member of the [{path}] objects a [nested] aggregation reads"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("path", path)
+    }
+
+    /// A regular expression `include` or `exclude`, named by `filter_key`, of an aggregation over
+    /// a field holding encoded ids, which take a list of hex ids instead (`400`,
+    /// `illegal_argument_exception`): `aggregation` carries the request's name for it and
+    /// `field_storage` is `encoded_id`.
+    pub(crate) fn pattern_on_encoded_ids(aggregation: &str, filter_key: &str) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!(
+                "[{filter_key}] of [{aggregation}] is a regular expression; its field holds encoded ids, which \
+                 take a list of hex ids, not a pattern"
+            ),
+        )
+        .with_metadata("field_storage", "encoded_id")
+    }
+
+    /// A request holding more bucket aggregations, nested or not, than one aggregate groups by
+    /// (`400`, `illegal_argument_exception`); `aggregation` carries the request's name for the
+    /// top-level aggregation whose buckets pass the limit and `limit` the most bucket
+    /// aggregations one request may hold.
+    pub(crate) fn aggregation_depth_exceeded(aggregation: &str, limit: usize) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!("a request may hold at most {limit} bucket aggregations; [{aggregation}] passes it"),
+        )
+        .with_metadata("limit", limit)
+    }
+
+    /// The hits the `top_hits` aggregations of one search would render passing
+    /// `search.max_result_window` (`400`, `illegal_argument_exception`): a `top_hits` renders up to
+    /// its `size` hits in every non-empty bucket the response answers, and the hits of every
+    /// `top_hits` of the search count together. `aggregation` carries the request's name for the
+    /// `top_hits` whose hits pass the window and `limit` the window.
+    pub(crate) fn top_hits_window_exceeded(aggregation: &str, limit: usize) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!(
+                "the [top_hits] aggregations would render more hits than search.max_result_window ({limit}) \
+                 allows; [{aggregation}] passes it"
+            ),
+        )
+        .with_metadata("limit", limit)
+    }
+
+    /// A `terms` aggregation on the trace id of the span profile asking for more traces than
+    /// `opensearch.max_cross_row_traces` (`400`, `illegal_argument_exception`); `aggregation`
+    /// carries the request's name for it and `limit` the most traces one search may ask for.
+    pub(crate) fn trace_terms_size_exceeded(aggregation: &str, limit: usize) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!(
+                "[terms] aggregation [{aggregation}] on the trace id asks for more traces than \
+                 opensearch.max_cross_row_traces ({limit}) allows"
+            ),
+        )
+        .with_metadata("limit", limit)
+    }
+
+    /// The error rejecting a metric aggregation running the trace-list `script` (the name a
+    /// refusal gives it) that also names `field`, a field other than `script_field`, the root
+    /// field the script reads (`400`, `illegal_argument_exception`): the script would run over a
+    /// value it does not compute. `aggregation` carries the request's name for it and `field` the
+    /// field it named.
+    pub(crate) fn trace_script_field_mismatch(
+        aggregation: &str,
+        script: &str,
+        field: &str,
+        script_field: &str,
+    ) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!("the {script} script of [{aggregation}] reads [{script_field}], not the field [{field}]"),
+        )
+        .with_metadata("field", field)
+    }
+
+    /// The error rejecting a metric aggregation running the trace-list `script` (the name a
+    /// refusal gives it), which takes no `field`, that names `field` (`400`,
+    /// `illegal_argument_exception`): a field beside the script would give its answer the
+    /// field's date format, which the script alone renders without. `aggregation` carries the
+    /// request's name for it and `field` the field it named.
+    pub(crate) fn trace_script_with_field(aggregation: &str, script: &str, field: &str) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!("the {script} script of [{aggregation}] reads its own fields and takes no field, got [{field}]"),
+        )
+        .with_metadata("field", field)
+    }
+
+    /// The error rejecting a metric aggregation running the trace-list `script` (the name a
+    /// refusal gives it) that also names a `missing` (`400`, `illegal_argument_exception`): the
+    /// script itself decides what a span without a root answers, and a `missing` would replace
+    /// that answer. `aggregation` carries the request's name for it and `key` is `missing`.
+    pub(crate) fn trace_script_with_missing(aggregation: &str, script: &str) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!(
+                "[missing] of [{aggregation}] does not apply to the {script} script, which decides itself what a \
+                 span without a root answers"
+            ),
+        )
+        .with_metadata("key", "missing")
+    }
+
+    /// The error rejecting a search running the trace-list `script` (the name a refusal gives it)
+    /// of `aggregation` that also reads `index`, an index outside the profile of `span_index`,
+    /// whose spans carry no root fields (`400`, `illegal_argument_exception`). `aggregation`
+    /// carries the request's name for it and `index` the other index.
+    pub(crate) fn trace_script_on_foreign_index(
+        aggregation: &str,
+        script: &str,
+        index: &str,
+        span_index: &str,
+    ) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!(
+                "the {script} script of aggregation [{aggregation}] reads traceGroupFields of [{span_index}], and \
+                 the search also reads [{index}]"
+            ),
+        )
+        .with_metadata("index", index)
+    }
+
+    /// A filter, sort or aggregation on a cross-row field of `index` whose other filters select
+    /// more than `max` traces (`400`, `illegal_argument_exception`): the root of every selected
+    /// trace would be read, and IceGate never truncates the set. `index` and `limit` carry the
+    /// index and `max` for a client. It carries its own kind because the PPL mapping tells it
+    /// apart from `illegal_argument`: no PPL source reaches a cross-row field, so PPL answers it
+    /// as internal.
+    pub(crate) fn too_many_cross_row_traces(index: &str, max: usize) -> Self {
+        Self {
+            kind: OpenSearchErrorKind::TooManyCrossRowTraces,
+            ..Self::illegal_argument(format!(
+                "a filter, sort or aggregation on a cross-row field of [{index}] reads the root span of every \
+                 trace the rest of the request selects, and it selects more than \
+                 opensearch.max_cross_row_traces ({max}) traces; narrow the time range or the other filters"
+            ))
+        }
+        .with_metadata("index", index)
+        .with_metadata("limit", max)
+    }
+
+    /// A query text past a limit of its parser (`400`, `parsing_exception`), whose value `limit`
+    /// carries for a client.
+    pub(crate) fn query_limit_exceeded(reason: impl Into<String>, limit: impl Into<Value>) -> Self {
+        Self::parsing(reason).with_metadata("limit", limit)
+    }
+
+    /// A request key `key` that is missing or holds a value of the wrong form (`400`,
+    /// `illegal_argument_exception`): `key` carries it for a client, and `value` the value the
+    /// request gave, when it gave one.
+    pub(crate) fn invalid_request_key(key: &str, value: Option<&Value>, reason: impl Into<String>) -> Self {
+        let error = Self::illegal_argument(reason).with_metadata("key", key);
+        match value {
+            Some(value) => error.with_metadata("value", value.clone()),
+            None => error,
+        }
+    }
+
+    /// A response `format` the endpoint does not render (`400`, `illegal_argument_exception`),
+    /// which `format` carries for a client.
+    pub(crate) fn unsupported_response_format(format: &str) -> Self {
+        Self::illegal_argument(format!(
+            "response format [{format}] is not supported; use jdbc, viz, csv or raw"
+        ))
+        .with_metadata("format", format)
+    }
+
+    /// A query parameter the requested response `format` cannot honour (`400`,
+    /// `illegal_argument_exception`); `parameter` and `format` carry both for a client.
+    pub(crate) fn unsupported_parameter_with_format(parameter: &str, format: &str) -> Self {
+        Self::illegal_argument(format!("{parameter} is not supported with format={format}"))
+            .with_metadata("parameter", parameter)
+            .with_metadata("format", format)
+    }
+
+    /// An explain `format` other than `json` (`400`, `illegal_argument_exception`), which
+    /// `format` carries for a client.
+    pub(crate) fn unsupported_explain_format(format: &str) -> Self {
+        Self::illegal_argument(format!("explain format [{format}] is not supported; use json"))
+            .with_metadata("format", format)
+    }
+
+    /// The request body exceeds `opensearch.max_request_body_bytes` (`413`).
+    pub(crate) fn payload_too_large() -> Self {
+        Self::new(
+            OpenSearchErrorKind::PayloadTooLarge,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "illegal_argument_exception",
+            "request body exceeds opensearch.max_request_body_bytes",
+        )
+    }
+
+    /// Attach `key: value` to the error and, unless `root_cause` replaces it, to its root cause.
+    fn with_metadata(mut self, key: &str, value: impl Into<Value>) -> Self {
+        self.metadata.insert(key.to_string(), value.into());
+        self
+    }
+
+    /// The error object without `root_cause`: `type`, `reason` and every metadata entry, as a
+    /// `_bulk` or `_mget` item carries its failure and as the envelope's error renders it, and its
+    /// root cause too unless the error wraps a shard-level failure.
+    pub(crate) fn render_cause(&self) -> Map<String, Value> {
+        let mut cause = Map::new();
+        cause.insert("type".to_string(), Value::String(self.error_type.to_string()));
+        cause.insert("reason".to_string(), Value::String(self.reason.clone()));
+        for (key, value) in &*self.metadata {
+            cause.insert(key.clone(), value.clone());
+        }
+        cause
+    }
+
+    /// The HTTP status of this error, which a `_bulk` item answers as its `status`.
+    pub(crate) const fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// The envelope's `reason`, which a refusal that wraps this error quotes as its cause.
+    pub(crate) const fn reason(&self) -> &str {
+        self.reason.as_str()
+    }
+
+    /// What kind of error this is; see [`OpenSearchErrorKind`].
+    pub(crate) const fn kind(&self) -> &OpenSearchErrorKind {
+        &self.kind
+    }
+
+    /// `index` does not exist (`404`). `index` is the concrete name that is missing, or the whole
+    /// expression when it matched nothing and the endpoint disallows an empty match.
+    pub(crate) fn index_not_found(index: &str) -> Self {
+        Self::new(
+            OpenSearchErrorKind::IndexNotFound {
+                index: index.to_string(),
+            },
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{index}]"),
+        )
+        .with_metadata("index", index)
+        .with_metadata("index_uuid", "_na_")
+        .with_metadata("resource.id", index)
+        .with_metadata("resource.type", "index_or_alias")
+    }
+
+    /// A search-phase failure (`400`, phase `query`, grouped) of one shard whose cause is
+    /// `root_cause`. The cause renders as the failed shard's `reason` and as `root_cause[0]`; the
+    /// failed shard names `index` when one is given.
+    fn search_phase_failure(kind: OpenSearchErrorKind, index: Option<&str>, root_cause: &Self) -> Self {
+        let shard_cause = root_cause.render_cause();
+        let mut failed_shard = Map::new();
+        failed_shard.insert("shard".to_string(), json!(0));
+        if let Some(index) = index {
+            failed_shard.insert("index".to_string(), json!(index));
+        }
+        failed_shard.insert("reason".to_string(), Value::Object(shard_cause.clone()));
+        let mut error = Self::new(
+            kind,
+            StatusCode::BAD_REQUEST,
+            "search_phase_execution_exception",
+            "all shards failed",
+        )
+        .with_metadata("phase", "query")
+        .with_metadata("grouped", true)
+        .with_metadata("failed_shards", Value::Array(vec![Value::Object(failed_shard)]));
+        error.root_cause = Some(Box::new(shard_cause));
+        error
+    }
+
+    /// A query that failed on the shard of `index` (`400`): a sort on a field the mapping lacks
+    /// without `unmapped_type`, a sort on a field that cannot be sorted on, or a leaf on a field
+    /// of the wrong type. Rendered as a `search_phase_execution_exception` (phase `query`,
+    /// grouped, one failed shard) whose root cause is the `query_shard_exception`; the entry of
+    /// `failed_shards` carries `shard`, `index` and `reason`.
+    pub(crate) fn query_shard(index: &str, reason: &str) -> Self {
+        Self::search_phase_failure(
+            OpenSearchErrorKind::QueryShard,
+            Some(index),
+            &Self::build_query_shard_cause(index, reason),
+        )
+    }
+
+    /// The [`query_shard`](Self::query_shard) failure for a literal that the field `field` of
+    /// `index` cannot hold, `detail` saying why. `field` is the name the request used, never the
+    /// column behind it; the root cause and the failed shard's reason carry it beside `index` for
+    /// a client.
+    pub(crate) fn malformed_field_literal(field: &str, index: &str, detail: &str) -> Self {
+        let shard_cause = Self::build_query_shard_cause(index, &format!("failed to create query: [{field}] {detail}"))
+            .with_metadata("field", field);
+        Self::search_phase_failure(OpenSearchErrorKind::QueryShard, Some(index), &shard_cause)
+    }
+
+    /// The `query_shard_exception` a query-shard failure on `index` wraps as its root cause.
+    fn build_query_shard_cause(index: &str, reason: &str) -> Self {
+        Self::new(
+            OpenSearchErrorKind::QueryShard,
+            StatusCode::BAD_REQUEST,
+            "query_shard_exception",
+            reason,
+        )
+        .with_metadata("index", index)
+        .with_metadata("index_uuid", "_na_")
+    }
+
+    /// `from + size` exceeds `search.max_result_window` (`400`, a search-phase failure whose root
+    /// cause is an `illegal_argument_exception`). No index is named: the window is checked before
+    /// any index is read.
+    pub(crate) fn result_window_too_large(from: usize, size: usize, max: usize) -> Self {
+        let cause = Self::illegal_argument(format!(
+            "result window is too large: from + size must be less than or equal to [{max}] but was [{}]",
+            from.saturating_add(size)
+        ));
+        Self::search_phase_failure(OpenSearchErrorKind::ResultWindowTooLarge, None, &cause)
+    }
+
+    /// One search's aggregations would answer more than `max` buckets (`400`).
+    ///
+    /// `actual` is the count reached when the limit was crossed: counting stops there, so it is
+    /// at least `max + 1` and not the size a complete answer would have. The status is `400`
+    /// rather than `503` because retrying cannot shrink the answer.
+    pub(crate) fn too_many_buckets(max: usize, actual: usize) -> Self {
+        Self::search_phase_failure(
+            OpenSearchErrorKind::TooManyBuckets,
+            None,
+            &Self::new(
+                OpenSearchErrorKind::TooManyBuckets,
+                StatusCode::BAD_REQUEST,
+                "too_many_buckets_exception",
+                format!(
+                    "Trying to create too many buckets. Must be less than or equal to: [{max}] but this \
+                     search reached [{actual}]. Narrow the time range or the interval, or raise \
+                     opensearch.search.max_buckets."
+                ),
+            )
+            .with_metadata("max_buckets", max),
+        )
+    }
+
+    /// An aggregation the searched indices cannot answer together, such as one over a field
+    /// typed differently across them (`400`). Buckets of keys of different types would otherwise
+    /// share one list.
+    pub(crate) fn aggregation_execution(reason: &str) -> Self {
+        Self::new(
+            OpenSearchErrorKind::AggregationExecution,
+            StatusCode::BAD_REQUEST,
+            "aggregation_execution_exception",
+            reason,
+        )
+    }
+
+    /// 404 `status_exception`: a plugin resource IceGate does not hold, such as an ML config.
+    pub(crate) fn status_not_found(reason: impl Into<String>) -> Self {
+        Self::new(
+            OpenSearchErrorKind::StatusNotFound,
+            StatusCode::NOT_FOUND,
+            "status_exception",
+            reason,
+        )
+    }
+
+    /// 404 `status_exception` for the ML config `id`, which IceGate never holds; `id` carries it
+    /// for a client.
+    pub(crate) fn ml_config_not_found(id: &str) -> Self {
+        Self::status_not_found(format!("no ML config [{id}]")).with_metadata("id", id)
+    }
+
+    /// An aggregation over `field`, which the searched indices give more than one type, mapped or
+    /// stored (`400`, `aggregation_execution_exception`). `field` and `indices_by_type` (each type
+    /// name mapped to the array of indices giving the field that type) are carried for a client.
+    pub(crate) fn aggregation_field_conflict(field: &str, reason: &str, indices_by_type: Map<String, Value>) -> Self {
+        Self::aggregation_execution(reason)
+            .with_metadata("field", field)
+            .with_metadata("indices_by_type", Value::Object(indices_by_type))
+    }
+
+    /// `_count` addressed to the data indices `index_names`, a comma-joined list (`400`), which
+    /// `index` carries for a client. Data indices are counted through `_search` with `size` 0.
+    pub(crate) fn count_on_data_indices(index_names: &str) -> Self {
+        Self::illegal_argument(format!(
+            "_count is not served on data indices [{index_names}]; send _search with size 0"
+        ))
+        .with_metadata("index", index_names)
+    }
+
+    /// A `_search` addressed to `index`, whose rows have no document id because its table has no
+    /// timestamp column (`400`), which `index` carries for a client.
+    pub(crate) fn missing_document_identity(index: &str) -> Self {
+        Self::illegal_argument(format!(
+            "index [{index}] has no [{COL_TIMESTAMP}] column, so its rows have no document id; \
+             query it through PPL instead of _search"
+        ))
+        .with_metadata("index", index)
+    }
+
+    /// The sort field `field` has different sort types in `first_index` and `other_index` (`400`),
+    /// which `field` and `indices` carry for a client.
+    pub(crate) fn sort_field_conflict(field: &str, first_index: &str, other_index: &str) -> Self {
+        Self::illegal_argument(format!(
+            "the sort field [{field}] has different types in the indices [{first_index}] and [{other_index}]"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("indices", json!([first_index, other_index]))
+    }
+
+    /// The `fields` or `docvalue_fields` name `field` has a different type in the searched indices
+    /// (`400`), so no one rendering projects it; `indices_by_type` maps each type name to the
+    /// indices that give `field` that type. `field` and `indices` (that map, as an object of index
+    /// name arrays) are carried for a client.
+    pub(crate) fn field_projection_conflict(field: &str, indices_by_type: &BTreeMap<&'static str, Vec<&str>>) -> Self {
+        let listing: Vec<String> = indices_by_type
+            .iter()
+            .map(|(field_type, indices)| format!("[{field_type}] in [{}]", indices.join(",")))
+            .collect();
+        let indices: Map<String, Value> = indices_by_type
+            .iter()
+            .map(|(field_type, indices)| ((*field_type).to_string(), json!(indices)))
+            .collect();
+        Self::illegal_argument(format!(
+            "field [{field}] has conflicting types: {}; it cannot be projected through fields or docvalue_fields",
+            listing.join(", ")
+        ))
+        .with_metadata("field", field)
+        .with_metadata("indices", Value::Object(indices))
+    }
+
+    /// The request key `key` names a feature the system indices do not serve (`400`), which `key`
+    /// carries for a client. It is refused rather than ignored, because ignoring it would answer a
+    /// different request.
+    pub(crate) fn unsupported_on_system_indices(key: &str) -> Self {
+        Self::illegal_argument(format!("[{key}] is not supported on system indices")).with_metadata("key", key)
+    }
+
+    /// An `_msearch` header names the key `key`, which no search option answers to (`400`), and
+    /// `key` carries it for a client. It is refused rather than ignored, because ignoring it would
+    /// run a different search than the one the header asks for.
+    pub(crate) fn unsupported_header_key(key: &str) -> Self {
+        Self::illegal_argument(format!("key [{key}] is not supported in the metadata section"))
+            .with_metadata("key", key)
+    }
+
+    /// The index expression `expression` selects the system indices `system_indices` beside data
+    /// indices (`400`), and one request reads one or the other: `index` carries the expression
+    /// and `system_indices` the system side, so a client knows which side to drop.
+    pub(crate) fn mixed_index_target(expression: &str, system_indices: &[String]) -> Self {
+        Self::illegal_argument(format!(
+            "[{expression}] mixes the system indices [{}] with data indices; one request reads one or the other",
+            system_indices.join(",")
+        ))
+        .with_metadata("index", expression)
+        .with_metadata("system_indices", json!(system_indices))
+    }
+
+    /// An index-level metadata request names the data index `index` (`400`), which `index`
+    /// carries for a client: only system indices have index-level metadata.
+    pub(crate) fn data_index_without_metadata(index: &str) -> Self {
+        Self::illegal_argument(format!(
+            "[{index}] is a data index: index-level metadata endpoints serve system indices only"
+        ))
+        .with_metadata("index", index)
+    }
+
+    /// The system-index field `field` is mapped with the type `field_type`, which no query reads
+    /// (`400`); `field` and `field_type` carry them for a client.
+    pub(crate) fn unqueryable_system_field(field: &str, field_type: &str) -> Self {
+        Self::illegal_argument(format!(
+            "the field [{field}] of type [{field_type}] cannot be queried on a system index"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("field_type", field_type)
+    }
+
+    /// The query leaf `leaf` holds the key `key`, which it does not read (`400`,
+    /// `parsing_exception`), and `key` carries it for a client. It is refused rather than
+    /// ignored, because ignoring it would run a different query.
+    pub(crate) fn unknown_query_key(leaf: &str, key: &str) -> Self {
+        Self::parsing(format!("[{leaf}] query does not support [{key}]")).with_metadata("key", key)
+    }
+
+    /// A query object holds the keys `keys` where it takes exactly one of them (`400`,
+    /// `parsing_exception`), and `keys` carries them, in request order, for a client.
+    pub(crate) fn conflicting_query_keys(reason: impl Into<String>, keys: &[&str]) -> Self {
+        Self::parsing(reason).with_metadata("keys", json!(keys))
+    }
+
+    /// The document `id` of `index` holds a value of the sort field `field` that does not read as
+    /// the field's type (`400`), which `field`, `index` and `id` carry for a client.
+    pub(crate) fn unreadable_sort_value(field: &str, index: &str, id: &str) -> Self {
+        Self::illegal_argument(format!(
+            "the sort field [{field}] of document [{id}] in index [{index}] holds a value that does not read as its type"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("index", index)
+        .with_metadata("id", id)
+    }
+
+    /// One `sort` reads the source `field` of `index` more than once (`400`), which `field` and
+    /// `index` carry for a client.
+    pub(crate) fn repeated_sort_field(field: &str, index: &str) -> Self {
+        Self::illegal_argument(format!(
+            "the sort reads the field [{field}] of index [{index}] more than once"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("index", index)
+    }
+
+    /// A query leaf on the field `field`, or on a path below it, that renders in `_source` only
+    /// and has no filter inverse (`400`); `field` is the name the request used, carried for a
+    /// client.
+    pub(crate) fn render_only_field(field: &str) -> Self {
+        Self::illegal_argument(format!("field [{field}] renders in _source only and cannot be queried"))
+            .with_metadata("field", field)
+    }
+
+    /// The index expression `expression` reaches the table `table` through the indices of several
+    /// `profiles` without naming each of them (`400`), so a wildcard would return one row more
+    /// than once. `index` (the expression), `table` and `profiles` (in the indices' name order)
+    /// are carried for a client.
+    pub(crate) fn table_reached_through_profiles(expression: &str, table: &str, profiles: &[&str]) -> Self {
+        Self::illegal_argument(format!(
+            "index expression [{expression}] reaches table [{table}] through the profiles [{}]; name each of its \
+             indices explicitly to read it more than once",
+            profiles.join(", ")
+        ))
+        .with_metadata("index", expression)
+        .with_metadata("table", table)
+        .with_metadata("profiles", json!(profiles))
+    }
+
+    /// A stored attribute key holding the character an escaping profile writes for `.` (`400`),
+    /// whose spelling would read back as a different key; `key` carries the stored key for a
+    /// client.
+    pub(crate) fn unescapable_attribute_key(key: &str) -> Self {
+        Self::illegal_argument(format!(
+            "stored attribute key [{key}] contains '@', which this index writes for '.'; read it through its native \
+             index"
+        ))
+        .with_metadata("key", key)
+    }
+
+    /// A `fields` or `docvalue_fields` pattern `field` on the index `index` of a non-native
+    /// profile, whose fields are named one by one (`400`); `field` and `index` are carried for a
+    /// client.
+    pub(crate) fn field_pattern_on_profile_index(field: &str, index: &str) -> Self {
+        Self::illegal_argument(format!(
+            "field pattern [{field}] is not supported on index [{index}]; name each field"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("index", index)
+    }
+
+    /// A `fields` or `docvalue_fields` entry naming `field`, a cross-row field of `index` that
+    /// renders in `_source` only (`400`); `field` and `index` are carried for a client.
+    pub(crate) fn cross_row_field_in_field_request(field: &str, index: &str) -> Self {
+        Self::illegal_argument(format!(
+            "field [{field}] is read from the root span of each trace and is not available in fields or \
+             docvalue_fields; read it from _source"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("index", index)
+    }
+
+    /// The `operation` (a sort or an aggregation) reads the field `field` of `index`, an encoded
+    /// id whose missing value renders `""`: a sort or a bucket over its stored bytes would place
+    /// that value apart from where `""` sorts and buckets (`400`). `field`, `index` and
+    /// `operation` are carried for a client.
+    pub(crate) fn unordered_missing_id(field: &str, index: &str, operation: &str) -> Self {
+        Self::illegal_argument(format!(
+            "[{operation}] on field [{field}] of index [{index}] is not supported: a missing id renders \"\", which the \
+             stored ids do not order or bucket"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("index", index)
+        .with_metadata("operation", operation)
+    }
+
+    /// The scroll `scroll_id` expired, or the snapshot object it reads is gone (`404`).
+    pub(crate) fn search_context_missing(scroll_id: &str) -> Self {
+        Self::new(
+            OpenSearchErrorKind::SearchContextMissing,
+            StatusCode::NOT_FOUND,
+            "search_context_missing_exception",
+            format!("No search context found for id [{scroll_id}]"),
+        )
+    }
+
+    /// The system index `index` already exists (`400`).
+    pub(crate) fn resource_already_exists(index: &str) -> Self {
+        Self::new(
+            OpenSearchErrorKind::ResourceAlreadyExists,
+            StatusCode::BAD_REQUEST,
+            "resource_already_exists_exception",
+            format!("index [{index}/_na_] already exists"),
+        )
+        .with_metadata("index", index)
+        .with_metadata("index_uuid", "_na_")
+    }
+
+    /// A write conditioned on a document state that does not hold (`409`): a stale
+    /// `if_seq_no` / `if_primary_term`, a condition on a missing document, or a create of an
+    /// existing id. An update of a missing document without `upsert` is
+    /// [`document_missing`](Self::document_missing) instead, with or without a condition.
+    pub(crate) fn version_conflict(index: &str, id: &str) -> Self {
+        Self::new(
+            OpenSearchErrorKind::VersionConflict,
+            StatusCode::CONFLICT,
+            "version_conflict_engine_exception",
+            format!("[{id}]: version conflict"),
+        )
+        .with_metadata("index", index)
+        .with_metadata("shard", "0")
+        .with_metadata("index_uuid", "_na_")
+    }
+
+    /// An update of a missing document that carries no `upsert` (`404`), before any condition it
+    /// carries is checked.
+    pub(crate) fn document_missing(index: &str, id: &str) -> Self {
+        Self::new(
+            OpenSearchErrorKind::DocumentMissing,
+            StatusCode::NOT_FOUND,
+            "document_missing_exception",
+            format!("[{id}]: document missing"),
+        )
+        .with_metadata("index", index)
+        .with_metadata("shard", "0")
+        .with_metadata("index_uuid", "_na_")
+    }
+
+    /// A write addressed to `index`, which accepts none: a data index, or a name that would create
+    /// an index outside the system indices (`403`).
+    pub(crate) fn cluster_block(index: &str) -> Self {
+        Self::new(
+            OpenSearchErrorKind::ClusterBlock,
+            StatusCode::FORBIDDEN,
+            "cluster_block_exception",
+            format!("index [{index}] blocked by: [FORBIDDEN/8/index write (api)];"),
+        )
+    }
+
+    /// A system-index write could not be confirmed: its compare-and-swap kept being refused or
+    /// losing its answer, or its snapshot object could not be stored, until the query deadline, or
+    /// a lineage it needed was missing (`503`, retryable). Its outcome is unknown: it may have
+    /// landed.
+    pub(crate) fn write_contention() -> Self {
+        Self::new(
+            OpenSearchErrorKind::WriteContention,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "write_contention_exception",
+            "the system-index write could not be confirmed; its outcome is unknown, retry later",
+        )
+    }
+
+    /// A system-index write would grow the tenant's decoded snapshot past `max_snapshot_bytes`
+    /// (`413`); nothing was written.
+    pub(crate) fn snapshot_too_large(max_snapshot_bytes: usize) -> Self {
+        Self::new(
+            OpenSearchErrorKind::SnapshotTooLarge,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "illegal_argument_exception",
+            format!(
+                "the write would grow the tenant's system indices past \
+                 opensearch.system_indices.max_snapshot_bytes ({max_snapshot_bytes} bytes)"
+            ),
+        )
+    }
+
+    /// An answer would pass `max_answer_bytes` (`400`), which a request avoids by asking for less;
+    /// `limit` carries the bound in bytes. An `_mget` or a `_search` is refused whole; on a `_bulk`
+    /// only the update item fails, and on an `_msearch` only the item.
+    pub(crate) fn answer_too_large(max_answer_bytes: usize) -> Self {
+        Self::illegal_argument(format!(
+            "the answer would pass opensearch.system_indices.max_answer_bytes ({max_answer_bytes} bytes)"
+        ))
+        .with_metadata("limit", max_answer_bytes)
+    }
+
+    /// An `_msearch` item answer would pass what is left of `max_answer_bytes` once the earlier
+    /// answered items took `used_bytes` of it (`400`); only that item fails. It is
+    /// [`answer_too_large`](Self::answer_too_large) plus `used_bytes`, and it is answered only for
+    /// an item that fits `max_answer_bytes` on its own: an item past the bound by its own size gets
+    /// `answer_too_large`, whatever the earlier items took.
+    pub(crate) fn msearch_answer_too_large(max_answer_bytes: usize, used_bytes: usize) -> Self {
+        Self::illegal_argument(format!(
+            "the answer would pass opensearch.system_indices.max_answer_bytes ({max_answer_bytes} bytes), \
+             of which the earlier answered _msearch items took {used_bytes} bytes"
+        ))
+        .with_metadata("limit", max_answer_bytes)
+        .with_metadata("used_bytes", used_bytes)
+    }
+
+    /// No route serves `method` on `path`: a `400` `illegal_argument_exception` in the envelope,
+    /// never a `404` or `405`.
+    pub(crate) fn no_handler(method: &Method, path: &str) -> Self {
+        Self {
+            kind: OpenSearchErrorKind::NoHandler,
+            ..Self::illegal_argument(format!("no handler found for uri [{path}] and method [{method}]"))
+        }
+    }
+}
+
+impl IntoResponse for OpenSearchError {
+    fn into_response(self) -> Response {
+        let is_retryable = self.status == StatusCode::SERVICE_UNAVAILABLE;
+        if self.status.is_server_error() && !is_retryable {
+            tracing::error!(error_type = self.error_type, reason = %self.reason, "opensearch request failed");
+        }
+        let cause = self.render_cause();
+        // `self` is not read as a whole again, so the override moves out of it; without one the
+        // root cause repeats the error's keys: built once, cloned into the cause list.
+        let root_cause = self.root_cause.map_or_else(|| cause.clone(), |root_cause| *root_cause);
+        let mut error = Map::new();
+        error.insert("root_cause".to_string(), Value::Array(vec![Value::Object(root_cause)]));
+        error.extend(cause);
+        if is_retryable {
+            // `reason` is not read again, so it moves into `details`; `status` is `Copy`.
+            error.insert("details".to_string(), Value::String(self.reason));
+        }
+        let body = json!({"error": Value::Object(error), "status": self.status.as_u16()});
+        let mut response = (self.status, body.to_string()).into_response();
+        let headers = response.headers_mut();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE_JSON));
+        if is_retryable {
+            headers.insert(header::RETRY_AFTER, HeaderValue::from(SHED_RETRY_AFTER_SECS));
+        }
+        response
+    }
+}
+
+impl From<QueryError> for OpenSearchError {
+    /// A mistake in the request (`Parse`, `Validation`, `NotImplemented`, `Plan`) is a `400`;
+    /// every other failure is a `500`.
+    fn from(error: QueryError) -> Self {
+        let reason = error.to_string();
+        match error {
+            QueryError::Parse(_) | QueryError::Validation(_) | QueryError::NotImplemented(_) | QueryError::Plan(_) => {
+                Self::illegal_argument(reason)
+            }
+            QueryError::DataFusion(_) | QueryError::Config(_) | QueryError::Iceberg(_) | QueryError::Internal(_) => {
+                Self::internal(reason)
+            }
+        }
+    }
+}
+
+/// Render `error` and read back its status and JSON body, for assertions on the envelope.
+#[cfg(test)]
+pub(crate) async fn render_envelope(error: OpenSearchError) -> (StatusCode, Value) {
+    read_envelope(error.into_response()).await
+}
+
+/// Read the status and the JSON body of `response`, for assertions on an answer in the envelope.
+#[cfg(test)]
+pub(crate) async fn read_envelope(response: Response) -> (StatusCode, Value) {
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("envelope body");
+    (status, serde_json::from_slice(&body).expect("the envelope is JSON"))
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::error::DataFusionError;
+    use serde_json::json;
+
+    use super::*;
+    use crate::error::parse_error;
+
+    #[tokio::test]
+    async fn an_illegal_argument_renders_type_and_reason_in_error_and_root_cause() {
+        let response = OpenSearchError::illegal_argument("bad thing").into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json; charset=UTF-8")
+        );
+
+        let (status, body) = render_envelope(OpenSearchError::illegal_argument("bad thing")).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            json!({
+                "error": {
+                    "root_cause": [{"type": "illegal_argument_exception", "reason": "bad thing"}],
+                    "type": "illegal_argument_exception",
+                    "reason": "bad thing"
+                },
+                "status": 400
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn shed_and_deadline_answer_503_with_details_and_retry_after() {
+        for error in [OpenSearchError::memory_pressure(), OpenSearchError::deadline_exceeded()] {
+            let response = error.clone().into_response();
+            let retry_after = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u32>().ok());
+            assert!(retry_after.is_some_and(|seconds| seconds > 0), "{error:?}");
+
+            let (status, body) = render_envelope(error).await;
+
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["status"], 503);
+            assert!(body["error"]["reason"].is_string());
+            assert_eq!(body["error"]["details"], body["error"]["reason"]);
+            assert_eq!(body["error"]["root_cause"][0]["type"], body["error"]["type"]);
+            assert!(body["error"]["root_cause"][0].get("details").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_two_503_causes_are_told_apart_by_type() {
+        let (_, shed) = render_envelope(OpenSearchError::memory_pressure()).await;
+        let (_, deadline) = render_envelope(OpenSearchError::deadline_exceeded()).await;
+
+        assert_eq!(shed["error"]["type"], "memory_pressure_exception");
+        assert_eq!(deadline["error"]["type"], "query_deadline_exceeded_exception");
+    }
+
+    /// Every variant of [`QueryError`] is driven, because the mapping is a `match` over all of
+    /// them and a variant moved to the other arm is invisible from the rest.
+    #[tokio::test]
+    async fn query_errors_map_to_client_and_server_statuses() {
+        let cases = [
+            (
+                parse_error("bad"),
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+            ),
+            (
+                QueryError::Validation("bad".to_string()),
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+            ),
+            (
+                QueryError::NotImplemented("x".to_string()),
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+            ),
+            (
+                QueryError::Plan("x".to_string()),
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+            ),
+            (
+                QueryError::Internal("x".to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exception",
+            ),
+            (
+                QueryError::Config("x".to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exception",
+            ),
+            (
+                QueryError::DataFusion(DataFusionError::Internal("x".to_string())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exception",
+            ),
+            (
+                QueryError::Iceberg(iceberg::Error::new(iceberg::ErrorKind::Unexpected, "x")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "exception",
+            ),
+        ];
+        for (query_error, expected_status, expected_type) in cases {
+            let label = format!("{query_error:?}");
+
+            let (status, body) = render_envelope(OpenSearchError::from(query_error)).await;
+
+            assert_eq!(status, expected_status, "{label}");
+            assert_eq!(body["error"]["type"], expected_type, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_route_is_a_well_formed_400_not_a_bare_string() {
+        let (status, body) = render_envelope(OpenSearchError::no_handler(&Method::DELETE, "/_nodes")).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        assert_eq!(body["error"]["root_cause"][0]["type"], "illegal_argument_exception");
+        assert!(body["error"]["reason"].is_string());
+    }
+
+    #[tokio::test]
+    async fn index_not_found_carries_the_index_metadata_in_error_and_root_cause() {
+        let (status, body) = render_envelope(OpenSearchError::index_not_found("nope")).await;
+
+        let cause = json!({
+            "type": "index_not_found_exception",
+            "reason": "no such index [nope]",
+            "index": "nope",
+            "index_uuid": "_na_",
+            "resource.id": "nope",
+            "resource.type": "index_or_alias"
+        });
+        let mut error = cause.clone();
+        error["root_cause"] = json!([cause]);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, json!({ "error": error, "status": 404 }));
+    }
+
+    #[tokio::test]
+    async fn system_store_errors_render_their_status_type_and_metadata() {
+        let (status, body) = render_envelope(OpenSearchError::resource_already_exists(".kibana_1")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "resource_already_exists_exception");
+        assert_eq!(
+            body["error"]["root_cause"][0]["type"],
+            "resource_already_exists_exception"
+        );
+        assert_eq!(body["error"]["index"], ".kibana_1");
+        assert_eq!(body["error"]["root_cause"][0]["index_uuid"], "_na_");
+
+        let (status, body) = render_envelope(OpenSearchError::cluster_block("logs")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "cluster_block_exception");
+        assert_eq!(
+            body["error"]["reason"],
+            "index [logs] blocked by: [FORBIDDEN/8/index write (api)];"
+        );
+        assert_eq!(body["status"], 403);
+
+        let (status, body) = render_envelope(OpenSearchError::write_contention()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"]["type"], "write_contention_exception");
+        assert!(body["error"]["details"].is_string());
+
+        let (status, body) = render_envelope(OpenSearchError::snapshot_too_large(1024)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["status"], 413);
+
+        let (status, body) = render_envelope(OpenSearchError::answer_too_large(1024)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        let reason = body["error"]["reason"].as_str().expect("the reason is a string");
+        assert!(
+            reason.contains("opensearch.system_indices.max_answer_bytes"),
+            "{reason}"
+        );
+        assert!(reason.contains("1024"), "{reason}");
+        assert_eq!(body["error"]["limit"], 1024);
+        assert!(body["error"].get("used_bytes").is_none(), "{body}");
+
+        let (status, body) = render_envelope(OpenSearchError::msearch_answer_too_large(1024, 700)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        let reason = body["error"]["reason"].as_str().expect("the reason is a string");
+        assert!(
+            reason.contains("opensearch.system_indices.max_answer_bytes"),
+            "{reason}"
+        );
+        assert_eq!(body["error"]["limit"], 1024);
+        assert_eq!(body["error"]["used_bytes"], 700);
+        assert_eq!(body["error"]["root_cause"][0]["used_bytes"], 700);
+    }
+
+    #[tokio::test]
+    async fn version_conflict_and_document_missing_carry_their_index_metadata() {
+        let (conflict_status, conflict) =
+            render_envelope(OpenSearchError::version_conflict(".kibana_1", "config:3.9.0")).await;
+        let (missing_status, missing) =
+            render_envelope(OpenSearchError::document_missing(".kibana_1", "config:3.9.0")).await;
+
+        assert_eq!(conflict_status, StatusCode::CONFLICT);
+        assert_eq!(conflict["status"], 409);
+        assert_eq!(conflict["error"]["type"], "version_conflict_engine_exception");
+        assert_eq!(conflict["error"]["index"], ".kibana_1");
+        assert_eq!(conflict["error"]["shard"], "0");
+        assert_eq!(conflict["error"]["index_uuid"], "_na_");
+        assert_eq!(
+            conflict["error"]["root_cause"][0]["type"],
+            "version_conflict_engine_exception"
+        );
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["status"], 404);
+        assert_eq!(missing["error"]["type"], "document_missing_exception");
+        assert_eq!(missing["error"]["index"], ".kibana_1");
+    }
+
+    #[tokio::test]
+    async fn a_result_window_above_the_limit_is_a_search_phase_failure_with_an_illegal_argument_root_cause() {
+        let (status, body) = render_envelope(OpenSearchError::result_window_too_large(9_000, 1_001, 10_000)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        assert_eq!(body["error"]["type"], "search_phase_execution_exception");
+        assert_eq!(body["error"]["phase"], "query");
+        assert_eq!(body["error"]["grouped"], true);
+        assert_eq!(body["error"]["root_cause"][0]["type"], "illegal_argument_exception");
+        // No index is named: the window is checked before any index is read.
+        assert_eq!(
+            body["error"]["failed_shards"],
+            json!([{"shard": 0, "reason": body["error"]["root_cause"][0].clone()}])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_query_shard_error_wraps_its_cause_as_the_root_cause() {
+        let shard_cause = json!({
+            "type": "query_shard_exception",
+            "reason": "No mapping found for [title] in order to sort on",
+            "index": ".kibana_1",
+            "index_uuid": "_na_"
+        });
+
+        let (status, body) = render_envelope(OpenSearchError::query_shard(
+            ".kibana_1",
+            "No mapping found for [title] in order to sort on",
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            json!({
+                "error": {
+                    "type": "search_phase_execution_exception",
+                    "reason": "all shards failed",
+                    "phase": "query",
+                    "grouped": true,
+                    "failed_shards": [{"shard": 0, "index": ".kibana_1", "reason": shard_cause.clone()}],
+                    "root_cause": [shard_cause]
+                },
+                "status": 400
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_field_literal_carries_the_requested_field_on_its_query_shard_cause() {
+        let error = OpenSearchError::malformed_field_literal(
+            "status.code",
+            "otel-v1-apm-span-000001",
+            "cannot hold the value [x]",
+        );
+        assert_eq!(error.kind(), &OpenSearchErrorKind::QueryShard);
+
+        let (status, body) = render_envelope(error).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "search_phase_execution_exception");
+        let cause = &body["error"]["root_cause"][0];
+        assert_eq!(cause["type"], "query_shard_exception");
+        assert_eq!(cause["field"], "status.code");
+        assert_eq!(cause["index"], "otel-v1-apm-span-000001");
+        assert_eq!(
+            body["error"]["failed_shards"],
+            json!([{"shard": 0, "index": "otel-v1-apm-span-000001", "reason": cause.clone()}])
+        );
+    }
+
+    #[tokio::test]
+    async fn too_many_buckets_is_a_search_phase_400_with_the_bucket_cause_in_root_cause() {
+        let (status, body) = render_envelope(OpenSearchError::too_many_buckets(3, 4)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        assert_eq!(body["error"]["type"], "search_phase_execution_exception");
+        assert_eq!(body["error"]["phase"], "query");
+        assert_eq!(body["error"]["grouped"], true);
+        let cause = &body["error"]["root_cause"][0];
+        assert_eq!(cause["type"], "too_many_buckets_exception");
+        assert_eq!(cause["max_buckets"], 3);
+        assert_eq!(
+            cause["reason"],
+            "Trying to create too many buckets. Must be less than or equal to: [3] but this search \
+             reached [4]. Narrow the time range or the interval, or raise \
+             opensearch.search.max_buckets."
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregation_execution_renders_its_reason_in_error_and_root_cause() {
+        let (status, body) = render_envelope(OpenSearchError::aggregation_execution(
+            "[severity_text] cannot be aggregated: it is [keyword] in [logs] and [long] in [audit_events]",
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "aggregation_execution_exception");
+        assert_eq!(
+            body["error"]["root_cause"][0]["type"],
+            "aggregation_execution_exception"
+        );
+        assert_eq!(
+            body["error"]["reason"],
+            "[severity_text] cannot be aggregated: it is [keyword] in [logs] and [long] in [audit_events]"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregation_field_conflict_carries_the_field_and_the_indices_of_each_type_in_error_and_root_cause() {
+        let mut indices_by_type = Map::new();
+        indices_by_type.insert("keyword".to_string(), json!(["logs"]));
+        indices_by_type.insert("long".to_string(), json!(["audit_events", "audit_trail"]));
+
+        let (status, body) = render_envelope(OpenSearchError::aggregation_field_conflict(
+            "severity_text",
+            "[severity_text] cannot be aggregated",
+            indices_by_type,
+        ))
+        .await;
+
+        let expected_indices = json!({"keyword": ["logs"], "long": ["audit_events", "audit_trail"]});
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        for cause in [&body["error"], &body["error"]["root_cause"][0]] {
+            assert_eq!(cause["type"], "aggregation_execution_exception");
+            assert_eq!(cause["reason"], "[severity_text] cannot be aggregated");
+            assert_eq!(cause["field"], "severity_text");
+            assert_eq!(cause["indices_by_type"], expected_indices);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_table_reached_through_profiles_carries_the_expression_table_and_profiles_in_error_and_root_cause() {
+        let (status, body) = render_envelope(OpenSearchError::table_reached_through_profiles(
+            "sp*,otel*",
+            "spans",
+            &["data_prepper", "native"],
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        for cause in [&body["error"], &body["error"]["root_cause"][0]] {
+            assert_eq!(cause["type"], "illegal_argument_exception");
+            assert_eq!(cause["index"], "sp*,otel*");
+            assert_eq!(cause["table"], "spans");
+            assert_eq!(cause["profiles"], json!(["data_prepper", "native"]));
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_refusals_carry_their_key_field_index_and_operation_in_error_and_root_cause() {
+        let cases = [
+            (
+                OpenSearchError::unescapable_attribute_key("user@domain"),
+                json!({"key": "user@domain"}),
+            ),
+            (
+                OpenSearchError::field_pattern_on_profile_index("status.*", "otel-v1-apm-span-000001"),
+                json!({"field": "status.*", "index": "otel-v1-apm-span-000001"}),
+            ),
+            (
+                OpenSearchError::cross_row_field_in_field_request("traceGroup", "otel-v1-apm-span-000001"),
+                json!({"field": "traceGroup", "index": "otel-v1-apm-span-000001"}),
+            ),
+            (
+                OpenSearchError::unordered_missing_id("parentSpanId", "otel-v1-apm-span-000001", "sort"),
+                json!({"field": "parentSpanId", "index": "otel-v1-apm-span-000001", "operation": "sort"}),
+            ),
+        ];
+        for (error, expected_metadata) in cases {
+            let (status, body) = render_envelope(error).await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{expected_metadata}");
+            for cause in [&body["error"], &body["error"]["root_cause"][0]] {
+                assert_eq!(cause["type"], "illegal_argument_exception", "{expected_metadata}");
+                for (key, value) in expected_metadata.as_object().expect("an object") {
+                    assert_eq!(&cause[key], value, "{key}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_memory_limit_error_is_an_illegal_argument_naming_the_limit() {
+        let (status, body) = render_envelope(OpenSearchError::memory_limit_exceeded(1_048_576)).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], 400);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        assert_eq!(body["error"]["root_cause"][0]["type"], "illegal_argument_exception");
+        assert_eq!(body["error"]["limit"], 1_048_576);
+        assert_eq!(body["error"]["root_cause"][0]["limit"], 1_048_576);
+    }
+
+    /// The position of `kind` in the declaration order. The match has no catch-all, so a kind
+    /// added later stops this test from compiling until it is listed in the cases below.
+    const fn find_kind_position(kind: &OpenSearchErrorKind) -> usize {
+        match kind {
+            OpenSearchErrorKind::IllegalArgument => 0,
+            OpenSearchErrorKind::Parsing => 1,
+            OpenSearchErrorKind::MemoryPressure => 2,
+            OpenSearchErrorKind::DeadlineExceeded => 3,
+            OpenSearchErrorKind::Internal => 4,
+            OpenSearchErrorKind::NoHandler => 5,
+            OpenSearchErrorKind::IndexNotFound { .. } => 6,
+            OpenSearchErrorKind::PayloadTooLarge => 7,
+            OpenSearchErrorKind::ResourceAlreadyExists => 8,
+            OpenSearchErrorKind::ClusterBlock => 9,
+            OpenSearchErrorKind::WriteContention => 10,
+            OpenSearchErrorKind::SnapshotTooLarge => 11,
+            OpenSearchErrorKind::VersionConflict => 12,
+            OpenSearchErrorKind::DocumentMissing => 13,
+            OpenSearchErrorKind::QueryShard => 14,
+            OpenSearchErrorKind::SearchContextMissing => 15,
+            OpenSearchErrorKind::ResultWindowTooLarge => 16,
+            OpenSearchErrorKind::TooManyBuckets => 17,
+            OpenSearchErrorKind::AggregationExecution => 18,
+            OpenSearchErrorKind::MemoryLimitExceeded { .. } => 19,
+            OpenSearchErrorKind::StatusNotFound => 20,
+            OpenSearchErrorKind::TooManyCrossRowTraces => 21,
+        }
+    }
+
+    #[test]
+    fn every_constructor_records_its_kind() {
+        let unit_cases = [
+            (
+                OpenSearchError::illegal_argument("x"),
+                OpenSearchErrorKind::IllegalArgument,
+            ),
+            (OpenSearchError::parsing("x"), OpenSearchErrorKind::Parsing),
+            (OpenSearchError::memory_pressure(), OpenSearchErrorKind::MemoryPressure),
+            (
+                OpenSearchError::deadline_exceeded(),
+                OpenSearchErrorKind::DeadlineExceeded,
+            ),
+            (OpenSearchError::internal("x"), OpenSearchErrorKind::Internal),
+            (
+                OpenSearchError::no_handler(&Method::GET, "/nope"),
+                OpenSearchErrorKind::NoHandler,
+            ),
+            (
+                OpenSearchError::payload_too_large(),
+                OpenSearchErrorKind::PayloadTooLarge,
+            ),
+            (
+                OpenSearchError::resource_already_exists(".kibana_1"),
+                OpenSearchErrorKind::ResourceAlreadyExists,
+            ),
+            (
+                OpenSearchError::cluster_block("logs"),
+                OpenSearchErrorKind::ClusterBlock,
+            ),
+            (
+                OpenSearchError::write_contention(),
+                OpenSearchErrorKind::WriteContention,
+            ),
+            (
+                OpenSearchError::snapshot_too_large(1024),
+                OpenSearchErrorKind::SnapshotTooLarge,
+            ),
+            (
+                OpenSearchError::version_conflict(".kibana_1", "doc-1"),
+                OpenSearchErrorKind::VersionConflict,
+            ),
+            (
+                OpenSearchError::document_missing(".kibana_1", "doc-1"),
+                OpenSearchErrorKind::DocumentMissing,
+            ),
+            (
+                OpenSearchError::query_shard("logs", "x"),
+                OpenSearchErrorKind::QueryShard,
+            ),
+            (
+                OpenSearchError::search_context_missing("scroll-1"),
+                OpenSearchErrorKind::SearchContextMissing,
+            ),
+            (
+                OpenSearchError::result_window_too_large(9_000, 2_000, 10_000),
+                OpenSearchErrorKind::ResultWindowTooLarge,
+            ),
+            (
+                OpenSearchError::too_many_buckets(10, 11),
+                OpenSearchErrorKind::TooManyBuckets,
+            ),
+            (
+                OpenSearchError::aggregation_execution("x"),
+                OpenSearchErrorKind::AggregationExecution,
+            ),
+            (
+                OpenSearchError::status_not_found("x"),
+                OpenSearchErrorKind::StatusNotFound,
+            ),
+            (
+                OpenSearchError::too_many_cross_row_traces("otel-v1-apm-span-000001", 2),
+                OpenSearchErrorKind::TooManyCrossRowTraces,
+            ),
+        ];
+        let mut positions: Vec<usize> = Vec::with_capacity(22);
+        for (error, kind) in &unit_cases {
+            assert_eq!(error.kind(), kind, "error {error:?}");
+            positions.push(find_kind_position(kind));
+        }
+        // The payload of a kind is read by destructuring: derived `PartialEq` does not count as a
+        // read for the `dead_code` lint.
+        let index_not_found = OpenSearchError::index_not_found("logs-x");
+        let OpenSearchErrorKind::IndexNotFound { index } = index_not_found.kind().clone() else {
+            panic!("index_not_found records IndexNotFound");
+        };
+        assert_eq!(index, "logs-x");
+        positions.push(find_kind_position(index_not_found.kind()));
+        let memory_limit = OpenSearchError::memory_limit_exceeded(4096);
+        let OpenSearchErrorKind::MemoryLimitExceeded { limit_bytes } = memory_limit.kind().clone() else {
+            panic!("memory_limit_exceeded records MemoryLimitExceeded");
+        };
+        assert_eq!(limit_bytes, 4096);
+        positions.push(find_kind_position(memory_limit.kind()));
+        // Every kind is covered exactly once.
+        positions.sort_unstable();
+        assert_eq!(positions, (0..22).collect::<Vec<_>>());
+        assert_eq!(OpenSearchError::illegal_argument("bad index").reason(), "bad index");
+    }
+
+    #[tokio::test]
+    async fn status_not_found_renders_a_404_status_exception() {
+        let (status, body) = render_envelope(OpenSearchError::status_not_found("no ML config [abc]")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["status"], 404);
+        assert_eq!(body["error"]["type"], "status_exception");
+        assert_eq!(body["error"]["reason"], "no ML config [abc]");
+        assert_eq!(body["error"]["root_cause"][0]["type"], "status_exception");
+        assert_eq!(body["error"]["root_cause"][0]["reason"], "no ML config [abc]");
+    }
+
+    #[tokio::test]
+    async fn too_many_cross_row_traces_names_the_index_and_the_limit() {
+        let (status, body) =
+            render_envelope(OpenSearchError::too_many_cross_row_traces("otel-v1-apm-span-000001", 2)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "illegal_argument_exception");
+        assert_eq!(body["error"]["root_cause"][0]["type"], "illegal_argument_exception");
+        assert_eq!(body["error"]["index"], "otel-v1-apm-span-000001");
+        assert_eq!(body["error"]["limit"], 2);
+        assert_eq!(body["error"]["root_cause"][0]["index"], "otel-v1-apm-span-000001");
+        assert_eq!(body["error"]["root_cause"][0]["limit"], 2);
+    }
+}

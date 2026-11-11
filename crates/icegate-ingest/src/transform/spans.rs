@@ -15,13 +15,13 @@ use icegate_common::{
     schema::{
         COL_ATTRIBUTES, COL_DROPPED_ATTRIBUTES_COUNT, COL_EVENTS, COL_FLAGS, COL_LINKS, COL_NAME,
         COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, COL_SPAN_ATTRIBUTES, COL_SPAN_ID, COL_TIMESTAMP, COL_TRACE_ID,
-        COL_TRACE_STATE,
+        COL_TRACE_STATE, SERVICE_NAME_ATTRIBUTE_KEY,
     },
 };
 
 use super::attributes::{
-    SERVICE_NAME_KEY, attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_schema_named,
-    extract_string_value, is_zero_bytes, now_micros, u32_count_to_i32,
+    attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_schema_named, extract_string_value,
+    is_zero_bytes, now_micros, u32_count_to_i32,
 };
 use super::nested_builders::{field_builder_missing, nested_field_index, nested_struct_builders};
 
@@ -209,7 +209,7 @@ pub fn spans_to_record_batch(
         let resource_attrs = resource_spans.resource.as_ref().map_or(&empty_attrs, |r| &r.attributes);
         let service_name = resource_attrs
             .iter()
-            .find(|kv| kv.key == SERVICE_NAME_KEY)
+            .find(|kv| kv.key == SERVICE_NAME_ATTRIBUTE_KEY)
             .and_then(|kv| extract_string_value(kv.value.as_ref()));
 
         // Flattened once per ResourceSpans / ScopeSpans and reused by every

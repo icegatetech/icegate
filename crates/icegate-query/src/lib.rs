@@ -23,6 +23,9 @@ pub mod loki;
 /// LogQL query language implementation
 pub mod logql;
 
+/// OpenSearch-compatible API server (Query DSL, Lucene, PPL, saved objects)
+pub mod opensearch;
+
 /// Prometheus API server (PromQL)
 pub mod prometheus;
 
@@ -32,8 +35,21 @@ pub mod tempo;
 /// TraceQL query language implementation
 pub mod traceql;
 
+/// The `OpenSearch` Query DSL: its AST, the JSON parser and date math, shared by every `OpenSearch`
+/// evaluator.
+pub(crate) mod query_dsl;
+
+/// PPL, the piped processing language of `/_plugins/_ppl`: its AST, the builder from the parse
+/// tree and the planner.
+pub(crate) mod ppl;
+
 /// Doubles and bootstrap shared by the crate's inline tests.
 #[cfg(test)]
 mod test_support;
+
+/// Table rows with explicit values, written the way production writes them; the `OpenSearch`
+/// integration binary includes the same file.
+#[cfg(test)]
+mod test_rows;
 
 pub use config::QueryConfig;

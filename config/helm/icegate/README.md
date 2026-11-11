@@ -443,6 +443,23 @@ an image pinned by digest (`icegate-ingest@sha256:...`) verifies the same way.
 | query.metrics.path | string | `"/metrics"` |  |
 | query.metrics.port | int | `9091` |  |
 | query.nodeSelector | object | `{}` |  |
+| query.opensearch.clusterName | string | `"icegate"` | Cluster name reported by GET /, /_nodes and /_cluster/health. It seeds the stable cluster and node identifiers, so changing it changes them. |
+| query.opensearch.enabled | bool | `false` | Run the OpenSearch-compatible listener. Off by default: it authenticates no caller, and the tenant is decided by query.tenant as on every query surface. |
+| query.opensearch.fieldDiscoveryWindowSecs | int | `86400` | How far back, in seconds, field discovery (_field_caps, _mapping) looks for attribute-map keys. |
+| query.opensearch.maxCrossRowTraces | int | `1000` | The most traces whose root spans one search reads for a filter, sort or aggregation on traceGroup or traceGroupFields, and the largest terms size on traceId of otel-v1-apm-span. Above it the search answers 400. |
+| query.opensearch.maxQueryMemoryBytes | int | `1073741824` | Bytes of memory one OpenSearch query may hold. The listener's sessions draw from a pool of this size, spilling to temporary files stays enabled, and a query needing more answers 400 naming the limit. Other protocols are unbounded. |
+| query.opensearch.maxRequestBodyBytes | int | `33554432` | Largest request body the listener accepts, in bytes. It also bounds how much of a refused request's body is drained. |
+| query.opensearch.maxTraceLookbackSecs | int | `3600` | How far, in seconds, before the earliest start of the spans it decorates the root span of a trace is looked for (traceGroup and traceGroupFields of otel-v1-apm-span). A root that started earlier renders those fields absent. |
+| query.opensearch.port | int | `9200` | Listener port. |
+| query.opensearch.ppl.maxResultRows | int | `nil` | Most rows a PPL query may return, counted after the request's fetch_size. A longer output is a 400 naming the limit, never truncated. null sets no row limit; the query deadline, the per-query memory limit and load shedding still bound every query. |
+| query.opensearch.search.maxBuckets | int | `65535` | Most buckets one search's aggregations may answer, every level counted; a search over it is refused with a 400, never truncated. |
+| query.opensearch.search.maxResultWindow | int | `10000` | Largest from + size a _search accepts, on data and system indices alike, and the largest page a system-index scroll opens with. A larger window is answered 400, never truncated. |
+| query.opensearch.systemIndices.cacheMaxBytes | int | `268435456` | Bound of the decoded-snapshot cache, in bytes; at least maxSnapshotBytes. |
+| query.opensearch.systemIndices.location | string | `""` | s3:// or s3a:// URL the store writes under. Empty resolves to the default prefix under the storage bucket (SystemIndicesConfig::DEFAULT_LOCATION_PREFIX in crates/icegate-query/src/opensearch/config.rs). It must not overlap a table location or the WAL base path; the listener refuses to start otherwise. |
+| query.opensearch.systemIndices.maxAnswerBytes | int | `268435456` | Bytes of stored documents one answer may carry; at least maxSnapshotBytes. An _mget or _search past it is refused whole with 400, _bulk update items past it fail one by one, and the answered items of an _msearch share it: an item past what the earlier ones left fails alone. |
+| query.opensearch.systemIndices.maxScrollLifetimeSecs | int | `900` | Longest scroll a system-index search may open, in seconds. A superseded snapshot object is kept this long plus the query deadline. |
+| query.opensearch.systemIndices.maxSnapshotBytes | int | `134217728` | Largest decoded snapshot one tenant may hold, in bytes. A write past it is answered 413 and changes nothing. |
+| query.opensearch.version | string | `"3.9.0"` | Version reported by GET / and /_nodes: a canonical MAJOR.MINOR.PATCH with major 3. Any other value is refused at startup. When OpenSearch Dashboards runs with opensearch.ignoreVersionMismatch false, keep this minor at or above the Dashboards minor: such a Dashboards holds its saved-object migration until IceGate reports a compatible version, then migrates without a restart (end-to-end case "a strict osd rejects icegate at 3.8.0 and migrates after icegate restarts at 3.9.0", scripts/opensearch-e2e/versions.spec.ts). IceGate does not check this; the chart deploys no Dashboards. |
 | query.pdb.enabled | bool | `false` |  |
 | query.pdb.minAvailable | int | `1` |  |
 | query.prometheus.enabled | bool | `true` |  |
@@ -463,6 +480,7 @@ an image pinned by digest (`icegate-ingest@sha256:...`) verifies the same way.
 | query.service.appProtocol.flightSql | string | `""` |  |
 | query.service.appProtocol.loki | string | `""` |  |
 | query.service.appProtocol.metrics | string | `""` |  |
+| query.service.appProtocol.opensearch | string | `""` |  |
 | query.service.appProtocol.prometheus | string | `""` |  |
 | query.service.appProtocol.tempo | string | `""` |  |
 | query.service.type | string | `"ClusterIP"` |  |

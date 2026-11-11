@@ -83,6 +83,30 @@ data:
       host: "0.0.0.0"
       port: {{ .Values.query.flightSql.port | default 8815 }}
       max_message_size: {{ .Values.query.flightSql.maxMessageSize | default 16777216 | int }}
+    opensearch:
+      enabled: {{ .Values.query.opensearch.enabled }}
+      host: "0.0.0.0"
+      port: {{ .Values.query.opensearch.port }}
+      version: {{ .Values.query.opensearch.version | quote }}
+      cluster_name: {{ .Values.query.opensearch.clusterName | quote }}
+      max_request_body_bytes: {{ .Values.query.opensearch.maxRequestBodyBytes | int }}
+      max_query_memory_bytes: {{ .Values.query.opensearch.maxQueryMemoryBytes | int }}
+      field_discovery_window_secs: {{ .Values.query.opensearch.fieldDiscoveryWindowSecs | int }}
+      max_trace_lookback_secs: {{ .Values.query.opensearch.maxTraceLookbackSecs | int }}
+      max_cross_row_traces: {{ .Values.query.opensearch.maxCrossRowTraces | int }}
+      system_indices:
+        {{- with .Values.query.opensearch.systemIndices.location }}
+        location: {{ . | quote }}
+        {{- end }}
+        max_scroll_lifetime_secs: {{ .Values.query.opensearch.systemIndices.maxScrollLifetimeSecs | int }}
+        cache_max_bytes: {{ .Values.query.opensearch.systemIndices.cacheMaxBytes | int }}
+        max_snapshot_bytes: {{ .Values.query.opensearch.systemIndices.maxSnapshotBytes | int }}
+        max_answer_bytes: {{ .Values.query.opensearch.systemIndices.maxAnswerBytes | int }}
+      search:
+        max_result_window: {{ .Values.query.opensearch.search.maxResultWindow | int }}
+        max_buckets: {{ .Values.query.opensearch.search.maxBuckets | int }}
+      ppl:
+        max_result_rows: {{ .Values.query.opensearch.ppl.maxResultRows | toJson }}
     metrics:
       enabled: {{ .Values.query.metrics.enabled }}
       host: "0.0.0.0"

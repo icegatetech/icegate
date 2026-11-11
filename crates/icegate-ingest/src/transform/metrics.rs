@@ -17,8 +17,13 @@ use arrow::{
 };
 use iceberg::arrow::schema_to_arrow_schema;
 use icegate_common::{
-    TenantId,
-    schema::{COL_DATA_POINT_ATTRIBUTES, COL_METADATA, COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES},
+    METRICS_TABLE, TenantId,
+    schema::{
+        AGGREGATION_TEMPORALITY_CUMULATIVE, AGGREGATION_TEMPORALITY_DELTA, COL_DATA_POINT_ATTRIBUTES, COL_METADATA,
+        COL_RESOURCE_ATTRIBUTES, COL_SCOPE_ATTRIBUTES, METRIC_TYPE_EXPONENTIAL_HISTOGRAM, METRIC_TYPE_GAUGE,
+        METRIC_TYPE_HISTOGRAM, METRIC_TYPE_SUM, METRIC_TYPE_SUMMARY, SERVICE_INSTANCE_ID_ATTRIBUTE_KEY,
+        SERVICE_NAME_ATTRIBUTE_KEY, promoted_resource_keys,
+    },
 };
 use opentelemetry_proto::tonic::{
     collector::metrics::v1::ExportMetricsServiceRequest,
@@ -30,10 +35,10 @@ use opentelemetry_proto::tonic::{
 };
 
 use super::attributes::{
-    SERVICE_INSTANCE_ID_KEY, SERVICE_NAME_KEY, attribute_map_builder, dedupe_dotted_attributes,
-    extract_map_fields_from_nested_struct, extract_map_fields_from_schema_named, extract_string_value,
-    flatten_any_value_dotted, is_zero_bytes, list_element_field, list_struct_fields, merge_dotted_levels,
-    nanos_to_micros, now_micros, u32_count_to_i32, u64_to_i64,
+    attribute_map_builder, dedupe_dotted_attributes, extract_map_fields_from_nested_struct,
+    extract_map_fields_from_schema_named, extract_string_value, flatten_any_value_dotted, is_zero_bytes,
+    list_element_field, list_struct_fields, merge_dotted_levels, nanos_to_micros, now_micros, u32_count_to_i32,
+    u64_to_i64,
 };
 
 /// Process-wide cache of the derived metrics Arrow schema.
@@ -63,25 +68,6 @@ pub fn metrics_arrow_schema() -> crate::error::Result<Arc<Schema>> {
         ))),
     }
 }
-
-/// `metric_type` string value stored in the table (per `SCHEMA.md`, lowercase).
-///
-/// One constant per `metric::Data` variant; all five are emitted by the driver.
-const METRIC_TYPE_GAUGE: &str = "gauge";
-const METRIC_TYPE_SUM: &str = "sum";
-const METRIC_TYPE_HISTOGRAM: &str = "histogram";
-const METRIC_TYPE_EXPONENTIAL_HISTOGRAM: &str = "exponential_histogram";
-const METRIC_TYPE_SUMMARY: &str = "summary";
-
-/// `aggregation_temporality` string values stored in the table (per `SCHEMA.md`).
-const AGG_TEMPORALITY_DELTA: &str = "DELTA";
-const AGG_TEMPORALITY_CUMULATIVE: &str = "CUMULATIVE";
-
-/// Promoted keys suppressed from the merged `attributes` MAP at the resource
-/// level so they are not stored twice (once in the column, once in the map) —
-/// mirrors the logs `LOG_PROMOTED_RESOURCE_KEYS` rule. A more specific
-/// scope/data-point attribute of the same name still overrides.
-const METRICS_PROMOTED_RESOURCE_KEYS: &[&str] = &[SERVICE_NAME_KEY, SERVICE_INSTANCE_ID_KEY];
 
 /// Data-point `time_unix_nano` in micros, or the ingest time when unset (0).
 const fn timestamp_or_default(time_unix_nano: u64, ingested: i64) -> i64 {
@@ -145,9 +131,9 @@ const fn histogram_buckets_consistent(bucket_counts: usize, explicit_bounds: usi
 /// treats as a strict-conformance drop for Sum/Histogram/ExponentialHistogram.
 const fn temporality_str(value: i32) -> Option<&'static str> {
     if value == AggregationTemporality::Delta as i32 {
-        Some(AGG_TEMPORALITY_DELTA)
+        Some(AGGREGATION_TEMPORALITY_DELTA)
     } else if value == AggregationTemporality::Cumulative as i32 {
-        Some(AGG_TEMPORALITY_CUMULATIVE)
+        Some(AGGREGATION_TEMPORALITY_CUMULATIVE)
     } else {
         None
     }
@@ -931,17 +917,17 @@ pub fn metrics_to_record_batch(
         // logs and spans transforms; no synthetic default is substituted.
         let service_name = resource_attrs
             .iter()
-            .find(|kv| kv.key == SERVICE_NAME_KEY)
+            .find(|kv| kv.key == SERVICE_NAME_ATTRIBUTE_KEY)
             .and_then(|kv| extract_string_value(kv.value.as_ref()));
         let service_instance_id = resource_attrs
             .iter()
-            .find(|kv| kv.key == SERVICE_INSTANCE_ID_KEY)
+            .find(|kv| kv.key == SERVICE_INSTANCE_ID_ATTRIBUTE_KEY)
             .and_then(|kv| extract_string_value(kv.value.as_ref()));
 
         // Flattened once per ResourceMetrics / ScopeMetrics and reused by every
         // data point beneath: with the levels in their own columns there is no
         // merged set to clone per point.
-        let resource_attributes = merge_dotted_levels(&[resource_attrs], METRICS_PROMOTED_RESOURCE_KEYS);
+        let resource_attributes = merge_dotted_levels(&[resource_attrs], promoted_resource_keys(METRICS_TABLE));
         for sm in &rm.scope_metrics {
             let scope_attrs = sm.scope.as_ref().map_or(&empty, |s| &s.attributes);
             let scope_attributes = dedupe_dotted_attributes(scope_attrs);
@@ -1983,5 +1969,39 @@ mod tests {
             .expect("map");
         // Duplicate "k" collapses to a single map entry.
         assert_eq!(attrs.value(0).len(), 1);
+    }
+
+    /// The metrics counterpart of the logs case: for both promoted keys the dotted spelling fills
+    /// the column, and both spellings, dotted and underscored, leave the resource map.
+    #[test]
+    fn every_promoted_metrics_resource_key_fills_its_column_and_leaves_the_resource_map() {
+        let resource_attributes = [
+            kv("service.name", "checkout"),
+            kv("service.instance.id", "checkout-7f9c"),
+            kv("service_name", "legacy-name"),
+            kv("service_instance_id", "legacy-instance"),
+            kv("kept.key", "kept-value"),
+        ];
+        let column_values = [("service.name", "checkout"), ("service.instance.id", "checkout-7f9c")];
+
+        let batch = metrics_batch_with(&resource_attributes, &[], &[]);
+
+        assert_eq!(
+            map_pairs(&batch, COL_RESOURCE_ATTRIBUTES),
+            BTreeMap::from([("kept.key".to_string(), "kept-value".to_string())])
+        );
+        for promoted_key in promoted_resource_keys(METRICS_TABLE) {
+            let (_, expected_value) = column_values
+                .iter()
+                .find(|(key, _)| *key == promoted_key.attribute_key)
+                .expect("the request carries every promoted key");
+            let column = batch
+                .column_by_name(promoted_key.column)
+                .expect("promoted column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("utf8 column");
+            assert_eq!(column.value(0), *expected_value, "{}", promoted_key.attribute_key);
+        }
     }
 }

@@ -5348,12 +5348,15 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-extra",
+ "base64 0.22.1",
  "bytes",
  "chrono",
+ "chrono-tz",
  "clap",
  "criterion",
  "datafusion 54.1.0",
  "datafusion-flight-sql-server",
+ "datafusion-functions-aggregate-common 54.1.0",
  "datafusion-tracing",
  "futures",
  "hex",
@@ -5363,8 +5366,10 @@ dependencies = [
  "iceberg",
  "iceberg-datafusion",
  "icegate-common",
+ "icegate-query-grammar",
  "icegate-queue",
  "itoa",
+ "lru",
  "object_store",
  "opentelemetry",
  "opentelemetry-proto",
@@ -5377,6 +5382,8 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "serde_json",
+ "serde_urlencoded",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "tikv-jemallocator",
@@ -5386,6 +5393,16 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "uuid",
+ "zstd 0.13.4",
+]
+
+[[package]]
+name = "icegate-query-grammar"
+version = "0.2.0"
+dependencies = [
+ "antlr4rust",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

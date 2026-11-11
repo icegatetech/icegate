@@ -1,0 +1,2326 @@
+//! The PPL commands trust needs beyond the core: `join`, subsearches, window commands and `append`, over
+//! real HTTP. Every row is written here with explicit values, and every expected row is stated by hand from
+//! the rules in `ppl/README.md`.
+#![allow(clippy::expect_used)]
+
+use std::sync::Arc;
+
+use iceberg::Catalog;
+use icegate_common::schema::{COL_NAME, COL_SERVICE_NAME, COL_TIMESTAMP};
+use icegate_common::{LOGS_TABLE, SPANS_TABLE};
+use icegate_query::engine::QueryEngineConfig;
+use icegate_query::opensearch::{OpenSearchConfig, PplLimitsConfig};
+use serde_json::{Value, json};
+
+use super::data::{Cell, Row, RowWriteError, commit_rows, write_wal_segment};
+use super::harness::{PplReply, TestServer};
+
+const TENANT_A: &str = "tenant-a";
+const TENANT_B: &str = "tenant-b";
+const PPL_ERROR_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
+/// A system index a test creates; no join side may read it.
+const SYSTEM_INDEX: &str = ".kibana_1";
+/// 2026-10-08T12:00:00Z in microseconds, computed outside the code.
+const NOON: i64 = 1_791_460_800_000_000;
+const SECOND: i64 = 1_000_000;
+
+/// Runs `query` as `tenant` and returns the jdbc answer; any status but 200 fails the test.
+async fn run_ppl(server: &TestServer, tenant: &str, query: &str) -> Value {
+    let reply = server.post_ppl(tenant, "/_plugins/_ppl", &json!({ "query": query })).await;
+    assert_eq!(reply.status, 200, "{query}: {}", reply.text);
+    reply.parse_json_body()
+}
+
+/// Runs `query` as `tenant`, expects the PPL envelope's 400 and returns the reply.
+async fn refuse_ppl(server: &TestServer, tenant: &str, query: &str) -> PplReply {
+    let reply = server.post_ppl(tenant, "/_plugins/_ppl", &json!({ "query": query })).await;
+    assert_eq!(reply.status, 400, "{query}: {}", reply.text);
+    assert_eq!(reply.content_type, PPL_ERROR_CONTENT_TYPE, "{query}");
+    reply
+}
+
+/// The logical and physical plan text `_explain` answers for `query`.
+async fn explain_ppl(server: &TestServer, tenant: &str, query: &str) -> (String, String) {
+    let reply = server
+        .post_ppl(tenant, "/_plugins/_ppl/_explain", &json!({ "query": query }))
+        .await;
+    assert_eq!(reply.status, 200, "{query}: {}", reply.text);
+    let body = reply.parse_json_body();
+    let plan_text = |key: &str| {
+        body["calcite"][key]
+            .as_str()
+            .unwrap_or_else(|| panic!("no calcite.{key} in {body}"))
+            .to_string()
+    };
+    (plan_text("logical"), plan_text("physical"))
+}
+
+/// Asserts that `error`, the `error` object of a PPL envelope, is the semantic refusal.
+fn assert_semantic_error(error: &Value) {
+    assert_eq!(error["type"], "SemanticCheckException", "{error}");
+    assert_eq!(error["code"], "SEMANTIC_ERROR", "{error}");
+}
+
+/// A listener configuration whose PPL row limit (100) is far below the rows the never-capped tests read
+/// inside a join side, a subsearch, a window or an append branch: the limit bounds only the final answer,
+/// so those tests answer in full only while no inner side is capped by it.
+fn build_row_limited_config() -> OpenSearchConfig {
+    OpenSearchConfig {
+        ppl: PplLimitsConfig {
+            max_result_rows: Some(100),
+        },
+        ..OpenSearchConfig::default()
+    }
+}
+
+/// Asserts that `query`, run alone as `tenant`, is refused for exceeding the row limit of
+/// [`build_row_limited_config`]: the proof that the limit is in force in a never-capped test.
+async fn assert_row_limit_refuses(server: &TestServer, tenant: &str, query: &str) {
+    let reply = refuse_ppl(server, tenant, query).await;
+    let error = &reply.parse_json_body()["error"];
+    assert_eq!(error["code"], "RESOURCE_LIMIT_EXCEEDED", "{query}: {error}");
+    assert_eq!(error["context"]["limit"], 100, "{query}: {error}");
+}
+
+/// Asserts that `reply` is the semantic refusal whose `context` names `name`, what the refusal is
+/// about. Its reason is IceGate's own wording and is not read.
+fn assert_semantic_refusal_naming(reply: &PplReply, name: &str) {
+    let error = &reply.parse_json_body()["error"];
+    assert_semantic_error(error);
+    assert_eq!(error["context"], json!({ "name": name }), "{}", reply.text);
+}
+
+/// The lines of `plan` that mention `operator`.
+fn find_plan_lines<'p>(plan: &'p str, operator: &str) -> Vec<&'p str> {
+    plan.lines().filter(|line| line.contains(operator)).collect()
+}
+
+/// One entry of a jdbc answer's `schema`.
+fn build_schema_column(name: &str, column_type: &str) -> Value {
+    json!({ "name": name, "type": column_type })
+}
+
+/// Creates [`SYSTEM_INDEX`] for `tenant` through the index API; any status but 200 fails the test.
+///
+/// # Errors
+///
+/// The transport error when the request cannot be sent.
+async fn create_system_index(server: &TestServer, tenant: &str) -> Result<(), reqwest::Error> {
+    let created = server
+        .request(reqwest::Method::PUT, Some(tenant), &format!("/{SYSTEM_INDEX}"))
+        .header("content-type", "application/json")
+        .body(json!({ "mappings": { "properties": { "x": { "type": "keyword" } } } }).to_string())
+        .send()
+        .await?;
+    assert_eq!(created.status().as_u16(), 200, "PUT /{SYSTEM_INDEX}");
+    Ok(())
+}
+
+/// Rows on each side (Iceberg, WAL) of the order tests: more than the engine's batch size, so each side
+/// arrives in more than one record batch.
+const ROWS_PER_SIDE: usize = 9_000;
+
+/// The bodies `00000`, `00001`, … of `count` numbered rows: row `k`'s body is `k` in five digits.
+fn build_numbered_bodies(count: usize) -> Vec<String> {
+    (0..count).map(|offset| format!("{offset:05}")).collect()
+}
+
+/// Tenant-A log rows at `NOON + k` µs with body `bodies[k]`, for every `k` of the given parity: parity 0 for the
+/// even rows, 1 for the odd ones. Split by parity across Iceberg and the WAL, the two sides interleave in time,
+/// so only an explicit order can put them in sequence.
+fn build_numbered_rows(bodies: &[String], parity: usize) -> Vec<Row<'_>> {
+    bodies
+        .iter()
+        .zip(0_i64..)
+        .skip(parity)
+        .step_by(2)
+        .map(|(body, offset)| {
+            build_log_row(
+                TENANT_A,
+                NOON + offset,
+                vec![(icegate_common::schema::COL_BODY, Cell::Text(body))],
+            )
+        })
+        .collect()
+}
+
+/// Writes the logs of the order tests: `2 * ROWS_PER_SIDE` tenant-A rows from [`build_numbered_rows`], the even
+/// rows as one Iceberg commit and the odd rows as one WAL segment, plus a tenant-B row one microsecond before row
+/// 0 in the Iceberg commit, which would come first in time order if tenant A read it.
+///
+/// Asserts first that `ROWS_PER_SIDE` exceeds the engine's batch size, so each side arrives in more than one
+/// record batch.
+///
+/// # Errors
+///
+/// The write error of the Iceberg commit or of the WAL segment.
+async fn write_numbered_logs_across_iceberg_and_wal(
+    server: &TestServer,
+    catalog: &Arc<dyn Catalog>,
+) -> Result<(), RowWriteError> {
+    assert!(
+        ROWS_PER_SIDE > QueryEngineConfig::default().batch_size,
+        "each side must span more than one record batch"
+    );
+    let bodies = build_numbered_bodies(2 * ROWS_PER_SIDE);
+    let mut iceberg_rows = build_numbered_rows(&bodies, 0);
+    iceberg_rows.push(build_log_row(
+        TENANT_B,
+        NOON - 1,
+        vec![(icegate_common::schema::COL_BODY, Cell::Text("tenant-b"))],
+    ));
+    commit_rows(catalog, LOGS_TABLE, &iceberg_rows).await?;
+    write_wal_segment(
+        &server.wal_store,
+        catalog,
+        LOGS_TABLE,
+        1,
+        &build_numbered_rows(&bodies, 1),
+    )
+    .await
+}
+
+/// A log row of `tenant` at `micros` with `cells`.
+fn build_log_row<'a>(tenant: &'a str, micros: i64, mut cells: Vec<(&'a str, Cell<'a>)>) -> Row<'a> {
+    cells.push((COL_TIMESTAMP, Cell::Micros(micros)));
+    Row { tenant, cells }
+}
+
+/// A span row of `tenant` at `micros` named `name` in `service_name`; ids keep their zero default.
+fn build_span_row<'a>(tenant: &'a str, micros: i64, service_name: &'a str, name: &'a str) -> Row<'a> {
+    Row {
+        tenant,
+        cells: vec![
+            (COL_TIMESTAMP, Cell::Micros(micros)),
+            (COL_SERVICE_NAME, Cell::Text(service_name)),
+            (COL_NAME, Cell::Text(name)),
+        ],
+    }
+}
+
+/// `join`: hash keys from the equalities, the residual kept in the join, aliases, tenant scope, no cap.
+mod join {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{
+        ArrayRef, Decimal128Array, FixedSizeBinaryArray, Int64Array, StringArray, TimestampMicrosecondArray,
+    };
+    use icegate_common::schema::{
+        COL_BODY, COL_CURRENCY, COL_DURATION_MICROS, COL_END_TIMESTAMP, COL_INGESTED_TIMESTAMP, COL_INPUT_USD_PER_1M,
+        COL_MIN_INPUT_TOKENS, COL_MODEL, COL_OUTPUT_USD_PER_1M, COL_PARENT_SPAN_ID, COL_PROVIDER, COL_REGION,
+        COL_SERVICE_TIER, COL_SOURCE, COL_SPAN_ID, COL_TENANT_ID, COL_TRACE_ID, COL_VALID_FROM, COL_VALID_FROM_SOURCE,
+        PRICE_DECIMAL_PRECISION, PRICE_DECIMAL_SCALE,
+    };
+    use icegate_common::{OPERATIONS_TABLE, PRICES_TABLE};
+
+    use super::super::data::commit_table_columns;
+    use super::super::test_rows::OPERATION_NAME;
+    use super::*;
+
+    /// `operations` columns that have no shared constant in `icegate_common::schema`.
+    const PROVIDER_NAME: &str = "provider_name";
+    const REQUEST_MODEL: &str = "request_model";
+    const INPUT_TOKENS: &str = "input_tokens";
+    const OUTPUT_TOKENS: &str = "output_tokens";
+
+    /// 2026-01-01, 2026-03-01, 2026-06-01 and 2026-07-01 at 00:00 UTC in microseconds, computed outside
+    /// the code.
+    const JANUARY_1: i64 = 1_767_225_600_000_000;
+    const MARCH_1: i64 = 1_772_323_200_000_000;
+    const JUNE_1: i64 = 1_780_272_000_000_000;
+    const JULY_1: i64 = 1_782_864_000_000_000;
+
+    /// The parent span id of the child span in the residual test.
+    const PARENT_SPAN_ID: [u8; 8] = [0x01, 0, 0, 0, 0, 0, 0, 0];
+
+    fn build_string_column(values: &[&str]) -> ArrayRef {
+        Arc::new(StringArray::from(values.to_vec()))
+    }
+
+    fn build_long_column(values: &[i64]) -> ArrayRef {
+        Arc::new(Int64Array::from(values.to_vec()))
+    }
+
+    fn build_micros_column(values: &[i64]) -> ArrayRef {
+        Arc::new(TimestampMicrosecondArray::from(values.to_vec()))
+    }
+
+    /// A price column holding `tenths` / 10 USD per row, at the schema's decimal precision and scale.
+    fn build_rate_column(tenths: &[i128]) -> Result<ArrayRef, RowWriteError> {
+        let scale = i8::try_from(PRICE_DECIMAL_SCALE)?;
+        let precision = u8::try_from(PRICE_DECIMAL_PRECISION)?;
+        let unit = 10_i128.pow(PRICE_DECIMAL_SCALE - 1);
+        Ok(Arc::new(
+            Decimal128Array::from(tenths.iter().map(|value| value * unit).collect::<Vec<_>>())
+                .with_precision_and_scale(precision, scale)?,
+        ))
+    }
+
+    fn build_id_column<const N: usize>(values: &[[u8; N]]) -> Result<ArrayRef, RowWriteError> {
+        Ok(Arc::new(FixedSizeBinaryArray::try_from_iter(values.iter())?))
+    }
+
+    /// Tenant-A logs `l1`–`l3` and spans `s1`–`s3`, plus a tenant-B span whose service only `l3` shares.
+    async fn commit_equality_rows(catalog: &Arc<dyn iceberg::Catalog>) -> Result<(), RowWriteError> {
+        commit_rows(
+            catalog,
+            LOGS_TABLE,
+            &[
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("l1")), (COL_SERVICE_NAME, Cell::Text("checkout"))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON + SECOND,
+                    vec![(COL_BODY, Cell::Text("l2")), (COL_SERVICE_NAME, Cell::Text("cart"))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON + 2 * SECOND,
+                    vec![(COL_BODY, Cell::Text("l3")), (COL_SERVICE_NAME, Cell::Text("search"))],
+                ),
+            ],
+        )
+        .await?;
+        commit_rows(
+            catalog,
+            SPANS_TABLE,
+            &[
+                build_span_row(TENANT_A, NOON, "checkout", "s1"),
+                build_span_row(TENANT_A, NOON, "checkout", "s2"),
+                build_span_row(TENANT_A, NOON, "cart", "s3"),
+                build_span_row(TENANT_B, NOON, "search", "b-span"),
+            ],
+        )
+        .await
+    }
+
+    fn format_equality_join(kind: &str) -> String {
+        format!(
+            "source=logs | fields body, service_name | {kind} join left=l right=s on l.service_name = s.service_name \
+             [ source=spans | fields name, service_name ] | sort body, name"
+        )
+    }
+
+    #[tokio::test]
+    async fn left_and_inner_joins_on_equality_answer_the_stated_rows() {
+        let (server, catalog) = TestServer::start().await;
+        commit_equality_rows(&catalog).await.expect("commit the equality rows");
+
+        let left_answer = run_ppl(&server, TENANT_A, &format_equality_join("left")).await;
+        assert_eq!(
+            left_answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("service_name", "string"),
+                build_schema_column("name", "string"),
+                build_schema_column("s.service_name", "string")
+            ])
+        );
+        assert_eq!(
+            left_answer["datarows"],
+            json!([
+                ["l1", "checkout", "s1", "checkout"],
+                ["l1", "checkout", "s2", "checkout"],
+                ["l2", "cart", "s3", "cart"],
+                ["l3", "search", null, null]
+            ])
+        );
+
+        let inner_answer = run_ppl(&server, TENANT_A, &format_equality_join("inner")).await;
+        assert_eq!(
+            inner_answer["datarows"],
+            json!([
+                ["l1", "checkout", "s1", "checkout"],
+                ["l1", "checkout", "s2", "checkout"],
+                ["l2", "cart", "s3", "cart"]
+            ])
+        );
+        server.shutdown().await;
+    }
+
+    /// `l1` matches `s1` by time; `l2` precedes `s1` and `s1` has a parent, so the residual fails and the
+    /// left join keeps `l2` with NULLs; `l3` follows no span in time but `s2` is a root, so `isnull` matches.
+    const RESIDUAL_JOIN: &str = "source=logs | fields body, service_name, timestamp \
+         | left join left=l right=s on l.service_name = s.service_name \
+           and (l.timestamp >= s.timestamp or isnull(s.parent_span_id)) \
+           [ source=spans | fields name, service_name, timestamp, parent_span_id ] \
+         | fields body, name | sort body";
+
+    #[tokio::test]
+    async fn a_left_join_with_or_ranges_and_isnull_keeps_unmatched_left_rows() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_log_row(
+                    TENANT_A,
+                    NOON + 10 * SECOND,
+                    vec![(COL_BODY, Cell::Text("l1")), (COL_SERVICE_NAME, Cell::Text("checkout"))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON - 10 * SECOND,
+                    vec![(COL_BODY, Cell::Text("l2")), (COL_SERVICE_NAME, Cell::Text("checkout"))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("l3")), (COL_SERVICE_NAME, Cell::Text("cart"))],
+                ),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        let mut child = build_span_row(TENANT_A, NOON, "checkout", "s1");
+        child.cells.push((COL_PARENT_SPAN_ID, Cell::Bytes(&PARENT_SPAN_ID)));
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[child, build_span_row(TENANT_A, NOON + 100 * SECOND, "cart", "s2")],
+        )
+        .await
+        .expect("commit spans");
+
+        let answer = run_ppl(&server, TENANT_A, RESIDUAL_JOIN).await;
+        assert_eq!(answer["datarows"], json!([["l1", "s1"], ["l2", null], ["l3", "s2"]]));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn aliases_qualify_columns_on_both_sides() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("x1")), (COL_SERVICE_NAME, Cell::Text("checkout"))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("x2")), (COL_SERVICE_NAME, Cell::Text("checkout"))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("x3")), (COL_SERVICE_NAME, Cell::Text("cart"))],
+                ),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        // Committed before the first query: the engine reads a table snapshot it refreshes on an interval.
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[build_span_row(TENANT_A, NOON, "cart", "s-cart")],
+        )
+        .await
+        .expect("commit spans");
+
+        let self_join_query = "source=logs | fields body, service_name \
+             | inner join left=x right=y on x.service_name = y.service_name and x.body < y.body \
+               [ source=logs | fields body, service_name ] | sort body";
+        let answer = run_ppl(&server, TENANT_A, self_join_query).await;
+        assert_eq!(
+            answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("service_name", "string"),
+                build_schema_column("y.body", "string"),
+                build_schema_column("y.service_name", "string")
+            ])
+        );
+        assert_eq!(answer["datarows"], json!([["x1", "checkout", "x2", "checkout"]]));
+
+        // A table name qualifies too while the other side does not offer the same name.
+        let table_qualified_query = "source=logs | fields body, service_name | where body = 'x3' \
+             | inner join on logs.service_name = spans.service_name [ source=spans | fields name, service_name ]";
+        let answer = run_ppl(&server, TENANT_A, table_qualified_query).await;
+        assert_eq!(
+            answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("service_name", "string"),
+                build_schema_column("name", "string"),
+                build_schema_column("spans.service_name", "string")
+            ])
+        );
+        assert_eq!(answer["datarows"], json!([["x3", "cart", "s-cart", "cart"]]));
+
+        // `body` is offered by both sides, so the bare name is not visible.
+        let ambiguous_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | fields body | inner join right=y on body = y.body [ source=logs | fields body ]",
+        )
+        .await;
+        let ambiguous_error = &ambiguous_reply.parse_json_body()["error"];
+        assert_eq!(
+            ambiguous_error["type"], "SemanticCheckException",
+            "{}",
+            ambiguous_reply.text
+        );
+        assert_eq!(ambiguous_error["code"], "FIELD_NOT_FOUND", "{}", ambiguous_reply.text);
+        assert_eq!(ambiguous_error["context"]["field"], "body", "{}", ambiguous_reply.text);
+
+        // A right side over two indices carries no table qualifier, so its colliding `service_name` has
+        // nothing to be renamed by until `right=` names one.
+        let unrenamable_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | fields body, service_name | inner join on body = name \
+             [ source=logs,spans | fields name, service_name ]",
+        )
+        .await;
+        assert_semantic_error(&unrenamable_reply.parse_json_body()["error"]);
+        let renamed_query = "source=logs | fields body, service_name \
+             | inner join left=l right=r on l.service_name = r.service_name \
+               [ source=logs,spans | fields name, service_name ] | sort body, name";
+        let renamed_answer = run_ppl(&server, TENANT_A, renamed_query).await;
+        assert_eq!(
+            renamed_answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("service_name", "string"),
+                build_schema_column("name", "string"),
+                build_schema_column("r.service_name", "string")
+            ])
+        );
+        // Each log meets the two logs and, for `cart`, the span of its service; a log row has no `name`.
+        assert_eq!(
+            renamed_answer["datarows"],
+            json!([
+                ["x1", "checkout", null, "checkout"],
+                ["x1", "checkout", null, "checkout"],
+                ["x2", "checkout", null, "checkout"],
+                ["x2", "checkout", null, "checkout"],
+                ["x3", "cart", null, "cart"],
+                ["x3", "cart", "s-cart", "cart"]
+            ])
+        );
+
+        // A chained join reusing `right=s` would rename its `service_name` onto the `s.service_name` the
+        // first join already output; a different alias renames it apart.
+        let first_join = "source=logs | fields body, service_name \
+             | inner join left=l right=s on l.service_name = s.service_name \
+             [ source=spans | fields name, service_name ]";
+        let reused_alias_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            &format!(
+                "{first_join} | inner join left=l right=s on l.service_name = s.service_name \
+                 [ source=spans | fields name, service_name ]"
+            ),
+        )
+        .await;
+        assert_semantic_refusal_naming(&reused_alias_reply, "s.service_name");
+        let chained_answer = run_ppl(
+            &server,
+            TENANT_A,
+            &format!(
+                "{first_join} | inner join left=l right=t on l.service_name = t.service_name \
+                 [ source=spans | fields name, service_name ]"
+            ),
+        )
+        .await;
+        assert_eq!(
+            chained_answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("service_name", "string"),
+                build_schema_column("name", "string"),
+                build_schema_column("s.service_name", "string"),
+                build_schema_column("t.name", "string"),
+                build_schema_column("t.service_name", "string")
+            ])
+        );
+        assert_eq!(
+            chained_answer["datarows"],
+            json!([["x3", "cart", "s-cart", "cart", "s-cart", "cart"]])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn max_zero_is_unlimited() {
+        let (server, catalog) = TestServer::start().await;
+        commit_equality_rows(&catalog).await.expect("commit the equality rows");
+        for options in ["max=0", ""] {
+            let query = format!(
+                "source=logs | where body = 'l1' | fields body, service_name \
+                 | left join {options} left=l right=s on l.service_name = s.service_name \
+                   [ source=spans | fields name, service_name ] | fields body, name | sort name"
+            );
+            assert_eq!(
+                run_ppl(&server, TENANT_A, &query).await["datarows"],
+                json!([["l1", "s1"], ["l1", "s2"]]),
+                "{query}"
+            );
+        }
+        let capped_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | left join max=1 left=l right=s on l.service_name = s.service_name [ source=spans ]",
+        )
+        .await;
+        assert_semantic_refusal_naming(&capped_reply, "max");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_join_plan_hashes_on_the_equality_conjuncts_with_a_residual_filter() {
+        let (server, _catalog) = TestServer::start().await;
+        let (logical_plan, physical_plan) = explain_ppl(&server, TENANT_A, RESIDUAL_JOIN).await;
+
+        let logical_joins = find_plan_lines(&logical_plan, "Left Join:");
+        assert_eq!(logical_joins.len(), 1, "{logical_plan}");
+        assert!(
+            logical_joins[0].contains("Filter:"),
+            "the residual stays in the join:\n{logical_plan}"
+        );
+
+        let hash_joins = find_plan_lines(&physical_plan, "HashJoinExec");
+        assert_eq!(hash_joins.len(), 1, "{physical_plan}");
+        let hash_join = hash_joins[0];
+        assert!(
+            !hash_join.contains("on=[]"),
+            "the equality is a hash key:\n{physical_plan}"
+        );
+        let residual = hash_join.split_once("filter=").map_or("", |(_, rest)| rest);
+        assert!(
+            residual.contains(" OR "),
+            "the residual is the join filter:\n{physical_plan}"
+        );
+        assert!(
+            find_plan_lines(&physical_plan, "NestedLoopJoinExec").is_empty(),
+            "{physical_plan}"
+        );
+        assert!(
+            find_plan_lines(&physical_plan, "FilterExec")
+                .iter()
+                .all(|line| !line.contains("IS NULL")),
+            "no post-join filter carries the residual:\n{physical_plan}"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_priced_block_style_left_join_against_prices_effective_answers_the_stated_costs() {
+        let (server, catalog) = TestServer::start().await;
+        // Key (openai, gpt-4o, standard, global, 0): January then June, so the January row's valid_to is
+        // June 1. Key (…, 2000) is the long-prompt tier from January. The `batch` row is filtered out by the
+        // right side's own `where`.
+        commit_table_columns(
+            &catalog,
+            PRICES_TABLE,
+            4,
+            &[
+                (
+                    COL_PROVIDER,
+                    build_string_column(&["openai", "openai", "openai", "openai"]),
+                ),
+                (
+                    COL_MODEL,
+                    build_string_column(&["gpt-4o", "gpt-4o", "gpt-4o", "gpt-4o"]),
+                ),
+                (
+                    COL_SERVICE_TIER,
+                    build_string_column(&["standard", "standard", "standard", "batch"]),
+                ),
+                (
+                    COL_REGION,
+                    build_string_column(&["global", "global", "global", "global"]),
+                ),
+                (COL_MIN_INPUT_TOKENS, build_long_column(&[0, 0, 2000, 0])),
+                (
+                    COL_VALID_FROM,
+                    build_micros_column(&[JANUARY_1, JUNE_1, JANUARY_1, JANUARY_1]),
+                ),
+                (
+                    COL_VALID_FROM_SOURCE,
+                    build_string_column(&["vendor", "vendor", "vendor", "vendor"]),
+                ),
+                (
+                    COL_INPUT_USD_PER_1M,
+                    build_rate_column(&[25, 30, 20, 10]).expect("rate column"),
+                ),
+                (
+                    COL_OUTPUT_USD_PER_1M,
+                    build_rate_column(&[100, 150, 80, 10]).expect("rate column"),
+                ),
+                (COL_CURRENCY, build_string_column(&["USD", "USD", "USD", "USD"])),
+                (COL_SOURCE, build_string_column(&["test", "test", "test", "test"])),
+            ],
+        )
+        .await
+        .expect("commit prices");
+        commit_table_columns(
+            &catalog,
+            OPERATIONS_TABLE,
+            5,
+            &[
+                (
+                    COL_TENANT_ID,
+                    build_string_column(&[TENANT_A, TENANT_A, TENANT_A, TENANT_A, TENANT_B]),
+                ),
+                (
+                    COL_TRACE_ID,
+                    build_id_column(&[[0x0a; 16], [0x0a; 16], [0x0a; 16], [0x0a; 16], [0x0b; 16]]).expect("id column"),
+                ),
+                (
+                    COL_SPAN_ID,
+                    build_id_column(&[[0x01; 8], [0x02; 8], [0x03; 8], [0x04; 8], [0x05; 8]]).expect("id column"),
+                ),
+                (
+                    COL_TIMESTAMP,
+                    build_micros_column(&[MARCH_1, JULY_1, MARCH_1, MARCH_1, MARCH_1]),
+                ),
+                (
+                    COL_END_TIMESTAMP,
+                    build_micros_column(&[MARCH_1, JULY_1, MARCH_1, MARCH_1, MARCH_1]),
+                ),
+                (COL_DURATION_MICROS, build_long_column(&[0, 0, 0, 0, 0])),
+                (
+                    COL_INGESTED_TIMESTAMP,
+                    build_micros_column(&[MARCH_1, JULY_1, MARCH_1, MARCH_1, MARCH_1]),
+                ),
+                (
+                    OPERATION_NAME,
+                    build_string_column(&["op1", "op2", "op3", "op4", "op-b"]),
+                ),
+                (
+                    PROVIDER_NAME,
+                    build_string_column(&["openai", "openai", "openai", "openai", "openai"]),
+                ),
+                (
+                    REQUEST_MODEL,
+                    build_string_column(&["gpt-4o", "gpt-4o", "gpt-4o", "unknown-model", "gpt-4o"]),
+                ),
+                (INPUT_TOKENS, build_long_column(&[1000, 1000, 5000, 1000, 1000])),
+                (OUTPUT_TOKENS, build_long_column(&[200, 200, 100, 200, 200])),
+            ],
+        )
+        .await
+        .expect("commit operations");
+
+        let priced_query = "source=operations \
+             | fields operation_name, span_id, timestamp, provider_name, request_model, input_tokens, output_tokens \
+             | left join max=0 left=o right=p on o.provider_name = p.provider and o.request_model = p.model \
+               and o.timestamp >= p.valid_from and (o.timestamp < p.valid_to or isnull(p.valid_to)) \
+               and o.input_tokens >= p.min_input_tokens \
+               [ source=prices_effective | where service_tier = 'standard' and region = 'global' \
+                 | fields provider, model, valid_from, valid_to, min_input_tokens, \
+                 input_usd_per_1m, output_usd_per_1m ] \
+             | sort - valid_from, - min_input_tokens | dedup span_id \
+             | eval cost_usd = if(isnull(input_usd_per_1m), 0.0D, \
+                 input_tokens * input_usd_per_1m / 1000000.0D + output_tokens * output_usd_per_1m / 1000000.0D) \
+             | fields operation_name, cost_usd | sort operation_name";
+        let answer = run_ppl(&server, TENANT_A, priced_query).await;
+        assert_eq!(
+            answer["schema"],
+            json!([
+                build_schema_column("operation_name", "string"),
+                build_schema_column("cost_usd", "double")
+            ])
+        );
+        // op1 (March, 1000 in / 200 out) is priced by January's 2.5 / 10: 1000 * 2.5 / 1e6 + 200 * 10 / 1e6,
+        // which IEEE double arithmetic evaluates to 0.0045000000000000005. op2 (July) by June's 3 / 15:
+        // 0.006. op3 (5000 in) matches January's two tiers; the 2000-token tier sorts first and wins:
+        // 5000 * 2 / 1e6 + 100 * 8 / 1e6 = 0.0108. op4's model has no price: 0.0. Tenant B's op-b never shows.
+        assert_eq!(
+            answer["datarows"],
+            json!([
+                ["op1", 0.004_500_000_000_000_000_5],
+                ["op2", 0.006],
+                ["op3", 0.0108],
+                ["op4", 0.0]
+            ])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_join_right_side_never_reads_another_tenants_rows() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![
+                        (COL_BODY, Cell::Text("a-log")),
+                        (COL_SERVICE_NAME, Cell::Text("checkout")),
+                    ],
+                ),
+                build_log_row(
+                    TENANT_B,
+                    NOON,
+                    vec![
+                        (COL_BODY, Cell::Text("b-log")),
+                        (COL_SERVICE_NAME, Cell::Text("checkout")),
+                    ],
+                ),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        // One WAL segment file holds both tenants' spans; only tenant B has a `checkout` span.
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            SPANS_TABLE,
+            0,
+            &[
+                build_span_row(TENANT_A, NOON, "cart", "a-span"),
+                build_span_row(TENANT_B, NOON, "checkout", "b-span"),
+            ],
+        )
+        .await
+        .expect("write spans segment");
+        let format_join_query = |kind: &str| {
+            format!(
+                "source=logs | fields body, service_name | {kind} join left=l right=s \
+                 on l.service_name = s.service_name [ source=spans | fields name, service_name ] | fields body, name"
+            )
+        };
+
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &format_join_query("left")).await["datarows"],
+            json!([["a-log", null]])
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &format_join_query("inner")).await["datarows"],
+            json!([])
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_B, &format_join_query("inner")).await["datarows"],
+            json!([["b-log", "b-span"]])
+        );
+
+        // A right side over a system index is refused like a system-index source, naming the index.
+        create_system_index(&server, TENANT_A).await.expect("create the system index");
+        let system_side = refuse_ppl(
+            &server,
+            TENANT_A,
+            &format!("source=logs | inner join right=k on body = k.x [ source={SYSTEM_INDEX} ]"),
+        )
+        .await;
+        assert_semantic_refusal_naming(&system_side, SYSTEM_INDEX);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_ill_typed_join_criteria_is_a_semantic_400() {
+        let (server, catalog) = TestServer::start().await;
+        commit_equality_rows(&catalog).await.expect("commit the equality rows");
+        // A MAP compared with a timestamp fits no comparison type.
+        let reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | inner join left=l right=s on l.log_attributes = s.timestamp [ source=spans ]",
+        )
+        .await;
+        assert_semantic_error(&reply.parse_json_body()["error"]);
+
+        // Criteria of a string type are no predicate.
+        let string_criteria_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | inner join left=l right=s on concat(l.body, s.name) [ source=spans ]",
+        )
+        .await;
+        assert_semantic_error(&string_criteria_reply.parse_json_body()["error"]);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_join_side_over_ten_thousand_rows_is_never_capped() {
+        let (server, catalog) = TestServer::start_with_config(build_row_limited_config()).await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[build_log_row(
+                TENANT_A,
+                NOON,
+                vec![(COL_BODY, Cell::Text("l1")), (COL_SERVICE_NAME, Cell::Text("checkout"))],
+            )],
+        )
+        .await
+        .expect("commit logs");
+        let names: Vec<String> = (0..10_050).map(|index| format!("s{index}")).collect();
+        let mut spans: Vec<Row<'_>> = names
+            .iter()
+            .zip(0_i64..)
+            .map(|(name, offset)| build_span_row(TENANT_A, NOON + offset, "checkout", name))
+            .collect();
+        spans.extend((0..5).map(|offset| build_span_row(TENANT_B, NOON + offset, "checkout", "b-span")));
+        commit_rows(&catalog, SPANS_TABLE, &spans).await.expect("commit spans");
+
+        let query = "source=logs | fields body, service_name \
+             | inner join left=l right=s on l.service_name = s.service_name \
+             [ source=spans | fields name, service_name ] \
+             | stats count() as n";
+        assert_row_limit_refuses(&server, TENANT_A, "source=spans | fields name").await;
+        assert_eq!(run_ppl(&server, TENANT_A, query).await["datarows"], json!([[10_050]]));
+        server.shutdown().await;
+    }
+}
+
+/// Subsearches: `where … in [ … ]` as a semi-join and `source=[ … ]`, through the tenant scope, uncapped.
+mod subsearch {
+    use icegate_common::schema::{COL_BODY, COL_SEVERITY_TEXT, COL_TRACE_ID};
+
+    use super::*;
+
+    const TRACE_ONE: [u8; 16] = [0x01; 16];
+    const TRACE_TWO: [u8; 16] = [0x02; 16];
+    const TRACE_THREE: [u8; 16] = [0x03; 16];
+
+    /// A distinct trace id per index: the index in the first eight bytes, big-endian.
+    fn build_indexed_trace_id(index: u64) -> [u8; 16] {
+        let mut id = [0_u8; 16];
+        id[..8].copy_from_slice(&index.to_be_bytes());
+        id
+    }
+
+    fn build_traced_span_row<'a>(tenant: &'a str, trace_id: &'a [u8], name: &'a str) -> Row<'a> {
+        let mut row = build_span_row(tenant, NOON, "checkout", name);
+        row.cells.push((COL_TRACE_ID, Cell::Bytes(trace_id)));
+        row
+    }
+
+    const IN_SUBSEARCH: &str = "source=logs | where trace_id in [ source=spans | where name = 'match' | fields trace_id ] | fields body | sort body";
+
+    /// The rows come sorted before the `where`, and the subsearch sits beside another `and` conjunct: the
+    /// semi-join keeps no row order, so the sort must still hold after it.
+    const SORTED_IN_SUBSEARCH: &str = "source=logs | sort - body \
+         | where body != 'zz' and trace_id in [ source=spans | where name = 'match' | fields trace_id ] \
+         | fields body";
+
+    #[tokio::test]
+    async fn where_in_a_subsearch_plans_an_uncapped_semi_join_and_keeps_the_sort_order() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("l1")), (COL_TRACE_ID, Cell::Bytes(&TRACE_ONE))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("l2")), (COL_TRACE_ID, Cell::Bytes(&TRACE_TWO))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("l3")), (COL_TRACE_ID, Cell::Bytes(&TRACE_THREE))],
+                ),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        // `TRACE_ONE` matches twice in the subsearch and still yields one `l1`.
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[
+                build_traced_span_row(TENANT_A, &TRACE_ONE, "match"),
+                build_traced_span_row(TENANT_A, &TRACE_ONE, "match"),
+                build_traced_span_row(TENANT_A, &TRACE_TWO, "match"),
+                build_traced_span_row(TENANT_A, &TRACE_THREE, "other"),
+            ],
+        )
+        .await
+        .expect("commit spans");
+
+        assert_eq!(
+            run_ppl(&server, TENANT_A, IN_SUBSEARCH).await["datarows"],
+            json!([["l1"], ["l2"]])
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_A, SORTED_IN_SUBSEARCH).await["datarows"],
+            json!([["l2"], ["l1"]])
+        );
+
+        let (_logical_plan, physical_plan) = explain_ppl(&server, TENANT_A, IN_SUBSEARCH).await;
+        let semi_join_count = find_plan_lines(&physical_plan, "HashJoinExec")
+            .into_iter()
+            .filter(|line| line.contains("Semi"))
+            .count();
+        assert_eq!(semi_join_count, 1, "one semi-join:\n{physical_plan}");
+        for limit in ["GlobalLimitExec", "LocalLimitExec", "fetch="] {
+            assert!(
+                find_plan_lines(&physical_plan, limit).is_empty(),
+                "no cap ({limit}):\n{physical_plan}"
+            );
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_in_subsearch_matching_more_than_ten_thousand_rows_is_never_capped() {
+        let (server, catalog) = TestServer::start_with_config(build_row_limited_config()).await;
+        let trace_ids: Vec<[u8; 16]> = (0..10_053).map(build_indexed_trace_id).collect();
+        let logs: Vec<Row<'_>> = trace_ids
+            .iter()
+            .zip(0_i64..)
+            .map(|(trace_id, offset)| {
+                build_log_row(TENANT_A, NOON + offset, vec![(COL_TRACE_ID, Cell::Bytes(trace_id))])
+            })
+            .collect();
+        commit_rows(&catalog, LOGS_TABLE, &logs).await.expect("commit logs");
+        // Tenant A's subsearch matches the first 10 050 ids; the last three exist only as tenant B spans.
+        let mut spans: Vec<Row<'_>> = trace_ids[..10_050]
+            .iter()
+            .map(|trace_id| build_traced_span_row(TENANT_A, trace_id, "match"))
+            .collect();
+        spans.extend(
+            trace_ids[10_050..]
+                .iter()
+                .map(|trace_id| build_traced_span_row(TENANT_B, trace_id, "match")),
+        );
+        commit_rows(&catalog, SPANS_TABLE, &spans).await.expect("commit spans");
+
+        let query = "source=logs | where trace_id in [ source=spans | where name = 'match' | fields trace_id ] \
+             | stats count() as n";
+        assert_row_limit_refuses(
+            &server,
+            TENANT_A,
+            "source=spans | where name = 'match' | fields trace_id",
+        )
+        .await;
+        assert_eq!(run_ppl(&server, TENANT_A, query).await["datarows"], json!([[10_050]]));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_subsearch_source_with_an_alias_feeds_the_pipeline() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![
+                        (COL_BODY, Cell::Text("e1")),
+                        (COL_SEVERITY_TEXT, Cell::Text("ERROR")),
+                        (COL_SERVICE_NAME, Cell::Text("checkout")),
+                    ],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![
+                        (COL_BODY, Cell::Text("i1")),
+                        (COL_SEVERITY_TEXT, Cell::Text("INFO")),
+                        (COL_SERVICE_NAME, Cell::Text("checkout")),
+                    ],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![
+                        (COL_BODY, Cell::Text("e2")),
+                        (COL_SEVERITY_TEXT, Cell::Text("ERROR")),
+                        (COL_SERVICE_NAME, Cell::Text("cart")),
+                    ],
+                ),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[build_span_row(TENANT_A, NOON, "checkout", "s-checkout")],
+        )
+        .await
+        .expect("commit spans");
+        let errors = "[ source=logs | where severity_text = 'ERROR' | fields body, service_name ]";
+
+        let count_query = format!("source={errors} as t | stats count() as n");
+        assert_eq!(run_ppl(&server, TENANT_A, &count_query).await["datarows"], json!([[2]]));
+
+        let join_query = format!(
+            "source={errors} as t | inner join right=s on t.service_name = s.service_name \
+             [ source=spans | fields name, service_name ] | fields body, name"
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &join_query).await["datarows"],
+            json!([["e1", "s-checkout"]])
+        );
+
+        let unaliased_query = format!("source={errors} | fields body | sort body");
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &unaliased_query).await["datarows"],
+            json!([["e1"], ["e2"]])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_alias_on_an_index_source_is_a_semantic_400() {
+        let (server, _catalog) = TestServer::start().await;
+        let reply = refuse_ppl(&server, TENANT_A, "source=logs as l | fields body").await;
+        assert_semantic_refusal_naming(&reply, "l");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_subsearch_column_of_another_type_is_a_semantic_400() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[build_log_row(TENANT_A, NOON, vec![(COL_BODY, Cell::Text("a"))])],
+        )
+        .await
+        .expect("commit logs");
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[build_span_row(TENANT_A, NOON, "checkout", "s1")],
+        )
+        .await
+        .expect("commit spans");
+        // Positive control: the same subsearch against a string column answers, so the 400 below
+        // comes from the column type alone.
+        run_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | where body in [ source=spans | fields name ]",
+        )
+        .await;
+        // A MAP compared with the subsearch's string column fits no comparison type.
+        let reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | where log_attributes in [ source=spans | fields name ]",
+        )
+        .await;
+        assert_semantic_error(&reply.parse_json_body()["error"]);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_subsearch_never_reads_another_tenants_rows() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("l1")), (COL_SERVICE_NAME, Cell::Text("checkout"))],
+                ),
+                build_log_row(
+                    TENANT_A,
+                    NOON,
+                    vec![(COL_BODY, Cell::Text("l2")), (COL_SERVICE_NAME, Cell::Text("cart"))],
+                ),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        // One WAL segment file: tenant A has a `checkout` span, only tenant B a `cart` span.
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            SPANS_TABLE,
+            0,
+            &[
+                build_span_row(TENANT_A, NOON, "checkout", "a-span"),
+                build_span_row(TENANT_B, NOON, "cart", "b-span"),
+            ],
+        )
+        .await
+        .expect("write spans segment");
+
+        let filtered_query = "source=logs | where service_name in [ source=spans | fields service_name ] | fields body";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, filtered_query).await["datarows"],
+            json!([["l1"]])
+        );
+        let source_query = "source=[ source=spans | fields name ] | fields name";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, source_query).await["datarows"],
+            json!([["a-span"]])
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_B, source_query).await["datarows"],
+            json!([["b-span"]])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn misplaced_wide_and_system_index_subsearches_are_semantic_400s() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[build_log_row(
+                TENANT_A,
+                NOON,
+                vec![(COL_BODY, Cell::Text("l1")), (COL_SERVICE_NAME, Cell::Text("checkout"))],
+            )],
+        )
+        .await
+        .expect("commit logs");
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[build_span_row(TENANT_A, NOON, "checkout", "a-span")],
+        )
+        .await
+        .expect("commit spans");
+
+        let nested_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | where body = 'x' or service_name in [ source=spans | fields service_name ]",
+        )
+        .await;
+        assert_semantic_refusal_naming(&nested_reply, "in");
+        let two_column_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | where service_name in [ source=spans | fields name, service_name ]",
+        )
+        .await;
+        assert_semantic_refusal_naming(&two_column_reply, "in");
+
+        // A subsearch over a system index is refused like a system-index source, naming the index.
+        create_system_index(&server, TENANT_A).await.expect("create the system index");
+        for query in [
+            format!("source=logs | where body in [ source={SYSTEM_INDEX} | fields x ]"),
+            format!("source=[ source={SYSTEM_INDEX} ]"),
+        ] {
+            let system_reply = refuse_ppl(&server, TENANT_A, &query).await;
+            assert_semantic_refusal_naming(&system_reply, SYSTEM_INDEX);
+        }
+        server.shutdown().await;
+    }
+}
+
+/// `eventstats` and `streamstats`: aggregates per group added to every row, in the incoming order.
+mod window {
+    use icegate_common::schema::{COL_BODY, COL_SEVERITY_TEXT};
+
+    use super::*;
+
+    fn build_logged_row<'a>(
+        tenant: &'a str,
+        second: i64,
+        body: &'a str,
+        service: Option<&'a str>,
+        severity: &'a str,
+    ) -> Row<'a> {
+        let mut cells = vec![(COL_BODY, Cell::Text(body)), (COL_SEVERITY_TEXT, Cell::Text(severity))];
+        if let Some(service) = service {
+            cells.push((COL_SERVICE_NAME, Cell::Text(service)));
+        }
+        build_log_row(tenant, NOON + second * SECOND, cells)
+    }
+
+    /// A server over the tenant-A logs `a`–`e`, logged 1–5 seconds after noon: `a` and `c` in `checkout`,
+    /// `b` in `cart`, `d` and `e` without a service, and only `c` at `ERROR`; plus a tenant-B `checkout` row
+    /// `z` in the same WAL file as `d` and `e`, which no tenant-A query may count.
+    ///
+    /// # Errors
+    ///
+    /// The write error when a row cannot be committed or the WAL segment cannot be written.
+    async fn start_grouped_logs_server() -> Result<TestServer, RowWriteError> {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_logged_row(TENANT_A, 1, "a", Some("checkout"), "INFO"),
+                build_logged_row(TENANT_A, 2, "b", Some("cart"), "INFO"),
+                build_logged_row(TENANT_A, 3, "c", Some("checkout"), "ERROR"),
+            ],
+        )
+        .await?;
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            LOGS_TABLE,
+            1,
+            &[
+                build_logged_row(TENANT_A, 4, "d", None, "INFO"),
+                build_logged_row(TENANT_A, 5, "e", None, "INFO"),
+                build_logged_row(TENANT_B, 6, "z", Some("checkout"), "INFO"),
+            ],
+        )
+        .await?;
+        Ok(server)
+    }
+
+    #[tokio::test]
+    async fn eventstats_adds_group_aggregates_to_every_row_with_bucket_nullable() {
+        let server = start_grouped_logs_server().await.expect("start the grouped logs server");
+
+        let format_grouped_query = |options: &str| {
+            format!(
+                "source=logs | sort body | eventstats {options} count() as n, max(timestamp) as newest by service_name \
+                 | fields body, service_name, n, newest"
+            )
+        };
+        let nullable_answer = run_ppl(&server, TENANT_A, &format_grouped_query("")).await;
+        assert_eq!(
+            nullable_answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("service_name", "string"),
+                build_schema_column("n", "bigint"),
+                build_schema_column("newest", "timestamp")
+            ])
+        );
+        assert_eq!(
+            nullable_answer["datarows"],
+            json!([
+                ["a", "checkout", 2, "2026-10-08 12:00:03"],
+                ["b", "cart", 1, "2026-10-08 12:00:02"],
+                ["c", "checkout", 2, "2026-10-08 12:00:03"],
+                ["d", null, 2, "2026-10-08 12:00:05"],
+                ["e", null, 2, "2026-10-08 12:00:05"]
+            ])
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &format_grouped_query("bucket_nullable=true")).await["datarows"],
+            nullable_answer["datarows"]
+        );
+
+        let non_nullable_answer = run_ppl(&server, TENANT_A, &format_grouped_query("bucket_nullable=false")).await;
+        assert_eq!(
+            non_nullable_answer["datarows"],
+            json!([
+                ["a", "checkout", 2, "2026-10-08 12:00:03"],
+                ["b", "cart", 1, "2026-10-08 12:00:02"],
+                ["c", "checkout", 2, "2026-10-08 12:00:03"],
+                ["d", null, null, null],
+                ["e", null, null, null]
+            ])
+        );
+
+        let whole_query = "source=logs | sort - body | eventstats count() as total | fields body, total";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, whole_query).await["datarows"],
+            json!([["e", 5], ["d", 5], ["c", 5], ["b", 5], ["a", 5]])
+        );
+
+        // An aggregate named like an input column replaces it in place: `service_name` stays second, now a
+        // count. INFO holds a, b, d and e.
+        let replacing_query = "source=logs | fields body, service_name, severity_text | sort body \
+             | eventstats count() as service_name by severity_text | head 1";
+        let replacing_answer = run_ppl(&server, TENANT_A, replacing_query).await;
+        assert_eq!(
+            replacing_answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("service_name", "bigint"),
+                build_schema_column("severity_text", "string")
+            ])
+        );
+        assert_eq!(replacing_answer["datarows"], json!([["a", 4, "INFO"]]));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_ordinal_eventstats_records_survives_fields_and_fillnull_for_a_later_streamstats() {
+        let server = start_grouped_logs_server().await.expect("start the grouped logs server");
+
+        // `fields` keeps the hidden ordinal `eventstats` recorded for the later `streamstats`; `fillnull`'s
+        // all-fields form skips it and fills the visible string columns only.
+        let filled_query = "source=logs | sort body | eventstats count() as n by service_name \
+             | fields body, service_name | fillnull with 'none' | streamstats count() as rn \
+             | fields body, service_name, rn";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, filled_query).await["datarows"],
+            json!([
+                ["a", "checkout", 1],
+                ["b", "cart", 2],
+                ["c", "checkout", 3],
+                ["d", "none", 4],
+                ["e", "none", 5]
+            ])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn window_commands_refuse_duplicate_names_unsupported_functions_and_replaced_promoted_columns() {
+        let server = start_grouped_logs_server().await.expect("start the grouped logs server");
+
+        for command in ["eventstats", "streamstats"] {
+            let twice_reply = refuse_ppl(
+                &server,
+                TENANT_A,
+                &format!("source=logs | {command} count() as n, max(timestamp) as n"),
+            )
+            .await;
+            assert_semantic_refusal_naming(&twice_reply, "n");
+
+            let distinct_reply =
+                refuse_ppl(&server, TENANT_A, &format!("source=logs | {command} dc(service_name)")).await;
+            assert_semantic_refusal_naming(&distinct_reply, "dc");
+
+            // An aggregate that replaces the column a promoted attribute reads leaves that attribute unreadable.
+            let replaced_reply = refuse_ppl(
+                &server,
+                TENANT_A,
+                &format!(
+                    "source=logs | {command} count() as service_name | where resource_attributes.service.name = 'api'"
+                ),
+            )
+            .await;
+            assert_semantic_refusal_naming(&replaced_reply, "resource_attributes.service.name");
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn eventstats_computes_every_supported_aggregate_and_refuses_span_keys() {
+        let server = start_grouped_logs_server().await.expect("start the grouped logs server");
+
+        // `elapsed` is a row's second after noon (a=1 … e=5). `count(service_name)` counts non-NULL values, so
+        // the NULL group of d and e counts 0; `a` and `b` name one aggregate twice and share its window column.
+        let aggregates_query = "source=logs | sort body \
+             | eval elapsed = timestampdiff(SECOND, timestamp('2026-10-08 12:00:00'), timestamp) \
+             | eventstats count(service_name) as services, sum(elapsed) as elapsed_sum, \
+               avg(elapsed) as elapsed_avg, min(elapsed) as elapsed_min, count() as a, count() as b by service_name \
+             | fields body, services, elapsed_sum, elapsed_avg, elapsed_min, a, b";
+        let aggregates_answer = run_ppl(&server, TENANT_A, aggregates_query).await;
+        assert_eq!(
+            aggregates_answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("services", "bigint"),
+                build_schema_column("elapsed_sum", "bigint"),
+                build_schema_column("elapsed_avg", "double"),
+                build_schema_column("elapsed_min", "bigint"),
+                build_schema_column("a", "bigint"),
+                build_schema_column("b", "bigint")
+            ])
+        );
+        assert_eq!(
+            aggregates_answer["datarows"],
+            json!([
+                ["a", 2, 4, 2.0, 1, 2, 2],
+                ["b", 1, 2, 2.0, 2, 1, 1],
+                ["c", 2, 4, 2.0, 1, 2, 2],
+                ["d", 0, 9, 4.5, 4, 2, 2],
+                ["e", 0, 9, 4.5, 4, 2, 2]
+            ])
+        );
+
+        let span_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | eventstats count() by span(timestamp, 1h)",
+        )
+        .await;
+        assert_semantic_refusal_naming(&span_reply, "span");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn streamstats_count_by_numbers_rows_in_their_sorted_order() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_logged_row(TENANT_A, 1, "a", Some("checkout"), "INFO"),
+                build_logged_row(TENANT_A, 3, "c", Some("checkout"), "INFO"),
+                build_logged_row(TENANT_A, 5, "e", Some("cart"), "INFO"),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            LOGS_TABLE,
+            1,
+            &[
+                build_logged_row(TENANT_A, 2, "b", Some("cart"), "INFO"),
+                build_logged_row(TENANT_A, 4, "d", Some("checkout"), "INFO"),
+                build_logged_row(TENANT_B, 3, "z", Some("checkout"), "INFO"),
+            ],
+        )
+        .await
+        .expect("write logs segment");
+
+        let ascending_query =
+            "source=logs | sort timestamp | streamstats count() as rn by service_name | fields body, service_name, rn";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, ascending_query).await["datarows"],
+            json!([
+                ["a", "checkout", 1],
+                ["b", "cart", 1],
+                ["c", "checkout", 2],
+                ["d", "checkout", 3],
+                ["e", "cart", 2]
+            ])
+        );
+        let descending_query = "source=logs | sort - timestamp | streamstats count() as rn by service_name | fields body, service_name, rn";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, descending_query).await["datarows"],
+            json!([
+                ["e", "cart", 1],
+                ["d", "checkout", 1],
+                ["c", "checkout", 2],
+                ["b", "cart", 2],
+                ["a", "checkout", 3]
+            ])
+        );
+        let first_per_group_query =
+            "source=logs | sort timestamp | streamstats count() as rn by service_name | where rn = 1 | fields body";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, first_per_group_query).await["datarows"],
+            json!([["a"], ["b"]])
+        );
+        let running_query = "source=logs | sort timestamp | streamstats count() as seen | fields body, seen";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, running_query).await["datarows"],
+            json!([["a", 1], ["b", 2], ["c", 3], ["d", 4], ["e", 5]])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_where_after_eventstats_or_streamstats_never_moves_below_them() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_logged_row(TENANT_A, 1, "a", Some("checkout"), "INFO"),
+                build_logged_row(TENANT_A, 2, "b", Some("cart"), "ERROR"),
+                build_logged_row(TENANT_A, 3, "c", Some("checkout"), "ERROR"),
+                // Read by tenant A, `z` would be a third `checkout` row and a third answer row.
+                build_logged_row(TENANT_B, 4, "z", Some("checkout"), "ERROR"),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        // A filter moved below either command would make `c` the first and only `checkout` row: 1, not 2.
+        let event_query = "source=logs | sort body | eventstats count() as n by service_name \
+             | where severity_text = 'ERROR' | fields body, n";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, event_query).await["datarows"],
+            json!([["b", 1], ["c", 2]])
+        );
+        let stream_query = "source=logs | sort body | streamstats count() as rn by service_name \
+             | where severity_text = 'ERROR' | fields body, rn";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, stream_query).await["datarows"],
+            json!([["b", 1], ["c", 2]])
+        );
+
+        for query in [event_query, stream_query] {
+            let (logical_plan, _physical_plan) = explain_ppl(&server, TENANT_A, query).await;
+            let lines: Vec<&str> = logical_plan.lines().collect();
+            let filter_line = lines
+                .iter()
+                .position(|line| line.contains("Filter:") && line.contains("severity_text"))
+                .unwrap_or_else(|| panic!("no severity filter:\n{logical_plan}"));
+            let window_line = lines
+                .iter()
+                .position(|line| line.contains("WindowAggr"))
+                .unwrap_or_else(|| panic!("no window:\n{logical_plan}"));
+            assert!(
+                filter_line < window_line,
+                "the filter stays above the window:\n{logical_plan}"
+            );
+            assert!(
+                find_plan_lines(&logical_plan, "TableScan")
+                    .iter()
+                    .all(|line| !line.contains("ERROR")),
+                "the filter never reaches the scan:\n{logical_plan}"
+            );
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn eventstats_over_more_than_ten_thousand_rows_is_never_capped() {
+        let (server, catalog) = TestServer::start_with_config(build_row_limited_config()).await;
+        let mut rows: Vec<Row<'_>> = (0..10_050)
+            .map(|offset| {
+                build_log_row(
+                    TENANT_A,
+                    NOON + offset,
+                    vec![(COL_SERVICE_NAME, Cell::Text("checkout"))],
+                )
+            })
+            .collect();
+        rows.extend((0..3).map(|offset| {
+            build_log_row(
+                TENANT_B,
+                NOON + offset,
+                vec![(COL_SERVICE_NAME, Cell::Text("checkout"))],
+            )
+        }));
+        commit_rows(&catalog, LOGS_TABLE, &rows).await.expect("commit logs");
+
+        let query =
+            "source=logs | eventstats count() as n by service_name | stats count() as rows, max(n) as group_size";
+        assert_row_limit_refuses(
+            &server,
+            TENANT_A,
+            "source=logs | eventstats count() as n by service_name",
+        )
+        .await;
+        assert_eq!(
+            run_ppl(&server, TENANT_A, query).await["datarows"],
+            json!([[10_050, 10_050]])
+        );
+        server.shutdown().await;
+    }
+
+    /// Over [`write_numbered_logs_across_iceberg_and_wal`], ascending time order ranks the row with body `k` at
+    /// `k + 1`, and descending time order after `eventstats` ranks it at `18000 - k` with a total of 18000. The
+    /// helper's tenant-B row would take rank 1 ascending and make the total 18001 if tenant A read it.
+    #[tokio::test]
+    async fn streamstats_follows_the_sorted_order_across_iceberg_and_wal_beyond_one_batch() {
+        let (server, catalog) = TestServer::start().await;
+        write_numbered_logs_across_iceberg_and_wal(&server, &catalog)
+            .await
+            .expect("write the numbered logs");
+
+        let ascending_query = "source=logs | sort timestamp | streamstats count() as rn \
+             | where rn = 1 or rn = 2 or rn = 9001 or rn = 18000 | fields body, rn";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, ascending_query).await["datarows"],
+            json!([["00000", 1], ["00001", 2], ["09000", 9001], ["17999", 18000]])
+        );
+
+        // `fields` keeps the hidden ordinal `eventstats` left behind, so `streamstats` still numbers the rows in
+        // descending order.
+        let chained_query = "source=logs | sort - timestamp | eventstats count() as total | fields body, total \
+             | streamstats count() as rn | where rn = 1 or rn = 2 or rn = 9001 or rn = 18000 | fields body, rn, total";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, chained_query).await["datarows"],
+            json!([
+                ["17999", 1, 18000],
+                ["17998", 2, 18000],
+                ["08999", 9001, 18000],
+                ["00000", 18000, 18000]
+            ])
+        );
+        server.shutdown().await;
+    }
+}
+
+/// `append`: branches concatenated in order onto the union of their columns, tenant-scoped, uncapped.
+mod append {
+    use icegate_common::schema::{COL_BODY, COL_DURATION_MICROS, COL_RESOURCE_ATTRIBUTES};
+
+    use super::*;
+
+    fn build_body_row<'a>(tenant: &'a str, micros: i64, body: &'a str, service: &'a str) -> Row<'a> {
+        build_log_row(
+            tenant,
+            micros,
+            vec![(COL_BODY, Cell::Text(body)), (COL_SERVICE_NAME, Cell::Text(service))],
+        )
+    }
+
+    #[tokio::test]
+    async fn append_concatenates_branches_in_order() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_body_row(TENANT_A, NOON, "c1", "checkout"),
+                build_body_row(TENANT_A, NOON, "c2", "checkout"),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        // Tenant B's `c4` shares the WAL file with `c3`; read by tenant A it would lead the pipeline's rows.
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            LOGS_TABLE,
+            1,
+            &[
+                build_body_row(TENANT_A, NOON, "c3", "checkout"),
+                build_body_row(TENANT_B, NOON, "c4", "checkout"),
+            ],
+        )
+        .await
+        .expect("write logs segment");
+        // Tenant B's `a0` shares the Iceberg commit with the spans; read by tenant A it would lead the branch.
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[
+                build_span_row(TENANT_A, NOON, "checkout", "s2"),
+                build_span_row(TENANT_A, NOON, "cart", "s1"),
+                build_span_row(TENANT_B, NOON, "checkout", "a0"),
+            ],
+        )
+        .await
+        .expect("commit spans");
+
+        let query = "source=logs | where service_name = 'checkout' | sort - body | fields body, service_name \
+             | append [ source=spans | sort name | fields name, service_name ]";
+        let answer = run_ppl(&server, TENANT_A, query).await;
+        assert_eq!(
+            answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("service_name", "string"),
+                build_schema_column("name", "string")
+            ])
+        );
+        assert_eq!(
+            answer["datarows"],
+            json!([
+                ["c3", "checkout", null],
+                ["c2", "checkout", null],
+                ["c1", "checkout", null],
+                [null, "cart", "s1"],
+                [null, "checkout", "s2"]
+            ])
+        );
+
+        let chained_query = "source=logs | where body = 'c1' | fields body \
+             | append [ source=logs | where body = 'c3' | fields body ] \
+             | append [ source=logs | where body = 'c2' | fields body ]";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, chained_query).await["datarows"],
+            json!([["c1"], ["c3"], ["c2"]])
+        );
+        // The first `append` leaves an order no scan gives (descending, then ascending), so the second `append`
+        // keeps it only by reading the order the first one leaves.
+        let reordered_chain_query = "source=logs | sort - body | fields body \
+             | append [ source=logs | sort body | fields body ] \
+             | append [ source=logs | where body = 'c1' | fields body ]";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, reordered_chain_query).await["datarows"],
+            json!([["c3"], ["c2"], ["c1"], ["c1"], ["c2"], ["c3"], ["c1"]])
+        );
+
+        let conflict_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            "source=logs | fields body | append [ source=spans | eval body = 1 | fields body ]",
+        )
+        .await;
+        assert_semantic_refusal_naming(&conflict_reply, "body");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_logs_context_style_anchor_with_two_appended_neighbour_branches_answers_the_stated_rows() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_body_row(TENANT_A, NOON - 3 * SECOND, "o3", "checkout"),
+                build_body_row(TENANT_A, NOON - 2 * SECOND, "o2", "checkout"),
+                build_body_row(TENANT_A, NOON, "anchor", "checkout"),
+                build_body_row(TENANT_A, NOON + 2 * SECOND, "n2", "checkout"),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        // The nearest neighbours and tenant B's rows at the same instants share one WAL segment file.
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            LOGS_TABLE,
+            1,
+            &[
+                build_body_row(TENANT_A, NOON - SECOND, "o1", "checkout"),
+                build_body_row(TENANT_A, NOON + SECOND, "n1", "checkout"),
+                build_body_row(TENANT_A, NOON + 3 * SECOND, "n3", "checkout"),
+                build_body_row(TENANT_B, NOON - SECOND, "b-older", "checkout"),
+                build_body_row(TENANT_B, NOON + SECOND, "b-newer", "checkout"),
+            ],
+        )
+        .await
+        .expect("write logs segment");
+
+        let context_query = "source=logs | where timestamp = '2026-10-08 12:00:00' and body = 'anchor' | head 1 \
+             | eval context_row_kind = 'anchor' | fields timestamp, body, context_row_kind \
+             | append [ source=logs | where timestamp < '2026-10-08 12:00:00' | sort - timestamp | head 2 \
+                 | eval context_row_kind = 'older' | fields timestamp, body, context_row_kind ] \
+             | append [ source=logs | where timestamp > '2026-10-08 12:00:00' | sort timestamp | head 2 \
+                 | eval context_row_kind = 'newer' | fields timestamp, body, context_row_kind ]";
+        let answer = run_ppl(&server, TENANT_A, context_query).await;
+        assert_eq!(
+            answer["schema"],
+            json!([
+                build_schema_column("timestamp", "timestamp"),
+                build_schema_column("body", "string"),
+                build_schema_column("context_row_kind", "string")
+            ])
+        );
+        assert_eq!(
+            answer["datarows"],
+            json!([
+                ["2026-10-08 12:00:00", "anchor", "anchor"],
+                ["2026-10-08 11:59:59", "o1", "older"],
+                ["2026-10-08 11:59:58", "o2", "older"],
+                ["2026-10-08 12:00:01", "n1", "newer"],
+                ["2026-10-08 12:00:02", "n2", "newer"]
+            ])
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_appended_branch_never_reads_another_tenants_rows() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[build_body_row(TENANT_A, NOON, "a-log", "checkout")],
+        )
+        .await
+        .expect("commit logs");
+        // One WAL segment file holds both tenants' spans.
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            SPANS_TABLE,
+            0,
+            &[
+                build_span_row(TENANT_A, NOON, "checkout", "a-span"),
+                build_span_row(TENANT_B, NOON, "checkout", "b-span"),
+            ],
+        )
+        .await
+        .expect("write spans segment");
+
+        let query = "source=logs | fields body | append [ source=spans | fields name ]";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, query).await["datarows"],
+            json!([["a-log", null], [null, "a-span"]])
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_B, query).await["datarows"],
+            json!([[null, "b-span"]])
+        );
+
+        // A branch over a system index is refused like a system-index source, naming the index.
+        create_system_index(&server, TENANT_A).await.expect("create the system index");
+        let system_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            &format!("source=logs | append [ source={SYSTEM_INDEX} ]"),
+        )
+        .await;
+        assert_semantic_refusal_naming(&system_reply, SYSTEM_INDEX);
+        server.shutdown().await;
+    }
+
+    /// The listener's row limit bounds only the query's output: the branch alone is refused for exceeding
+    /// it, while the same branch under `append` and `stats` is read in full and answers one row. The
+    /// branch also holds more rows than the default `search.max_result_window`, so that window applied to
+    /// it would change the count as well.
+    #[tokio::test]
+    async fn an_appended_branch_beyond_the_row_limit_is_never_capped() {
+        const BRANCH_ROWS: i64 = 10_050;
+        let config = build_row_limited_config();
+        assert!(
+            i64::try_from(config.search.max_result_window).expect("the window fits an i64") < BRANCH_ROWS,
+            "the branch must exceed the default result window"
+        );
+        let (server, catalog) = TestServer::start_with_config(config).await;
+        let mut spans: Vec<Row<'_>> = (0..BRANCH_ROWS)
+            .map(|offset| build_span_row(TENANT_A, NOON + offset, "checkout", "a-span"))
+            .collect();
+        spans.extend((0..3).map(|offset| build_span_row(TENANT_B, NOON + offset, "checkout", "b-span")));
+        commit_rows(&catalog, SPANS_TABLE, &spans).await.expect("commit spans");
+
+        assert_row_limit_refuses(&server, TENANT_A, "source=spans | fields name").await;
+
+        let query = "source=logs | fields body | append [ source=spans | fields name ] | stats count() as n";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, query).await["datarows"],
+            json!([[BRANCH_ROWS]])
+        );
+        server.shutdown().await;
+    }
+
+    /// Both sides read [`write_numbered_logs_across_iceberg_and_wal`]; the pipeline is sorted ascending and the
+    /// branch descending, and both drop their sort key. `streamstats` reads the order `append` leaves: the
+    /// pipeline's row of rank `r` has body `r - 1` and the branch's row of rank `18000 + r` has body `18000 - r`.
+    /// The helper's tenant-B row would take rank 1 if tenant A read it.
+    #[tokio::test]
+    async fn append_keeps_both_sides_in_order_across_iceberg_and_wal_beyond_one_batch() {
+        let (server, catalog) = TestServer::start().await;
+        write_numbered_logs_across_iceberg_and_wal(&server, &catalog)
+            .await
+            .expect("write the numbered logs");
+
+        let query = "source=logs | sort timestamp | fields body \
+             | append [ source=logs | sort - timestamp | fields body ] | streamstats count() as rn \
+             | where rn = 1 or rn = 9001 or rn = 18000 or rn = 18001 or rn = 18002 or rn = 36000 | fields body, rn";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, query).await["datarows"],
+            json!([
+                ["00000", 1],
+                ["09000", 9001],
+                ["17999", 18000],
+                ["17999", 18001],
+                ["17998", 18002],
+                ["00000", 36000]
+            ])
+        );
+        server.shutdown().await;
+    }
+
+    /// Each side sorts on a column its `fields` drops, so each carries its sort key as a hidden column: a
+    /// timestamp in the pipeline, an integer in the branch. Hidden columns are no part of the column union, so
+    /// the two types never meet.
+    #[tokio::test]
+    async fn append_drops_the_hidden_sort_keys_of_both_sides() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[
+                build_body_row(TENANT_A, NOON + SECOND, "l2", "checkout"),
+                build_body_row(TENANT_A, NOON, "l1", "checkout"),
+                // Read by tenant A, `b-log` would lead the pipeline's rows.
+                build_body_row(TENANT_B, NOON - SECOND, "b-log", "checkout"),
+            ],
+        )
+        .await
+        .expect("commit logs");
+        let build_timed_span_row = |tenant, name, duration| {
+            let mut row = build_span_row(tenant, NOON, "checkout", name);
+            row.cells.push((COL_DURATION_MICROS, Cell::Long(duration)));
+            row
+        };
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[
+                build_timed_span_row(TENANT_A, "slow", 30),
+                build_timed_span_row(TENANT_A, "fast", 10),
+                build_timed_span_row(TENANT_A, "mid", 20),
+                // Read by tenant A, `b-fastest` would lead the branch's rows.
+                build_timed_span_row(TENANT_B, "b-fastest", 5),
+            ],
+        )
+        .await
+        .expect("commit spans");
+
+        let query = "source=logs | sort timestamp | fields body \
+             | append [ source=spans | sort duration_micros | fields name ]";
+        let answer = run_ppl(&server, TENANT_A, query).await;
+        assert_eq!(
+            answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("name", "string")
+            ])
+        );
+        assert_eq!(
+            answer["datarows"],
+            json!([
+                ["l1", null],
+                ["l2", null],
+                [null, "fast"],
+                [null, "mid"],
+                [null, "slow"]
+            ])
+        );
+        server.shutdown().await;
+    }
+
+    /// `resource_attributes` is a map in both tables, whose nested Iceberg field ids each table numbers on its
+    /// own: the column is one PPL type on both sides, so `append` unions it rather than refusing it.
+    #[tokio::test]
+    async fn append_unions_a_map_column_logs_and_spans_share() {
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            LOGS_TABLE,
+            &[build_log_row(
+                TENANT_A,
+                NOON,
+                vec![
+                    (COL_BODY, Cell::Text("l1")),
+                    (COL_RESOURCE_ATTRIBUTES, Cell::Map(&[("host.name", "node-a")])),
+                ],
+            )],
+        )
+        .await
+        .expect("commit logs");
+        let build_hosted_span_row = |tenant, name, resource_attributes| {
+            let mut row = build_span_row(tenant, NOON, "checkout", name);
+            row.cells.push((COL_RESOURCE_ATTRIBUTES, Cell::Map(resource_attributes)));
+            row
+        };
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[
+                build_hosted_span_row(TENANT_A, "s1", &[("host.name", "node-b")]),
+                // Read by tenant A, `b-span` would lead the branch's rows.
+                build_hosted_span_row(TENANT_B, "b-span", &[("host.name", "node-z")]),
+            ],
+        )
+        .await
+        .expect("commit spans");
+
+        let query = "source=logs | fields body, resource_attributes \
+             | append [ source=spans | sort name | fields name, resource_attributes ]";
+        let answer = run_ppl(&server, TENANT_A, query).await;
+        assert_eq!(
+            answer["schema"],
+            json!([
+                build_schema_column("body", "string"),
+                build_schema_column("resource_attributes", "struct"),
+                build_schema_column("name", "string")
+            ])
+        );
+        assert_eq!(
+            answer["datarows"],
+            json!([
+                ["l1", { "host.name": "node-a" }, null],
+                [null, { "host.name": "node-b" }, "s1"]
+            ])
+        );
+        server.shutdown().await;
+    }
+}
+
+/// Hex id literals: folded to the column's fixed width for every comparison, refused when invalid, pushed
+/// into both scans, ordered as bytes.
+mod hex_ids {
+    use icegate_common::schema::{COL_PARENT_SPAN_ID, COL_SPAN_ID, COL_TRACE_ID};
+
+    use super::super::test_rows::build_first_byte_id;
+    use super::*;
+
+    const TRACE_01: [u8; 16] = build_first_byte_id(0x01);
+    const TRACE_7F: [u8; 16] = build_first_byte_id(0x7f);
+    const TRACE_80: [u8; 16] = build_first_byte_id(0x80);
+    const TRACE_FF: [u8; 16] = build_first_byte_id(0xff);
+    const SPAN_01: [u8; 8] = build_first_byte_id(0x01);
+    const SPAN_02: [u8; 8] = build_first_byte_id(0x02);
+    const SPAN_03: [u8; 8] = build_first_byte_id(0x03);
+    const SPAN_04: [u8; 8] = build_first_byte_id(0x04);
+    const SPAN_05: [u8; 8] = build_first_byte_id(0x05);
+
+    /// The same ids as hex, written out by hand.
+    const HEX_01: &str = "01000000000000000000000000000000";
+    const HEX_7F: &str = "7f000000000000000000000000000000";
+    const HEX_7F_UPPER: &str = "7F000000000000000000000000000000";
+    const HEX_80: &str = "80000000000000000000000000000000";
+    const HEX_FF: &str = "ff000000000000000000000000000000";
+    const SPAN_HEX_01: &str = "0100000000000000";
+    const SPAN_HEX_02: &str = "0200000000000000";
+    const SPAN_HEX_03: &str = "0300000000000000";
+
+    fn build_id_span_row<'a>(
+        tenant: &'a str,
+        micros: i64,
+        name: &'a str,
+        trace_id: &'a [u8],
+        span_id: &'a [u8],
+    ) -> Row<'a> {
+        let mut row = build_span_row(tenant, micros, "checkout", name);
+        row.cells.push((COL_TRACE_ID, Cell::Bytes(trace_id)));
+        row.cells.push((COL_SPAN_ID, Cell::Bytes(span_id)));
+        row
+    }
+
+    /// Spans `one`–`four` of tenant A at noon, in Iceberg and in the WAL, and tenant B's `b-two` with
+    /// `two`'s ids in the same WAL file. `two` is the child of `one`.
+    ///
+    /// # Errors
+    ///
+    /// The write error of the Iceberg commit or of the WAL segment.
+    async fn seed_id_spans(server: &TestServer, catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteError> {
+        let mut two = build_id_span_row(TENANT_A, NOON, "two", &TRACE_7F, &SPAN_02);
+        two.cells.push((COL_PARENT_SPAN_ID, Cell::Bytes(&SPAN_01)));
+        commit_rows(
+            catalog,
+            SPANS_TABLE,
+            &[build_id_span_row(TENANT_A, NOON, "one", &TRACE_01, &SPAN_01), two],
+        )
+        .await?;
+        write_wal_segment(
+            &server.wal_store,
+            catalog,
+            SPANS_TABLE,
+            1,
+            &[
+                build_id_span_row(TENANT_A, NOON, "three", &TRACE_80, &SPAN_03),
+                build_id_span_row(TENANT_A, NOON, "four", &TRACE_FF, &SPAN_04),
+                build_id_span_row(TENANT_B, NOON, "b-two", &TRACE_7F, &SPAN_02),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn string_literals_compared_with_id_columns_fold_to_fixed_binary_for_each_operator() {
+        let (server, catalog) = TestServer::start().await;
+        seed_id_spans(&server, &catalog).await.expect("seed spans");
+        for (condition, expected_rows) in [
+            (format!("trace_id = '{HEX_7F}'"), json!([["two"]])),
+            (format!("trace_id = '{HEX_7F_UPPER}'"), json!([["two"]])),
+            (format!("'{HEX_7F}' = trace_id"), json!([["two"]])),
+            (format!("trace_id != '{HEX_7F}'"), json!([["four"], ["one"], ["three"]])),
+            (format!("trace_id < '{HEX_7F}'"), json!([["one"]])),
+            (format!("trace_id <= '{HEX_7F}'"), json!([["one"], ["two"]])),
+            (format!("trace_id > '{HEX_7F}'"), json!([["four"], ["three"]])),
+            (format!("trace_id >= '{HEX_80}'"), json!([["four"], ["three"]])),
+            (
+                format!("trace_id in ('{HEX_01}', '{HEX_FF}')"),
+                json!([["four"], ["one"]]),
+            ),
+            (format!("span_id = '{SPAN_HEX_03}'"), json!([["three"]])),
+            (format!("parent_span_id = '{SPAN_HEX_01}'"), json!([["two"]])),
+        ] {
+            let query = format!("source=spans | where {condition} | fields name | sort name");
+            assert_eq!(
+                run_ppl(&server, TENANT_A, &query).await["datarows"],
+                expected_rows,
+                "{query}"
+            );
+        }
+        let rendered_query = format!("source=spans | where trace_id = '{HEX_7F}' | fields trace_id, span_id");
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &rendered_query).await["datarows"],
+            json!([[HEX_7F, SPAN_HEX_02]])
+        );
+        server.shutdown().await;
+    }
+
+    /// `between` folds both bounds as a comparison does, so its answer is that of `>=` and `<=` with the
+    /// same literals; tenant B's `b-two`, in the same WAL segment with `two`'s trace id, stays out.
+    #[tokio::test]
+    async fn between_on_an_id_folds_both_bounds_like_the_comparisons() {
+        let (server, catalog) = TestServer::start().await;
+        seed_id_spans(&server, &catalog).await.expect("seed spans");
+        for (condition, expected_rows) in [
+            (
+                format!("trace_id between '{HEX_01}' and '{HEX_7F}'"),
+                json!([["one"], ["two"]]),
+            ),
+            (
+                format!("trace_id between '{HEX_7F_UPPER}' and '{HEX_80}'"),
+                json!([["three"], ["two"]]),
+            ),
+            (
+                format!("trace_id not between '{HEX_01}' and '{HEX_7F}'"),
+                json!([["four"], ["three"]]),
+            ),
+            (
+                format!("trace_id >= '{HEX_01}' and trace_id <= '{HEX_7F}'"),
+                json!([["one"], ["two"]]),
+            ),
+            (
+                format!("span_id between '{SPAN_HEX_02}' and '{SPAN_HEX_03}'"),
+                json!([["three"], ["two"]]),
+            ),
+        ] {
+            let query = format!("source=spans | where {condition} | fields name | sort name");
+            assert_eq!(
+                run_ppl(&server, TENANT_A, &query).await["datarows"],
+                expected_rows,
+                "{query}"
+            );
+        }
+        server.shutdown().await;
+    }
+
+    /// A bound that is no id literal is refused as in a comparison: invalid hex names the literal, a value of
+    /// another type names the id field.
+    #[tokio::test]
+    async fn between_on_an_id_with_an_invalid_or_mistyped_bound_is_a_400() {
+        // Reads no rows: the refusal comes while planning, so no other tenant's row could change it.
+        let (server, _catalog) = TestServer::start().await;
+        let invalid_reply = refuse_ppl(
+            &server,
+            TENANT_A,
+            &format!("source=spans | where trace_id between '{HEX_01}' and 'zz'"),
+        )
+        .await;
+        assert_semantic_refusal_naming(&invalid_reply, "zz");
+        let mistyped_reply = refuse_ppl(&server, TENANT_A, "source=spans | where span_id between 1 and 2").await;
+        assert_semantic_refusal_naming(&mistyped_reply, COL_SPAN_ID);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_hex_or_a_wrong_length_is_a_400() {
+        // Reads no rows: the refusal comes while planning, so no other tenant's row could change it.
+        let (server, _catalog) = TestServer::start().await;
+        // Each refusal names the literal it refuses: not hex, or another number of bytes than the id.
+        for (condition, literal) in [
+            (
+                "trace_id = 'zz000000000000000000000000000000'".to_string(),
+                "zz000000000000000000000000000000",
+            ),
+            ("trace_id != '7f00'".to_string(), "7f00"),
+            (format!("span_id = '{HEX_7F}'"), HEX_7F),
+            (format!("trace_id in ('{HEX_01}', 'abc')"), "abc"),
+            ("'xyz' < trace_id".to_string(), "xyz"),
+        ] {
+            let query = format!("source=spans | where {condition}");
+            let refused_reply = refuse_ppl(&server, TENANT_A, &query).await;
+            assert_semantic_refusal_naming(&refused_reply, literal);
+        }
+        server.shutdown().await;
+    }
+
+    /// Only a string literal folds: an id compared with a column, a number or a listed number of another type
+    /// is refused, naming the id field.
+    #[tokio::test]
+    async fn an_id_compared_with_a_non_string_literal_operand_of_another_type_is_a_400() {
+        // Reads no rows: the refusal comes while planning, so no other tenant's row could change it.
+        let (server, _catalog) = TestServer::start().await;
+        for (condition, id_field) in [
+            ("trace_id = service_name", COL_TRACE_ID),
+            ("span_id = 5", COL_SPAN_ID),
+            ("name != parent_span_id", COL_PARENT_SPAN_ID),
+            ("trace_id in (1, 2)", COL_TRACE_ID),
+        ] {
+            let query = format!("source=spans | where {condition}");
+            let refused_reply = refuse_ppl(&server, TENANT_A, &query).await;
+            assert_semantic_refusal_naming(&refused_reply, id_field);
+        }
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_trace_id_literal_reaches_the_wal_and_iceberg_scans_as_fixed_binary() {
+        const MIXED_TRACE: [u8; 16] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+        ];
+        const MIXED_HEX: &str = "0123456789abcdeffedcba9876543210";
+        // The WAL scan prints a fixed-size binary literal as the hex of its first ten bytes and `...`; the
+        // case it prints is not this contract.
+        const MIXED_HEX_IN_WAL_FILTER: &str = " = 0123456789abcdeffedc...";
+        let (server, catalog) = TestServer::start().await;
+        commit_rows(
+            &catalog,
+            SPANS_TABLE,
+            &[build_id_span_row(TENANT_A, NOON, "committed", &MIXED_TRACE, &SPAN_01)],
+        )
+        .await
+        .expect("commit spans");
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            SPANS_TABLE,
+            1,
+            &[
+                build_id_span_row(TENANT_A, NOON, "hot", &MIXED_TRACE, &SPAN_02),
+                build_id_span_row(TENANT_B, NOON, "b-hot", &MIXED_TRACE, &SPAN_03),
+            ],
+        )
+        .await
+        .expect("write spans segment");
+        let query = format!("source=spans | where trace_id = '{MIXED_HEX}' | fields name | sort name");
+
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &query).await["datarows"],
+            json!([["committed"], ["hot"]])
+        );
+
+        let (_logical_plan, physical_plan) = explain_ppl(&server, TENANT_A, &query).await;
+        let iceberg_scan_lines = find_plan_lines(&physical_plan, "IcegateIcebergScan");
+        assert_eq!(iceberg_scan_lines.len(), 1, "{physical_plan}");
+        // The case in which the scan prints the datum is not this contract.
+        let iceberg_predicate = iceberg_scan_lines[0]
+            .split_once("predicate:[")
+            .map_or("", |(_, rest)| rest)
+            .to_ascii_lowercase();
+        assert!(
+            iceberg_predicate.contains("trace_id") && iceberg_predicate.contains(MIXED_HEX),
+            "the Iceberg scan prunes on the fixed-width id:\n{physical_plan}"
+        );
+        let wal_scan_lines = find_plan_lines(&physical_plan, "DataSourceExec");
+        assert_eq!(wal_scan_lines.len(), 1, "{physical_plan}");
+        let wal_predicate = wal_scan_lines[0].split_once("predicate=").map_or("", |(_, rest)| rest);
+        let wal_filter = wal_predicate
+            .split_once(", pruning_predicate=")
+            .map_or(wal_predicate, |(filter, _)| filter);
+        assert!(
+            wal_filter.split(" AND ").any(|conjunct| conjunct.starts_with("trace_id@")
+                && conjunct.to_ascii_lowercase().ends_with(MIXED_HEX_IN_WAL_FILTER)),
+            "the WAL scan compares the column with the fixed-width id:\n{physical_plan}"
+        );
+        assert!(
+            !wal_predicate.contains("CAST(trace_id"),
+            "no cast of the column:\n{physical_plan}"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn keyset_comparisons_on_hex_ids_follow_byte_order() {
+        let (server, catalog) = TestServer::start().await;
+        seed_id_spans(&server, &catalog).await.expect("seed spans");
+        write_wal_segment(
+            &server.wal_store,
+            &catalog,
+            SPANS_TABLE,
+            2,
+            &[build_id_span_row(
+                TENANT_A,
+                NOON - SECOND,
+                "earlier",
+                &TRACE_01,
+                &SPAN_05,
+            )],
+        )
+        .await
+        .expect("write spans segment");
+
+        // A signed byte comparison would put `80…` and `ff…` before `01…`; byte order puts them last. Tenant
+        // B's `b-two` at noon shares `two`'s trace id and would add a fifth row if tenant A read it.
+        let query_sorted_by_trace_id =
+            "source=spans | where timestamp = '2026-10-08 12:00:00' | sort trace_id | fields name";
+        assert_eq!(
+            run_ppl(&server, TENANT_A, query_sorted_by_trace_id).await["datarows"],
+            json!([["one"], ["two"], ["three"], ["four"]])
+        );
+        // The page after (noon, `7f…`) in `- timestamp, trace_id` order.
+        let next_page_query = format!(
+            "source=spans | where timestamp < '2026-10-08 12:00:00' \
+             or (timestamp = '2026-10-08 12:00:00' and trace_id > '{HEX_7F}') \
+             | sort - timestamp, trace_id | fields name, trace_id | head 3"
+        );
+        assert_eq!(
+            run_ppl(&server, TENANT_A, &next_page_query).await["datarows"],
+            json!([["three", HEX_80], ["four", HEX_FF], ["earlier", HEX_01]])
+        );
+        server.shutdown().await;
+    }
+}

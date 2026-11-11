@@ -27,14 +27,14 @@ use icegate_common::TenantId;
 use icegate_common::schema::{
     COL_ANNOTATOR_KIND, COL_ERROR_TYPE, COL_EVALUATION_METADATA, COL_EVALUATIONS, COL_EXPLANATION, COL_IDENTIFIER,
     COL_NAME, COL_RESPONSE_ID, COL_SCORE_LABEL, COL_SCORE_VALUE, COL_TARGET_SCOPE, COL_TARGET_SPAN_ID,
-    COL_TARGET_TRACE_ID,
+    COL_TARGET_TRACE_ID, SERVICE_NAME_ATTRIBUTE_KEY,
 };
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 
 use self::projection::{EvaluationResult, OperationRow, project_operation_row};
 use super::attributes::{
-    DEPLOYMENT_ENVIRONMENT_KEY, DEPLOYMENT_ENVIRONMENT_NAME_KEY, SERVICE_NAME_KEY, extract_string_value,
-    list_element_field, list_struct_fields, now_micros,
+    DEPLOYMENT_ENVIRONMENT_KEY, DEPLOYMENT_ENVIRONMENT_NAME_KEY, extract_string_value, list_element_field,
+    list_struct_fields, now_micros,
 };
 use super::nested_builders::{field_builder_missing, nested_field_index, nested_struct_builders};
 
@@ -139,7 +139,7 @@ pub fn operations_to_record_batch(
     // Revisit if this walk becomes a measurable ingest hot-path cost.
     for resource_spans in &request.resource_spans {
         let resource_attrs = resource_spans.resource.as_ref().map_or(&empty_attrs, |r| &r.attributes);
-        let service_name = find_string_attribute(resource_attrs, SERVICE_NAME_KEY);
+        let service_name = find_string_attribute(resource_attrs, SERVICE_NAME_ATTRIBUTE_KEY);
         // Resolved by the resource's first row, so a resource without LLM spans never pays for it.
         let environment: OnceCell<Option<Rc<str>>> = OnceCell::new();
 

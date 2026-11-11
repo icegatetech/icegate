@@ -16,6 +16,7 @@ use icegate_common::ICEGATE_NAMESPACE;
 use icegate_queue::ParquetQueueReader;
 
 use super::WalQueryConfig;
+use super::iceberg_only::IcebergOnlyTableProvider;
 use super::schema::IcegateSchemaProvider;
 
 /// Catalog provider that substitutes our custom schema provider for the
@@ -86,8 +87,8 @@ impl CatalogProvider for IcegateCatalogProvider {
     }
 }
 
-/// Build a standard schema provider using `IcebergStaticTableProvider` for
-/// all tables in the given namespace.
+/// Build a standard schema provider using `IcebergStaticTableProvider`, inside
+/// [`IcebergOnlyTableProvider`], for all tables in the given namespace.
 ///
 /// This is the non-WAL path, used for namespaces other than "icegate".
 async fn build_standard_schema_provider(
@@ -103,7 +104,8 @@ async fn build_standard_schema_provider(
             let provider = IcebergStaticTableProvider::try_new_from_table(table).await?;
             Ok::<_, iceberg::Error>((
                 ident.name().to_string(),
-                Arc::new(provider) as Arc<dyn datafusion::datasource::TableProvider>,
+                Arc::new(IcebergOnlyTableProvider::new(Arc::new(provider)))
+                    as Arc<dyn datafusion::datasource::TableProvider>,
             ))
         }
     }))

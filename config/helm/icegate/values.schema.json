@@ -124,6 +124,51 @@
         "prometheus": { "type": ["object", "null"], "additionalProperties": true, "description": "Prometheus-compatible API listener." },
         "tempo": { "type": ["object", "null"], "additionalProperties": true, "description": "Tempo-compatible API listener." },
         "flightSql": { "type": ["object", "null"], "additionalProperties": true, "description": "Arrow Flight SQL listener." },
+        "opensearch": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "OpenSearch-compatible API listener.",
+          "properties": {
+            "enabled": { "type": "boolean", "description": "Run the listener." },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Listener port." },
+            "version": { "type": "string", "description": "Version reported by GET / and /_nodes: canonical MAJOR.MINOR.PATCH, major 3." },
+            "clusterName": { "type": "string", "minLength": 1, "description": "Cluster name reported by GET /, /_nodes and /_cluster/health." },
+            "maxRequestBodyBytes": { "type": "integer", "minimum": 1, "description": "Largest request body accepted, in bytes." },
+            "maxQueryMemoryBytes": { "type": "integer", "minimum": 1, "description": "Bytes of memory one OpenSearch query may hold; a query needing more answers 400." },
+            "fieldDiscoveryWindowSecs": { "type": "integer", "minimum": 1, "description": "Field-discovery window, in seconds." },
+            "maxTraceLookbackSecs": { "type": "integer", "minimum": 1, "description": "Root-span lookback of the cross-row trace fields, in seconds." },
+            "maxCrossRowTraces": { "type": "integer", "minimum": 1, "description": "Most traces one search reads the root spans of." },
+            "systemIndices": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "description": "Per-tenant store of the dot-prefixed system indices.",
+              "properties": {
+                "location": { "type": "string", "pattern": "^$|^s3a?://[^/]+", "description": "s3:// or s3a:// URL; empty resolves to the default prefix under the storage bucket (SystemIndicesConfig::DEFAULT_LOCATION_PREFIX in crates/icegate-query/src/opensearch/config.rs)." },
+                "maxScrollLifetimeSecs": { "type": "integer", "minimum": 1, "description": "Longest system-index scroll, in seconds." },
+                "cacheMaxBytes": { "type": "integer", "minimum": 1, "description": "Bound of the decoded-snapshot cache, in bytes." },
+                "maxSnapshotBytes": { "type": "integer", "minimum": 1, "description": "Largest decoded snapshot per tenant, in bytes." },
+                "maxAnswerBytes": { "type": "integer", "minimum": 1, "description": "Bytes of stored documents one answer may carry; at least maxSnapshotBytes." }
+              }
+            },
+            "search": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "description": "Limits of _search on the OpenSearch listener.",
+              "properties": {
+                "maxResultWindow": { "type": "integer", "minimum": 1, "description": "Largest from + size a _search accepts, on data and system indices alike." },
+                "maxBuckets": { "type": "integer", "minimum": 1, "description": "Most buckets one search's aggregations may answer." }
+              }
+            },
+            "ppl": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "description": "Limits of the PPL endpoint on the OpenSearch listener.",
+              "properties": {
+                "maxResultRows": { "type": ["integer", "null"], "minimum": 1, "description": "Most rows a PPL query may return; null sets no row limit." }
+              }
+            }
+          }
+        },
         "metrics": { "type": ["object", "null"], "additionalProperties": true, "description": "Operational listener: /health always, /metrics when enabled." },
         "tls": {
           "type": ["object", "null"],

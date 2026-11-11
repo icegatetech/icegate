@@ -79,7 +79,7 @@ use icegate_common::schema::COL_TENANT_ID;
 
 /// `CatalogProvider` decorator that returns tenant-scoped schemas.
 ///
-/// Constructed once per Flight SQL request from the engine's shared
+/// Constructed once per request from the engine's shared
 /// catalog provider; cheap to clone (`Arc` only) so it can be handed
 /// to `SessionContext::register_catalog` without further care.
 #[derive(Debug)]

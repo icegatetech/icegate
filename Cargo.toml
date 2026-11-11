@@ -5,6 +5,7 @@ members = [
     "crates/icegate-catalog-s3",
     "crates/icegate-queue",
     "crates/icegate-query",
+    "crates/icegate-query-grammar",
     "crates/icegate-ingest",
     "crates/icegate-maintain",
 ]
@@ -56,6 +57,7 @@ redundant_pub_crate = "allow"
 icegate-common = { path = "crates/icegate-common" }
 icegate-catalog-s3 = { path = "crates/icegate-catalog-s3" }
 icegate-queue = { path = "crates/icegate-queue" }
+icegate-query-grammar = { path = "crates/icegate-query-grammar" }
 
 # The job/task framework, extracted to icegatetech/jobmanager as a standalone tool.
 # It is not published to a registry, so a version IS a git rev. Pinned to an immutable
@@ -106,6 +108,9 @@ iceberg-datafusion = { git = "https://github.com/icegatetech/iceberg-rust", rev 
 
 # DataFusion
 datafusion = "54.1"
+# DataFusion's t-digest, used directly by the OpenSearch `percentiles` aggregate;
+# `datafusion` does not re-export it. Keep it on the same minor as `datafusion`.
+datafusion-functions-aggregate-common = "54.1"
 datafusion-tracing = "54.0"
 # 0.4.15 builds against datafusion 52 / arrow-flight 57, which no longer unify
 # with the pins above (SQLOptions, SessionState and the FlightSqlService trait all
@@ -124,7 +129,14 @@ clap = { version = "4", features = ["derive"] }
 
 # Configuration
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order`: a JSON object serializes its keys in insertion order, never sorted. Ingest
+# stores a kvlist body or attribute with its keys in arrival order, and the OpenSearch API renders
+# `_mapping` properties in the schema's column order. A cargo feature is unified across one build,
+# and the service image builds the whole workspace at once, so it is enabled once here: a crate
+# built or tested alone then serializes exactly as it does in that image.
+serde_json = { version = "1", features = ["preserve_order"] }
+# Query-string decoding of the OpenSearch endpoint parameters (strict, per-endpoint lists).
+serde_urlencoded = "0.7"
 serde_yaml = "0.9"
 toml = "1.0.6"
 
@@ -175,6 +187,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Date and time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 
 # Regex for matcher evaluation
 regex = "1.12"
@@ -182,6 +195,7 @@ regex = "1.12"
 # Utilities
 itoa = "1"
 bytes = "1.11.1"
+zstd = "0.13"
 base64 = "0.22"
 percent-encoding = "2"
 sha2 = "0.10"

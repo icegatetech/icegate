@@ -26,6 +26,8 @@ bytes = { workspace = true }
 
 # ANTLR parser
 antlr4rust = { workspace = true }
+# The generated Lucene query-string parser that `query_dsl::lucene` walks.
+icegate-query-grammar = { workspace = true }
 
 # Iceberg
 iceberg = { workspace = true }
@@ -33,6 +35,7 @@ iceberg-datafusion = { workspace = true }
 
 # DataFusion
 datafusion = { workspace = true }
+datafusion-functions-aggregate-common = { workspace = true }
 datafusion-tracing = { workspace = true }
 datafusion-flight-sql-server = { workspace = true }
 
@@ -68,7 +71,15 @@ regex = { workspace = true }
 
 # Configuration
 serde = { workspace = true }
+# Object keys keep insertion order (OpenSearch `_mapping` properties follow the schema's column
+# order): the workspace dependency enables `preserve_order` for every crate.
 serde_json = { workspace = true }
+# Bounded cache of OpenSearch MAP-key enumerations, keyed by tenant.
+lru = { workspace = true }
+serde_urlencoded = { workspace = true }
+# Stable cluster and node identifiers of the OpenSearch listener.
+sha2 = { workspace = true }
+base64 = { workspace = true }
 
 # HTTP server
 axum = { workspace = true }
@@ -89,9 +100,16 @@ hex = { workspace = true }
 
 # Date and time
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 
 # Utilities
 itoa = { workspace = true }
+# Fresh object names: the startup probe's key and each snapshot object's name.
+uuid = { workspace = true }
+# Snapshot objects of the system-index store are zstd frames.
+zstd = { workspace = true }
+# Jitter of the system-index write loop's backoff, so contending replicas spread apart.
+rand = { workspace = true }
 tikv-jemallocator = { workspace = true }
 
 [[bench]]
@@ -99,7 +117,7 @@ name = "loki_queries"
 harness = false
 
 [dev-dependencies]
-icegate-common = { workspace = true, features = ["test-harness"] }
+icegate-common = { workspace = true, features = ["test-harness", "testing"] }
 # `testing` carries `InMemoryMetricExporter`, which is how a test reads back the
 # labels a counter was incremented with.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

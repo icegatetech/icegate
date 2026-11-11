@@ -11,6 +11,10 @@ on:
       - 'config/docker/otel-collector/config.yaml'
       - 'config/docker/grafana/provisioning/datasources/datasources.yaml'
       - 'config/kustomize/base/otel-collector/configmap.yaml'
+      # read by crates/icegate-query/tests/config_file.rs
+      - 'config/docker/query.yaml'
+      - 'config/docker/docker-compose.yml'
+      - 'config/docker/opensearch-dashboards/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'clippy.toml'
@@ -27,6 +31,10 @@ on:
       - 'config/docker/otel-collector/config.yaml'
       - 'config/docker/grafana/provisioning/datasources/datasources.yaml'
       - 'config/kustomize/base/otel-collector/configmap.yaml'
+      # read by crates/icegate-query/tests/config_file.rs
+      - 'config/docker/query.yaml'
+      - 'config/docker/docker-compose.yml'
+      - 'config/docker/opensearch-dashboards/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'clippy.toml'

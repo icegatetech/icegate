@@ -8,6 +8,18 @@ x-logging: &fluentd-logging
     fluentd-retry-wait: "1s"
     tag: "docker.{{.Name}}"
 
+# One otelgen process emits one signal (and one metric type), so each signal
+# the `load` profile feeds into ingest is its own service built on this base.
+x-otelgen: &otelgen
+  image: ghcr.io/krzko/otelgen:v0.5.2
+  depends_on:
+    ingest-probe:
+      condition: service_healthy
+  restart: unless-stopped
+  profiles:
+    - load
+  logging: *fluentd-logging
+
 # TODO(med): make a base compose for basic components and an overlay compose for profile components
 
 services:
@@ -212,6 +224,7 @@ services:
       - "9090:9090"
       - "3200:3200"
       - "8815:8815"
+      - "9200:9200"
     volumes:
       - ./query.yaml:/etc/icegate/query.yaml:ro
     depends_on:
@@ -311,21 +324,47 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
       GF_USERS_DEFAULT_THEME: "system"
+      # The Grafana OpenSearch datasource plugin the stand's OpenSearch datasources use. This is
+      # the one place its version is pinned.
+      GF_PLUGINS_PREINSTALL_SYNC: grafana-opensearch-datasource@2.34.4
+    depends_on:
+      query:
+        condition: service_started
+    logging: *fluentd-logging
+
+  # OpenSearch Dashboards over the query service's OpenSearch listener. The image's minor stays
+  # at or below the minor the query service reports (config/docker/query.yaml, or the code
+  # default), pinned by crates/icegate-query/tests/config_file.rs.
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:3.9.0
+    ports:
+      - "5601:5601"
+    volumes:
+      - ./opensearch-dashboards/opensearch_dashboards.yml:/usr/share/opensearch-dashboards/config/opensearch_dashboards.yml:ro
+    environment:
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
     depends_on:
       query:
         condition: service_started
     logging: *fluentd-logging
 
   otelgen:
-    image: ghcr.io/krzko/otelgen:v0.5.2
+    <<: *otelgen
     command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "logs", "multi", "--workers", "10", "--duration", "0"]
-    depends_on:
-      ingest-probe:
-        condition: service_healthy
-    restart: unless-stopped
-    profiles:
-      - load
-    logging: *fluentd-logging
+
+  otelgen-traces:
+    <<: *otelgen
+    # The stand generates traces with these two scenarios. The large
+    # --number-traces keeps `traces multi` sending for the stand's lifetime.
+    command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "--duration", "0", "traces", "multi", "--number-traces", "1000000000", "--scenarios", "microservices", "--scenarios", "basic"]
+
+  otelgen-metrics:
+    <<: *otelgen
+    command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "--duration", "0", "metrics", "sum"]
+
+  otelgen-histogram:
+    <<: *otelgen
+    command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "--duration", "0", "metrics", "histogram"]
 
   prometheus:
     image: prom/prometheus:v3.9.1

@@ -1,0 +1,114 @@
+name: OpenSearch E2E
+
+# A separate workflow, not a job of ci.yml: it builds every image and runs the whole Compose
+# stand with OpenSearch Dashboards and Grafana, which is far slower than the checks every PR
+# waits on. scripts/opensearch-e2e/README.md describes the suite.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'crates/**'
+      - 'config/docker/**'
+      - 'scripts/opensearch-e2e/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/opensearch-e2e.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'crates/**'
+      - 'config/docker/**'
+      - 'scripts/opensearch-e2e/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/opensearch-e2e.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: OpenSearch clients against the stand
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      # A debug build: the suite queries a handful of rows, and a debug build compiles faster
+      # than the release profile.
+      PROFILE: debug
+      COMPOSE: docker compose -f config/docker/docker-compose.yml -f config/docker/docker-compose.e2e.yml
+    steps:
+      # docker-images: false, unlike ci.yml: the stand needs a working Docker daemon.
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: scripts/opensearch-e2e/package.json
+          cache: npm
+          cache-dependency-path: scripts/opensearch-e2e/package-lock.json
+
+      - name: Install the suite
+        working-directory: scripts/opensearch-e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Build the stand
+        run: $COMPOSE build
+
+      - name: Start the stand
+        run: $COMPOSE up -d
+
+      - name: Seed the stand
+        id: seed
+        run: scripts/opensearch-e2e/seed.sh
+
+      - name: OpenSearch Dashboards cases
+        if: ${{ !cancelled() && steps.seed.outcome == 'success' }}
+        working-directory: scripts/opensearch-e2e
+        run: npx playwright test --project=osd
+
+      - name: Grafana cases
+        if: ${{ !cancelled() && steps.seed.outcome == 'success' }}
+        working-directory: scripts/opensearch-e2e
+        run: npx playwright test --project=grafana
+
+      # Collected before the version cases, which reset the stand.
+      - name: Collect the stand's logs
+        if: failure()
+        run: $COMPOSE logs --no-color --timestamps > stand.log
+
+      # The version cases append their stands' logs to test-results/stand-versions.log before
+      # each reset; the upload step below already carries test-results/.
+      - name: Version cases
+        if: ${{ !cancelled() }}
+        working-directory: scripts/opensearch-e2e
+        run: npx playwright test --project=versions
+
+      - name: Upload the failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensearch-e2e-failure
+          path: |
+            stand.log
+            scripts/opensearch-e2e/playwright-report/
+            scripts/opensearch-e2e/test-results/
+          retention-days: 14
+
+      - name: Stop the stand
+        if: always()
+        run: $COMPOSE down -v --remove-orphans

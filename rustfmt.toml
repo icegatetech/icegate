@@ -13,7 +13,16 @@ ignore = [
     "crates/icegate-query/src/traceql/antlr/",
     "!crates/icegate-query/src/traceql/antlr/mod.rs",
     "!crates/icegate-query/src/traceql/antlr/tests.rs",
-    "!crates/icegate-query/src/traceql/antlr/visitors.rs"
+    "!crates/icegate-query/src/traceql/antlr/visitors.rs",
+    "crates/icegate-query/src/query_dsl/analyzer/word_break_tables.rs",
+    "crates/icegate-query/src/query_dsl/analyzer/lowercase_table.rs",
+    "crates/icegate-query-grammar/src/lucene/",
+    "!crates/icegate-query-grammar/src/lucene/mod.rs",
+    "!crates/icegate-query-grammar/src/lucene/tests.rs",
+    "crates/icegate-query-grammar/src/ppl/",
+    "!crates/icegate-query-grammar/src/ppl/mod.rs",
+    "!crates/icegate-query-grammar/src/ppl/char_stream.rs",
+    "!crates/icegate-query-grammar/src/ppl/tests.rs",
 ]
 
 # Basic formatting

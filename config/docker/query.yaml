@@ -24,8 +24,8 @@ catalog:
     disk_dir: /tmp/icegate/cache
     disk_size_mb: 4096
 
-# Hard ceiling on one query's wall clock, enforced on Loki, Prometheus, Tempo and
-# Flight SQL. Together with `max_age_secs` (left at the icegate-query default) it
+# Hard ceiling on one query's wall clock, enforced on Loki, Prometheus, Tempo,
+# Flight SQL and OpenSearch. Together with `max_age_secs` (left at the icegate-query default) it
 # bounds how long a query can outlive the catalog provider it was planned
 # against, and so how far behind the committed WAL boundary a live reader can be.
 engine:
@@ -62,6 +62,13 @@ flight_sql:
   port: 8815
   max_message_size: 16777216
 
+# OpenSearch-compatible API. Like every other reader of the stand it reads the
+# tenant its x-scope-orgid header names.
+opensearch:
+  enabled: true
+  host: 0.0.0.0
+  port: 9200
+
 tracing:
   enabled: true
   service_name: icegate-query
@@ -72,6 +79,7 @@ metrics:
   enabled: true
   host: 0.0.0.0
   port: 9091
+  path: /metrics
 
 # Server-side TLS for every listener of this service, `/metrics` and `/health`
 # included. Off while this block is absent: the stand serves plaintext. To turn

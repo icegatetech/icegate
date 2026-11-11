@@ -211,7 +211,7 @@ query:
     ## rather than commented out, and unsetting it fails the render.
     maxAgeSecs: 30
     ## Hard ceiling (seconds) on one query's wall clock, enforced on Loki,
-    ## Prometheus, Tempo and Flight SQL. Together with maxAgeSecs it bounds how
+    ## Prometheus, Tempo, Flight SQL and OpenSearch. Together with maxAgeSecs it bounds how
     ## long a query can hold a cached provider, and so how far behind the
     ## committed WAL boundary a live reader can be — which is the window
     ## maintain.walCleanup.keepSegmentsCount has to cover in segments. Raising
@@ -265,6 +265,51 @@ query:
     enabled: true
     port: 8815
     maxMessageSize: 16777216
+
+  ## OpenSearch-compatible API (Query DSL, Lucene, PPL, saved objects).
+  opensearch:
+    # -- Run the OpenSearch-compatible listener. Off by default: it authenticates no caller, and the tenant is decided by query.tenant as on every query surface.
+    enabled: false
+    # -- Listener port.
+    port: 9200
+    # -- Version reported by GET / and /_nodes: a canonical MAJOR.MINOR.PATCH with major 3. Any other value is refused at startup. When OpenSearch Dashboards runs with opensearch.ignoreVersionMismatch false, keep this minor at or above the Dashboards minor: such a Dashboards holds its saved-object migration until IceGate reports a compatible version, then migrates without a restart (end-to-end case "a strict osd rejects icegate at 3.8.0 and migrates after icegate restarts at 3.9.0", scripts/opensearch-e2e/versions.spec.ts). IceGate does not check this; the chart deploys no Dashboards.
+    version: "3.9.0"
+    # -- Cluster name reported by GET /, /_nodes and /_cluster/health. It seeds the stable cluster and node identifiers, so changing it changes them.
+    clusterName: icegate
+    # -- Largest request body the listener accepts, in bytes. It also bounds how much of a refused request's body is drained.
+    maxRequestBodyBytes: 33554432
+    # -- Bytes of memory one OpenSearch query may hold. The listener's sessions draw from a
+    # pool of this size, spilling to temporary files stays enabled, and a query needing more
+    # answers 400 naming the limit. Other protocols are unbounded.
+    maxQueryMemoryBytes: 1073741824
+    # -- How far back, in seconds, field discovery (_field_caps, _mapping) looks for attribute-map keys.
+    fieldDiscoveryWindowSecs: 86400
+    # -- How far, in seconds, before the earliest start of the spans it decorates the root span of a trace is looked for (traceGroup and traceGroupFields of otel-v1-apm-span). A root that started earlier renders those fields absent.
+    maxTraceLookbackSecs: 3600
+    # -- The most traces whose root spans one search reads for a filter, sort or aggregation on traceGroup or traceGroupFields, and the largest terms size on traceId of otel-v1-apm-span. Above it the search answers 400.
+    maxCrossRowTraces: 1000
+    ## Per-tenant store of the dot-prefixed system indices (saved objects).
+    systemIndices:
+      # -- s3:// or s3a:// URL the store writes under. Empty resolves to the default prefix under the storage bucket (SystemIndicesConfig::DEFAULT_LOCATION_PREFIX in crates/icegate-query/src/opensearch/config.rs). It must not overlap a table location or the WAL base path; the listener refuses to start otherwise.
+      location: ""
+      # -- Longest scroll a system-index search may open, in seconds. A superseded snapshot object is kept this long plus the query deadline.
+      maxScrollLifetimeSecs: 900
+      # -- Bound of the decoded-snapshot cache, in bytes; at least maxSnapshotBytes.
+      cacheMaxBytes: 268435456
+      # -- Largest decoded snapshot one tenant may hold, in bytes. A write past it is answered 413 and changes nothing.
+      maxSnapshotBytes: 134217728
+      # -- Bytes of stored documents one answer may carry; at least maxSnapshotBytes. An _mget or _search past it is refused whole with 400, _bulk update items past it fail one by one, and the answered items of an _msearch share it: an item past what the earlier ones left fails alone.
+      maxAnswerBytes: 268435456
+    ## Limits of _search.
+    search:
+      # -- Largest from + size a _search accepts, on data and system indices alike, and the largest page a system-index scroll opens with. A larger window is answered 400, never truncated.
+      maxResultWindow: 10000
+      # -- Most buckets one search's aggregations may answer, every level counted; a search over it is refused with a 400, never truncated.
+      maxBuckets: 65535
+    ## Limits of the PPL endpoint (/_plugins/_ppl).
+    ppl:
+      # -- (int) Most rows a PPL query may return, counted after the request's fetch_size. A longer output is a 400 naming the limit, never truncated. null sets no row limit; the query deadline, the per-query memory limit and load shedding still bound every query.
+      maxResultRows: null
 
   ## Prometheus metrics endpoint
   metrics:
@@ -337,6 +382,7 @@ query:
       prometheus: ""
       tempo: ""
       flightSql: ""
+      opensearch: ""
       metrics: ""
 
   ## Ingress

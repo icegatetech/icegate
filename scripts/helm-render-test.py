@@ -9,8 +9,29 @@ front of it is writable by any neighbour in the namespace, and a loopback
 to say beyond that. None of the three is visible in the default render, so each is
 rendered here on purpose.
 
+A section the binary reads with every key optional fails quietly instead: a value
+the template drops, or renders under a name the binary does not read, leaves the
+binary on its code default with no error anywhere. The default render cannot show
+it, because the chart default and the code default are the same value, so such a
+section is rendered here with every value moved off its default.
+
+One `opensearch` value has the opposite failure. An empty `systemIndices.location`
+asks the binary to resolve its default location, which the binary reads only from
+an absent key: rendered as an empty string, it is a location the query
+configuration refuses to load, so every release on the chart defaults that
+enables the listener would fail to start. The listener is off by default, so the
+chart defaults are rendered here with it enabled, and the section is read for the
+key it must not carry.
+
+A listener port fails quietly as well: a containerPort or Service port spelled as
+a literal renders the default exactly like the value does, and a Service whose
+render condition omits the listener publishes nothing for it. The OpenSearch
+listener is off by default, so its port is rendered here enabled on a
+non-default number, and enabled as the only listener.
+
 Both components carry the tenant policy and the operational listener the probes
-address, so those two checks run per component off `COMPONENTS`. The rest is
+address, so those two checks run per component off `COMPONENTS`. The `opensearch`
+section and the OpenSearch listener port are query's alone. The rest is
 ingest-only, because the sidecar split is: only ingest has listener hosts,
 published-port keys, extraContainers and a NOTES port-forward command.
 
@@ -107,6 +128,7 @@ APP_PROTOCOL_PORTS = (  # (component, values key, rendered port name, service te
     ("query", "prometheus", "prometheus", "templates/service-query.yaml"),
     ("query", "tempo", "tempo", "templates/service-query.yaml"),
     ("query", "flightSql", "flight-sql", "templates/service-query.yaml"),
+    ("query", "opensearch", "opensearch", "templates/service-query.yaml"),
     ("query", "metrics", "metrics", "templates/service-query.yaml"),
     ("maintain", "metrics", "metrics", "templates/service-maintain.yaml"),
     ("catalogServer", "http", "http", "templates/service-catalog.yaml"),
@@ -127,6 +149,8 @@ SERVICE_PORT_ARGS = (
     "catalog.backend=s3",
     "--set",
     "query.flightSql.enabled=true",
+    "--set",
+    "query.opensearch.enabled=true",
 )
 
 # Every values path that names an image, with the workload and container the render
@@ -337,6 +361,64 @@ LONG_FULLNAME_CASES = (  # (description, global.fullnameOverride, expected migra
     ("a fullname cut at a hyphen", "icegate-" + "x" * 46 + "-yyyyy", "icegate-" + "x" * 46 + "-migrate"),
 )
 
+# Every `query.opensearch` value moved off its chart default, and the section of
+# query.yaml it must render into, under the names the binary reads. Both are
+# literals, so the check is not a second reading of the template. The values go in
+# through `--set-json`, which reads a number as a float the way a values file does,
+# so the body limit, the per-query memory limit and the three system-index byte
+# bounds, all above a million, also pin the `| int` that keeps each out of the
+# exponent form the binary refuses.
+OPENSEARCH_VALUES = {
+    "enabled": True,
+    "port": 9201,
+    "version": "3.10.1",
+    "clusterName": "c1",
+    "maxRequestBodyBytes": 1048577,
+    "maxQueryMemoryBytes": 1073741825,
+    "fieldDiscoveryWindowSecs": 3601,
+    "maxTraceLookbackSecs": 3601,
+    "maxCrossRowTraces": 1001,
+    "systemIndices": {
+        "location": "s3://saved-objects/tenants",
+        "maxScrollLifetimeSecs": 901,
+        "cacheMaxBytes": 268435457,
+        "maxSnapshotBytes": 134217729,
+        "maxAnswerBytes": 268435458,
+    },
+    "search": {"maxResultWindow": 10001, "maxBuckets": 65536},
+    "ppl": {"maxResultRows": 5001},
+}
+OPENSEARCH_SECTION = {
+    "enabled": True,
+    "host": "0.0.0.0",
+    "port": 9201,
+    "version": "3.10.1",
+    "cluster_name": "c1",
+    "max_request_body_bytes": 1048577,
+    "max_query_memory_bytes": 1073741825,
+    "field_discovery_window_secs": 3601,
+    "max_trace_lookback_secs": 3601,
+    "max_cross_row_traces": 1001,
+    "system_indices": {
+        "location": "s3://saved-objects/tenants",
+        "max_scroll_lifetime_secs": 901,
+        "cache_max_bytes": 268435457,
+        "max_snapshot_bytes": 134217729,
+        "max_answer_bytes": 268435458,
+    },
+    "search": {"max_result_window": 10001, "max_buckets": 65536},
+    "ppl": {"max_result_rows": 5001},
+}
+
+# The system_indices section an enabled release renders on the chart defaults: the
+# four bounds, and no location, so the binary resolves the default one.
+SYSTEM_INDICES_DEFAULT_SECTION = {
+    "max_scroll_lifetime_secs": 900,
+    "cache_max_bytes": 268435456,
+    "max_snapshot_bytes": 134217728,
+    "max_answer_bytes": 268435456,
+}
+
 
 def digest_for_row(position: int) -> str:
     """A well-formed digest that no other row of `IMAGE_DIGEST_KEYS` shares.
@@ -489,6 +571,48 @@ def check_probe_target(component: str) -> None:
         fail(f"{component}.metrics.port must reach metrics.port of {component}.yaml: expected {port}, got {bound}")
     else:
         ok(f"{component}.metrics.port reaches both the metrics containerPort and {component}.yaml")
+
+
+def pair_values_with_types(mapping: dict) -> dict:
+    """`mapping` with each value paired with its type, so comparing two results compares types too.
+
+    Python holds `1048577.0 == 1048577` and `True == 1`, while the binary refuses a
+    float where it reads an integer, so a plain comparison would pass a render the
+    binary cannot load. A nested mapping is paired the same way, recursively, so a
+    float inside a nested section is caught too.
+    """
+    return {
+        key: pair_values_with_types(value) if isinstance(value, dict) else (type(value), value)
+        for key, value in mapping.items()
+    }
+
+
+def check_opensearch_section() -> None:
+    """Every `query.opensearch` value reaches query.yaml under the name the binary reads."""
+    rendered = render_chart(
+        "--set-json",
+        f"query.opensearch={json.dumps(OPENSEARCH_VALUES)}",
+        show_only="templates/configmap-query.yaml",
+    )
+    section = read_component_config(rendered, "query.yaml").get("opensearch") or {}
+    if pair_values_with_types(section) != pair_values_with_types(OPENSEARCH_SECTION):
+        fail(f"query.opensearch must render into query.yaml as {OPENSEARCH_SECTION}, got {section}")
+    else:
+        ok("every query.opensearch value reaches the opensearch section of query.yaml under the name the binary reads")
+
+
+def check_system_indices_default_location() -> None:
+    """An empty `query.opensearch.systemIndices.location` renders no `location` key at all."""
+    rendered = render_chart("--set", "query.opensearch.enabled=true", show_only="templates/configmap-query.yaml")
+    opensearch = read_component_config(rendered, "query.yaml").get("opensearch") or {}
+    section = opensearch.get("system_indices") or {}
+    if pair_values_with_types(section) != pair_values_with_types(SYSTEM_INDICES_DEFAULT_SECTION):
+        fail(
+            f"an enabled release on the chart defaults must render system_indices as "
+            f"{SYSTEM_INDICES_DEFAULT_SECTION}, with no location, got {section}"
+        )
+    else:
+        ok("an empty query.opensearch.systemIndices.location renders no location, so the binary resolves its default")
 
 
 def check_operational_host() -> None:
@@ -1493,10 +1617,58 @@ def check_migrate_service_account_name_refused() -> None:
         ok(f"serviceAccount.name {MIGRATE_SERVICE_ACCOUNT} renders while migrate is off")
 
 
+def check_opensearch_listener() -> None:
+    """The OpenSearch listener's port: absent while disabled, one number everywhere once enabled.
+
+    The listener is off by default, so the default render must publish nothing for it. Enabled on
+    a non-default number, the container port, the Service port and query.yaml must all carry that
+    number, because a literal in any template renders the default exactly like the value does.
+    Enabled as the only listener, with every other protocol and the metrics endpoint off, it must
+    still get its Service: the render condition lists the listeners that publish a port.
+    """
+    deployment = render_chart(show_only="templates/deployment-query.yaml")
+    service = render_chart(show_only="templates/service-query.yaml")
+    if "opensearch" in read_container_port_names(deployment) or read_service_port(service, "opensearch") is not None:
+        fail("the default render must publish no port for the disabled OpenSearch listener")
+    else:
+        ok("the default render publishes no OpenSearch port")
+
+    port = 19200
+    port_args = ("--set", "query.opensearch.enabled=true", "--set", f"query.opensearch.port={port}")
+    declared = read_container_port(render_chart(*port_args, show_only="templates/deployment-query.yaml"), "opensearch")
+    published = read_service_port(render_chart(*port_args, show_only="templates/service-query.yaml"), "opensearch")
+    rendered = read_component_config(
+        render_chart(*port_args, show_only="templates/configmap-query.yaml"), "query.yaml"
+    ).get("opensearch", {})
+    if declared != port:
+        fail(f"query.opensearch.port must reach the opensearch containerPort: expected {port}, got {declared}")
+    elif published != port:
+        fail(f"query.opensearch.port must reach the opensearch Service port: expected {port}, got {published}")
+    elif rendered.get("port") != port or rendered.get("enabled") is not True:
+        fail(f"query.opensearch must reach query.yaml as enabled on {port}, got {rendered}")
+    else:
+        ok(f"query.opensearch.port reaches the containerPort, the Service and query.yaml as {port}")
+
+    alone_args = (
+        "--set", "query.loki.enabled=false",
+        "--set", "query.prometheus.enabled=false",
+        "--set", "query.tempo.enabled=false",
+        "--set", "query.flightSql.enabled=false",
+        "--set", "query.metrics.enabled=false",
+        "--set", "query.opensearch.enabled=true",
+    )
+    if read_service_port(render_chart(*alone_args), "opensearch") is None:
+        fail("an OpenSearch-only release must still render the query Service with the opensearch port")
+    else:
+        ok("an OpenSearch-only release renders the query Service with the opensearch port")
+
+
 for component_name in COMPONENTS:
     check_tenant_policy(component_name)
     check_probe_target(component_name)
 
+check_opensearch_section()
+check_system_indices_default_location()
 check_operational_host()
 check_otlp_port_names()
 check_otlp_host_guards()
@@ -1529,5 +1701,6 @@ check_migrate_service_account_name_refused()
 # The Secret volume is a new volume type in every pod that serves TLS; the level allows
 # `secret`, and this proves the pods rendered with it on still meet the level.
 check_restricted_profile(*(flag for component in TLS_COMPONENTS for flag in tls_args(component)))
+check_opensearch_listener()
 
 sys.exit(report_failures())

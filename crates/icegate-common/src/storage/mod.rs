@@ -28,7 +28,7 @@ pub mod prefetch;
 mod registry;
 mod retryable;
 
-pub use base_path::is_persistent_base_path;
+pub use base_path::{is_persistent_base_path, strip_s3_scheme};
 pub use builder::ObjectStoreWithPath;
 pub use cache::{StorageCache, build_storage_cache, register_foyer_metrics};
 pub use config::{S3Config, StorageBackend, StorageConfig};

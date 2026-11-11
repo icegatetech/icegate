@@ -3,7 +3,9 @@
 //! Provides [`ShedPolicy`], the [`shed_when_pressured`] middleware, and the
 //! [`default_shed_response`] builder used by the Loki/Tempo/Prometheus query
 //! surfaces and the OTLP/HTTP ingest surface to reject new requests with a
-//! `503 Service Unavailable` while the process is under memory pressure.
+//! `503 Service Unavailable` while the process is under memory pressure. The
+//! `OpenSearch` query surface uses the same policy and middleware with a body of
+//! its own.
 
 use axum::{
     Json,
@@ -60,7 +62,7 @@ fn shed_retry_after() -> (header::HeaderName, HeaderValue) {
 /// `bypass_paths` MUST list every health/readiness probe path for the surface: a
 /// probe that received a 503 while shedding would make the kubelet kill the pod
 /// exactly when it is trying to recover. `drain_limit_bytes` is `Some` only for
-/// large-body surfaces (OTLP/HTTP), which must drain before answering so the
+/// large-body surfaces (OTLP/HTTP and `OpenSearch`), which must drain before answering so the
 /// client reads the 503 instead of a connection reset; the surfaces that carry
 /// query strings rather than payloads pass `None` and answer immediately.
 #[derive(Clone)]
@@ -73,7 +75,7 @@ pub struct ShedPolicy {
 
 impl ShedPolicy {
     /// Build a policy for one surface. `surface` is the metric attribute value
-    /// (`"loki" | "tempo" | "prometheus" | "otlp_http"`); `drain_limit_bytes` is
+    /// (`"loki" | "tempo" | "prometheus" | "otlp_http" | "opensearch"`); `drain_limit_bytes` is
     /// the bound handed to [`drain_request_body`] when the request is shed.
     #[must_use]
     pub const fn new(

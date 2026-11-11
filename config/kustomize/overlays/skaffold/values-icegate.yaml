@@ -70,6 +70,9 @@ query:
     enabled: true
     port: 8815
     maxMessageSize: 16777216
+  opensearch:
+    enabled: true
+    port: 9200
   tracing:
     enabled: true
     otlpEndpoint: http://otel-collector.observability.svc.cluster.local.:4317

@@ -135,6 +135,57 @@ impl MetadataScanConfig {
     }
 }
 
+/// Enumerate label names per attribute level: the `i`-th set holds what `configs[i]` yields.
+///
+/// Same single plan and single open of each data file as [`scan_labels`], which is the union of
+/// this result. A caller that must know which MAP column a key came from (`OpenSearch` field
+/// discovery lists each key under its own column) uses this form.
+///
+/// # Errors
+///
+/// Returns an error if iceberg planning fails or if a referenced Parquet file cannot be read.
+#[tracing::instrument(
+    skip(table, configs, extra_predicate),
+    fields(
+        tenant_id = %tenant_id,
+        num_configs = configs.len(),
+        num_files = tracing::field::Empty,
+    )
+)]
+pub async fn scan_label_levels(
+    table: &Table,
+    tenant_id: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    configs: &[MetadataScanConfig],
+    extra_predicate: Predicate,
+) -> Result<Vec<BTreeSet<String>>, MetadataScanError> {
+    let predicate = predicate::combine(base_predicate(tenant_id, start, end), extra_predicate);
+    let plan_stream = plan_files(table, &predicate).await?;
+    let file_io = table.file_io().clone();
+
+    let mut num_files: usize = 0;
+    let mut stream = plan_stream
+        .map_err(MetadataScanError::Iceberg)
+        .map_ok(|task| {
+            let file_io = file_io.clone();
+            let predicate = predicate.clone();
+            async move { scan_label_levels_for_file(&file_io, task, &predicate, configs).await }
+        })
+        .try_buffer_unordered(METADATA_SCAN_CONCURRENCY);
+
+    let mut levels: Vec<BTreeSet<String>> = vec![BTreeSet::new(); configs.len()];
+    while let Some(file_levels) = stream.next().await {
+        for (level, mut file_level) in levels.iter_mut().zip(file_levels?) {
+            level.append(&mut file_level);
+        }
+        num_files += 1;
+    }
+    tracing::Span::current().record("num_files", num_files);
+
+    Ok(levels)
+}
+
 /// Compute the set of label/tag names visible in `table` for the given
 /// tenant, time range, and additional predicate.
 ///
@@ -153,14 +204,6 @@ impl MetadataScanConfig {
 ///
 /// Returns an error if iceberg planning fails or if a referenced Parquet file
 /// cannot be read.
-#[tracing::instrument(
-    skip(table, configs, extra_predicate),
-    fields(
-        tenant_id = %tenant_id,
-        num_configs = configs.len(),
-        num_files = tracing::field::Empty,
-    )
-)]
 pub async fn scan_labels(
     table: &Table,
     tenant_id: &str,
@@ -169,28 +212,8 @@ pub async fn scan_labels(
     configs: &[MetadataScanConfig],
     extra_predicate: Predicate,
 ) -> Result<BTreeSet<String>, MetadataScanError> {
-    let predicate = predicate::combine(base_predicate(tenant_id, start, end), extra_predicate);
-    let plan_stream = plan_files(table, &predicate).await?;
-    let file_io = table.file_io().clone();
-
-    let mut num_files: usize = 0;
-    let mut stream = plan_stream
-        .map_err(MetadataScanError::Iceberg)
-        .map_ok(|task| {
-            let file_io = file_io.clone();
-            let predicate = predicate.clone();
-            async move { scan_labels_for_file(&file_io, task, &predicate, configs).await }
-        })
-        .try_buffer_unordered(METADATA_SCAN_CONCURRENCY);
-
-    let mut result: BTreeSet<String> = BTreeSet::new();
-    while let Some(r) = stream.next().await {
-        result.extend(r?);
-        num_files += 1;
-    }
-    tracing::Span::current().record("num_files", num_files);
-
-    Ok(result)
+    let levels = scan_label_levels(table, tenant_id, start, end, configs, extra_predicate).await?;
+    Ok(levels.into_iter().flatten().collect())
 }
 
 /// Compute the distinct values of a single label in `table` for the given
@@ -423,7 +446,7 @@ async fn plan_files(table: &Table, predicate: &Predicate) -> Result<FileScanTask
     scan.plan_files().await.map_err(MetadataScanError::Iceberg)
 }
 
-/// Process one Parquet file for a label/tag enumeration request.
+/// Process one Parquet file for a label/tag enumeration request, returning one set per config.
 ///
 /// Neither stage materializes row batches:
 /// - Indexed-column labels are derived from `null_count` in row-group
@@ -432,17 +455,17 @@ async fn plan_files(table: &Table, predicate: &Predicate) -> Result<FileScanTask
 ///   `attributes.*.key` sub-column (one range read per row group, data
 ///   pages never decoded).
 #[tracing::instrument(skip_all, fields(file = %task.data_file_path))]
-async fn scan_labels_for_file(
+async fn scan_label_levels_for_file(
     file_io: &iceberg::io::FileIO,
     task: FileScanTask,
     predicate: &Predicate,
     configs: &[MetadataScanConfig],
-) -> Result<BTreeSet<String>, MetadataScanError> {
+) -> Result<Vec<BTreeSet<String>>, MetadataScanError> {
     // Opened once and reused across levels: the footer decode and the file
     // handle are properties of the file, not of the level being enumerated.
     let (mut reader, metadata) = parquet_reader::open_file_direct(file_io, &task).await?;
 
-    let mut out: BTreeSet<String> = BTreeSet::new();
+    let mut levels = Vec::with_capacity(configs.len());
     for config in configs {
         // Each level accumulates into its OWN set, because
         // `collect_map_keys_via_dict` finishes by applying that level's
@@ -452,9 +475,9 @@ async fn scan_labels_for_file(
         let mut level: BTreeSet<String> = BTreeSet::new();
         labels::collect_indexed_from_metadata(&metadata, config, &mut level);
         labels::collect_map_keys_via_dict(&mut reader, &metadata, predicate, config, &mut level).await?;
-        out.append(&mut level);
+        levels.push(level);
     }
-    Ok(out)
+    Ok(levels)
 }
 
 /// Process one Parquet file for a label/tag-value enumeration request.
@@ -520,7 +543,7 @@ async fn scan_coalesced_map_label_values_for_file(
 /// Process one Parquet file for an INT32-indexed tag-value enumeration
 /// request (e.g. `status_code`, `kind`).
 ///
-/// Mirrors [`scan_labels_for_file`] / [`scan_label_values_for_file`] so the
+/// Mirrors [`scan_label_levels_for_file`] / [`scan_label_values_for_file`] so the
 /// per-file logic lives next to its tracing span and can be unit-tested in
 /// isolation. The actual scan goes through a dictionary-page read on the
 /// indexed column with row-group statistics fallback for chunks that skip
