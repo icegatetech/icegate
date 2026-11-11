@@ -61,8 +61,8 @@ const SPAN_D = '7a2190356b5c4e1f';
 const TRACES_PAGE = '/app/observability-traces#/traces';
 /** The OSD server route every Trace Analytics page sends its `_search` bodies through. */
 const TRACE_ANALYTICS_QUERY_ROUTE = '/api/observability/trace_analytics/query';
-/** The ss4o metrics index IceGate names after the stand's tenant. */
-const SS4O_METRICS_INDEX = 'ss4o_metrics-demo';
+/** IceGate's ss4o metrics index, one of the `ss4o_metrics-*-*` indices the Metrics page lists. */
+const SS4O_METRICS_INDEX = 'ss4o_metrics-icegate-default';
 const HISTOGRAM_METRIC = 'e2e.checkout.duration';
 
 let seed: Seed;
