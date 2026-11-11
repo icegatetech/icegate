@@ -3303,7 +3303,8 @@ fn build_describe_row(
 
 /// The PPL type name `describe` reports for `field` of `entry`: `array` for an object field that reads
 /// a list column, the type a source reads it as (see [`PplType::from_data_type`]); otherwise the name
-/// of its field-model type ([`name_describe_type`]).
+/// of its field-model type ([`name_describe_type`]), `array` for a `nested` field, which a source
+/// reads as a list of structs.
 ///
 /// # Errors
 ///
@@ -3336,6 +3337,7 @@ const fn name_describe_type(field_type: FieldType) -> &'static str {
         FieldType::Double => "double",
         FieldType::Boolean => "boolean",
         FieldType::Object => "struct",
+        FieldType::Nested => PplType::Array.name(),
     }
 }
 

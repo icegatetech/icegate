@@ -31,6 +31,10 @@ pub(crate) enum FieldType {
     Boolean,
     /// A structured value: present in `_source`, not itself searchable or aggregatable.
     Object,
+    /// A list of objects each indexed apart from its row: present in `_source`, not itself
+    /// searchable or aggregatable, and its members are no fields of the row, so a query leaf
+    /// outside a nested context matches nothing on them.
+    Nested,
 }
 
 impl FieldType {
@@ -45,6 +49,7 @@ impl FieldType {
             Self::Double => "double",
             Self::Boolean => "boolean",
             Self::Object => "object",
+            Self::Nested => "nested",
         }
     }
 }

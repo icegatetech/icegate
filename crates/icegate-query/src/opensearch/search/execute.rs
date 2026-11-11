@@ -1206,7 +1206,7 @@ fn decide_field_kind(field: &ResolvedField, entry: &IndexEntry) -> Result<SortKe
             FieldType::Keyword,
             FieldValue::Column { .. } | FieldValue::MapKey { .. } | FieldValue::Encoded(_) | FieldValue::Derived(_),
         ) => Ok(SortKeyKind::Text),
-        (FieldType::Text | FieldType::Object, _) => Err(OpenSearchError::query_shard(
+        (FieldType::Text | FieldType::Object | FieldType::Nested, _) => Err(OpenSearchError::query_shard(
             entry.name(),
             &format!(
                 "field [{}] of type [{}] is not sortable",

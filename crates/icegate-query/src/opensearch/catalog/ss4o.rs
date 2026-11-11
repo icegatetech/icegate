@@ -55,7 +55,7 @@ const SS4O_TRACE_EXTRA_FIELDS: [(&str, ProfileFieldSource); 1] =
     [("@timestamp", ProfileFieldSource::Alias("startTime"))];
 
 /// The fields of the ss4o metrics index, in `_mapping` order.
-const SS4O_METRIC_FIELDS: [(&str, ProfileFieldSource); 29] = [
+const SS4O_METRIC_FIELDS: [(&str, ProfileFieldSource); 31] = [
     ("serviceName", ProfileFieldSource::Column(COL_SERVICE_NAME)),
     ("name", ProfileFieldSource::Column(COL_METRIC_NAME)),
     ("description", ProfileFieldSource::Column(COL_DESCRIPTION)),
@@ -65,6 +65,7 @@ const SS4O_METRIC_FIELDS: [(&str, ProfileFieldSource); 29] = [
     ("monotonic", ProfileFieldSource::Column(COL_IS_MONOTONIC)),
     ("startTime", ProfileFieldSource::Time(COL_START_TIMESTAMP)),
     ("@timestamp", ProfileFieldSource::Time(COL_TIMESTAMP)),
+    ("time", ProfileFieldSource::Alias("@timestamp")),
     ("value@int", ProfileFieldSource::Column(COL_VALUE_INT)),
     ("value@double", ProfileFieldSource::Column(COL_VALUE_DOUBLE)),
     (METRIC_VALUE_FIELD, ProfileFieldSource::MetricValue),
@@ -82,6 +83,13 @@ const SS4O_METRIC_FIELDS: [(&str, ProfileFieldSource); 29] = [
     (
         "explicitBoundsCount",
         ProfileFieldSource::ArrayLength(COL_EXPLICIT_BOUNDS),
+    ),
+    (
+        "buckets",
+        ProfileFieldSource::HistogramBuckets {
+            bounds: COL_EXPLICIT_BOUNDS,
+            counts: COL_BUCKET_COUNTS,
+        },
     ),
     (
         "quantileValuesCount",

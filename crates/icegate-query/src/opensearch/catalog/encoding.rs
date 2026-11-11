@@ -30,6 +30,10 @@ use super::data_prepper::DURATION_IN_NANOS_FIELD;
 use super::field::{
     FieldType, FieldValue, IndexField, ResolvedField, SelectedField, covers_every_key, glob_matches_some_extension,
 };
+use super::histogram::{
+    BUCKET_COUNT_MEMBER, BUCKET_MAX_MEMBER, BUCKET_MEMBERS, BUCKET_MIN_MEMBER, HistogramBounds, HistogramShapeError,
+    build_histogram_buckets_expr, read_row_bounds,
+};
 use super::map_key_cache::MapKeys;
 use super::native::{METRIC_VALUE_FIELD, find_promoted_resource_key, native_column_type};
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
@@ -184,6 +188,16 @@ pub(crate) enum DerivedField {
     /// A metric point's value: `coalesce(value_double, cast(value_int as double))`, NULL on
     /// histogram and summary rows.
     MetricValue,
+    /// An explicit-bucket histogram's buckets as `{min, max, count}` objects (see
+    /// [`build_histogram_buckets_expr`]): a `nested` field, absent where the counts are NULL.
+    HistogramBuckets {
+        /// The stored explicit bounds.
+        bounds: &'static str,
+        /// The stored bucket counts.
+        counts: &'static str,
+        /// The field name a request uses for the buckets; refusals name it.
+        field: &'static str,
+    },
 }
 
 impl EncodedField {
@@ -227,6 +241,7 @@ impl DerivedField {
                 ident(COL_VALUE_DOUBLE),
                 cast(ident(COL_VALUE_INT), DataType::Float64),
             ]),
+            Self::HistogramBuckets { bounds, counts, .. } => build_histogram_buckets_expr(ident(bounds), ident(counts)),
         }
     }
 }
@@ -694,7 +709,16 @@ pub(crate) fn lower_derived_term(field: DerivedField, value: &Value, index: &str
                 double_side
             })
         }
+        DerivedField::HistogramBuckets { field: field_name, .. } => Err(report_bucket_list_comparison(field_name)),
     }
+}
+
+/// The 400 for a term or a range on the histogram buckets `field`, a list of objects no literal
+/// compares with. A query leaf never reaches it: a leaf on a `nested` field matches nothing.
+fn report_bucket_list_comparison(field: &str) -> OpenSearchError {
+    OpenSearchError::illegal_argument(format!(
+        "field [{field}] is a list of bucket objects and compares with no value"
+    ))
 }
 
 /// Lower a range on a derived field. `durationInNanos` is monotonic in `duration_micros`, so
@@ -760,18 +784,20 @@ pub(crate) fn lower_derived_range(
                 None => double_side,
             })
         }
+        DerivedField::HistogramBuckets { field: field_name, .. } => Err(report_bucket_list_comparison(field_name)),
     }
 }
 
 /// Lower `exists` on a derived field: present wherever its source column is; a list length
-/// wherever the list is not NULL, and the metric value wherever either value column is set. The
-/// list test reads the length, so it stays out of the scan, which cannot evaluate a predicate on
-/// a list column.
+/// wherever the list is not NULL, the metric value wherever either value column is set, and the
+/// histogram buckets wherever their counts are not NULL. The list tests read the length, so they
+/// stay out of the scan, which cannot evaluate a predicate on a list column.
 pub(crate) fn lower_derived_exists(field: DerivedField) -> Expr {
     match field {
         DerivedField::DurationInNanos => ident(COL_DURATION_MICROS).is_not_null(),
         DerivedField::ArrayLength { .. } => field.build_read_expr().is_not_null(),
         DerivedField::MetricValue => ident(COL_VALUE_DOUBLE).is_not_null().or(ident(COL_VALUE_INT).is_not_null()),
+        DerivedField::HistogramBuckets { counts, .. } => cardinality(ident(counts)).is_not_null(),
     }
 }
 
@@ -1250,8 +1276,9 @@ pub(crate) fn render_encoded_value(
 ///
 /// # Errors
 ///
-/// Returns `500` when a source column is missing or of another type, or the duration product
-/// overflows.
+/// Returns `500` when a source column is missing or of another type, the duration product
+/// overflows, or a histogram row's lists contradict each other (see
+/// [`render_histogram_buckets`]).
 pub(crate) fn render_derived_value(
     field: DerivedField,
     batch: &RecordBatch,
@@ -1290,7 +1317,48 @@ pub(crate) fn render_derived_value(
             Ok(read_i64(read_batch_column(batch, COL_VALUE_INT)?, row)?
                 .map_or(Value::Null, |integer| Value::from(convert_integer_to_double(integer))))
         }
+        DerivedField::HistogramBuckets { bounds, counts, .. } => render_histogram_buckets(batch, row, bounds, counts),
     }
+}
+
+/// The explicit-bucket histogram buckets at `row` as `{min, max, count}` objects, one per stored
+/// count in stored order, a NULL count absent from its bucket as in [`render_exponential_buckets`];
+/// `Value::Null` when the counts are NULL.
+///
+/// # Errors
+///
+/// Returns `500` for a column of another type, a row whose bounds contradict its counts (see
+/// [`HistogramBounds::try_new`]), and a bound with no JSON number.
+fn render_histogram_buckets(
+    batch: &RecordBatch,
+    row: usize,
+    bounds_column: &str,
+    counts_column: &str,
+) -> Result<Value, OpenSearchError> {
+    let count_lists = read_batch_column(batch, counts_column)?;
+    if count_lists.is_null(row) {
+        return Ok(Value::Null);
+    }
+    let counts = count_lists
+        .as_list_opt::<i32>()
+        .ok_or_else(|| report_unexpected_type("a list", count_lists.data_type()))?
+        .value(row);
+    let report_shape = |error: HistogramShapeError| OpenSearchError::internal(error.to_string());
+    let row_bounds = read_row_bounds(read_batch_column(batch, bounds_column)?.as_ref(), row).map_err(report_shape)?;
+    let bounds = HistogramBounds::try_new(row_bounds, counts.len()).map_err(report_shape)?;
+    let mut rendered_buckets = Vec::with_capacity(counts.len());
+    for bucket_index in 0..counts.len() {
+        let (min, max) = bounds.read_bucket_range(bucket_index);
+        let mut bucket = Map::new();
+        bucket.insert(BUCKET_MIN_MEMBER.to_string(), render_finite_double(min)?);
+        bucket.insert(BUCKET_MAX_MEMBER.to_string(), render_finite_double(max)?);
+        let count = render_array_value(counts.as_ref(), bucket_index)?;
+        if !count.is_null() {
+            bucket.insert(BUCKET_COUNT_MEMBER.to_string(), count);
+        }
+        rendered_buckets.push(Value::Object(bucket));
+    }
+    Ok(Value::Array(rendered_buckets))
 }
 
 /// `value` as the nearest double, as `cast(value_int as double)` computes it.
@@ -1467,6 +1535,15 @@ pub(crate) enum ProfileFieldSource {
         /// Whether the buckets lie below zero.
         is_negative: bool,
     },
+    /// Explicit-bucket histogram buckets: a `nested` field of `{min, max, count}` objects, whose
+    /// members `_field_caps` and `_mapping` list below it and no query outside a nested context
+    /// resolves.
+    HistogramBuckets {
+        /// The stored explicit bounds.
+        bounds: &'static str,
+        /// The stored bucket counts.
+        counts: &'static str,
+    },
     /// Summary quantiles.
     Quantiles,
     /// Exemplars.
@@ -1547,6 +1624,7 @@ const fn find_encoded_column(source: ProfileFieldSource) -> Option<&'static str>
         | ProfileFieldSource::DurationInNanos
         | ProfileFieldSource::MetricValue
         | ProfileFieldSource::ArrayLength(_)
+        | ProfileFieldSource::HistogramBuckets { .. }
         | ProfileFieldSource::Object
         | ProfileFieldSource::Attributes(_)
         | ProfileFieldSource::Events
@@ -1585,6 +1663,7 @@ const fn map_column_encoding(source: ProfileFieldSource, column_type: &DataType)
         | ProfileFieldSource::DurationInNanos
         | ProfileFieldSource::MetricValue
         | ProfileFieldSource::ArrayLength(_)
+        | ProfileFieldSource::HistogramBuckets { .. }
         | ProfileFieldSource::Object
         | ProfileFieldSource::Attributes(_)
         | ProfileFieldSource::Events
@@ -1603,6 +1682,14 @@ const fn map_derived_field(name: &'static str, source: ProfileFieldSource) -> Op
         ProfileFieldSource::ArrayLength(column) => {
             Some((FieldType::Long, DerivedField::ArrayLength { column, field: name }))
         }
+        ProfileFieldSource::HistogramBuckets { bounds, counts } => Some((
+            FieldType::Nested,
+            DerivedField::HistogramBuckets {
+                bounds,
+                counts,
+                field: name,
+            },
+        )),
         ProfileFieldSource::Column(_)
         | ProfileFieldSource::Alias(_)
         | ProfileFieldSource::HexIdOrEmpty(_)
@@ -1661,7 +1748,10 @@ fn resolve_profile_source(schema: &Schema, name: &'static str, source: ProfileFi
             let (field_type, encoded_field) = map_column_encoding(source, column_type)?;
             (field_type, FieldValue::Encoded(encoded_field))
         }
-        ProfileFieldSource::DurationInNanos | ProfileFieldSource::MetricValue | ProfileFieldSource::ArrayLength(_) => {
+        ProfileFieldSource::DurationInNanos
+        | ProfileFieldSource::MetricValue
+        | ProfileFieldSource::ArrayLength(_)
+        | ProfileFieldSource::HistogramBuckets { .. } => {
             let (field_type, derived_field) = map_derived_field(name, source)?;
             (field_type, FieldValue::Derived(derived_field))
         }
@@ -1721,8 +1811,9 @@ fn resolve_attribute_key(
 /// Resolve `name` against `table` over its table's `schema`. `<attributes object>.<key>`
 /// reads the stored key the spelling names, with no enumeration; a path below a render-only
 /// field resolves to that field under the requested path, so a leaf on it is refused naming the
-/// path. An alias resolves as its target under its own name. A structural object and an unknown
-/// name resolve to nothing, so a leaf on either matches nothing.
+/// path. An alias resolves as its target under its own name. A structural object, a member of a
+/// `nested` field and an unknown name resolve to nothing, so a leaf on any of them matches
+/// nothing.
 pub(crate) fn resolve_profile_field(table: &ProfileTable, schema: &Schema, name: &str) -> Option<ResolvedField> {
     if let Some((declared_name, _)) = table.find_field(name) {
         return resolve_declared_field(table, schema, declared_name);
@@ -1759,6 +1850,9 @@ pub(crate) fn resolve_profile_field(table: &ProfileTable, schema: &Schema, name:
             | ProfileFieldSource::Temporality
             | ProfileFieldSource::MetricValue
             | ProfileFieldSource::ArrayLength(_)
+            // A bucket object is indexed apart from its row, so outside a nested context a member
+            // path is no field of the row and a leaf on it matches nothing.
+            | ProfileFieldSource::HistogramBuckets { .. }
             | ProfileFieldSource::Object
             | ProfileFieldSource::Events
             | ProfileFieldSource::Links
@@ -1791,7 +1885,9 @@ pub(crate) fn is_nullable_encoded_id(schema: &Schema, value: &FieldValue) -> boo
 /// The fields of `table` over its table's `schema`, in declared order. Each attribute object
 /// lists one `keyword` leaf per key of `map_keys` under its MAP column, in the table's
 /// spelling. Events list `events.time` (date) and `events.name`, neither searchable nor
-/// aggregatable. A nullable encoded id (see [`is_nullable_encoded_id`]) is searchable but not
+/// aggregatable. Histogram buckets are a `nested` field, neither searchable nor aggregatable
+/// itself, followed by its members (`BUCKET_MEMBERS`), searchable and aggregatable inside a
+/// nested context. A nullable encoded id (see [`is_nullable_encoded_id`]) is searchable but not
 /// aggregatable. An alias lists with its target's type; a render-only field is an `object`.
 ///
 /// # Errors
@@ -1818,6 +1914,16 @@ pub(crate) fn list_profile_fields(
                 });
                 fields.push(build_unsearchable_leaf(format!("{name}.time"), FieldType::Date));
                 fields.push(build_unsearchable_leaf(format!("{name}.name"), FieldType::Keyword));
+            }
+            ProfileFieldSource::HistogramBuckets { .. } => {
+                fields.push(IndexField {
+                    field_type: FieldType::Nested,
+                    parent,
+                    ..IndexField::object((*name).to_string())
+                });
+                fields.extend(BUCKET_MEMBERS.iter().map(|(member, member_type)| {
+                    IndexField::leaf(format!("{name}.{member}"), *member_type, Some((*name).to_string()))
+                }));
             }
             ProfileFieldSource::Attributes(column) => {
                 fields.push(IndexField {
@@ -1873,8 +1979,8 @@ pub(crate) fn list_profile_fields(
 /// The fields a full-text pattern reaches on `table`: the leaves whose names it matches, and each
 /// attribute MAP whose every key path it covers, selected whole, as a native MAP column is. A
 /// pattern covering the resource attributes also reaches the columns `table` promotes resource
-/// keys to, as a native index's pattern does. Objects, lists and render-only fields are never
-/// reached, and neither is a cross-row field, which only a search of its own index reads.
+/// keys to, as a native index's pattern does. Objects, lists, `nested` and render-only fields are
+/// never reached, and neither is a cross-row field, which only a search of its own index reads.
 ///
 /// # Errors
 ///
@@ -1893,6 +1999,7 @@ pub(crate) fn expand_profile_pattern(
             | ProfileFieldSource::Events
             | ProfileFieldSource::Links
             | ProfileFieldSource::ExponentialBuckets { .. }
+            | ProfileFieldSource::HistogramBuckets { .. }
             | ProfileFieldSource::Quantiles
             | ProfileFieldSource::Exemplars
             | ProfileFieldSource::CrossRow(_) => {}
@@ -2023,7 +2130,10 @@ fn render_source_field(
             offset,
             is_negative,
         } => render_exponential_buckets(batch, row, counts, offset, is_negative),
-        ProfileFieldSource::DurationInNanos | ProfileFieldSource::MetricValue | ProfileFieldSource::ArrayLength(_) => {
+        ProfileFieldSource::DurationInNanos
+        | ProfileFieldSource::MetricValue
+        | ProfileFieldSource::ArrayLength(_)
+        | ProfileFieldSource::HistogramBuckets { .. } => {
             let (_, derived_field) = map_derived_field(name, source)
                 .ok_or_else(|| OpenSearchError::internal(format!("profile field [{name}] derives no value")))?;
             render_derived_value(derived_field, batch, row)

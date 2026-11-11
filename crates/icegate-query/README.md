@@ -214,6 +214,12 @@ hidden indices is on, and offers `timestamp` as the time field of a pattern over
   filter keys offer them (`grafana field pickers and ad-hoc filter keys list dotted map keys`).
 - `_mapping` lists a native table's properties in its schema column order, and a map's keys in
   stored-key byte order; a profile index lists its fields in the profile's declared order.
+- `ss4o_metrics-icegate-default` serves a histogram's `buckets` as a `nested` field of
+  `{min, max, count}` objects, derived from `explicit_bounds` and `bucket_counts`
+  (`src/opensearch/catalog/histogram.rs` states the open ends), and `time` as another name of
+  `@timestamp`. A query leaf on `buckets` or a member path outside a nested context matches
+  nothing (`ss4o_metrics_renders_histogram_buckets_as_min_max_count_objects`,
+  `ss4o_metrics_lists_buckets_as_a_nested_field`).
 - `_field_caps` reports exactly three metadata fields when the requested patterns select them:
   `_id` (searchable through `ids`, not aggregatable), `_index` and `_source` (neither).
 - Field discovery lists the map keys of committed rows within

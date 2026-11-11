@@ -1329,11 +1329,22 @@ pub(super) fn build_metric_row<'a>(
     tenant: &'a str,
     name: &'a str,
     metric_type: &'a str,
+    cells: Vec<(&'a str, Cell<'a>)>,
+) -> Row<'a> {
+    build_metric_row_at(tenant, T0, name, metric_type, cells)
+}
+
+/// A metrics row at `micros`, ingested then: the required columns plus `cells`.
+fn build_metric_row_at<'a>(
+    tenant: &'a str,
+    micros: i64,
+    name: &'a str,
+    metric_type: &'a str,
     mut cells: Vec<(&'a str, Cell<'a>)>,
 ) -> Row<'a> {
     let mut row_cells = vec![
-        (COL_TIMESTAMP, Cell::Micros(T0)),
-        (COL_INGESTED_TIMESTAMP, Cell::Micros(T0)),
+        (COL_TIMESTAMP, Cell::Micros(micros)),
+        (COL_INGESTED_TIMESTAMP, Cell::Micros(micros)),
         (COL_METRIC_NAME, Cell::Text(name)),
         (COL_METRIC_TYPE, Cell::Text(metric_type)),
     ];
@@ -2228,6 +2239,220 @@ async fn a_full_text_leaf_matches_nothing_on_a_render_only_field_and_reads_names
             "{query}"
         );
     }
+    server.shutdown().await;
+}
+
+/// The histogram metric of [`commit_histogram_metrics`].
+const HISTOGRAM_METRIC: &str = "http.server.duration";
+/// The sum metric of [`commit_histogram_metrics`], one minute after the histogram.
+const SUM_METRIC: &str = "http.server.requests";
+/// Tenant B's histogram metric: a leak would list it, or add a hit.
+const TENANT_B_HISTOGRAM_METRIC: &str = "rpc.server.duration";
+/// One minute, in microseconds.
+const MINUTE_MICROS: i64 = 60_000_000;
+
+/// Tenant A's histogram at `T0` (bounds `[1.0, 5.0]`, counts `[2, 3, 4]`) and its sum one minute
+/// later; tenant B's histogram at `T0`.
+async fn commit_histogram_metrics(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteError> {
+    commit_rows(
+        catalog,
+        METRICS_TABLE,
+        &[
+            build_metric_row(
+                TENANT_A,
+                HISTOGRAM_METRIC,
+                "histogram",
+                vec![
+                    (COL_AGGREGATION_TEMPORALITY, Cell::Text("DELTA")),
+                    (COL_BUCKET_COUNTS, Cell::Longs(&[2, 3, 4])),
+                    (COL_EXPLICIT_BOUNDS, Cell::Doubles(&[1.0, 5.0])),
+                ],
+            ),
+            build_metric_row_at(
+                TENANT_A,
+                T0 + MINUTE_MICROS,
+                SUM_METRIC,
+                "sum",
+                vec![
+                    (COL_VALUE_INT, Cell::Long(7)),
+                    (COL_AGGREGATION_TEMPORALITY, Cell::Text("CUMULATIVE")),
+                ],
+            ),
+            build_metric_row(
+                TENANT_B,
+                TENANT_B_HISTOGRAM_METRIC,
+                "histogram",
+                vec![
+                    (COL_BUCKET_COUNTS, Cell::Longs(&[1, 1])),
+                    (COL_EXPLICIT_BOUNDS, Cell::Doubles(&[2.0])),
+                ],
+            ),
+        ],
+    )
+    .await
+}
+
+/// The `_source` of every hit of a search of the ss4o metrics index with `body`, as tenant A.
+async fn search_metric_sources(server: &TestServer, body: &Value) -> Vec<Value> {
+    let answer = fetch_ok_answer(server, TENANT_A, &format!("/{SS4O_METRICS}/_search"), body)
+        .await
+        .expect("search request");
+    answer["hits"]["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|hit| hit["_source"].clone())
+        .collect()
+}
+
+/// A sample-document search reads a histogram's buckets as `{min, max, count}` objects: bucket
+/// `i` runs from bound `i - 1` to bound `i`, and an open end is the most negative or the most
+/// positive finite `f32` widened to `f64`, as JSON holds no infinity. A row that is not a
+/// histogram has no `buckets`, and a leaf on `buckets` or a path below it, outside a nested
+/// context, matches nothing: the bucket objects are no fields of the row.
+#[tokio::test]
+async fn ss4o_metrics_renders_histogram_buckets_as_min_max_count_objects() {
+    let (server, catalog) = TestServer::start().await;
+    commit_histogram_metrics(&catalog).await.expect("commit metrics");
+    let sample_body =
+        |name: &str| json!({"size": 1, "query": {"bool": {"must": [{"term": {"name": {"value": name}}}]}}});
+
+    let histogram_answer = server
+        .request(Method::POST, Some(TENANT_A), &format!("/{SS4O_METRICS}/_search"))
+        .json(&sample_body(HISTOGRAM_METRIC))
+        .send()
+        .await
+        .expect("search request");
+    assert_eq!(histogram_answer.status(), StatusCode::OK);
+    let histogram_text = histogram_answer.text().await.expect("answer text");
+    let sum_sources = search_metric_sources(&server, &sample_body(SUM_METRIC)).await;
+
+    // Pinned on the wire: the test client's JSON parser rounds a 17-digit double by one unit in
+    // the last place, which would hide a wrong open end.
+    assert!(
+        histogram_text.contains(
+            r#""buckets":[{"min":-3.4028234663852886e+38,"max":1.0,"count":2},{"min":1.0,"max":5.0,"count":3},{"min":5.0,"max":3.4028234663852886e+38,"count":4}]"#
+        ),
+        "{histogram_text}"
+    );
+    assert_eq!(sum_sources.len(), 1, "{sum_sources:?}");
+    assert!(sum_sources[0].get("buckets").is_none(), "{}", sum_sources[0]);
+    for query in [
+        json!({"term": {"buckets.min": 1.0}}),
+        json!({"range": {"buckets.count": {"gte": 0}}}),
+        json!({"exists": {"field": "buckets"}}),
+        json!({"exists": {"field": "buckets.max"}}),
+        json!({"term": {"buckets": 2}}),
+    ] {
+        let sources = search_metric_sources(&server, &json!({"query": query})).await;
+
+        assert_eq!(sources, Vec::<Value>::new(), "{query}");
+    }
+    server.shutdown().await;
+}
+
+/// `time` is the data point's time under another name: a range on it selects the rows the same
+/// range on `@timestamp` selects, with bounds written to the second, a dot, the milliseconds and
+/// three zeros, and `Z`, and it is not repeated in `_source`. `T0` is `2025-10-09T08:53:20Z` and
+/// the sum lies one minute later.
+#[tokio::test]
+async fn ss4o_metrics_time_is_the_data_point_time_and_filters_like_it() {
+    let (server, catalog) = TestServer::start().await;
+    commit_histogram_metrics(&catalog).await.expect("commit metrics");
+    let window_body = |field: &str, end: &str| {
+        json!({"query": {"bool": {"must": [
+            {"range": {field: {"gte": "2025-10-09T08:53:20.000000Z", "lte": end}}}
+        ]}}})
+    };
+
+    for (end, expected_names) in [
+        ("2025-10-09T08:53:20.999000Z", vec![HISTOGRAM_METRIC]),
+        ("2025-10-09T08:54:20.999000Z", vec![HISTOGRAM_METRIC, SUM_METRIC]),
+    ] {
+        for field in ["time", "@timestamp"] {
+            let sources = search_metric_sources(&server, &window_body(field, end)).await;
+            let mut names: Vec<&str> = sources.iter().map(|source| source["name"].as_str().expect("name")).collect();
+            names.sort_unstable();
+
+            assert_eq!(names, expected_names, "{field} up to {end}");
+            assert!(sources.iter().all(|source| source.get("time").is_none()), "{sources:?}");
+        }
+    }
+    server.shutdown().await;
+}
+
+/// `buckets` is a `nested` field whose objects hold a `double` `min` and `max` and a `long`
+/// `count`, in `_field_caps` and in `_mapping`; `time` is a `date`.
+#[tokio::test]
+async fn ss4o_metrics_lists_buckets_as_a_nested_field() {
+    let (server, catalog) = TestServer::start().await;
+    commit_histogram_metrics(&catalog).await.expect("commit metrics");
+    let capability = |field_type: &str, is_searchable: bool| json!({field_type: {"type": field_type, "searchable": is_searchable, "aggregatable": is_searchable}});
+
+    let (caps_status, caps) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        &format!("/{SS4O_METRICS}/_field_caps?fields=buckets*,time"),
+        None,
+    )
+    .await
+    .expect("field caps");
+    let (mapping_status, mapping) = send_request(
+        &server,
+        Method::GET,
+        TENANT_A,
+        &format!("/{SS4O_METRICS}/_mapping"),
+        None,
+    )
+    .await
+    .expect("mapping");
+
+    assert_eq!(caps_status, StatusCode::OK, "{caps}");
+    assert_eq!(
+        caps["fields"],
+        json!({
+            "buckets": capability("nested", false),
+            "buckets.min": capability("double", true),
+            "buckets.max": capability("double", true),
+            "buckets.count": capability("long", true),
+            "time": capability("date", true),
+        })
+    );
+    assert_eq!(mapping_status, StatusCode::OK, "{mapping}");
+    let properties = &mapping[SS4O_METRICS]["mappings"]["properties"];
+    assert_eq!(
+        properties["buckets"],
+        json!({"type": "nested", "properties": {
+            "min": {"type": "double"},
+            "max": {"type": "double"},
+            "count": {"type": "long"},
+        }})
+    );
+    assert_eq!(properties["time"], json!({"type": "date"}));
+    server.shutdown().await;
+}
+
+/// The metric-name request of OSD 3.9's Metrics page answers the histogram metrics
+/// only: the sum is no `HISTOGRAM`, and tenant B's histogram is another tenant's.
+#[tokio::test]
+async fn osd_metric_names_list_only_histograms() {
+    let (server, catalog) = TestServer::start().await;
+    commit_histogram_metrics(&catalog).await.expect("commit metrics");
+    let body = json!({
+        "size": 0,
+        "query": {"bool": {"filter": [{"term": {"kind": "HISTOGRAM"}}]}},
+        "aggs": {"distinct_names": {"terms": {"field": "name", "size": 500}}}
+    });
+
+    let answer = fetch_ok_answer(&server, TENANT_A, &format!("/{SS4O_METRICS}/_search"), &body)
+        .await
+        .expect("search request");
+
+    assert_eq!(
+        answer["aggregations"]["distinct_names"]["buckets"],
+        json!([{"key": HISTOGRAM_METRIC, "doc_count": 1}])
+    );
     server.shutdown().await;
 }
 

@@ -171,7 +171,7 @@ const fn read_search_kind(field: &ResolvedField) -> Option<SearchKind> {
         FieldType::Long => Some(SearchKind::Long),
         FieldType::Double => Some(SearchKind::Double),
         FieldType::Boolean => Some(SearchKind::Boolean),
-        FieldType::Object => None,
+        FieldType::Object | FieldType::Nested => None,
     }
 }
 
@@ -541,8 +541,10 @@ enum ProfileLeaf<'q> {
 ///
 /// # Errors
 ///
-/// A leaf on a render-only field (see [`EncodedField::is_render_only`]), or on a path below one,
-/// is [`OpenSearchError::render_only_field`]; a term pattern on another encoded or derived field
+/// A leaf on a `nested` field matches nothing: its objects are indexed apart from the row, so
+/// only a nested context reaches them. A leaf on a render-only field (see
+/// [`EncodedField::is_render_only`]), or on a path below one, is
+/// [`OpenSearchError::render_only_field`]; a term pattern on another encoded or derived field
 /// is the query-shard 400 of a term pattern on a typed field; otherwise the errors of the field's
 /// lowering. A leaf on a cross-row field whose index has no trace roots attached is
 /// `illegal_argument`. Each refusal names the field as the request did (`field.name`), never the
@@ -552,6 +554,9 @@ fn lower_profile_leaf(
     leaf: ProfileLeaf<'_>,
     scope: &LoweringScope<'_>,
 ) -> Result<Option<Expr>, OpenSearchError> {
+    if field.field_type == FieldType::Nested {
+        return Ok(Some(lit(false)));
+    }
     if let FieldValue::Encoded(encoded_field) = &field.value
         && encoded_field.is_render_only()
     {
@@ -675,7 +680,7 @@ fn lower_term(query: &TermQuery, scope: &LoweringScope<'_>) -> Result<Expr, Open
             let data_type = read_typed_column_type(&field, scope)?;
             lower_date_term(read_expr, &text, &data_type, &field, scope)
         }
-        (FieldType::Object, _) => Ok(lit(false)),
+        (FieldType::Object | FieldType::Nested, _) => Ok(lit(false)),
         (FieldType::Text, _) => match_text_token(read_expr, &text, query.case_insensitive),
     }
 }
@@ -742,7 +747,7 @@ fn lower_terms(query: &TermsQuery, scope: &LoweringScope<'_>) -> Result<Expr, Op
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(covered_ranges.into_iter().reduce(Expr::or).unwrap_or_else(|| lit(false)))
         }
-        (FieldType::Object, _) => Ok(lit(false)),
+        (FieldType::Object | FieldType::Nested, _) => Ok(lit(false)),
         // One token equals one of the terms, each row tokenized once for all of them.
         (FieldType::Text, _) => Ok(match_text_tokens(read_expr, &texts, false)),
     }
@@ -787,7 +792,7 @@ fn lower_range(query: &RangeQuery, scope: &LoweringScope<'_>) -> Result<Expr, Op
         (FieldType::Integer | FieldType::Long, _) => lower_integer_range(query, read_expr, &field, scope),
         (FieldType::Double, _) => lower_double_range(query, read_expr, &field, scope),
         (FieldType::Boolean, _) => lower_boolean_range(query, read_expr, &field, scope),
-        (FieldType::Object | FieldType::Date, _) => Ok(lit(false)),
+        (FieldType::Object | FieldType::Nested | FieldType::Date, _) => Ok(lit(false)),
         (FieldType::Text, _) => lower_text_range(read_expr, query),
     }
 }
@@ -1236,6 +1241,8 @@ fn lower_exists(query: &ExistsQuery, scope: &LoweringScope<'_>) -> Result<Expr, 
                 cardinality(read_expr).gt(lit(0_u64))
             }
         }
+        // A nested field's objects are no fields of the row.
+        (FieldType::Nested, _) => lit(false),
         (FieldType::Object, FieldValue::MapKey { .. } | FieldValue::HexId { .. })
         | (
             FieldType::Text
@@ -1271,7 +1278,7 @@ fn lower_prefix(query: &PrefixQuery, scope: &LoweringScope<'_>) -> Result<Expr, 
                 starts_with(read_expr, lit(query.value.clone()))
             })
         }
-        (FieldType::Object, _) => Ok(lit(false)),
+        (FieldType::Object | FieldType::Nested, _) => Ok(lit(false)),
         (FieldType::Text, _) => lower_text_prefix(field.value.build_read_expr(), query),
         (FieldType::Keyword, FieldValue::HexId { .. })
         | (FieldType::Date | FieldType::Integer | FieldType::Long | FieldType::Double | FieldType::Boolean, _) => {
@@ -1300,7 +1307,7 @@ fn lower_wildcard(query: &WildcardQuery, scope: &LoweringScope<'_>) -> Result<Ex
             Some(LIKE_ESCAPE),
             query.case_insensitive,
         ))),
-        (FieldType::Object, _) => Ok(lit(false)),
+        (FieldType::Object | FieldType::Nested, _) => Ok(lit(false)),
         (FieldType::Text, _) => lower_text_wildcard(field.value.build_read_expr(), query),
         (FieldType::Keyword, FieldValue::HexId { .. })
         | (FieldType::Date | FieldType::Integer | FieldType::Long | FieldType::Double | FieldType::Boolean, _) => {
@@ -1332,7 +1339,7 @@ fn lower_regexp(query: &RegexpQuery, scope: &LoweringScope<'_>) -> Result<Expr, 
         (FieldType::Keyword, FieldValue::Column { .. } | FieldValue::MapKey { .. }) => {
             Ok(build_keyword_regex_match_udf(pattern).call(vec![field.value.build_read_expr()]))
         }
-        (FieldType::Object, _) => Ok(lit(false)),
+        (FieldType::Object | FieldType::Nested, _) => Ok(lit(false)),
         (FieldType::Text, _) => Ok(build_text_regex_match_udf(pattern).call(vec![field.value.build_read_expr()])),
         (FieldType::Keyword, FieldValue::HexId { .. })
         | (FieldType::Date | FieldType::Integer | FieldType::Long | FieldType::Double | FieldType::Boolean, _) => {

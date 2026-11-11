@@ -1514,7 +1514,7 @@ fn check_field_for_aggregation(
     let field_type = field.field_type;
     let is_number = matches!(field_type, FieldType::Integer | FieldType::Long | FieldType::Double);
     let is_metric_input = is_number || matches!(field_type, FieldType::Boolean | FieldType::Date);
-    let is_text_or_object = matches!(field_type, FieldType::Text | FieldType::Object);
+    let is_text_or_object = matches!(field_type, FieldType::Text | FieldType::Object | FieldType::Nested);
     let refuse = |kind_name: &str| {
         Err(OpenSearchError::unsupported_aggregation_field(
             field_name,
@@ -1653,7 +1653,7 @@ const fn map_field_data_type(field: &ResolvedField) -> Option<DataType> {
         (_, FieldType::Long) => Some(DataType::Int64),
         (_, FieldType::Double) => Some(DataType::Float64),
         (_, FieldType::Boolean) => Some(DataType::Boolean),
-        (_, FieldType::Text | FieldType::Object) => None,
+        (_, FieldType::Text | FieldType::Object | FieldType::Nested) => None,
     }
 }
 

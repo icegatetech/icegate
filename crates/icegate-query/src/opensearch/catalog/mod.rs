@@ -11,6 +11,7 @@ mod data_prepper;
 mod encoding;
 mod expression;
 mod field;
+mod histogram;
 mod map_key_cache;
 mod native;
 mod registry;

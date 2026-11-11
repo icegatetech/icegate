@@ -101,7 +101,9 @@ the relation from that table and declares no field of its own.
   declared order (the order `describe` lists), aliases included: `time`, `@message` and
   `observerTime` read their targets. An object (`severity`, `resource`, `status`) is a `struct` of
   its members, NULL when every member is; an attribute object is its MAP; a list column is an
-  `array`. `describe` lists the same fields with the same types, a list column as `array` too
+  `array`, and so is the metrics `buckets`, a list of `{min, max, count}` structs, NULL on a row
+  that is no histogram (`ss4o_metrics_buckets_read_as_an_array_of_bucket_structs`). `describe`
+  lists the same fields with the same types, a list column and `buckets` as `array` too
   (`describe_and_a_bare_source_agree_on_the_ss4o_logs_columns`,
   `describe_and_a_bare_source_agree_on_the_ss4o_traces_and_metrics_columns` and
   `osd_associated_logs_query_lists_the_logs_of_one_trace` in `tests/opensearch/ppl_ss4o.rs`).

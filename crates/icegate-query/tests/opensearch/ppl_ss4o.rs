@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use iceberg::Catalog;
 use icegate_common::schema::{
-    COL_KIND, COL_LOG_ATTRIBUTES, COL_NAME, COL_PARENT_SPAN_ID, COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME, COL_SPAN_ID,
-    COL_STATUS_CODE, COL_TRACE_ID, COL_VALUE_DOUBLE, COL_VALUE_INT,
+    COL_BUCKET_COUNTS, COL_EXPLICIT_BOUNDS, COL_KIND, COL_LOG_ATTRIBUTES, COL_NAME, COL_PARENT_SPAN_ID,
+    COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME, COL_SPAN_ID, COL_STATUS_CODE, COL_TRACE_ID, COL_VALUE_DOUBLE,
+    COL_VALUE_INT,
 };
 use icegate_common::{LOGS_TABLE, METRICS_TABLE, SPANS_TABLE};
 use reqwest::StatusCode;
@@ -432,7 +433,7 @@ async fn describe_and_a_bare_source_agree_on_the_ss4o_logs_columns() {
 
 /// Over the ss4o traces and metrics indices, a bare source's columns are the top-level fields
 /// `describe` lists, in its order and with its types, but for the fields PPL cannot read. A list
-/// column (`bucketCountsList`) is an `array` in both.
+/// column (`bucketCountsList`) and the `nested` histogram `buckets` are an `array` in both.
 #[tokio::test]
 async fn describe_and_a_bare_source_agree_on_the_ss4o_traces_and_metrics_columns() {
     let (server, catalog) = TestServer::start().await;
@@ -469,10 +470,83 @@ async fn describe_and_a_bare_source_agree_on_the_ss4o_traces_and_metrics_columns
         assert_eq!(read_schema(&source_answer), described_columns, "{index}");
     }
     let metrics_columns = describe_top_level_fields(&server, SS4O_METRICS).await;
-    assert!(
-        metrics_columns.contains(&("bucketCountsList".to_string(), "array".to_string())),
-        "{metrics_columns:?}"
-    );
+    for array_field in ["bucketCountsList", "buckets"] {
+        assert!(
+            metrics_columns.contains(&(array_field.to_string(), "array".to_string())),
+            "{array_field}: {metrics_columns:?}"
+        );
+    }
+    server.shutdown().await;
+}
+
+/// `buckets` reads as the array of `{min, max, count}` structs `_source` shows: bucket `i` runs
+/// from bound `i - 1` to bound `i`, an open end is the most negative or most positive finite
+/// `f32`, and a row that is not a histogram reads NULL, so `is not null` keeps the histograms.
+/// The other tenant's histogram never appears.
+#[tokio::test]
+async fn ss4o_metrics_buckets_read_as_an_array_of_bucket_structs() {
+    let (server, catalog) = TestServer::start().await;
+    commit_rows(
+        &catalog,
+        METRICS_TABLE,
+        &[
+            build_metric_row(
+                TENANT,
+                "http.server.duration",
+                "histogram",
+                vec![
+                    (COL_BUCKET_COUNTS, Cell::Longs(&[2, 3, 4])),
+                    (COL_EXPLICIT_BOUNDS, Cell::Doubles(&[1.0, 5.0])),
+                ],
+            ),
+            build_metric_row(
+                TENANT,
+                "cpu.usage",
+                "gauge",
+                vec![(COL_VALUE_DOUBLE, Cell::Double(0.5))],
+            ),
+            build_metric_row(
+                OTHER_TENANT,
+                "rpc.server.duration",
+                "histogram",
+                vec![
+                    (COL_BUCKET_COUNTS, Cell::Longs(&[1, 1])),
+                    (COL_EXPLICIT_BOUNDS, Cell::Doubles(&[2.0])),
+                ],
+            ),
+        ],
+    )
+    .await
+    .expect("commit metrics");
+
+    let answer = run_query(
+        &server,
+        &format!("source={SS4O_METRICS} | where buckets is not null | fields name, buckets"),
+    )
+    .await;
+
+    let rows = read_rows(&answer).as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0][0], "http.server.duration");
+    let buckets = &rows[0][1];
+    assert_eq!(buckets[0]["max"], 1.0);
+    assert_eq!(buckets[0]["count"], 2);
+    assert_eq!(buckets[1], json!({"min": 1.0, "max": 5.0, "count": 3}));
+    assert_eq!(buckets[2]["min"], 5.0);
+    assert_eq!(buckets[2]["count"], 4);
+    assert_eq!(buckets.as_array().map(Vec::len), Some(3));
+    // The test client's JSON parser may round a 17-digit double by one unit in the last place;
+    // the exact open ends are pinned on the wire by the `_source` test.
+    for (open_end, expected) in [
+        (&buckets[0]["min"], f64::from(f32::MIN)),
+        (&buckets[2]["max"], f64::from(f32::MAX)),
+    ] {
+        let value = open_end.as_f64().expect("an open end");
+        assert!(
+            (value - expected).abs() <= expected.abs() * f64::EPSILON,
+            "{value} is not {expected}"
+        );
+    }
     server.shutdown().await;
 }
 

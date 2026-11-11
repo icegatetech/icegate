@@ -251,7 +251,8 @@ fn find_integer_range(field_type: FieldType) -> Option<(i64, i64)> {
         | FieldType::Date
         | FieldType::Double
         | FieldType::Boolean
-        | FieldType::Object => None,
+        | FieldType::Object
+        | FieldType::Nested => None,
     }
 }
 
