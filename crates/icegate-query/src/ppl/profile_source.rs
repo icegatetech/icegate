@@ -268,7 +268,8 @@ pub(super) enum ProfileFilter<'a> {
 /// as on a native id column (see the README, Id literals).
 ///
 /// `None` when the inverse does not apply and the filter is planned on the read value instead:
-/// `!=` (its rows include values the inverse cannot tell apart), a literal of another type than the
+/// `!=` but on such an id (its rows include values the inverse cannot tell apart), a literal of
+/// another type than the
 /// field reads, an id range bounded by `""`, `is not null` on the span kind (an unnamed stored kind
 /// reads NULL), and every field that reads a column as stored.
 ///
@@ -322,7 +323,8 @@ pub(super) fn lower_profile_filter(
 }
 
 /// `filter` on an id that reads as hex text, `""` for NULL: each literal is an id literal, `""`
-/// selecting the NULL rows; `None` for `!=` and for a range bounded by `""`.
+/// selecting the NULL rows, `!=` keeping the rows whose value differs; `None` for a range bounded by
+/// `""` and a literal that is no string.
 ///
 /// # Errors
 ///
@@ -372,6 +374,21 @@ fn lower_id_filter(
         if !check_id_literal(literal)? {
             return Ok(None);
         }
+    }
+    if let (
+        ProfileFilter::Compare(CompareOperator::NotEqual, PplLiteral::String(text)),
+        EncodedField::HexIdOrEmpty { column, .. },
+    ) = (filter, id_field)
+    {
+        // The value `""` differs from every id: it differs from `""` exactly where an id is stored,
+        // and from an id exactly where the stored id is NULL or another id.
+        let stored_id = ident(*column);
+        if text.is_empty() {
+            return Ok(Some(stored_id.is_not_null()));
+        }
+        let id = decode_fixed_binary_literal(text, &DataType::FixedSizeBinary(width))
+            .map_err(|error| PplError::invalid_id_literal(name, text, &error))?;
+        return Ok(Some(stored_id.clone().is_null().or(stored_id.not_eq(lit(id)))));
     }
     apply_inverse(
         filter,
@@ -455,4 +472,25 @@ fn refuse_inverse_literal(name: &str, error: OpenSearchError) -> PplError {
         return PplError::semantic_naming(name, error.reason());
     }
     PplError::from(error)
+}
+
+/// The literal a comparison of the field `name`, whose resolved value is `value`, with `literal`
+/// reads, wherever the comparison stands: on an id that reads as hex text (`parentSpanId`), a
+/// string literal is an id literal, compared in the lower-case hex the value is written in (`""`
+/// stays `""`). `None` for any other field or literal, which lowers as written.
+///
+/// # Errors
+///
+/// [`PplError::invalid_id_literal`] for a non-empty literal that is no hex of the id's width, the
+/// refusal of a native id column.
+pub(super) fn fold_id_literal(value: &FieldValue, name: &str, literal: &PplLiteral) -> Result<Option<Expr>, PplError> {
+    let (FieldValue::Encoded(EncodedField::HexIdOrEmpty { width, .. }), PplLiteral::String(text)) = (value, literal)
+    else {
+        return Ok(None);
+    };
+    if !text.is_empty() {
+        decode_fixed_binary_literal(text, &DataType::FixedSizeBinary(*width))
+            .map_err(|error| PplError::invalid_id_literal(name, text, &error))?;
+    }
+    Ok(Some(lit(text.to_ascii_lowercase())))
 }

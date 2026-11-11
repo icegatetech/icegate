@@ -835,3 +835,158 @@ async fn a_wildcard_reaching_logs_through_two_profiles_is_refused_naming_it() {
     assert_semantic_refusal_naming(&answer, "*logs*");
     server.shutdown().await;
 }
+
+/// `describe` of a native index types a list column `array`, the type a bare source reads it as.
+#[tokio::test]
+async fn describe_types_a_native_list_column_array_as_a_bare_source_reads_it() {
+    let (server, catalog) = TestServer::start().await;
+    seed_spans(&catalog).await;
+
+    let described_columns = describe_top_level_fields(&server, SPANS_TABLE).await;
+    let source_answer = run_query(&server, "source=spans | head 1").await;
+
+    let events_column = ("events".to_string(), "array".to_string());
+    assert!(described_columns.contains(&events_column), "{described_columns:?}");
+    assert!(
+        read_schema(&source_answer).contains(&events_column),
+        "{}",
+        source_answer.body
+    );
+    server.shutdown().await;
+}
+
+const LETTER_PARENT: [u8; 8] = [0xab; 8];
+const OTHER_LETTER_PARENT: [u8; 8] = [0xcd; 8];
+
+/// Three `acme` spans whose parents are written with hex letters: `0a…` under `abab…`, the root
+/// `0b…`, and `0c…` under `cdcd…`.
+async fn seed_letter_parent_spans(catalog: &Arc<dyn Catalog>) {
+    commit_rows(
+        catalog,
+        SPANS_TABLE,
+        &[
+            build_span_row(
+                TENANT,
+                &TRACE,
+                &[0x0a; 8],
+                (T0, 10_000),
+                vec![
+                    (COL_NAME, Cell::Text("a")),
+                    (COL_PARENT_SPAN_ID, Cell::Bytes(&LETTER_PARENT)),
+                ],
+            ),
+            build_span_row(
+                TENANT,
+                &TRACE,
+                &[0x0b; 8],
+                (T0, 10_000),
+                vec![(COL_NAME, Cell::Text("b"))],
+            ),
+            build_span_row(
+                TENANT,
+                &TRACE,
+                &[0x0c; 8],
+                (T0, 10_000),
+                vec![
+                    (COL_NAME, Cell::Text("c")),
+                    (COL_PARENT_SPAN_ID, Cell::Bytes(&OTHER_LETTER_PARENT)),
+                ],
+            ),
+        ],
+    )
+    .await
+    .expect("commit spans");
+}
+
+/// A string literal compared with `parentSpanId` is an id literal wherever the comparison stands:
+/// either case selects the same parent, and a test and its negation (`!=`, `not`, `not in`) keep
+/// complementary rows; a root's parent reads `""`, so a negation keeps it.
+#[tokio::test]
+async fn a_parent_span_id_literal_in_either_case_selects_like_a_native_id_literal() {
+    let (server, catalog) = TestServer::start().await;
+    seed_letter_parent_spans(&catalog).await;
+    let cases = [
+        ("where parentSpanId = 'ABABABABABABABAB'", json!([["0a0a0a0a0a0a0a0a"]])),
+        ("where parentSpanId = 'abababababababab'", json!([["0a0a0a0a0a0a0a0a"]])),
+        (
+            "where parentSpanId != 'ABABABABABABABAB'",
+            json!([["0b0b0b0b0b0b0b0b"], ["0c0c0c0c0c0c0c0c"]]),
+        ),
+        (
+            "where not parentSpanId = 'ABABABABABABABAB'",
+            json!([["0b0b0b0b0b0b0b0b"], ["0c0c0c0c0c0c0c0c"]]),
+        ),
+        (
+            "where parentSpanId not in ('ABABABABABABABAB')",
+            json!([["0b0b0b0b0b0b0b0b"], ["0c0c0c0c0c0c0c0c"]]),
+        ),
+        (
+            "where parentSpanId between 'ABABABABABABABAB' and 'CDCDCDCDCDCDCDCD'",
+            json!([["0a0a0a0a0a0a0a0a"], ["0c0c0c0c0c0c0c0c"]]),
+        ),
+        (
+            "where not parentSpanId between 'ABABABABABABABAB' and 'CDCDCDCDCDCDCDCD'",
+            json!([["0b0b0b0b0b0b0b0b"]]),
+        ),
+    ];
+    let native_answer = run_query(
+        &server,
+        "source=spans | where parent_span_id != 'ABABABABABABABAB' | fields span_id | sort span_id",
+    )
+    .await;
+
+    for (condition, expected_rows) in cases {
+        let query = format!("source={SS4O_TRACES} | {condition} | fields spanId | sort spanId");
+        let answer = run_query(&server, &query).await;
+
+        assert_eq!(answer.status, StatusCode::OK, "{query}: {}", answer.body);
+        assert_eq!(read_rows(&answer), &expected_rows, "{query}");
+    }
+    // The native column holds the root's parent as NULL, which `!=` drops; the profile reads it as
+    // `""`, which differs from every id. Both exclude the `abab…` child.
+    assert_eq!(read_rows(&native_answer), &json!([["0c0c0c0c0c0c0c0c"]]));
+    let eval_answer = run_query(
+        &server,
+        &format!(
+            "source={SS4O_TRACES} | eval child = case(parentSpanId = 'ABABABABABABABAB', 'yes' else 'no') | fields spanId, child | sort spanId"
+        ),
+    )
+    .await;
+    assert_eq!(
+        read_rows(&eval_answer),
+        &json!([
+            ["0a0a0a0a0a0a0a0a", "yes"],
+            ["0b0b0b0b0b0b0b0b", "no"],
+            ["0c0c0c0c0c0c0c0c", "no"]
+        ])
+    );
+    server.shutdown().await;
+}
+
+/// A malformed parent id is the native malformed-id refusal wherever the comparison stands: under
+/// `not`, in `not in`, and in an `eval`.
+#[tokio::test]
+async fn a_malformed_parent_span_id_is_refused_in_every_comparison_like_over_spans() {
+    let (server, catalog) = TestServer::start().await;
+    seed_letter_parent_spans(&catalog).await;
+    let cases = [
+        ("where not parentSpanId = 'xyz'", "where not parent_span_id = 'xyz'"),
+        (
+            "where parentSpanId not in ('xyz')",
+            "where parent_span_id not in ('xyz')",
+        ),
+        (
+            "eval child = case(parentSpanId = 'xyz', 'yes' else 'no')",
+            "eval child = case(parent_span_id = 'xyz', 'yes' else 'no')",
+        ),
+    ];
+
+    for (profile_command, native_command) in cases {
+        let profile_answer = run_query(&server, &format!("source={SS4O_TRACES} | {profile_command}")).await;
+        let native_answer = run_query(&server, &format!("source=spans | {native_command}")).await;
+
+        assert_semantic_refusal_naming(&profile_answer, "xyz");
+        assert_semantic_refusal_naming(&native_answer, "xyz");
+    }
+    server.shutdown().await;
+}

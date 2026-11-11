@@ -49,7 +49,7 @@ use super::functions::{
     match_string_literal, parse_timestamp_literal, plan_aggregate_call,
 };
 use super::profile_source::{
-    ProfileFilter, STORED_COLUMN_PREFIX, lower_profile_filter, resolve_stored_field, scan_ss4o_index,
+    ProfileFilter, STORED_COLUMN_PREFIX, fold_id_literal, lower_profile_filter, resolve_stored_field, scan_ss4o_index,
 };
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::opensearch::catalog::{
@@ -2532,8 +2532,10 @@ fn lower_comparison(
     right: &PplExpr,
     scope: &ExpressionScope<'_>,
 ) -> Result<Expr, PplError> {
-    let left = lower_expression(left, scope)?;
-    let right = lower_expression(right, scope)?;
+    let (left, right) = (
+        lower_compared_operand(left, right, scope)?,
+        lower_compared_operand(right, left, scope)?,
+    );
     let (left, right) = coerce_timestamp_operands(left, right, scope.schema)?;
     let (left, right) = coerce_fixed_binary_operands(left, right, scope.schema)?;
     Ok(match operator {
@@ -2544,6 +2546,22 @@ fn lower_comparison(
         CompareOperator::Greater => left.gt(right),
         CompareOperator::GreaterOrEqual => left.gt_eq(right),
     })
+}
+
+/// `operand` of a comparison with `counterpart`: a literal compared with a profile id that reads as
+/// hex text is an id literal ([`fold_id_literal`]); any other operand lowers as written.
+fn lower_compared_operand(
+    operand: &PplExpr,
+    counterpart: &PplExpr,
+    scope: &ExpressionScope<'_>,
+) -> Result<Expr, PplError> {
+    if let (PplExpr::Literal(literal), PplExpr::Field(name)) = (operand, counterpart)
+        && let Some((value, _)) = find_profile_filter_field(name, scope)
+        && let Some(folded_literal) = fold_id_literal(&value, name, literal)?
+    {
+        return Ok(folded_literal);
+    }
+    lower_expression(operand, scope)
 }
 
 fn lower_negation(inner: &PplExpr, scope: &ExpressionScope<'_>) -> Result<Expr, PplError> {
@@ -2635,10 +2653,12 @@ fn lower_in_list(
     is_negated: bool,
     scope: &ExpressionScope<'_>,
 ) -> Result<Expr, PplError> {
+    let tested_value = value;
     let mut value = lower_expression(value, scope)?;
     let mut listed_values = Vec::with_capacity(list.len());
     for item in list {
-        let (folded_value, item) = coerce_timestamp_operands(value, lower_expression(item, scope)?, scope.schema)?;
+        let item = lower_compared_operand(item, tested_value, scope)?;
+        let (folded_value, item) = coerce_timestamp_operands(value, item, scope.schema)?;
         value = folded_value;
         listed_values.push(item);
     }
@@ -2653,9 +2673,13 @@ fn lower_between(
     is_negated: bool,
     scope: &ExpressionScope<'_>,
 ) -> Result<Expr, PplError> {
+    let (low, high) = (
+        lower_compared_operand(low, value, scope)?,
+        lower_compared_operand(high, value, scope)?,
+    );
     let value = lower_expression(value, scope)?;
-    let (value, low) = coerce_timestamp_operands(value, lower_expression(low, scope)?, scope.schema)?;
-    let (value, high) = coerce_timestamp_operands(value, lower_expression(high, scope)?, scope.schema)?;
+    let (value, low) = coerce_timestamp_operands(value, low, scope.schema)?;
+    let (value, high) = coerce_timestamp_operands(value, high, scope.schema)?;
     let (value, low) = coerce_fixed_binary_operands(value, low, scope.schema)?;
     let (value, high) = coerce_fixed_binary_operands(value, high, scope.schema)?;
     check_between_types(&value, &low, &high, scope.schema)?;

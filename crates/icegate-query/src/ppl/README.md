@@ -128,9 +128,13 @@ the relation from that table and declares no field of its own.
   where a stored kind without a name reads NULL). It keeps exactly the rows the test of the read
   value keeps. A literal of another type than the field reads, `!=`, `not in`, `not between`,
   `is null`, and a test below `not` or in any other expression read the field's value and do not
-  prune. On `parentSpanId` such a test reads each string literal as an id literal: `''` selects the
-  roots (NULL parents), and a malformed literal is the 400 of a native id column, naming the
-  literal; a range bounded by `''` reads the value. `parentSpanId != ''` reads the value too.
+  prune.
+- **`parentSpanId`** reads as lower-case hex text, `""` for a root's NULL parent. A string literal
+  compared with it is an id literal in every comparison, `in` and `between`, wherever it stands
+  (`where`, `not`, `eval`): either case, compared as lower-case hex, and a malformed one is the 400 of a
+  native id column, naming the literal. In a filter position `=`, `!=`, `in` and the ranges not
+  bounded by `''` lower to the stored `parent_span_id`, `''` meaning NULL. A root's parent is `""`,
+  never NULL, so `!=` and `not` keep the roots, where the native `parent_span_id` (NULL) drops them.
 - **Fields PPL cannot read.** A field `_source` reshapes from a whole list of the row (the span
   `events` and `links`; the metrics `positiveBuckets`, `negativeBuckets`, `quantiles` and
   `exemplar`) is no column, and naming it, or a path below it, is a 400 `SEMANTIC_ERROR` naming it.
@@ -380,7 +384,10 @@ Prepper span index although that index cannot be a PPL source (see [Sources](#so
 its rows without a dot, but for the fields PPL cannot read, name the columns of a bare source, in the same
 order (see [ss4o indices](#ss4o-indices)). Per row: `TABLE_CAT` is `opensearch.cluster_name`; `TABLE_NAME` is the
 index as written; `COLUMN_NAME` the field name; `TYPE_NAME` is `string` for `text` and `keyword`,
-`timestamp` for `date`, `int`, `bigint`, `double`, `boolean`, and `struct` for objects; `NUM_PREC_RADIX`
+`timestamp` for `date`, `int`, `bigint`, `double`, `boolean`, `array` for an object field that reads a
+list column (the type a source reads it as: `events` of `spans`, `bucketCountsList` of
+`ss4o_metrics-icegate-default`; `describe_types_a_native_list_column_array_as_a_bare_source_reads_it` in
+`tests/opensearch/ppl_ss4o.rs`), and `struct` for every other object; `NUM_PREC_RADIX`
 10; `NULLABLE` 2; `ORDINAL_POSITION` the 0-based row number; `IS_NULLABLE` and `IS_GENERATEDCOLUMN`
 empty strings; `IS_AUTOINCREMENT` `NO`; every other column null. MAP keys come from field discovery, so
 keys only in the WAL are not listed. The source names exactly one data index: an unknown name is the
