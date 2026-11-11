@@ -23,7 +23,7 @@
  * are "order accepted" and "payment authorized", of B "payment declined", of C "inventory low" and
  * "card expired", of D "order shipped".
  */
-import { test, expect, type Page, type APIRequestContext } from '@playwright/test';
+import { test, expect, type Page, type APIRequestContext, type Locator } from '@playwright/test';
 import {
   OSD_HEADERS,
   OSD_URL,
@@ -855,6 +855,16 @@ function isTracePayloadOf(body: any, traceId: string): boolean {
   return (body?.query?.bool?.must ?? []).some((clause: any) => clause.term?.traceId === traceId);
 }
 
+/**
+ * The data grid cells whose text is `text`. A cell's accessible name is its text followed by the
+ * screen-reader position `Row: <n>, Column: <m>:`, which shares an element with the text, so a
+ * cell is matched by that name rather than by its text.
+ */
+function gridCells(page: Page, text: string): Locator {
+  const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return page.getByRole('grid').getByRole('gridcell', { name: new RegExp(`^${escaped} Row: \\d+, Column: \\d+:$`) });
+}
+
 const ALL_SPAN_IDS = [ROOT_SPAN_A, CHILD_SPAN_A, ROOT_SPAN_B, CHILD_SPAN_B, ROOT_SPAN_C, CHILD_SPAN_C, SPAN_D];
 
 /**
@@ -867,9 +877,8 @@ async function expectSpanView(page: Page, answer: any, view: SpanView, spanIds: 
   expect(answer.hits.hits.map((hit: any) => hit._source.spanId)).toEqual(spanIds);
   expect(answer.hits.total.value).toBe(spanIds.length);
   await expect(page.getByTestId('trace-table-mode-selector')).toContainText(`${view} (${spanIds.length})`);
-  const grid = page.getByRole('grid');
   for (const spanId of ALL_SPAN_IDS) {
-    const cells = grid.getByText(spanId, { exact: true });
+    const cells = gridCells(page, spanId);
     if (spanIds.includes(spanId)) {
       await expect(cells.first(), spanId).toBeVisible();
     } else {
@@ -879,6 +888,8 @@ async function expectSpanView(page: Page, answer: any, view: SpanView, spanIds: 
 }
 
 test('trace analytics lists the seeded spans in every span view', async ({ page }) => {
+  // The grid renders only the rows inside the viewport; this height holds all seven.
+  await page.setViewportSize({ width: 1280, height: 1600 });
   await presetTraceAnalytics(page, 'all_spans');
   const allSpans = waitForTraceAnalyticsAnswer(page, (body) => readSpanView(body) === 'All Spans');
   await page.goto(TRACES_PAGE);
@@ -935,14 +946,13 @@ test('trace analytics traces table shows each trace with its latency, errors and
   ]);
 
   await expect(page.getByTestId('trace-table-mode-selector')).toContainText('Traces (4)');
-  const grid = page.getByRole('grid');
-  await expect(grid.getByRole('link')).toHaveText([TRACE_D, TRACE_B, TRACE_C, TRACE_A]);
+  await expect(page.getByRole('grid').getByRole('link')).toHaveText([TRACE_D, TRACE_B, TRACE_C, TRACE_A]);
   for (const text of ['POST /refund', 'POST /orders', 'GET /checkout', '735.51', '250', '152.17']) {
-    await expect(grid.getByText(text, { exact: true }), text).toHaveCount(1);
+    await expect(gridCells(page, text), text).toHaveCount(1);
   }
   // The Errors column says whether a trace has errors: only C does.
-  await expect(grid.getByText('Yes', { exact: true })).toHaveCount(1);
-  await expect(grid.getByText('No', { exact: true })).toHaveCount(3);
+  await expect(gridCells(page, 'Yes')).toHaveCount(1);
+  await expect(gridCells(page, 'No')).toHaveCount(3);
 });
 
 test('trace analytics trace detail shows overview, services and spans', async ({ page }) => {
@@ -994,6 +1004,12 @@ test('view associated logs lists the logs of the trace', async ({ page }) => {
     .getByRole('button', { name: 'View associated logs' });
   await expect(viewLogs).toBeEnabled();
   await viewLogs.click();
+  // The explorer opens with OSD's associated-logs query and the trace's time range filled in,
+  // and runs it when Run is clicked.
+  await expect(page.getByTestId('searchAutocompleteTextArea')).toHaveValue(
+    `source = ss4o_logs-*,opensearch_dashboards_sample_data_otel_logs* | where traceId='${TRACE_C}'`
+  );
+  await page.getByRole('button', { name: 'Run', exact: true }).click();
 
   const { answer } = await logs;
   const columns: string[] = answer.schema.map((column: { name: string }) => column.name);
