@@ -9,9 +9,9 @@
 //! every listed bucket in request order: a `range` with its key and echoed bounds (an object keyed
 //! by key when `keyed`), a `date_range` with its key and its bounds as epoch milliseconds and
 //! strings, named `filters` as an object keyed by name and anonymous ones as an array of bucket
-//! bodies, a `filter` as its single bucket's body. A sub-aggregation answers inside each bucket
-//! under its own name; a metric answers as `render_metric` writes it, and a `top_hits` as
-//! `render_top_hits` writes it.
+//! bodies, a `filter` and a `nested` as their single bucket's body. A sub-aggregation answers
+//! inside each bucket under its own name; a metric answers as `render_metric` writes it, and a
+//! `top_hits` as `render_top_hits` writes it.
 
 use std::cell::RefCell;
 
@@ -173,11 +173,11 @@ impl Renderer<'_, '_> {
                 };
                 Ok(json!({ "buckets": buckets }))
             }
-            LevelKind::Filter { .. } => {
+            LevelKind::Filter { .. } | LevelKind::Nested => {
                 let bucket = instance
                     .buckets
                     .first()
-                    .ok_or_else(|| OpenSearchError::internal("a filter level answers no bucket"))?;
+                    .ok_or_else(|| OpenSearchError::internal("a single-bucket level answers no bucket"))?;
                 Ok(Value::Object(self.render_bucket_body(level, parent_path, bucket)?))
             }
         }
@@ -270,7 +270,8 @@ fn insert_bucket_key(
             LevelKind::Range { .. }
             | LevelKind::DateRange { .. }
             | LevelKind::Filters { .. }
-            | LevelKind::Filter { .. },
+            | LevelKind::Filter { .. }
+            | LevelKind::Nested,
             _,
         ) => Err(OpenSearchError::internal(format!(
             "a bucket of [{}] renders its key with its bounds or its name",

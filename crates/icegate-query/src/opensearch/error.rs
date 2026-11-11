@@ -243,6 +243,39 @@ impl OpenSearchError {
         .with_metadata("index", index)
     }
 
+    /// An aggregation of `aggregation_type` placed where it does not run: any kind but `filter`
+    /// and the `sum`, `min`, `max`, `value_count` and `avg` metrics inside a `nested`
+    /// aggregation, and a `nested` below another aggregation (`400`, `illegal_argument_exception`);
+    /// `aggregation` carries the request's name for it and `aggregation_type` its type.
+    pub(crate) fn misplaced_aggregation(aggregation: &str, aggregation_type: &str, reason: &str) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!("aggregation [{aggregation}] of type [{aggregation_type}] {reason}"),
+        )
+        .with_metadata("aggregation_type", aggregation_type)
+    }
+
+    /// A `nested` aggregation whose `path` is no nested field of `index` (`400`,
+    /// `illegal_argument_exception`); `aggregation`, `path` and `index` are carried for a client.
+    pub(crate) fn undeclared_nested_path(aggregation: &str, path: &str, index: &str) -> Self {
+        Self::unsupported_aggregation(
+            aggregation,
+            format!("[nested] aggregation [{aggregation}] reads [{path}], which is no nested field of [{index}]"),
+        )
+        .with_metadata("path", path)
+        .with_metadata("index", index)
+    }
+
+    /// A field read inside a `nested` aggregation that is no member of the objects at `path`
+    /// (`400`, `illegal_argument_exception`); `field` and `path` are carried for a client.
+    pub(crate) fn field_outside_nested_path(field: &str, path: &str) -> Self {
+        Self::illegal_argument(format!(
+            "field [{field}] is no member of the [{path}] objects a [nested] aggregation reads"
+        ))
+        .with_metadata("field", field)
+        .with_metadata("path", path)
+    }
+
     /// A regular expression `include` or `exclude`, named by `filter_key`, of an aggregation over
     /// a field holding encoded ids, which take a list of hex ids instead (`400`,
     /// `illegal_argument_exception`): `aggregation` carries the request's name for it and

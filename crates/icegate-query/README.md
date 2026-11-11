@@ -273,6 +273,13 @@ These hold for a search over data indices; a search over system indices is docum
   time range it is a 400 `illegal_argument_exception` naming `index` and `limit`.
   Grafana's metrics editor panels with `bucket_script` and `moving_avg` render
   (`metrics editor bucket_script and moving_avg panels render`).
+- `nested` runs at the top level of a request, over a field every searched index declares
+  `nested` (today `buckets` of `ss4o_metrics-icegate-default`); its `doc_count` counts the objects
+  of the matching rows, and inside it only `filter` and `sum`, `min`, `max`, `value_count` and
+  `avg` run, over the objects' members. Any other placement, path, kind, field or query is a 400
+  naming it (`src/opensearch/search/aggs/parse.rs` and `NestedObjectScope` in
+  `src/query_dsl/lower.rs` state the rules); `reverse_nested` is a 400. OpenSearch Dashboards
+  3.9's Metrics bin-count request answers in full (`tests/opensearch/osd_metrics.rs`).
 
 ### `_cat` endpoints
 

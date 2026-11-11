@@ -29,6 +29,12 @@
 //! surviving buckets of its parent, which is the semi-join to the surviving ancestors, and a
 //! `terms` level ordered by a metric is ranked there per parent bucket, by its order, then by key
 //! ascending. `render` writes the response, on the blocking pool too.
+//!
+//! A top-level `nested` aggregation reads other rows than its siblings: the objects of its path
+//! in the matching rows, one row per object ([`AggregationRowSet::NestedObjects`]). Its own
+//! layout holds it as a single-bucket level over those rows, and its sub-aggregations below it;
+//! the layout of the matching rows leaves it out. Each row set is planned, executed, assembled
+//! and rendered on its own, and the pipelines run over the merged answer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
@@ -78,7 +84,7 @@ use crate::opensearch::search::execute::convert_plan_error;
 use crate::opensearch::search::request::SortOrder;
 use crate::opensearch::system_index::run_blocking_work;
 use crate::query_dsl::ast::Query;
-use crate::query_dsl::lower::{LoweringScope, lower_query};
+use crate::query_dsl::lower::{LoweringScope, NestedObjectScope, lower_query};
 
 /// Column of a bucket's document count.
 pub(super) const DOC_COUNT_COLUMN: &str = "__doc_count";
@@ -155,6 +161,21 @@ pub(crate) struct AggregationScope<'a> {
     /// The request's `now`, taken once per request, which `date_range` bounds resolve
     /// against.
     pub(crate) now: DateTime<Utc>,
+}
+
+/// The rows one layout aggregates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AggregationRowSet {
+    /// The matching rows, read by every aggregation of the request but the top-level `nested`
+    /// ones and their sub-aggregations.
+    Documents,
+    /// The objects of the path of the top-level `nested` aggregation at `position` among the
+    /// request's top-level aggregations, one row per object of the matching rows, read by it and
+    /// its sub-aggregations.
+    NestedObjects {
+        /// The aggregation's position among the request's top-level aggregations.
+        position: usize,
+    },
 }
 
 /// Where an aggregation of the request sits in the layout.
@@ -235,6 +256,8 @@ pub(super) enum LevelKind<'a> {
         /// The ordinal of the level's bucket query.
         filter_ordinal: usize,
     },
+    /// The `nested` bucket, holding every row of the nested objects its layout reads.
+    Nested,
 }
 
 /// A bucket aggregation of the request.
@@ -288,7 +311,8 @@ pub(super) struct TopHitsSlot<'a> {
     pub(super) granularity: Granularity,
 }
 
-/// The request's aggregations in preorder: a parent level precedes its children.
+/// The request's aggregations over one row set in preorder: a parent level precedes its
+/// children.
 pub(super) struct AggregationLayout<'a> {
     /// The top-level aggregations, in request order.
     pub(super) top: Vec<LayoutNode>,
@@ -303,31 +327,40 @@ pub(super) struct AggregationLayout<'a> {
     pub(super) bucket_queries: Vec<&'a Query>,
     /// The request's `now`, which `date_range` bounds resolve against.
     now: DateTime<Utc>,
+    /// The rows the layout aggregates.
+    row_set: AggregationRowSet,
 }
 
 impl<'a> AggregationLayout<'a> {
-    /// Lay out `tree`, resolve every `terms` order path to its metric and every `date_range`
-    /// bound against `now`, and number the bucket queries.
+    /// Lay out the aggregations of `tree` that read `row_set`, resolve every `terms` order path
+    /// to its metric and every `date_range` bound against `now`, and number the bucket queries.
     ///
     /// # Errors
     ///
-    /// `400 parsing_exception` for a metric or a `top_hits` with sub-aggregations; `400
+    /// `500` for a nested row set whose position holds no top-level `nested` aggregation; `400
+    /// parsing_exception` for a metric or a `top_hits` with sub-aggregations; `400
     /// aggregation_execution_exception` for an order path naming no metric sub-aggregation of
     /// its level, or no statistic of that metric; `400 illegal_argument_exception` for more than
     /// `MAX_BUCKET_LEVELS` bucket aggregations in the request (naming the top-level aggregation
     /// that passes the limit under `aggregation`, the limit under `limit`), a `date_histogram`
     /// interval or offset out of range, and a `date_range` bound that is malformed or outside
     /// the representable time range ([`resolve_date_ranges`]).
-    pub(super) fn new(tree: &'a AggregationTree, now: DateTime<Utc>) -> Result<Self, OpenSearchError> {
+    pub(super) fn new(
+        tree: &'a AggregationTree,
+        row_set: AggregationRowSet,
+        now: DateTime<Utc>,
+    ) -> Result<Self, OpenSearchError> {
+        let aggregations = select_row_set_roots(tree, row_set)?;
         let mut layout = Self {
-            top: Vec::with_capacity(tree.aggregations.len()),
+            top: Vec::with_capacity(aggregations.len()),
             levels: Vec::new(),
             metrics: Vec::new(),
             top_hits: Vec::new(),
             bucket_queries: Vec::new(),
             now,
+            row_set,
         };
-        for aggregation in &tree.aggregations {
+        for aggregation in aggregations {
             let node = layout.add_node(aggregation, &[])?;
             if layout.levels.len() > MAX_BUCKET_LEVELS {
                 return Err(OpenSearchError::aggregation_depth_exceeded(
@@ -343,7 +376,8 @@ impl<'a> AggregationLayout<'a> {
     }
 
     /// Add `aggregation`, nested under the levels `ancestors`, and its sub-aggregations; `None` for
-    /// a pipeline, which runs over the rendered tree and takes no node.
+    /// a pipeline, which runs over the rendered tree and takes no node, and for a `nested` in the
+    /// layout of the matching rows, which its own layout answers.
     ///
     /// # Errors
     ///
@@ -381,6 +415,12 @@ impl<'a> AggregationLayout<'a> {
                 self.bucket_queries.push(query);
                 self.add_level(aggregation, LevelKind::Filter { filter_ordinal }, ancestors)
             }
+            // Parsing places a `nested` at the top only, so only the layout of its own objects,
+            // which starts at it, holds it.
+            AggregationKind::Nested(_) => match self.row_set {
+                AggregationRowSet::Documents => return Ok(None),
+                AggregationRowSet::NestedObjects { .. } => self.add_level(aggregation, LevelKind::Nested, ancestors),
+            },
             AggregationKind::Avg(spec) => self.add_metric(aggregation, MetricKind::Avg, spec, ancestors),
             AggregationKind::Sum(spec) => self.add_metric(aggregation, MetricKind::Sum, spec, ancestors),
             AggregationKind::Min(spec) => self.add_metric(aggregation, MetricKind::Min, spec, ancestors),
@@ -438,7 +478,8 @@ impl<'a> AggregationLayout<'a> {
             | LevelKind::Range { .. }
             | LevelKind::DateRange { .. }
             | LevelKind::Filters { .. }
-            | LevelKind::Filter { .. } => None,
+            | LevelKind::Filter { .. }
+            | LevelKind::Nested => None,
         };
         self.levels.push(BucketLevel {
             name: &aggregation.name,
@@ -687,7 +728,7 @@ pub(super) fn resolve_plan_inputs(
 ///
 /// A `range`, `date_range`, `filters` or `filter` level is keyed by bucket ordinal
 /// ([`plan_ordinals`]): a scalar when no row can meet two of its conditions, a membership list
-/// otherwise.
+/// otherwise. A `nested` level keys every row by the ordinal of its one bucket.
 ///
 /// # Errors
 ///
@@ -778,6 +819,8 @@ fn plan_level_key(level: &BucketLevel<'_>, rows: &DFSchema) -> Result<LevelKey, 
         LevelKind::Filter { filter_ordinal } => {
             plan_ordinals(vec![col(name_bucket_filter_column(*filter_ordinal))], true)
         }
+        // Every object row belongs to the one bucket, keyed as a `filter` bucket's ordinal.
+        LevelKind::Nested => Ok(build_scalar_key(lit(0_i32))),
     }
 }
 
@@ -1102,7 +1145,8 @@ fn cut_ranked_terms_levels(
                 | LevelKind::Range { .. }
                 | LevelKind::DateRange { .. }
                 | LevelKind::Filters { .. }
-                | LevelKind::Filter { .. } => None,
+                | LevelKind::Filter { .. }
+                | LevelKind::Nested => None,
             },
             Granularity::Top => None,
         })
@@ -1243,36 +1287,98 @@ pub(super) fn compute_level_mask(grouped_levels: &[usize], path: &[usize]) -> Re
         .ok_or_else(|| OpenSearchError::internal("too many bucket levels for the level mask"))
 }
 
+/// The rows the aggregations of a search read, as [`plan_aggregation_rows`] plans them.
+#[derive(Debug)]
+pub(crate) struct AggregationRows {
+    /// The matching rows ([`AggregationRowSet::Documents`]).
+    documents: LogicalPlan,
+    /// The object rows of each top-level `nested` aggregation
+    /// ([`AggregationRowSet::NestedObjects`]), with its position among the request's top-level
+    /// aggregations.
+    nested_objects: Vec<(usize, LogicalPlan)>,
+}
+
 /// Answer the aggregations of `tree` over `rows`.
 ///
-/// `rows` holds one column per field the tree names, named by the field name and holding the
-/// field's single type across the searched indices (a row lacking the field holds NULL), and one
-/// `Boolean` column per `filter` / `filters` bucket query ([`plan_aggregation_rows`] builds it).
-/// The answer maps each top-level aggregation's request name to its rendered result. The
-/// aggregations are computed by at most one stage aggregate without an unnest, plus one per
-/// distinct chain of levels whose buckets overlap, plus one distinct-count branch per granularity
-/// holding a `cardinality` ([`plan_aggregations`]); every plan runs in `scope.session`, so the
-/// plans share its memory pool and its limit. A `top_hits` runs after assembly, over the buckets
-/// the response renders ([`collect_top_hits`]); `rows` then also carries the searched index's
-/// table columns. The pipelines of `tree`, which [`plan_aggregation_rows`] validated, run last,
-/// over the rendered tree ([`apply_pipelines`]). Assembly, the `top_hits` rendering, the
-/// aggregations' rendering and the pipelines run on the blocking pool.
+/// Each row set of `rows` is answered on its own ([`execute_row_set`]), concurrently; the
+/// answers merge into one map keyed by each top-level aggregation's request name, in request
+/// order. The pipelines of `tree`, which [`plan_aggregation_rows`] validated, run last, over the
+/// merged tree ([`apply_pipelines`]), on the blocking pool.
+///
+/// # Errors
+///
+/// The errors of [`execute_row_set`] for any row set; the value errors of [`apply_pipelines`];
+/// `500` when blocking work does not finish.
+pub(crate) async fn execute_aggregations(
+    rows: AggregationRows,
+    tree: Arc<AggregationTree>,
+    scope: &AggregationScope<'_>,
+) -> Result<Map<String, Value>, OpenSearchError> {
+    let AggregationRows {
+        documents,
+        nested_objects,
+    } = rows;
+    let document_answers = execute_row_set(documents, Arc::clone(&tree), AggregationRowSet::Documents, scope);
+    let nested_answers = try_join_all(nested_objects.into_iter().map(|(position, objects)| {
+        execute_row_set(
+            objects,
+            Arc::clone(&tree),
+            AggregationRowSet::NestedObjects { position },
+            scope,
+        )
+    }));
+    let (document_answers, nested_answers) = futures::try_join!(document_answers, nested_answers)?;
+    run_blocking_work("applying pipeline aggregations", move || {
+        let mut aggregations = if nested_answers.is_empty() {
+            document_answers
+        } else {
+            // Each row set answers its own aggregations; the response keeps the request's order.
+            let mut answers = document_answers;
+            answers.extend(nested_answers.into_iter().flatten());
+            tree.aggregations
+                .iter()
+                .filter_map(|aggregation| answers.remove_entry(&aggregation.name))
+                .collect()
+        };
+        apply_pipelines(&tree.aggregations, &mut aggregations)?;
+        Ok(aggregations)
+    })
+    .await
+}
+
+/// Answer the aggregations of `tree` that read `row_set` over `rows`, without the pipelines.
+///
+/// `rows` holds one column per field those aggregations name, named by the field name and holding
+/// the field's single type across the searched indices (a row lacking the field holds NULL), and
+/// one `Boolean` column per `filter` / `filters` bucket query ([`plan_aggregation_rows`] builds
+/// it). The answer maps each of their top-level aggregations' request names to its rendered
+/// result. The aggregations are computed by at most one stage aggregate without an unnest, plus
+/// one per distinct chain of levels whose buckets overlap, plus one distinct-count branch per
+/// granularity holding a `cardinality` ([`plan_aggregations`]); every plan runs in
+/// `scope.session`, so the plans share its memory pool and its limit. A `top_hits` runs after
+/// assembly, over the buckets the response renders ([`collect_top_hits`]); `rows` then also
+/// carries the searched index's table columns. Assembly, the `top_hits` rendering and the
+/// aggregations' rendering run on the blocking pool.
 ///
 /// # Errors
 ///
 /// The layout's errors ([`AggregationLayout::new`]); the errors of [`resolve_plan_inputs`];
 /// `400 too_many_buckets_exception` past `scope.max_buckets`; `400 illegal_argument_exception`
 /// naming a `histogram` whose bucket index for a value or a bound lies past the `i64` range;
-/// the session's execution errors,
-/// the memory limit among them; the errors of [`collect_top_hits`], the `top_hits` hits past
-/// `scope.max_result_window` among them; the value errors of [`apply_pipelines`]; `500` when
+/// the session's execution errors, the memory limit among them; the errors of
+/// [`collect_top_hits`], the `top_hits` hits past `scope.max_result_window` among them; `500` when
 /// planning fails or blocking work does not finish.
-pub(crate) async fn execute_aggregations(
+async fn execute_row_set(
     rows: LogicalPlan,
     tree: Arc<AggregationTree>,
+    row_set: AggregationRowSet,
     scope: &AggregationScope<'_>,
 ) -> Result<Map<String, Value>, OpenSearchError> {
-    let layout = AggregationLayout::new(&tree, scope.now)?;
+    let layout = AggregationLayout::new(&tree, row_set, scope.now)?;
+    // A row set no aggregation reads answers nothing, without a stage or a rendering.
+    if layout.top.is_empty() {
+        return Ok(Map::new());
+    }
     let inputs = resolve_plan_inputs(&layout, rows.schema())?;
     // Only a tree holding a `top_hits` reads the matching rows again, after assembly. Cloning a
     // plan copies its root node; its inputs are shared.
@@ -1310,7 +1416,7 @@ pub(crate) async fn execute_aggregations(
     let max_buckets = scope.max_buckets;
     let assembly_tree = Arc::clone(&tree);
     let assembled = run_blocking_work("assembling aggregation buckets", move || {
-        let layout = AggregationLayout::new(&assembly_tree, now)?;
+        let layout = AggregationLayout::new(&assembly_tree, row_set, now)?;
         assemble_aggregations(&layout, outputs, &distinct_outputs, max_buckets)
     })
     .await?;
@@ -1319,10 +1425,8 @@ pub(crate) async fn execute_aggregations(
         None => TopHitsResults::default(),
     };
     run_blocking_work("rendering aggregations", move || {
-        let layout = AggregationLayout::new(&tree, now)?;
-        let mut aggregations = render_aggregations(&layout, &inputs, &assembled, top_hits_results)?;
-        apply_pipelines(&tree.aggregations, &mut aggregations)?;
-        Ok(aggregations)
+        let layout = AggregationLayout::new(&tree, row_set, now)?;
+        render_aggregations(&layout, &inputs, &assembled, top_hits_results)
     })
     .await
 }
@@ -1338,18 +1442,20 @@ struct AggregationField {
     values: Vec<Option<FieldValue>>,
 }
 
-/// The matching rows of a search, projected onto what `tree` reads.
+/// The rows the aggregations of a search read: its matching rows, and the objects of each
+/// top-level `nested` aggregation's path.
 ///
-/// One branch per index: its scan, filtered by the query lowered for that index, projected onto
-/// one column per field (NULL where the index lacks the field), every column cast to the field's
-/// single type, and onto one `Boolean` column per `filter` / `filters` bucket query
-/// ([`name_bucket_filter_column`]): the bucket query lowered for that index, `false` where it
-/// does not match, so a field the index does not map matches nothing there. The branches are
-/// concatenated with `UNION ALL`; because every branch already has the same column types, no
-/// union coercion takes place. With no index the plan is empty. A tree holding a `top_hits`
-/// reads one index: each row then also carries every table column of that index under
-/// [`name_hit_column`], and a search of several indices is a `400 illegal_argument_exception`
-/// naming the aggregation under `aggregation`.
+/// The matching rows: one branch per index, its scan filtered by the query lowered for that
+/// index, projected onto one column per field (NULL where the index lacks the field), every
+/// column cast to the field's single type, and onto one `Boolean` column per `filter` /
+/// `filters` bucket query ([`name_bucket_filter_column`]): the bucket query lowered for that
+/// index, `false` where it does not match, so a field the index does not map matches nothing
+/// there. The branches are concatenated with `UNION ALL`; because every branch already has the
+/// same column types, no union coercion takes place. With no index the plan is empty. A tree
+/// holding a `top_hits` reads one index: each row then also carries every table column of that
+/// index under [`name_hit_column`], and a search of several indices is a `400
+/// illegal_argument_exception` naming the aggregation under `aggregation`. The objects of a
+/// `nested` are planned by [`plan_nested_object_rows`].
 ///
 /// # Errors
 ///
@@ -1359,17 +1465,18 @@ struct AggregationField {
 /// illegal_argument_exception` for a field an aggregation cannot read (as
 /// [`check_field_for_aggregation`] lists them), with the `field`, its `field_type`, the `index`,
 /// the `aggregation` and its `aggregation_type`; the structural pipeline errors of
-/// [`validate_pipelines`], which are checked first, before any plan is built; the lowering's
-/// errors; `500` when planning fails.
+/// [`validate_pipelines`], which are checked first, before any plan is built; the errors of
+/// [`plan_nested_object_rows`]; the lowering's errors; `500` when planning fails.
 pub(crate) fn plan_aggregation_rows(
     session: &TenantSession,
     entries: &[&IndexEntry],
     query: &Query,
     now: DateTime<Utc>,
     tree: &AggregationTree,
-) -> Result<LogicalPlan, OpenSearchError> {
+) -> Result<AggregationRows, OpenSearchError> {
     validate_pipelines(&tree.aggregations)?;
-    let layout = AggregationLayout::new(tree, now)?;
+    let row_set = AggregationRowSet::Documents;
+    let layout = AggregationLayout::new(tree, row_set, now)?;
     if let Some(slot) = layout.top_hits.first()
         && entries.len() > 1
     {
@@ -1383,19 +1490,22 @@ pub(crate) fn plan_aggregation_rows(
             ),
         ));
     }
-    let fields = resolve_aggregation_fields(session, entries, tree)?;
+    let fields = resolve_aggregation_fields(
+        session,
+        entries,
+        &list_aggregations(tree, row_set)?,
+        |_, entry, name| Ok(session.resolve_field(entry, name)),
+    )?;
     let mut branches = Vec::with_capacity(entries.len());
     for (position, &entry) in entries.iter().enumerate() {
-        let scope = LoweringScope { session, entry, now };
+        let scope = LoweringScope {
+            session,
+            entry,
+            now,
+            nested_objects: None,
+        };
         let predicate = lower_query(query, &scope)?;
-        let mut projection = fields
-            .iter()
-            .map(|field| build_branch_column(field, position))
-            .collect::<Result<Vec<_>, _>>()?;
-        for (ordinal, bucket_query) in layout.bucket_queries.iter().enumerate() {
-            let bucket_match = lower_query(bucket_query, &scope)?;
-            projection.push(coalesce(vec![bucket_match, lit(false)]).alias(name_bucket_filter_column(ordinal)));
-        }
+        let mut projection = project_branch_columns(&fields, position, &layout.bucket_queries, &scope)?;
         let scan = session.scan_index(entry)?;
         if !layout.top_hits.is_empty() {
             // Every table column a hit renders, under a name no aggregated field takes.
@@ -1411,15 +1521,205 @@ pub(crate) fn plan_aggregation_rows(
             .map_err(convert_plan_error)?;
         branches.push(branch);
     }
+    let documents = union_branch_rows(branches, &fields, layout.bucket_queries.len())?;
+    let nested_objects = tree
+        .aggregations
+        .iter()
+        .enumerate()
+        .filter_map(|(position, aggregation)| {
+            let AggregationKind::Nested(spec) = &aggregation.kind else {
+                return None;
+            };
+            let target = NestedTarget {
+                tree,
+                position,
+                aggregation,
+                path: &spec.path,
+            };
+            Some(plan_nested_object_rows(session, entries, query, now, target).map(|objects| (position, objects)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AggregationRows {
+        documents,
+        nested_objects,
+    })
+}
+
+/// The column of a matching row's list of nested objects, and, once unnested, of one object.
+const NESTED_OBJECT_COLUMN: &str = "__nested_object";
+
+/// A top-level `nested` aggregation of the request.
+#[derive(Clone, Copy)]
+struct NestedTarget<'a> {
+    /// The request's aggregations.
+    tree: &'a AggregationTree,
+    /// Its position among the request's top-level aggregations.
+    position: usize,
+    /// The aggregation.
+    aggregation: &'a NamedAggregation,
+    /// The nested field it reads, as the request names it.
+    path: &'a str,
+}
+
+/// The objects of `target`'s path in the matching rows, one row per object, projected onto what
+/// `target` and its sub-aggregations read.
+///
+/// One branch per index: its scan, filtered by the query lowered for that index as for the
+/// matching rows, its list of objects unnested (a row without objects yields none), then one
+/// column per member the metrics read and one `Boolean` column per `filter` query, lowered over
+/// the objects ([`NestedObjectScope`]). The branches are joined as the matching rows are
+/// ([`union_branch_rows`]).
+///
+/// # Errors
+///
+/// [`OpenSearchError::undeclared_nested_path`] when a searched index declares no nested field at
+/// the path; [`OpenSearchError::field_outside_nested_path`] for a field a metric reads, or a
+/// `filter` leaf names, that is no member of the objects; the errors of
+/// [`check_field_for_aggregation`] for a member a metric cannot read; the lowering's errors, the
+/// queries [`NestedObjectScope`] refuses among them; `500` when planning fails.
+fn plan_nested_object_rows(
+    session: &TenantSession,
+    entries: &[&IndexEntry],
+    query: &Query,
+    now: DateTime<Utc>,
+    target: NestedTarget<'_>,
+) -> Result<LogicalPlan, OpenSearchError> {
+    let row_set = AggregationRowSet::NestedObjects {
+        position: target.position,
+    };
+    let layout = AggregationLayout::new(target.tree, row_set, now)?;
+    let mut objects_by_entry = Vec::with_capacity(entries.len());
+    for &entry in entries {
+        let nested_field = session
+            .resolve_field(entry, target.path)
+            .filter(|field| field.field_type == FieldType::Nested)
+            .ok_or_else(|| {
+                OpenSearchError::undeclared_nested_path(&target.aggregation.name, target.path, entry.name())
+            })?;
+        let scope = LoweringScope {
+            session,
+            entry,
+            now,
+            nested_objects: None,
+        };
+        let predicate = lower_query(query, &scope)?;
+        let object_column = Column::from_name(NESTED_OBJECT_COLUMN);
+        let objects = session
+            .scan_index(entry)?
+            .filter(predicate)
+            .and_then(|builder| builder.project(vec![nested_field.value.build_read_expr().alias(NESTED_OBJECT_COLUMN)]))
+            .and_then(|builder| builder.unnest_column(object_column.clone()))
+            .and_then(|builder| builder.filter(Expr::Column(object_column.clone()).is_not_null()))
+            .map_err(convert_plan_error)?;
+        let members = match objects
+            .schema()
+            .field_with_unqualified_name(NESTED_OBJECT_COLUMN)
+            .map_err(convert_plan_error)?
+            .data_type()
+        {
+            DataType::Struct(members) => members.clone(),
+            other => {
+                return Err(OpenSearchError::internal(format!(
+                    "the objects of [{}] in [{}] are {other}, not objects",
+                    target.path,
+                    entry.name()
+                )));
+            }
+        };
+        // A second unnest spreads each object's members into the columns
+        // `<NESTED_OBJECT_COLUMN>.<member>`, which every branch renames to the member paths.
+        let objects = objects.unnest_column(object_column).map_err(convert_plan_error)?;
+        objects_by_entry.push((entry, objects, members));
+    }
+    let fields = resolve_aggregation_fields(
+        session,
+        entries,
+        &list_aggregations(target.tree, row_set)?,
+        |position, _, name| {
+            let (_, _, members) = objects_by_entry.get(position).ok_or_else(|| {
+                OpenSearchError::internal(format!("no objects of [{}] at index position {position}", target.path))
+            })?;
+            NestedObjectScope {
+                path: target.path,
+                members,
+            }
+            .resolve_member(name)
+            .map(Some)
+        },
+    )?;
+    let mut branches = Vec::with_capacity(entries.len());
+    for (position, (entry, objects, members)) in objects_by_entry.into_iter().enumerate() {
+        let object_scope = NestedObjectScope {
+            path: target.path,
+            members: &members,
+        };
+        let member_columns: Vec<Expr> = members
+            .iter()
+            .map(|member| {
+                Expr::Column(Column::from_name(format!("{NESTED_OBJECT_COLUMN}.{}", member.name())))
+                    .alias(object_scope.name_member_column(member.name()))
+            })
+            .collect();
+        let scope = LoweringScope {
+            session,
+            entry,
+            now,
+            nested_objects: Some(object_scope),
+        };
+        let projection = project_branch_columns(&fields, position, &layout.bucket_queries, &scope)?;
+        let branch = objects
+            .project(member_columns)
+            .and_then(|builder| builder.project(projection))
+            .and_then(LogicalPlanBuilder::build)
+            .map_err(convert_plan_error)?;
+        branches.push(branch);
+    }
+    union_branch_rows(branches, &fields, layout.bucket_queries.len())
+}
+
+/// The columns every row set's branch for the index at `position` carries: one per field, cast
+/// to its single type, then one `Boolean` per bucket query, lowered in `scope`, `false` where it
+/// does not match.
+///
+/// # Errors
+///
+/// The lowering's errors; `500` for a field type no literal represents.
+fn project_branch_columns(
+    fields: &[AggregationField],
+    position: usize,
+    bucket_queries: &[&Query],
+    scope: &LoweringScope<'_>,
+) -> Result<Vec<Expr>, OpenSearchError> {
+    let mut projection = Vec::with_capacity(fields.len() + bucket_queries.len());
+    for field in fields {
+        projection.push(build_branch_column(field, position)?);
+    }
+    for (ordinal, bucket_query) in bucket_queries.iter().enumerate() {
+        let bucket_match = lower_query(bucket_query, scope)?;
+        projection.push(coalesce(vec![bucket_match, lit(false)]).alias(name_bucket_filter_column(ordinal)));
+    }
+    Ok(projection)
+}
+
+/// `branches`, one per searched index, joined with `UNION ALL`; with no index, an empty relation
+/// of the columns a branch carries ([`project_branch_columns`]), each field NULL and each of the
+/// `bucket_query_count` bucket queries `false`.
+///
+/// # Errors
+///
+/// `500` when planning fails.
+fn union_branch_rows(
+    branches: Vec<LogicalPlan>,
+    fields: &[AggregationField],
+    bucket_query_count: usize,
+) -> Result<LogicalPlan, OpenSearchError> {
     let mut branches = branches.into_iter();
     let Some(first_branch) = branches.next() else {
         let mut nulls = fields
             .iter()
             .map(|field| build_typed_null(&field.data_type).map(|null| null.alias(field.name.as_str())))
             .collect::<Result<Vec<_>, _>>()?;
-        nulls.extend(
-            (0..layout.bucket_queries.len()).map(|ordinal| lit(false).alias(name_bucket_filter_column(ordinal))),
-        );
+        nulls.extend((0..bucket_query_count).map(|ordinal| lit(false).alias(name_bucket_filter_column(ordinal))));
         return LogicalPlanBuilder::empty(false)
             .project(nulls)
             .and_then(LogicalPlanBuilder::build)
@@ -1431,20 +1731,26 @@ pub(crate) fn plan_aggregation_rows(
         .map_err(convert_plan_error)
 }
 
-/// The distinct fields the aggregations of `tree` read ([`AggregationKind::read_fields`]), each
-/// checked against every aggregation that reads it; `filter` and `filters` read none. An encoded id whose stored column admits NULL
-/// is refused with [`OpenSearchError::unordered_missing_id`]: its missing value renders `""`,
-/// which no bucket or count over the stored bytes reads.
+/// The distinct fields `aggregations` read ([`AggregationKind::read_fields`]), each resolved in
+/// every searched index by `resolve_field` (given the index's position and entry) and checked
+/// against every aggregation that reads it; `filter`, `filters` and `nested` read none. An
+/// encoded id whose stored column admits NULL is refused with
+/// [`OpenSearchError::unordered_missing_id`]: its missing value renders `""`, which no bucket or
+/// count over the stored bytes reads.
 fn resolve_aggregation_fields(
     session: &TenantSession,
     entries: &[&IndexEntry],
-    tree: &AggregationTree,
+    aggregations: &[&NamedAggregation],
+    resolve_field: impl Fn(usize, &IndexEntry, &str) -> Result<Option<ResolvedField>, OpenSearchError>,
 ) -> Result<Vec<AggregationField>, OpenSearchError> {
     let mut fields: Vec<AggregationField> = Vec::new();
-    for aggregation in list_aggregations(tree) {
+    for aggregation in aggregations {
         for name in aggregation.kind.read_fields() {
-            let resolved: Vec<Option<ResolvedField>> =
-                entries.iter().map(|entry| session.resolve_field(entry, name)).collect();
+            let resolved = entries
+                .iter()
+                .enumerate()
+                .map(|(position, entry)| resolve_field(position, entry, name))
+                .collect::<Result<Vec<_>, _>>()?;
             check_field_for_aggregation(aggregation, name, entries, &resolved)?;
             for (entry, field) in entries.iter().zip(&resolved) {
                 if let Some(field) = field
@@ -1467,15 +1773,51 @@ fn resolve_aggregation_fields(
     Ok(fields)
 }
 
-/// Every aggregation of `tree`, parents before their children.
-fn list_aggregations(tree: &AggregationTree) -> Vec<&NamedAggregation> {
+/// The top-level aggregations of `tree` a layout of `row_set` starts from: all of them for the
+/// matching rows, the one `nested` for its objects.
+///
+/// # Errors
+///
+/// `500` when `row_set`'s position holds no top-level `nested` aggregation.
+fn select_row_set_roots(
+    tree: &AggregationTree,
+    row_set: AggregationRowSet,
+) -> Result<&[NamedAggregation], OpenSearchError> {
+    match row_set {
+        AggregationRowSet::Documents => Ok(tree.aggregations.as_slice()),
+        AggregationRowSet::NestedObjects { position } => tree
+            .aggregations
+            .get(position)
+            .filter(|aggregation| matches!(aggregation.kind, AggregationKind::Nested(_)))
+            .map(std::slice::from_ref)
+            .ok_or_else(|| {
+                OpenSearchError::internal(format!("no top-level [nested] aggregation at position {position}"))
+            }),
+    }
+}
+
+/// Every aggregation of `tree` that reads `row_set`, parents before their children: over the
+/// matching rows, every one but the sub-aggregations of a `nested`, which read its objects.
+///
+/// # Errors
+///
+/// The errors of [`select_row_set_roots`].
+fn list_aggregations(
+    tree: &AggregationTree,
+    row_set: AggregationRowSet,
+) -> Result<Vec<&NamedAggregation>, OpenSearchError> {
     let mut listed = Vec::new();
-    let mut unvisited_aggregations: Vec<&NamedAggregation> = tree.aggregations.iter().rev().collect();
+    let mut unvisited_aggregations: Vec<&NamedAggregation> =
+        select_row_set_roots(tree, row_set)?.iter().rev().collect();
     while let Some(aggregation) = unvisited_aggregations.pop() {
         listed.push(aggregation);
-        unvisited_aggregations.extend(aggregation.children.iter().rev());
+        let are_children_objects =
+            row_set == AggregationRowSet::Documents && matches!(aggregation.kind, AggregationKind::Nested(_));
+        if !are_children_objects {
+            unvisited_aggregations.extend(aggregation.children.iter().rev());
+        }
     }
-    listed
+    Ok(listed)
 }
 
 /// Refuse a field mapped to different types, or stored as different Arrow types, across the
@@ -1483,7 +1825,7 @@ fn list_aggregations(tree: &AggregationTree) -> Vec<&NamedAggregation> {
 /// numbers (`histogram`, `range`; `avg`, `sum`, `min`, `max`, `stats`, `percentiles` and
 /// `percentile_ranks` also booleans and dates), a `date_histogram` and a `date_range` dates, a
 /// `terms`, a `value_count` and a `cardinality` anything but text and objects; `filter`,
-/// `filters` and the pipelines read no field. `extended_stats` reads numbers only.
+/// `filters`, `nested` and the pipelines read no field. `extended_stats` reads numbers only.
 fn check_field_for_aggregation(
     aggregation: &NamedAggregation,
     field_name: &str,
@@ -1556,6 +1898,7 @@ fn check_field_for_aggregation(
         | AggregationKind::DateRange(_)
         | AggregationKind::Filters(_)
         | AggregationKind::Filter(_)
+        | AggregationKind::Nested(_)
         | AggregationKind::ExtendedStats(_)
         | AggregationKind::TopHits(_)
         | AggregationKind::CumulativeSum(_)
@@ -1623,6 +1966,7 @@ fn choose_row_data_type(aggregation: &NamedAggregation, resolved: &[Option<Resol
         | AggregationKind::ExtendedStats(_) => DataType::Float64,
         AggregationKind::Filters(_)
         | AggregationKind::Filter(_)
+        | AggregationKind::Nested(_)
         | AggregationKind::TopHits(_)
         | AggregationKind::CumulativeSum(_)
         | AggregationKind::Derivative(_)
@@ -1689,7 +2033,7 @@ mod tests {
     use rand::{Rng, SeedableRng};
     use serde_json::{Map, Value, json};
 
-    use super::{AggregationScope, execute_aggregations, plan_aggregation_rows};
+    use super::{AggregationRows, AggregationScope, execute_aggregations, plan_aggregation_rows};
     use crate::opensearch::SearchLimitsConfig;
     use crate::opensearch::error::{OpenSearchError, render_envelope};
     use crate::opensearch::extract::parse_parameters;
@@ -1741,7 +2085,17 @@ mod tests {
             max_result_window: SearchLimitsConfig::default().max_result_window,
             now: read_request_now(),
         };
-        execute_aggregations(rows, Arc::new(tree), &scope).await.map(Value::Object)
+        execute_aggregations(read_document_rows(rows), Arc::new(tree), &scope)
+            .await
+            .map(Value::Object)
+    }
+
+    /// `rows` as the matching rows of a search without a `nested` aggregation.
+    pub(super) fn read_document_rows(rows: LogicalPlan) -> AggregationRows {
+        AggregationRows {
+            documents: rows,
+            nested_objects: Vec::new(),
+        }
     }
 
     async fn aggregate_rows(rows: RecordBatch, aggregations: Value) -> Value {
@@ -2995,7 +3349,7 @@ mod tests {
                     parse_aggregations(&json!({"ranked": {"terms": {"field": "k", "size": size, "order": order}}}))
                         .expect("a terms");
 
-                let answer = execute_aggregations(scan_rows(rows), Arc::new(tree), &scope)
+                let answer = execute_aggregations(read_document_rows(scan_rows(rows)), Arc::new(tree), &scope)
                     .await
                     .expect("the aggregations answer");
 
@@ -3199,8 +3553,8 @@ mod bucket_tree_tests {
         aggregate_plan, assert_too_many_buckets, read_default_max_buckets, read_request_now, scan_rows,
     };
     use super::{
-        AggregationLayout, Granularity, LEVEL_MASK_COLUMN, compute_level_mask, name_bucket_filter_column,
-        name_key_column, plan_aggregations, resolve_plan_inputs,
+        AggregationLayout, AggregationRowSet, Granularity, LEVEL_MASK_COLUMN, compute_level_mask,
+        name_bucket_filter_column, name_key_column, plan_aggregations, resolve_plan_inputs,
     };
     use crate::opensearch::error::{OpenSearchError, render_envelope};
     use crate::opensearch::search::aggs::parse::parse_aggregations;
@@ -3386,7 +3740,8 @@ mod bucket_tree_tests {
             "hours": {"date_histogram": {"field": "timestamp", "fixed_interval": "1h"}}
         }))
         .expect("parse the aggregations");
-        let layout = AggregationLayout::new(&tree, read_request_now()).expect("lay out the aggregations");
+        let layout = AggregationLayout::new(&tree, AggregationRowSet::Documents, read_request_now())
+            .expect("lay out the aggregations");
         let rows = scan_test_rows(&build_hourly_rows());
         let inputs = resolve_plan_inputs(&layout, rows.schema()).expect("resolve the inputs");
         let mut plans = plan_aggregations(rows, &layout, &inputs).expect("plan the aggregate");
@@ -3446,7 +3801,8 @@ mod bucket_tree_tests {
             }
         });
         let tree = parse_aggregations(&aggregations).expect("parse the aggregations");
-        let layout = AggregationLayout::new(&tree, read_request_now()).expect("lay out the aggregations");
+        let layout = AggregationLayout::new(&tree, AggregationRowSet::Documents, read_request_now())
+            .expect("lay out the aggregations");
         let rows = scan_test_rows(&build_hourly_rows());
         let inputs = resolve_plan_inputs(&layout, rows.schema()).expect("resolve the inputs");
         let mut plans = plan_aggregations(rows, &layout, &inputs).expect("plan the aggregate");
@@ -4665,7 +5021,8 @@ mod bucket_tree_tests {
             "all_scores": {"cardinality": {"field": "score"}}
         }))
         .expect("parse the aggregations");
-        let layout = AggregationLayout::new(&tree, read_request_now()).expect("lay out the aggregations");
+        let layout = AggregationLayout::new(&tree, AggregationRowSet::Documents, read_request_now())
+            .expect("lay out the aggregations");
         let rows = scan_test_rows(&build_hourly_rows());
         let inputs = resolve_plan_inputs(&layout, rows.schema()).expect("resolve the inputs");
         let plans = plan_aggregations(rows, &layout, &inputs).expect("plan the aggregations");
@@ -4806,7 +5163,8 @@ mod bucket_tree_tests {
             "durations": {"cardinality": {"field": "duration_micros"}}
         });
         let tree = parse_aggregations(&request).expect("parse the aggregations");
-        let layout = AggregationLayout::new(&tree, read_request_now()).expect("lay out the aggregations");
+        let layout = AggregationLayout::new(&tree, AggregationRowSet::Documents, read_request_now())
+            .expect("lay out the aggregations");
         let rows = scan_test_rows(&build_hourly_rows());
         let inputs = resolve_plan_inputs(&layout, rows.schema()).expect("resolve the inputs");
         let plans = plan_aggregations(rows, &layout, &inputs).expect("plan the aggregations");
@@ -5139,7 +5497,8 @@ mod bucket_tree_tests {
         assert_eq!(api["c"], json!({"values": {"100.0": 4.0}}));
         // One digest per field: "a" and "b" share the duration digest.
         let tree = parse_aggregations(&aggregations).expect("parse the request");
-        let layout = AggregationLayout::new(&tree, read_request_now()).expect("lay out the request");
+        let layout = AggregationLayout::new(&tree, AggregationRowSet::Documents, read_request_now())
+            .expect("lay out the request");
         let rows_plan = scan_test_rows(&rows);
         let inputs = resolve_plan_inputs(&layout, rows_plan.schema()).expect("resolve the inputs");
         let plans = plan_aggregations(rows_plan, &layout, &inputs).expect("plan the request");

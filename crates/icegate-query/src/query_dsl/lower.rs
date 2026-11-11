@@ -6,7 +6,7 @@
 //! tenant scope: isolation is the scan's, not the predicate's.
 
 use chrono::{DateTime, Utc};
-use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 use datafusion::functions::core::expr_fn::coalesce;
 use datafusion::functions::string::expr_fn::{lower, starts_with};
 use datafusion::functions_nested::expr_fn::cardinality;
@@ -51,7 +51,7 @@ use crate::query_dsl::udf::{
 };
 
 /// What a query is lowered against: one index of one tenant-scoped session, at the request
-/// instant.
+/// instant, or the objects of one nested field of that index.
 #[derive(Clone, Copy)]
 pub(crate) struct LoweringScope<'a> {
     /// The tenant-scoped session whose tables the predicate reads.
@@ -60,6 +60,63 @@ pub(crate) struct LoweringScope<'a> {
     pub(crate) entry: &'a IndexEntry,
     /// The request instant that date math resolves against.
     pub(crate) now: DateTime<Utc>,
+    /// The nested objects the predicate filters instead of the index's rows, inside a `nested`
+    /// aggregation; `None` for the rows.
+    pub(crate) nested_objects: Option<NestedObjectScope<'a>>,
+}
+
+/// The objects of one nested field, each a row of its own, as a `nested` aggregation reads them:
+/// the member `m` of the field at `path` is the column `<path>.<m>` of those rows
+/// ([`NestedObjectScope::name_member_column`]).
+///
+/// A predicate over them reads their members only, through `term`, `terms`, `range`, `exists`,
+/// `bool`, `constant_score`, `match_all` and `match_none`: a leaf on any other name is
+/// [`OpenSearchError::field_outside_nested_path`], since an object holds no field of its row, and
+/// any other query is a `400 parsing_exception` naming it under `construct`.
+#[derive(Clone, Copy)]
+pub(crate) struct NestedObjectScope<'a> {
+    /// The nested field, as the request names it.
+    pub(crate) path: &'a str,
+    /// The members of one object, with their stored types.
+    pub(crate) members: &'a Fields,
+}
+
+impl NestedObjectScope<'_> {
+    /// The column of the object rows holding `member`.
+    pub(crate) fn name_member_column(&self, member: &str) -> String {
+        format!("{}.{member}", self.path)
+    }
+
+    /// Resolve `name`, a member path `<path>.<member>`, to its column of the object rows, typed
+    /// as [`native_column_type`] types the member.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenSearchError::field_outside_nested_path`] for a name that is no member path,
+    /// and the 500 of [`native_column_type`] for a member no `OpenSearch` type represents.
+    pub(crate) fn resolve_member(&self, name: &str) -> Result<ResolvedField, OpenSearchError> {
+        let member = name
+            .strip_prefix(self.path)
+            .and_then(|path_rest| path_rest.strip_prefix('.'))
+            .and_then(|member_name| self.members.find(member_name))
+            .ok_or_else(|| OpenSearchError::field_outside_nested_path(name, self.path))?
+            .1;
+        Ok(ResolvedField {
+            name: name.to_string(),
+            field_type: native_column_type(member)?,
+            value: FieldValue::Column {
+                column: self.name_member_column(member.name()),
+            },
+        })
+    }
+
+    /// The stored type of the member whose column is `column`; `None` for no member's column.
+    fn find_member_type(&self, column: &str) -> Option<DataType> {
+        self.members
+            .iter()
+            .find(|member| self.name_member_column(member.name()) == column)
+            .map(|member| member.data_type().clone())
+    }
 }
 
 /// Lower `query` to a predicate over `scope.entry`'s tenant-scoped scan.
@@ -82,6 +139,17 @@ pub(crate) struct LoweringScope<'a> {
 /// `OpenSearch` type represents or for an `ids` value of an index with hashed ids and no
 /// timestamp column; and the error the index's table failed to open with.
 pub(crate) fn lower_query(query: &Query, scope: &LoweringScope<'_>) -> Result<Expr, OpenSearchError> {
+    if let Some(objects) = scope.nested_objects
+        && let Some(query_type) = name_query_outside_nested_objects(query)
+    {
+        return Err(OpenSearchError::unsupported_construct(
+            query_type,
+            format!(
+                "[{query_type}] queries do not run inside a [nested] aggregation over [{}]",
+                objects.path
+            ),
+        ));
+    }
     match query {
         Query::MatchAll => Ok(lit(true)),
         Query::MatchNone => Ok(lit(false)),
@@ -110,6 +178,36 @@ pub(crate) fn lower_query(query: &Query, scope: &LoweringScope<'_>) -> Result<Ex
         Query::MapValues(query) => Ok(lower_map_values(query)),
         Query::TokenPhrase(query) => lower_token_phrase(query, scope),
         Query::TokenSet(query) => lower_token_set(query, scope),
+    }
+}
+
+/// The request name of `query` when it does not run over nested objects (see
+/// [`NestedObjectScope`]); `None` for the queries that do.
+const fn name_query_outside_nested_objects(query: &Query) -> Option<&'static str> {
+    match query {
+        Query::MatchAll
+        | Query::MatchNone
+        | Query::Bool(_)
+        | Query::ConstantScore(_)
+        | Query::Term(_)
+        | Query::Terms(_)
+        | Query::Range(_)
+        | Query::Exists(_) => None,
+        Query::Ids(_) => Some("ids"),
+        Query::Prefix(_) => Some("prefix"),
+        Query::Wildcard(_) => Some("wildcard"),
+        Query::Regexp(_) => Some("regexp"),
+        Query::Nested(_) => Some("nested"),
+        Query::Match(_) => Some("match"),
+        Query::MatchPhrase(_) => Some("match_phrase"),
+        Query::MatchPhrasePrefix(_) => Some("match_phrase_prefix"),
+        Query::MultiMatch(_) => Some("multi_match"),
+        Query::SimpleQueryString(_) => Some("simple_query_string"),
+        Query::LuceneQueryString(_) => Some("query_string"),
+        // Built by the full-text resolver, which nested objects never reach.
+        Query::MapValues(_) => Some("map_values"),
+        Query::TokenPhrase(_) => Some("token_phrase"),
+        Query::TokenSet(_) => Some("token_set"),
     }
 }
 
@@ -464,6 +562,9 @@ fn require_should_matches(should_clauses: Vec<Expr>, minimum_should_count: u32) 
 ///
 /// Returns that 500, and the error the index's table failed to open with.
 fn resolve_lowering_field(scope: &LoweringScope<'_>, name: &str) -> Result<Option<ResolvedField>, OpenSearchError> {
+    if let Some(objects) = scope.nested_objects {
+        return objects.resolve_member(name).map(Some);
+    }
     if let Some(field) = scope.session.resolve_field(scope.entry, name) {
         return Ok(Some(field.into_lowering_view()));
     }
@@ -852,10 +953,21 @@ fn read_typed_column_type(field: &ResolvedField, scope: &LoweringScope<'_>) -> R
             field.name
         )));
     };
-    scope
-        .session
-        .column_data_type(scope.entry, column)?
+    read_column_type(scope, column)?
         .ok_or_else(|| OpenSearchError::internal(format!("column `{column}` vanished from its table")))
+}
+
+/// The Arrow type of `column` in the rows `scope` filters: a member's stored type over nested
+/// objects, the column's type in the index's table otherwise; `None` for no such column.
+///
+/// # Errors
+///
+/// Returns the error the index's table failed to open with.
+fn read_column_type(scope: &LoweringScope<'_>, column: &str) -> Result<Option<DataType>, OpenSearchError> {
+    scope.nested_objects.map_or_else(
+        || scope.session.column_data_type(scope.entry, column),
+        |objects| Ok(objects.find_member_type(column)),
+    )
 }
 
 /// The query-shard 400 for `text`, which is no value of `field`.
@@ -1232,10 +1344,7 @@ fn lower_exists(query: &ExistsQuery, scope: &LoweringScope<'_>) -> Result<Expr, 
             return Err(report_unlowered_profile_field(&field));
         }
         (FieldType::Object, FieldValue::Column { column }) => {
-            if matches!(
-                scope.session.column_data_type(scope.entry, column)?,
-                Some(DataType::Struct(_))
-            ) {
+            if matches!(read_column_type(scope, column)?, Some(DataType::Struct(_))) {
                 read_expr.is_not_null()
             } else {
                 cardinality(read_expr).gt(lit(0_u64))
@@ -1444,6 +1553,7 @@ mod tests {
             session: &session,
             entry,
             now: build_request_instant(),
+            nested_objects: None,
         };
         let predicate = lower_query(&parse_query(&query)?, &scope)?;
         let plan = session
@@ -2129,6 +2239,7 @@ mod tests {
             session: &session,
             entry: find_index_entry(&session, LOGS_TABLE),
             now: build_request_instant(),
+            nested_objects: None,
         };
         for (query, expected_bodies) in cases {
             let predicate = lower_query(&parse_query(&query).expect("parses"), &scope).expect("lowers");
@@ -2624,6 +2735,7 @@ mod tests {
             session: &session,
             entry,
             now: build_request_instant(),
+            nested_objects: None,
         };
         let query = parse_query(&json!({"term": {"trace_id": "0123456789abcdeffedcba9876543210"}})).expect("parse");
         let plan = session
@@ -3073,6 +3185,7 @@ mod tests {
             session: &session,
             entry,
             now: build_request_instant(),
+            nested_objects: None,
         };
 
         for query in [

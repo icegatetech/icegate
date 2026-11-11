@@ -637,6 +637,7 @@ impl AggregationKind {
             | Self::DateRange(_)
             | Self::Filters(_)
             | Self::Filter(_)
+            | Self::Nested(_)
             | Self::Avg(_)
             | Self::Sum(_)
             | Self::Min(_)
@@ -671,6 +672,7 @@ impl AggregationKind {
             | Self::DateRange(_)
             | Self::Filters(_)
             | Self::Filter(_)
+            | Self::Nested(_)
             | Self::Avg(_)
             | Self::Sum(_)
             | Self::Min(_)
@@ -696,6 +698,7 @@ impl AggregationKind {
             | Self::DateRange(_)
             | Self::Filters(_) => true,
             Self::Filter(_)
+            | Self::Nested(_)
             | Self::Avg(_)
             | Self::Sum(_)
             | Self::Min(_)
@@ -724,7 +727,7 @@ impl AggregationKind {
     /// step into with `>`.
     const fn is_single_bucket(&self) -> bool {
         match self {
-            Self::Filter(_) => true,
+            Self::Filter(_) | Self::Nested(_) => true,
             Self::Terms(_)
             | Self::DateHistogram(_)
             | Self::Histogram(_)
@@ -791,6 +794,7 @@ impl AggregationKind {
             | Self::DateRange(_)
             | Self::Filters(_)
             | Self::Filter(_)
+            | Self::Nested(_)
             | Self::TopHits(_) => false,
         }
     }

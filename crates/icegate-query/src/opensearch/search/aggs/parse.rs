@@ -6,6 +6,11 @@
 //! single-shard listener does not have, so every kind accepts and ignores them. A kind outside
 //! IceGate's aggregation surface, or a name that is no aggregation type, is a `parsing_exception`
 //! whose `construct` names it.
+//!
+//! A `nested` aggregation answers at the top level only, and inside it only the kinds of
+//! [`NESTED_OBJECT_KINDS`] run, at any depth: its objects are rows of their own, which no other
+//! kind is planned over. Either misplacement is an `illegal_argument_exception` naming the
+//! aggregation and its type ([`OpenSearchError::misplaced_aggregation`]).
 
 use std::fmt::Display;
 use std::time::Duration;
@@ -42,7 +47,8 @@ use crate::query_dsl::parse::parse_query;
 pub(super) const IGNORED_EXECUTION_KEYS: [&str; 3] = ["execution_hint", "shard_size", "collect_mode"];
 
 /// Kinds outside IceGate's aggregation surface (with every `geo_` kind).
-const OUT_OF_SCOPE_KINDS: [&str; 6] = [
+const OUT_OF_SCOPE_KINDS: [&str; 7] = [
+    "reverse_nested",
     "significant_terms",
     "significant_text",
     "ip_range",
@@ -53,6 +59,20 @@ const OUT_OF_SCOPE_KINDS: [&str; 6] = [
 
 /// Out-of-scope kinds whose name does not say so by a prefix.
 const OUT_OF_SCOPE_PIPELINES: [&str; 1] = ["extended_stats_bucket"];
+
+/// The kinds that run inside a `nested` aggregation, over its objects.
+const NESTED_OBJECT_KINDS: [&str; 6] = ["filter", "sum", "min", "max", "value_count", "avg"];
+
+/// Where an aggregation stands in the request, which decides the kinds it may be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregationPlacement {
+    /// A top-level aggregation of the request.
+    Top,
+    /// A sub-aggregation outside every `nested` aggregation.
+    SubAggregation,
+    /// A sub-aggregation of a `nested` aggregation, at any depth.
+    NestedSubAggregation,
+}
 
 /// The aggregations of one search request, in request order.
 #[derive(Debug)]
@@ -112,6 +132,9 @@ pub(crate) enum AggregationKind {
     Filters(FiltersSpec),
     /// The single bucket of the rows the query matches.
     Filter(Box<Query>),
+    /// The single bucket of every object of a nested field of the matching rows; its
+    /// sub-aggregations read those objects.
+    Nested(NestedSpec),
     /// `cumulative_sum`: the running total across the parent histogram's buckets.
     CumulativeSum(PipelineSpec),
     /// `derivative`: the difference to the previous bucket.
@@ -136,6 +159,7 @@ pub(crate) enum AggregationKind {
 
 impl AggregationKind {
     /// The field the aggregation reads; `None` for `filter` and `filters`, which read queries,
+    /// `nested`, which reads the objects of its path,
     /// `top_hits`, which reads whole rows, and the pipelines, which read the rendered tree.
     pub(crate) fn field(&self) -> Option<&str> {
         match self {
@@ -156,6 +180,7 @@ impl AggregationKind {
             | Self::ExtendedStats(_)
             | Self::Filters(_)
             | Self::Filter(_)
+            | Self::Nested(_)
             | Self::TopHits(_)
             | Self::CumulativeSum(_)
             | Self::Derivative(_)
@@ -199,6 +224,7 @@ impl AggregationKind {
             | Self::DateRange(_)
             | Self::Filters(_)
             | Self::Filter(_)
+            | Self::Nested(_)
             | Self::TopHits(_)
             | Self::CumulativeSum(_)
             | Self::Derivative(_)
@@ -212,6 +238,14 @@ impl AggregationKind {
             | Self::MaxBucket(_) => None,
         }
     }
+}
+
+/// A `nested` request.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct NestedSpec {
+    /// The nested field whose objects the aggregation reads, as the request names it; whether the
+    /// searched indices declare it is checked when the rows are planned.
+    pub(crate) path: String,
 }
 
 /// A `date_histogram` request.
@@ -319,55 +353,98 @@ impl CalendarUnit {
 ///
 /// `400 parsing_exception` for a malformed object, an unknown key, an unknown or out-of-scope
 /// kind (the kind under `construct`); `400 illegal_argument_exception` for an invalid option
-/// value.
+/// value, and for a `nested` below another aggregation or a kind outside
+/// [`NESTED_OBJECT_KINDS`] inside a `nested` (see the module documentation).
 pub(crate) fn parse_aggregations(value: &Value) -> Result<AggregationTree, OpenSearchError> {
     Ok(AggregationTree {
-        aggregations: parse_named_aggregations(value)?,
+        aggregations: parse_named_aggregations(value, AggregationPlacement::Top)?,
     })
 }
 
-fn parse_named_aggregations(value: &Value) -> Result<Vec<NamedAggregation>, OpenSearchError> {
+fn parse_named_aggregations(
+    value: &Value,
+    placement: AggregationPlacement,
+) -> Result<Vec<NamedAggregation>, OpenSearchError> {
     let Value::Object(entries) = value else {
         return Err(OpenSearchError::parsing(
             "aggregations must be an object keyed by aggregation name",
         ));
     };
-    entries.iter().map(|(name, body)| parse_named_aggregation(name, body)).collect()
+    entries
+        .iter()
+        .map(|(name, body)| parse_named_aggregation(name, body, placement))
+        .collect()
 }
 
-fn parse_named_aggregation(name: &str, body: &Value) -> Result<NamedAggregation, OpenSearchError> {
+/// Parse the aggregation `name` standing at `placement`. Its sub-aggregations are parsed once its
+/// kind is known, since the kind decides where they stand.
+fn parse_named_aggregation(
+    name: &str,
+    body: &Value,
+    placement: AggregationPlacement,
+) -> Result<NamedAggregation, OpenSearchError> {
     let Value::Object(body) = body else {
         return Err(OpenSearchError::parsing(format!(
             "aggregation [{name}] must be an object"
         )));
     };
-    let mut kind = None;
-    let mut children = None;
+    let mut kind_entry = None;
+    let mut children_value = None;
     for (key, value) in body {
         match key.as_str() {
             "aggs" | "aggregations" => {
-                if children.is_some() {
+                if children_value.is_some() {
                     return Err(OpenSearchError::parsing(format!(
                         "found two sub-aggregation definitions in [{name}]"
                     )));
                 }
-                children = Some(parse_named_aggregations(value)?);
+                children_value = Some(value);
             }
             kind_name => {
-                if kind.is_some() {
+                if kind_entry.is_some() {
                     return Err(OpenSearchError::parsing(format!(
                         "found two aggregation types in [{name}], the second is [{kind_name}]"
                     )));
                 }
-                kind = Some(parse_kind(name, kind_name, value)?);
+                kind_entry = Some((kind_name, value));
             }
         }
     }
-    let kind = kind.ok_or_else(|| OpenSearchError::parsing(format!("missing aggregation type in [{name}]")))?;
+    let (kind_name, kind_value) =
+        kind_entry.ok_or_else(|| OpenSearchError::parsing(format!("missing aggregation type in [{name}]")))?;
+    let is_nested = kind_name == "nested";
+    match placement {
+        AggregationPlacement::NestedSubAggregation if !NESTED_OBJECT_KINDS.contains(&kind_name) => {
+            return Err(OpenSearchError::misplaced_aggregation(
+                name,
+                kind_name,
+                "does not run inside a [nested] aggregation",
+            ));
+        }
+        AggregationPlacement::SubAggregation if is_nested => {
+            return Err(OpenSearchError::misplaced_aggregation(
+                name,
+                kind_name,
+                "runs at the top level of a request only",
+            ));
+        }
+        AggregationPlacement::Top
+        | AggregationPlacement::SubAggregation
+        | AggregationPlacement::NestedSubAggregation => {}
+    }
+    let kind = parse_kind(name, kind_name, kind_value)?;
+    let children_placement = if is_nested || placement == AggregationPlacement::NestedSubAggregation {
+        AggregationPlacement::NestedSubAggregation
+    } else {
+        AggregationPlacement::SubAggregation
+    };
     Ok(NamedAggregation {
         name: name.to_string(),
         kind,
-        children: children.unwrap_or_default(),
+        children: children_value
+            .map(|value| parse_named_aggregations(value, children_placement))
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 
@@ -395,6 +472,7 @@ fn parse_kind(name: &str, kind_name: &str, value: &Value) -> Result<AggregationK
         "date_range" => Ok(AggregationKind::DateRange(parse_date_range(name, value)?)),
         "filters" => Ok(AggregationKind::Filters(parse_filters(name, value)?)),
         "filter" => Ok(AggregationKind::Filter(Box::new(parse_query(value)?))),
+        "nested" => Ok(AggregationKind::Nested(parse_nested(name, value)?)),
         "cumulative_sum" => Ok(AggregationKind::CumulativeSum(parse_cumulative_sum(name, value)?)),
         "derivative" => Ok(AggregationKind::Derivative(parse_derivative(name, value)?)),
         "serial_diff" => Ok(AggregationKind::SerialDiff(parse_serial_diff(name, value)?)),
@@ -427,6 +505,20 @@ fn parse_kind(name: &str, kind_name: &str, value: &Value) -> Result<AggregationK
             format!("unknown aggregation type [{kind_name}] in [{name}]"),
         )),
     }
+}
+
+fn parse_nested(name: &str, value: &Value) -> Result<NestedSpec, OpenSearchError> {
+    let mut path = None;
+    for (key, value) in expect_object(name, "nested", value)? {
+        match key.as_str() {
+            "path" => path = Some(expect_string(name, key, value)?.to_string()),
+            ignored if IGNORED_EXECUTION_KEYS.contains(&ignored) => {}
+            unknown => return Err(report_unsupported_key("nested", name, unknown)),
+        }
+    }
+    Ok(NestedSpec {
+        path: path.ok_or_else(|| report_missing_key("nested", name, "path"))?,
+    })
 }
 
 fn parse_date_histogram(name: &str, value: &Value) -> Result<DateHistogramSpec, OpenSearchError> {
@@ -1132,7 +1224,7 @@ mod tests {
     use super::super::terms::{TermsFilter, TermsOrder, TermsSpec};
     use super::{
         AggregationKind, AggregationTree, CalendarUnit, DateHistogramSpec, HistogramInterval, HistogramSpec,
-        MetricPath, classify_legacy_interval, parse_aggregations, parse_metric_path,
+        MetricPath, NestedSpec, classify_legacy_interval, parse_aggregations, parse_metric_path,
     };
     use crate::opensearch::error::{OpenSearchError, render_envelope};
     use crate::opensearch::script::MetricScript;
@@ -1953,5 +2045,88 @@ mod tests {
             "parsing_exception",
         )
         .await;
+    }
+
+    /// A `nested` names its path and keeps its sub-aggregations, whatever the order of its keys,
+    /// as the kind decides where they stand; the execution hints are ignored.
+    #[test]
+    fn nested_parses_its_path_and_keeps_its_sub_aggregations_in_either_key_order() {
+        for body in [
+            json!({"objects": {
+                "nested": {"path": "buckets", "execution_hint": "map"},
+                "aggs": {"count_sum": {"sum": {"field": "buckets.count"}}}
+            }}),
+            json!({"objects": {
+                "aggs": {"count_sum": {"sum": {"field": "buckets.count"}}},
+                "nested": {"path": "buckets"}
+            }}),
+        ] {
+            let tree = parse_aggregations(&body).expect("a nested aggregation");
+
+            let [nested] = tree.aggregations.as_slice() else {
+                panic!("one top-level aggregation in {body}");
+            };
+            assert!(
+                matches!(&nested.kind, AggregationKind::Nested(NestedSpec { path }) if path == "buckets"),
+                "{body}"
+            );
+            assert_eq!(
+                nested.children.iter().map(|child| child.name.as_str()).collect::<Vec<_>>(),
+                ["count_sum"],
+                "{body}"
+            );
+        }
+    }
+
+    /// A `nested` without a string `path`, or with a key it does not take, is a parsing 400.
+    /// Below a `nested`, at any depth, a kind outside the nested set is refused naming it before
+    /// its own body is read, and a `nested` below another aggregation is refused naming it; a
+    /// sibling of a top-level `nested` reads the rows freely.
+    #[tokio::test]
+    async fn nested_refuses_a_malformed_body_and_misplaced_aggregations() {
+        for (body, construct) in [
+            (json!({"objects": {"nested": {}}}), None),
+            (json!({"objects": {"nested": {"path": 1}}}), None),
+            (
+                json!({"objects": {"nested": {"path": "buckets", "score_mode": "avg"}}}),
+                Some("score_mode"),
+            ),
+        ] {
+            let error = assert_refusal(body.clone(), "parsing_exception").await;
+            assert_eq!(
+                error.get("construct").and_then(Value::as_str),
+                construct,
+                "{body}: {error}"
+            );
+        }
+        for (body, aggregation, aggregation_type) in [
+            (
+                json!({"objects": {"nested": {"path": "buckets"}, "aggs": {"by_max": {"terms": {"no_field": 1}}}}}),
+                "by_max",
+                "terms",
+            ),
+            (
+                json!({"objects": {"nested": {"path": "buckets"}, "aggs": {"upper": {
+                    "filter": {"match_all": {}},
+                    "aggs": {"total": {"sum_bucket": {"buckets_path": "x"}}}
+                }}}}),
+                "total",
+                "sum_bucket",
+            ),
+            (
+                json!({"upper": {"filter": {"match_all": {}}, "aggs": {"objects": {"nested": {"path": "buckets"}}}}}),
+                "objects",
+                "nested",
+            ),
+        ] {
+            let error = assert_refusal(body.clone(), "illegal_argument_exception").await;
+            assert_eq!(error["aggregation"], aggregation, "{body}: {error}");
+            assert_eq!(error["aggregation_type"], aggregation_type, "{body}: {error}");
+        }
+        parse_aggregations(&json!({
+            "objects": {"nested": {"path": "buckets"}},
+            "by_name": {"terms": {"field": "name"}, "aggs": {"names": {"cardinality": {"field": "name"}}}}
+        }))
+        .expect("a sibling of a nested reads the rows freely");
     }
 }

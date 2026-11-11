@@ -170,10 +170,13 @@ fn lower_outer_predicate(query: &Query, scope: &LoweringScope<'_>) -> Result<Exp
 }
 
 /// Lower the queries of every `filter` and `filters` aggregation of `aggregations`, and resolve
-/// the sort fields of every `top_hits`, for the cross-row probe; the results are discarded.
+/// the sort fields of every `top_hits`, for the cross-row probe; the results are discarded. The
+/// sub-aggregations of a `nested` read the members of its objects, never a field of the row, so
+/// none of them reads a cross-row field and the probe skips them.
 fn probe_aggregation_reads(aggregations: &[NamedAggregation], scope: &LoweringScope<'_>) {
     for aggregation in aggregations {
         match &aggregation.kind {
+            AggregationKind::Nested(_) => continue,
             AggregationKind::Filter(query) => {
                 let _ = lower_query(query, scope);
             }
@@ -238,7 +241,12 @@ fn probe_cross_row_reads(
     now: DateTime<Utc>,
 ) -> bool {
     let reads_before = session.count_cross_row_reads();
-    let scope = LoweringScope { session, entry, now };
+    let scope = LoweringScope {
+        session,
+        entry,
+        now,
+        nested_objects: None,
+    };
     let _ = lower_query(&request.query, &scope);
     probe_sort_fields(&request.sort, &scope);
     if let Some(tree) = tree {
@@ -367,7 +375,12 @@ async fn prepare_cross_row_reads(
         if !probe_cross_row_reads(session, entry, request, tree, now) {
             continue;
         }
-        let scope = LoweringScope { session, entry, now };
+        let scope = LoweringScope {
+            session,
+            entry,
+            now,
+            nested_objects: None,
+        };
         // A trace list's buckets are its first keys under the whole query, so the whole query
         // selects its traces. This holds only when neither the query nor the sort reads a root
         // field; otherwise the query itself needs the roots of traces outside the first keys.
@@ -1682,6 +1695,7 @@ async fn search_index<'a>(
         session: scope.session,
         entry: scope.entry,
         now: context.now,
+        nested_objects: None,
     };
     let matching_plan = scope
         .session
@@ -3290,7 +3304,16 @@ mod pruning_tests {
             .expect("now")
             .with_timezone(&Utc);
         let parsed_query = parse_query(query).expect("query");
-        let predicate = lower_query(&parsed_query, &LoweringScope { session, entry, now }).expect("lowered");
+        let predicate = lower_query(
+            &parsed_query,
+            &LoweringScope {
+                session,
+                entry,
+                now,
+                nested_objects: None,
+            },
+        )
+        .expect("lowered");
         let plan = session
             .scan_index(entry)
             .expect("scan")

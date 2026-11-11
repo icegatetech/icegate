@@ -601,7 +601,8 @@ pub(super) fn read_level_key(
             LevelKind::Range { .. }
             | LevelKind::DateRange { .. }
             | LevelKind::Filters { .. }
-            | LevelKind::Filter { .. },
+            | LevelKind::Filter { .. }
+            | LevelKind::Nested,
             ScalarValue::Int32(Some(ordinal)),
         ) => BucketKey::Long(i64::from(ordinal)),
         (_, other) => {
@@ -651,7 +652,7 @@ fn select_level(
         LevelKind::Range { spec } => select_fixed_buckets(level.name, spec.ranges.len(), candidates, budget),
         LevelKind::DateRange { spec, .. } => select_fixed_buckets(level.name, spec.ranges.len(), candidates, budget),
         LevelKind::Filters { filter_count, .. } => select_fixed_buckets(level.name, *filter_count, candidates, budget),
-        LevelKind::Filter { .. } => select_fixed_buckets(level.name, 1, candidates, budget),
+        LevelKind::Filter { .. } | LevelKind::Nested => select_fixed_buckets(level.name, 1, candidates, budget),
     }
 }
 

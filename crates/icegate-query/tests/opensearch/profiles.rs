@@ -1335,7 +1335,7 @@ pub(super) fn build_metric_row<'a>(
 }
 
 /// A metrics row at `micros`, ingested then: the required columns plus `cells`.
-fn build_metric_row_at<'a>(
+pub(super) fn build_metric_row_at<'a>(
     tenant: &'a str,
     micros: i64,
     name: &'a str,
