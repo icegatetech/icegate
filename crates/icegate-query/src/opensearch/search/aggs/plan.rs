@@ -34,7 +34,12 @@
 //! in the matching rows, one row per object ([`AggregationRowSet::NestedObjects`]). Its own
 //! layout holds it as a single-bucket level over those rows, and its sub-aggregations below it;
 //! the layout of the matching rows leaves it out. Each row set is planned, executed, assembled
-//! and rendered on its own, and the pipelines run over the merged answer.
+//! and rendered on its own, and the pipelines run over the merged answer. A request mixing
+//! `nested` with other aggregations therefore costs one more filtered scan of the matching rows per
+//! top-level `nested`; it buys rows of one object each, which document rows cannot carry. It is not
+//! available cheaper: one stage over both row sets would read the unnested rows, where each
+//! document repeats once per object, so every count and metric of the siblings would count a
+//! document as many times as it holds objects.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;

@@ -277,9 +277,8 @@ pub(super) enum ProfileFilter<'a> {
 ///
 /// `None` when the inverse does not apply and the filter is planned on the read value instead:
 /// `!=` but on such an id (its rows include values the inverse cannot tell apart), a literal of
-/// another type than the
-/// field reads, an id range bounded by `""`, `is not null` on the span kind (an unnamed stored kind
-/// reads NULL), and every field that reads a column as stored.
+/// another type than the field reads, an id range bounded by `""`, `is not null` on the span kind
+/// (an unnamed stored kind reads NULL), and every field that reads a column as stored.
 ///
 /// # Errors
 ///

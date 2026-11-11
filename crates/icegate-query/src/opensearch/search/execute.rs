@@ -323,7 +323,7 @@ fn find_trace_list_script(aggregations: &[NamedAggregation]) -> Option<(&str, &M
             .kind
             .read_metric_spec()
             .and_then(|spec| spec.value_script.as_ref())
-            .filter(|script| !matches!(script, MetricScript::Arithmetic(_)));
+            .filter(|script| script.reads_trace_root());
         script.map_or_else(
             || find_trace_list_script(&aggregation.children),
             |script| Some((aggregation.name.as_str(), script)),

@@ -347,8 +347,9 @@ pub(super) struct MetricInput {
     /// `value_count` and `cardinality`, which read the field's own value.
     pub(super) value: Expr,
     /// Whether an extreme also renders as a date string: the field is a date and no value script
-    /// computed the value. A script's answer, a date included, renders raw (no
-    /// `value_as_string`), as `OpenSearch`'s numeric values source of a script-only metric does.
+    /// computed the value. A script's answer, a date included, renders as `value` alone, without
+    /// `value_as_string` (`last_updated_reads_the_root_end_time_and_falls_back_to_the_span_end_time`
+    /// in `tests/opensearch/osd_traces.rs`).
     pub(super) is_rendered_as_date: bool,
 }
 

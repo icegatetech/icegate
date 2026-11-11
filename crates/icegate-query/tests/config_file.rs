@@ -155,8 +155,8 @@ const STAND_DATASOURCES_DOCUMENT: &str = concat!(
 /// The plugin id a Grafana `OpenSearch` datasource names in its `type`.
 const OPENSEARCH_PLUGIN_ID: &str = "grafana-opensearch-datasource";
 
-/// The Data Prepper span index the stand's traces datasource reads.
-const DATA_PREPPER_SPAN_INDEX: &str = "otel-v1-apm-span";
+/// The Data Prepper span alias the stand's traces datasource reads.
+const DATA_PREPPER_SPAN_ALIAS: &str = "otel-v1-apm-span";
 
 /// The parts of the stand's datasource provisioning this test reads.
 #[derive(Deserialize)]
@@ -231,7 +231,7 @@ fn every_stand_opensearch_datasource_states_the_version_the_stand_reports() {
     let expected_fields_by_database = [
         (LOGS_TABLE, COL_TIMESTAMP, Some(COL_BODY), Some(COL_SEVERITY_TEXT)),
         (SPANS_TABLE, COL_TIMESTAMP, None, None),
-        (DATA_PREPPER_SPAN_INDEX, "startTime", Some(""), Some("")),
+        (DATA_PREPPER_SPAN_ALIAS, "startTime", Some(""), Some("")),
     ];
 
     // The provisioning order is not part of the contract, so both sides are put in one order.
@@ -307,7 +307,7 @@ fn the_traces_datasource_links_to_the_logs_datasource_with_a_field_qualified_que
     let traces = document
         .datasources
         .iter()
-        .find(|datasource| datasource.json_data.database.as_deref() == Some(DATA_PREPPER_SPAN_INDEX))
+        .find(|datasource| datasource.json_data.database.as_deref() == Some(DATA_PREPPER_SPAN_ALIAS))
         .expect("the stand provisions a traces datasource");
     assert_eq!(traces.uid.as_deref(), Some("opensearch-traces-demo"));
     assert_eq!(traces.json_data.time_field.as_deref(), Some("startTime"));

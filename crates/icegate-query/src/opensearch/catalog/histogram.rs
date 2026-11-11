@@ -21,10 +21,9 @@ use datafusion::logical_expr::{
 use super::field::FieldType;
 
 /// The `min` of a histogram's first bucket, which has no lower bound: the most negative finite
-/// `f32`, widened to `f64`. Chosen to follow `createBuckets` of Data Prepper's
-/// `data-prepper-plugins/otel-proto-common/.../codec/OTelProtoOpensearchCodec.java`; IceGate's
-/// contract is the value itself, pinned by
-/// `ss4o_metrics_renders_histogram_buckets_as_min_max_count_objects`.
+/// `f32`, widened to `f64`, a finite value because JSON holds no infinity. Pinned by
+/// `ss4o_metrics_renders_histogram_buckets_as_min_max_count_objects` in
+/// `tests/opensearch/profiles.rs`.
 pub(crate) const UNBOUNDED_BUCKET_MIN: f64 = -UNBOUNDED_BUCKET_MAX;
 
 /// The `max` of a histogram's last bucket, which has no upper bound: the most positive finite

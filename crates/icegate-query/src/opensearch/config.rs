@@ -75,14 +75,15 @@ pub struct OpenSearchConfig {
     /// a path naming it still resolves.
     pub field_discovery_window_secs: u64,
     /// How far, in seconds, before the earliest start of the spans it decorates the root span
-    /// of a trace is looked for (`traceGroup` and `traceGroupFields` of the span index
-    /// `otel-v1-apm-span-000001`, aliased `otel-v1-apm-span`). A root that started earlier renders
-    /// those fields absent. Validated non-zero while the listener is enabled.
+    /// of a trace is looked for (`traceGroup` and `traceGroupFields` of the Data Prepper span
+    /// index, `DATA_PREPPER_SPAN_INDEX` in `catalog/data_prepper.rs`). A root that started earlier
+    /// renders those fields absent. Validated non-zero while the listener is enabled.
     pub max_trace_lookback_secs: u64,
     /// The most traces whose root spans one search reads for a filter, sort or aggregation on
-    /// `traceGroup` or `traceGroupFields`, and the largest `terms` size on `traceId` of the span
-    /// index `otel-v1-apm-span-000001`, aliased `otel-v1-apm-span`. Above it the search is a 400:
-    /// IceGate never truncates the set. Validated non-zero while the listener is enabled.
+    /// `traceGroup` or `traceGroupFields`, and the largest `terms` size on `traceId` of the Data
+    /// Prepper span index (`DATA_PREPPER_SPAN_INDEX` in `catalog/data_prepper.rs`). Above it the
+    /// search is a 400: IceGate never truncates the set. Validated non-zero while the listener is
+    /// enabled.
     pub max_cross_row_traces: usize,
     /// The per-tenant store of dot-prefixed system indices.
     pub system_indices: SystemIndicesConfig,

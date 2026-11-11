@@ -354,9 +354,8 @@ services:
 
   otelgen-traces:
     <<: *otelgen
-    # v0.5.2's help lists more scenarios, but only these two run; the others log
-    # "unknown scenario" for every trace. `traces multi` exits after
-    # --number-traces regardless of --duration, so the count stands in for "forever".
+    # The stand generates traces with these two scenarios. The large
+    # --number-traces keeps `traces multi` sending for the stand's lifetime.
     command: ["--otel-exporter-otlp-endpoint", "ingest:4317", "--insecure", "--duration", "0", "traces", "multi", "--number-traces", "1000000000", "--scenarios", "microservices", "--scenarios", "basic"]
 
   otelgen-metrics:

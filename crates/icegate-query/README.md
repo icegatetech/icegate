@@ -193,7 +193,9 @@ it selects the index wherever the index's own name would, by name, wildcard or e
 index is read once however many of its names an expression reaches, and every response names the
 index, never the alias. The one exception is `_mapping/field`, whose answer is keyed by the
 expression as requested. `_resolve/index` lists the index with its aliases and each alias with
-its index; `_cat/indices` and SQL `SHOW TABLES` list the index only. Dot-prefixed names are hidden unless
+its index; `_cat/indices` and SQL `SHOW TABLES` list the index only. `GET /_alias/<name>` lists
+the aliases of system indices only: `GET /_alias/otel-v1-apm-span` is a 404, while `_resolve/index`
+lists that alias. Dot-prefixed names are hidden unless
 `expand_wildcards` includes `hidden` or the pattern itself starts with `.`. OpenSearch
 Dashboards' index-pattern wizard therefore lists no system index until its switch for system and
 hidden indices is on, and offers `timestamp` as the time field of a pattern over `logs`
@@ -346,8 +348,8 @@ cannot see the deployed Dashboards and does not compare versions with it.
   Trace Analytics in Data Prepper mode reads the span index through its `otel-v1-apm-span-*`
   pattern: its span views (`trace analytics lists the seeded spans in every span view`) and a
   trace's detail page (`trace analytics trace detail shows overview, services and spans`). The
-  Metrics page lists only indices matching `ss4o_metrics-*-*`, which `ss4o_metrics-icegate-default`
-  does (`observability metrics plots the bins of a histogram metric`).
+  Metrics page lists the metrics index `ss4o_metrics-icegate-default` and plots its metrics
+  (`observability metrics plots the bins of a histogram metric`).
   `config/docker/opensearch-dashboards/opensearch_dashboards.yml` is the stand's configuration.
 - **Grafana**: one OpenSearch datasource per index whose `database` the panels read, each
   sending `x-scope-orgid` and stating `opensearch.version` as its `version`;

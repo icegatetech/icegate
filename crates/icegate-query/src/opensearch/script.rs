@@ -328,6 +328,15 @@ pub(crate) enum MetricScript {
 }
 
 impl MetricScript {
+    /// Whether the script reads its span's trace root, a field only the Data Prepper profile
+    /// computes: true for the trace-list scripts.
+    pub(crate) const fn reads_trace_root(&self) -> bool {
+        match self {
+            Self::Arithmetic(_) => false,
+            Self::TraceListLatency { .. } | Self::TraceLastUpdated => true,
+        }
+    }
+
     /// The name a refusal gives the script.
     pub(crate) const fn describe_script(&self) -> &'static str {
         match self {

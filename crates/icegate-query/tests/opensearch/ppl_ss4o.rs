@@ -458,7 +458,8 @@ async fn read_iceberg_scan_predicate(server: &TestServer, query: &str) -> String
 async fn trace_id_and_time_filters_over_ss4o_logs_reach_the_scan_as_stored_column_predicates() {
     let (server, catalog) = TestServer::start().await;
     seed_trace_logs(&catalog).await;
-    let time_query = format!("source={SS4O_LOGS} | where @timestamp >= '2025-10-09 08:53:21' | fields body");
+    let time_query =
+        format!("source={SS4O_LOGS} | where @timestamp >= '2025-10-09 08:53:21' | sort @timestamp | fields body");
 
     let trace_predicate = read_iceberg_scan_predicate(&server, ASSOCIATED_LOGS_QUERY).await;
     let time_predicate = read_iceberg_scan_predicate(&server, &time_query).await;
@@ -618,6 +619,35 @@ async fn ss4o_metrics_buckets_read_as_an_array_of_bucket_structs() {
             (value - expected).abs() <= expected.abs() * f64::EPSILON,
             "{value} is not {expected}"
         );
+    }
+    server.shutdown().await;
+}
+
+/// The metrics `buckets` is a list of bucket objects, which no literal compares with: a filter
+/// comparing it with one is a 400 naming it, never an empty answer.
+#[tokio::test]
+async fn a_literal_compared_with_ss4o_metrics_buckets_is_refused_naming_it() {
+    let (server, catalog) = TestServer::start().await;
+    commit_rows(
+        &catalog,
+        METRICS_TABLE,
+        &[build_metric_row(
+            TENANT,
+            "http.server.duration",
+            "histogram",
+            vec![
+                (COL_BUCKET_COUNTS, Cell::Longs(&[1, 1])),
+                (COL_EXPLICIT_BOUNDS, Cell::Doubles(&[1.0])),
+            ],
+        )],
+    )
+    .await
+    .expect("commit metrics");
+
+    for condition in ["buckets = 1", "buckets > 1"] {
+        let answer = run_query(&server, &format!("source={SS4O_METRICS} | where {condition}")).await;
+
+        assert_semantic_refusal_naming(&answer, "buckets");
     }
     server.shutdown().await;
 }

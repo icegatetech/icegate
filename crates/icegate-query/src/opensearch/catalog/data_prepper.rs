@@ -1,6 +1,6 @@
-//! The Data Prepper span profile: the span index `otel-v1-apm-span-000001`, aliased
-//! `otel-v1-apm-span`, over the `spans` table, so an `otel-v1-apm-span-*` pattern and the
-//! `otel-v1-apm-span` name both reach it.
+//! The Data Prepper span profile: the span index [`DATA_PREPPER_SPAN_INDEX`], aliased
+//! [`DATA_PREPPER_SPAN_ALIAS`], over the `spans` table, so a pattern of the alias followed by `-*`
+//! and the alias itself both reach it.
 //!
 //! Field names are camel-case (`traceId`, `spanId`, ...), ids are lowercase hex, the span kind is
 //! its `OTel` name, times are RFC 3339 text, and `_source` is a nested object. Attribute keys write
