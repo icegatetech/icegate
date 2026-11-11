@@ -2,11 +2,11 @@
 //! profile's field names, read from the profile's own field table (`opensearch/catalog/ss4o.rs`),
 //! so no field name, type or encoding is declared twice.
 //!
-//! The columns follow the rule the `OpenSearch` SQL plugin applies to an index mapping (see
-//! `README.md`, Sources): every field whose parent is no declared object is a column, aliases
-//! included, and an object is a struct of its members. The table's stored columns travel beside
-//! them as hidden columns, so a dotted, aliased or promoted name resolves to its stored column and
-//! a filter on it reaches the scan as a predicate on that column.
+//! Every field whose parent is no declared object is a column, aliases included, and an object is
+//! a struct of its members (`README.md`, ss4o indices, states the contract and the tests that pin
+//! it). The table's stored columns travel beside them as hidden columns, so a dotted, aliased or
+//! promoted name resolves to its stored column, and a filter on an encoded or derived field lowers
+//! through the profile's inverse to a predicate on those columns.
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -14,11 +14,18 @@ use datafusion::functions::core::expr_fn::{coalesce, named_struct};
 use datafusion::functions::encoding::expr_fn::encode;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder, cast, ident, lit, when};
 use icegate_common::schema::COL_TENANT_ID;
+use serde_json::Value;
 
+use super::ast::{CompareOperator, PplLiteral};
 use super::error::PplError;
+use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::opensearch::catalog::{
     EncodedField, FieldValue, IndexEntry, ProfileFieldSource, ProfileTable, ResolvedField, TenantSession,
+    lower_derived_exists, lower_derived_range, lower_derived_term, lower_encoded_exists, lower_encoded_range,
+    lower_encoded_term,
 };
+use crate::opensearch::error::OpenSearchError;
+use crate::query_dsl::ast::RangeBound;
 
 /// The prefix of the hidden columns that carry a profile source's stored columns, within the
 /// planner's reserved prefix (`RESERVED_NAME_PREFIX` of `plan.rs`): no field a query writes
@@ -236,4 +243,216 @@ impl ProfileRelation<'_> {
         };
         Ok(Some(when(is_present, named_struct(members)).end()?))
     }
+}
+
+/// A test of one profile field against literals, in a position of a `where` predicate where a row
+/// is kept only when the test is true (a top-level conjunct, or below `and` and `or` only). There,
+/// a predicate true on exactly the same rows answers the same, whatever it gives the others.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ProfileFilter<'a> {
+    /// `<field> <operator> <literal>`.
+    Compare(CompareOperator, &'a PplLiteral),
+    /// `<field> in (<literal>, …)`.
+    In(&'a [&'a PplLiteral]),
+    /// `<field> between <low> and <high>`.
+    Between(&'a PplLiteral, &'a PplLiteral),
+    /// `<field> is not null`.
+    IsNotNull,
+}
+
+/// `filter` on the encoded or derived profile field `name`, whose resolved value is `value`, lowered
+/// through the profile's inverse to a predicate over the hidden stored columns of
+/// [`scan_ss4o_index`], so the scan prunes by it as `_search` does. True on exactly the rows on
+/// which the filter of the field's read value is true, with one exception: on an id that reads
+/// `""` for NULL (`parentSpanId`), a string literal is an id literal, `""` selecting the NULL rows,
+/// as on a native id column (see the README, Id literals).
+///
+/// `None` when the inverse does not apply and the filter is planned on the read value instead:
+/// `!=` (its rows include values the inverse cannot tell apart), a literal of another type than the
+/// field reads, an id range bounded by `""`, `is not null` on the span kind (an unnamed stored kind
+/// reads NULL), and every field that reads a column as stored.
+///
+/// # Errors
+///
+/// The malformed-id refusal of a native id column ([`PplError::invalid_id_literal`]) for an id
+/// literal that is no hex of the id's width; a semantic refusal naming `name` for a literal the
+/// inverse refuses. `index` names the source index in such a refusal.
+pub(super) fn lower_profile_filter(
+    value: &FieldValue,
+    name: &str,
+    filter: ProfileFilter<'_>,
+    index: &str,
+) -> Result<Option<Expr>, PplError> {
+    let lowered = match value {
+        FieldValue::Encoded(id_field @ EncodedField::HexIdOrEmpty { width, .. }) => {
+            lower_id_filter(id_field, *width, name, filter, index)?
+        }
+        FieldValue::Encoded(encoded_field) if is_read_from_row(value) => {
+            let reads_number = matches!(encoded_field, EncodedField::StatusCodeOrZero { .. });
+            if matches!(
+                (encoded_field, filter),
+                (EncodedField::SpanKindName { .. }, ProfileFilter::IsNotNull)
+            ) {
+                return Ok(None);
+            }
+            apply_inverse(
+                filter,
+                reads_number,
+                |term| lower_encoded_term(encoded_field, name, term, index),
+                |lower, upper| lower_encoded_range(encoded_field, name, lower, upper, index),
+                || lower_encoded_exists(encoded_field),
+            )
+            .map_err(|error| refuse_inverse_literal(name, error))?
+        }
+        FieldValue::Derived(derived_field) => apply_inverse(
+            filter,
+            true,
+            |term| lower_derived_term(*derived_field, term, index),
+            |lower, upper| lower_derived_range(*derived_field, lower, upper, index),
+            || Ok(lower_derived_exists(*derived_field)),
+        )
+        .map_err(|error| refuse_inverse_literal(name, error))?,
+        FieldValue::Encoded(_)
+        | FieldValue::Column { .. }
+        | FieldValue::MapKey { .. }
+        | FieldValue::HexId { .. }
+        | FieldValue::CrossRow(_) => None,
+    };
+    lowered.map(read_stored_columns).transpose()
+}
+
+/// `filter` on an id that reads as hex text, `""` for NULL: each literal is an id literal, `""`
+/// selecting the NULL rows; `None` for `!=` and for a range bounded by `""`.
+///
+/// # Errors
+///
+/// [`PplError::invalid_id_literal`] for a literal that is no hex of `width` bytes.
+fn lower_id_filter(
+    id_field: &EncodedField,
+    width: i32,
+    name: &str,
+    filter: ProfileFilter<'_>,
+    index: &str,
+) -> Result<Option<Expr>, PplError> {
+    // Whether `literal` is a string; a non-empty one must be hex of the id's width.
+    let check_id_literal = |literal: &PplLiteral| -> Result<bool, PplError> {
+        let PplLiteral::String(text) = literal else {
+            return Ok(false);
+        };
+        if !text.is_empty() {
+            decode_fixed_binary_literal(text, &DataType::FixedSizeBinary(width))
+                .map_err(|error| PplError::invalid_id_literal(name, text, &error))?;
+        }
+        Ok(true)
+    };
+    let is_empty_bound = |literal: &PplLiteral| matches!(literal, PplLiteral::String(text) if text.is_empty());
+    let has_empty_bound = match filter {
+        ProfileFilter::Compare(
+            CompareOperator::Less
+            | CompareOperator::LessOrEqual
+            | CompareOperator::Greater
+            | CompareOperator::GreaterOrEqual,
+            literal,
+        ) => is_empty_bound(literal),
+        ProfileFilter::Between(low, high) => is_empty_bound(low) || is_empty_bound(high),
+        ProfileFilter::Compare(CompareOperator::Equal | CompareOperator::NotEqual, _)
+        | ProfileFilter::In(_)
+        | ProfileFilter::IsNotNull => false,
+    };
+    if has_empty_bound {
+        return Ok(None);
+    }
+    let literals: Vec<&PplLiteral> = match filter {
+        ProfileFilter::Compare(_, literal) => vec![literal],
+        ProfileFilter::In(literals) => literals.to_vec(),
+        ProfileFilter::Between(low, high) => vec![low, high],
+        ProfileFilter::IsNotNull => Vec::new(),
+    };
+    for literal in literals {
+        if !check_id_literal(literal)? {
+            return Ok(None);
+        }
+    }
+    apply_inverse(
+        filter,
+        false,
+        |term| lower_encoded_term(id_field, name, term, index),
+        |lower, upper| lower_encoded_range(id_field, name, lower, upper, index),
+        || lower_encoded_exists(id_field),
+    )
+    .map_err(|error| refuse_inverse_literal(name, error))
+}
+
+/// `filter` through a field's inverse: `term` for `=` and each `in` literal, `range` for an order
+/// comparison or `between` (bounds inclusive), `exists` for `is not null`. `None` for `!=` and for
+/// a literal that is not a number when `reads_number`, or not a string otherwise.
+///
+/// # Errors
+///
+/// The inverse's refusal of a literal.
+fn apply_inverse(
+    filter: ProfileFilter<'_>,
+    reads_number: bool,
+    term: impl Fn(&Value) -> Result<Expr, OpenSearchError>,
+    range: impl Fn(Option<&RangeBound>, Option<&RangeBound>) -> Result<Expr, OpenSearchError>,
+    exists: impl Fn() -> Result<Expr, OpenSearchError>,
+) -> Result<Option<Expr>, OpenSearchError> {
+    let read_bound = |literal: &PplLiteral, is_inclusive: bool| {
+        convert_literal(literal, reads_number).map(|value| RangeBound { value, is_inclusive })
+    };
+    let lowered = match filter {
+        ProfileFilter::Compare(CompareOperator::NotEqual, _) => None,
+        ProfileFilter::Compare(CompareOperator::Equal, literal) => {
+            convert_literal(literal, reads_number).map(|value| term(&value)).transpose()?
+        }
+        ProfileFilter::Compare(CompareOperator::Less, literal) => {
+            read_bound(literal, false).map(|bound| range(None, Some(&bound))).transpose()?
+        }
+        ProfileFilter::Compare(CompareOperator::LessOrEqual, literal) => {
+            read_bound(literal, true).map(|bound| range(None, Some(&bound))).transpose()?
+        }
+        ProfileFilter::Compare(CompareOperator::Greater, literal) => {
+            read_bound(literal, false).map(|bound| range(Some(&bound), None)).transpose()?
+        }
+        ProfileFilter::Compare(CompareOperator::GreaterOrEqual, literal) => {
+            read_bound(literal, true).map(|bound| range(Some(&bound), None)).transpose()?
+        }
+        ProfileFilter::In(literals) => {
+            let mut terms = Vec::with_capacity(literals.len());
+            for literal in literals {
+                let Some(value) = convert_literal(literal, reads_number) else {
+                    return Ok(None);
+                };
+                terms.push(term(&value)?);
+            }
+            terms.into_iter().reduce(Expr::or)
+        }
+        ProfileFilter::Between(low, high) => match (read_bound(low, true), read_bound(high, true)) {
+            (Some(low), Some(high)) => Some(range(Some(&low), Some(&high))?),
+            (None, _) | (_, None) => None,
+        },
+        ProfileFilter::IsNotNull => Some(exists()?),
+    };
+    Ok(lowered)
+}
+
+/// `literal` as the JSON value an inverse reads: a number when `reads_number`, a string otherwise;
+/// `None` for a literal of the other kind, which the read value compares by its own coercion.
+fn convert_literal(literal: &PplLiteral, reads_number: bool) -> Option<Value> {
+    match (literal, reads_number) {
+        (PplLiteral::String(text), false) => Some(Value::String(text.clone())),
+        (PplLiteral::Integer(number), true) => Some(Value::from(*number)),
+        (PplLiteral::Double(number), true) => serde_json::Number::from_f64(*number).map(Value::Number),
+        (PplLiteral::String(_) | PplLiteral::Boolean(_), true)
+        | (PplLiteral::Integer(_) | PplLiteral::Double(_) | PplLiteral::Boolean(_), false) => None,
+    }
+}
+
+/// The refusal of a literal an inverse cannot read, naming the field; any other error keeps its
+/// own mapping.
+fn refuse_inverse_literal(name: &str, error: OpenSearchError) -> PplError {
+    if error.status().is_client_error() {
+        return PplError::semantic_naming(name, error.reason());
+    }
+    PplError::from(error)
 }

@@ -74,10 +74,8 @@ resolved like the `_search` path with `ignore_unavailable=false`, `allow_no_indi
 open, non-hidden indices. A name that matches nothing is a 404 `INDEX_NOT_FOUND`. A wildcard part
 that matches nothing is skipped while another part matches, so only an expression that matches
 nothing as a whole is that 404: OSD's associated-logs source
-`ss4o_logs-*,opensearch_dashboards_sample_data_otel_logs*` reads the ss4o logs index. The
-OpenSearch SQL plugin (3.3.0.0) resolves a source the same way: it reads mappings and rows with
-the default index options (`allow_no_indices=true`, `ignore_unavailable=false`) and refuses an
-expression only when its mappings come back empty (`OpenSearchNodeClient.getIndexMappings`).
+`ss4o_logs-*,opensearch_dashboards_sample_data_otel_logs*` reads the ss4o logs index
+(`osd_associated_logs_query_lists_the_logs_of_one_trace` in `tests/opensearch/ppl_ss4o.rs`).
 Names are case-sensitive.
 
 A source on system indices is a 400, and so is a source on the Data Prepper span index
@@ -85,8 +83,9 @@ A source on system indices is a 400, and so is a source on the Data Prepper span
 which no PPL projection of one row can. A wildcard that reaches one table through two indices
 without naming each (`*` reaches `spans` and `otel-v1-apm-span-000001`) is a 400 as on
 `_search`, so no row is read twice. A source that reaches one table through two profiles in any
-way, names written out included (`logs,ss4o_logs-icegate-default`), is a 400 `SEMANTIC_ERROR`
-naming the source as written: the two field models do not union (binary `trace_id` against hex
+way, through a wildcard (`*logs*`) or with the names written out (`logs,ss4o_logs-icegate-default`),
+is a 400 `SEMANTIC_ERROR` naming the source as written, as is every other refusal of index
+resolution (a source mixing data and system indices): the two field models do not union (binary `trace_id` against hex
 `traceId`). `_search` reads such a named pair; PPL does not. `describe <index>` lists an index's
 fields and reads no rows, so its rules differ: see [`describe`](#describe).
 `source=[ <subsearch> ] [as t]` reads a subsearch's output: see [Subsearches](#subsearches).
@@ -101,12 +100,11 @@ the relation from that table and declares no field of its own.
 - **Columns.** Every field whose parent is no declared object is a column, in the profile's
   declared order (the order `describe` lists), aliases included: `time`, `@message` and
   `observerTime` read their targets. An object (`severity`, `resource`, `status`) is a `struct` of
-  its members, NULL when every member is; an attribute object is its MAP. This is the shape the
-  OpenSearch SQL plugin (3.3.0.0) gives a bare source over a mapping. Every mapped field, aliases
-  included, is a column of its row type (`OpenSearchIndex.getFieldTypes`; an alias from
-  `OpenSearchDataType.parseMapping`, read through its path by `CalciteEnumerableIndexScan`), and
-  the output drops a dotted field whose parent is also a field
-  (`CalciteRelNodeVisitor.tryToRemoveNestedFields`; `SymbolTable.lookupAllFields` in the v2 engine).
+  its members, NULL when every member is; an attribute object is its MAP; a list column is an
+  `array`. `describe` lists the same fields with the same types, a list column as `array` too
+  (`describe_and_a_bare_source_agree_on_the_ss4o_logs_columns`,
+  `describe_and_a_bare_source_agree_on_the_ss4o_traces_and_metrics_columns` and
+  `osd_associated_logs_query_lists_the_logs_of_one_trace` in `tests/opensearch/ppl_ss4o.rs`).
 - **Values** are those `_source` shows: ids as lowercase hex, times as timestamps, enumerations
   by name (`kind`, `aggregationTemporality`), derived fields computed (`durationInNanos`, `value`,
   the list lengths). An id whose stored column admits NULL (`parentSpanId`) reads as hex text, `""`
@@ -114,15 +112,25 @@ the relation from that table and declares no field of its own.
 - **Names.** A dotted member (`severity.text`, `status.code`), an object below another
   (`resource.attributes`), an attribute key (`attributes.http.method`) or a promoted resource
   attribute (`resource.attributes.service.name`, stored in `service_name`) resolves in every command
-  that takes a field, after the columns of that exact name, as the plugin's flattened fields do; a
-  `fields` that lists one keeps it as a column named by its path. Such a name reads the table's
-  stored columns, which travel with the rows as hidden columns, so it holds the stored value
-  whatever an earlier command did to the visible columns (`fields - severity | where
-  severity.text = 'ERROR'` filters). A filter on a profile field reaches the scan as a predicate
-  over its stored column, so one on a field that reads its column as stored (an id, a time, a
-  plain value, an attribute key) prunes the scan as on a native index. A string literal compared with
-  `traceId` or `spanId` is an id literal (see [Id literals](#id-literals)), a malformed one
-  included.
+  that takes a field, after the columns of that exact name; a `fields` that lists one keeps it as
+  a column named by its path. Such a name reads the table's stored columns, which travel with the
+  rows as hidden columns, so it holds the stored value whatever an earlier command did to the
+  visible columns (`fields - severity | where severity.text = 'ERROR'` filters). A string literal
+  compared with `traceId` or `spanId` is an id literal (see [Id literals](#id-literals)), a
+  malformed one included.
+- **Filters.** A filter on a field that reads its column as stored (an id, a time, a plain value,
+  an attribute key) is a predicate on that column, which the scan prunes by as on a native index.
+  On an encoded or derived field (`kind`, `status.code`, `traceState`, `durationInNanos`, the
+  metrics `kind`, `aggregationTemporality` and `value`, the list lengths) a test against literals
+  where the row is kept only when the test is true (a `where` conjunct, below `and` and `or` only)
+  lowers through the profile's inverse to a predicate on the stored columns, the one `_search`
+  uses: `=`, `<`, `<=`, `>`, `>=`, `in (…)`, `between`, and `is not null` (not on the span kind,
+  where a stored kind without a name reads NULL). It keeps exactly the rows the test of the read
+  value keeps. A literal of another type than the field reads, `!=`, `not in`, `not between`,
+  `is null`, and a test below `not` or in any other expression read the field's value and do not
+  prune. On `parentSpanId` such a test reads each string literal as an id literal: `''` selects the
+  roots (NULL parents), and a malformed literal is the 400 of a native id column, naming the
+  literal; a range bounded by `''` reads the value. `parentSpanId != ''` reads the value too.
 - **Fields PPL cannot read.** A field `_source` reshapes from a whole list of the row (the span
   `events` and `links`; the metrics `positiveBuckets`, `negativeBuckets`, `quantiles` and
   `exemplar`) is no column, and naming it, or a path below it, is a 400 `SEMANTIC_ERROR` naming it.

@@ -48,13 +48,16 @@ use super::functions::{
     FunctionContext, PlannedAggregate, is_higher_order_function, lower_arithmetic, lower_cast, lower_function_call,
     match_string_literal, parse_timestamp_literal, plan_aggregate_call,
 };
-use super::profile_source::{STORED_COLUMN_PREFIX, resolve_stored_field, scan_ss4o_index};
+use super::profile_source::{
+    ProfileFilter, STORED_COLUMN_PREFIX, lower_profile_filter, resolve_stored_field, scan_ss4o_index,
+};
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::opensearch::catalog::{
     FieldListing, FieldType, FieldValue, IndexEntry, IndexExpression, IndexField, IndexOptions, IndexTarget, Profile,
     TenantSession, find_profile_table,
 };
 use crate::opensearch::context::RequestContext;
+use crate::opensearch::error::OpenSearchErrorKind;
 use crate::opensearch::extract::ExpandWildcards;
 use crate::opensearch::glob::matches_glob;
 use crate::opensearch::search::aggs::plan_exact_distinct;
@@ -335,7 +338,16 @@ async fn resolve_data_entries<'session>(
             is_hidden: false,
         },
     };
-    match session.resolve_target(&index_expression, options).await? {
+    let target = session
+        .resolve_target(&index_expression, options)
+        .await
+        .map_err(|error| match error.kind() {
+            // Every 400 of index resolution is a refusal about the source: the expression mixes data
+            // and system indices, or a wildcard reaches one table through two profiles.
+            OpenSearchErrorKind::IllegalArgument => PplError::semantic_naming(expression, error.reason()),
+            _ => PplError::from(error),
+        })?;
+    match target {
         IndexTarget::Data(entries) => Ok(entries),
         IndexTarget::System(names) => {
             let reason = format!("PPL reads data indices only; [{}] are system indices", names.join(", "));
@@ -2347,7 +2359,7 @@ async fn plan_where(
             }
             in_subquery(lower_expression(expression, scope)?, Arc::new(subsearch.plan))
         } else {
-            lower_expression(conjunct, scope)?
+            lower_filter(conjunct, scope)?
         };
         predicates.push(predicate);
     }
@@ -2359,6 +2371,115 @@ async fn plan_where(
         return Ok(filtered_rows.sort(sort_keys.to_vec())?);
     }
     Ok(filtered_rows)
+}
+
+/// Lower `expression`, a predicate whose rows are kept only where it is true (a top-level conjunct of
+/// `where`), so a test of a profile field below `and` and `or` may lower through the profile's
+/// inverse ([`lower_profile_filter`]): such a test is true on the same rows as the test of the
+/// field's read value, and the scan prunes by it. Below any other operator a row with an unknown
+/// test could still be kept (`not`), so the test reads the field's value there.
+fn lower_filter(expression: &PplExpr, scope: &ExpressionScope<'_>) -> Result<Expr, PplError> {
+    match expression {
+        PplExpr::And(left, right) => Ok(lower_filter(left, scope)?.and(lower_filter(right, scope)?)),
+        PplExpr::Or(left, right) => Ok(lower_filter(left, scope)?.or(lower_filter(right, scope)?)),
+        _ => lower_profile_test(expression, scope)?.map_or_else(|| lower_expression(expression, scope), Ok),
+    }
+}
+
+/// `expression` through the inverse of a profile field when it tests one against literals (see
+/// [`ProfileFilter`]); `None` for any other expression and for a field that is no profile field of
+/// every source index alike ([`find_profile_filter_field`]).
+fn lower_profile_test(expression: &PplExpr, scope: &ExpressionScope<'_>) -> Result<Option<Expr>, PplError> {
+    let literals: Vec<&PplLiteral>;
+    let (name, filter) = match expression {
+        PplExpr::Compare { operator, left, right } => match (left.as_ref(), right.as_ref()) {
+            (PplExpr::Field(name), PplExpr::Literal(literal)) => (name, ProfileFilter::Compare(*operator, literal)),
+            (PplExpr::Literal(literal), PplExpr::Field(name)) => {
+                (name, ProfileFilter::Compare(swap_comparison(*operator), literal))
+            }
+            _ => return Ok(None),
+        },
+        PplExpr::In {
+            value,
+            list,
+            is_negated: false,
+        } => {
+            let PplExpr::Field(name) = value.as_ref() else {
+                return Ok(None);
+            };
+            let Some(listed_literals) = list
+                .iter()
+                .map(|item| match item {
+                    PplExpr::Literal(literal) => Some(literal),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(None);
+            };
+            literals = listed_literals;
+            (name, ProfileFilter::In(&literals))
+        }
+        PplExpr::Between {
+            value,
+            low,
+            high,
+            is_negated: false,
+        } => match (value.as_ref(), low.as_ref(), high.as_ref()) {
+            (PplExpr::Field(name), PplExpr::Literal(low), PplExpr::Literal(high)) => {
+                (name, ProfileFilter::Between(low, high))
+            }
+            _ => return Ok(None),
+        },
+        PplExpr::IsNull {
+            value,
+            is_negated: true,
+        } => {
+            let PplExpr::Field(name) = value.as_ref() else {
+                return Ok(None);
+            };
+            (name, ProfileFilter::IsNotNull)
+        }
+        _ => return Ok(None),
+    };
+    let Some((value, index)) = find_profile_filter_field(name, scope) else {
+        return Ok(None);
+    };
+    lower_profile_filter(&value, name, filter, index)
+}
+
+/// The comparison `operator` with its operands swapped: `literal < field` is `field > literal`.
+const fn swap_comparison(operator: CompareOperator) -> CompareOperator {
+    match operator {
+        CompareOperator::Equal => CompareOperator::Equal,
+        CompareOperator::NotEqual => CompareOperator::NotEqual,
+        CompareOperator::Less => CompareOperator::Greater,
+        CompareOperator::LessOrEqual => CompareOperator::GreaterOrEqual,
+        CompareOperator::Greater => CompareOperator::Less,
+        CompareOperator::GreaterOrEqual => CompareOperator::LessOrEqual,
+    }
+}
+
+/// The value the field `name` resolves to in every source index, with the first index's name, when
+/// every source index is a profile index resolving it alike and the name still reads the source's
+/// field: not a lambda parameter, and not a column an earlier command wrote. `None` otherwise, so
+/// the test reads the field as [`resolve_field`] does.
+fn find_profile_filter_field<'a>(name: &str, scope: &ExpressionScope<'a>) -> Option<(FieldValue, &'a str)> {
+    let source = scope.source?;
+    if scope.lambda_variables.iter().any(|(parameter, _)| parameter == name) || source.replaced_columns.contains(name) {
+        return None;
+    }
+    let mut values = source.entries.iter().map(|entry| {
+        find_profile_table(entry)?;
+        source
+            .session
+            .resolve_field(entry, name)
+            .map(|field| field.into_lowering_view().value)
+    });
+    let first_value = values.next()??;
+    values
+        .all(|value| value.as_ref() == Some(&first_value))
+        .then(|| (first_value, source.entries.first().map_or("", |entry| entry.name())))
 }
 
 /// The reason of the refusal of a lambda anywhere but as the second argument of an array function.
@@ -3057,11 +3178,11 @@ async fn plan_describe<'session>(
         }
     };
     let fields = session.list_fields(entry, now, FieldListing::WithMapKeys).await?;
-    let builder = build_describe_plan(
-        cluster_name,
-        index,
-        fields.iter().map(|field: &IndexField| (field.name.as_str(), field.field_type)),
-    )?;
+    let typed_fields = fields
+        .iter()
+        .map(|field: &IndexField| Ok((field.name.as_str(), name_field_describe_type(session, entry, field)?)))
+        .collect::<Result<Vec<_>, PplError>>()?;
+    let builder = build_describe_plan(cluster_name, index, typed_fields.into_iter())?;
     Ok(Pipeline {
         builder,
         source: None,
@@ -3079,7 +3200,7 @@ async fn plan_describe<'session>(
 fn build_describe_plan<'a>(
     cluster_name: &str,
     index: &str,
-    fields: impl Iterator<Item = (&'a str, FieldType)>,
+    fields: impl Iterator<Item = (&'a str, &'static str)>,
 ) -> Result<LogicalPlanBuilder, PplError> {
     let columns: Vec<Field> = DESCRIBE_COLUMNS
         .iter()
@@ -3091,7 +3212,7 @@ fn build_describe_plan<'a>(
     let schema: DFSchemaRef = Arc::new(DFSchema::try_from(Schema::new(columns)).map_err(report_defect)?);
     let rows = fields
         .enumerate()
-        .map(|(position, (name, field_type))| build_describe_row(cluster_name, index, name, field_type, position))
+        .map(|(position, (name, type_name))| build_describe_row(cluster_name, index, name, type_name, position))
         .collect::<Result<Vec<_>, PplError>>()?;
     // A `VALUES` plan needs at least one row; an index without fields answers the empty relation,
     // which carries the named schema itself.
@@ -3117,7 +3238,7 @@ fn build_describe_row(
     cluster_name: &str,
     index: &str,
     field_name: &str,
-    field_type: FieldType,
+    type_name: &str,
     position: usize,
 ) -> Result<Vec<Expr>, PplError> {
     let ordinal = i32::try_from(position).map_err(|_| PplError::Semantic {
@@ -3134,7 +3255,7 @@ fn build_describe_row(
         build_text_literal(index),
         build_text_literal(field_name),
         build_null_integer(),
-        build_text_literal(name_describe_type(field_type)),
+        build_text_literal(type_name),
         build_null_integer(),
         build_null_integer(),
         build_null_integer(),
@@ -3154,6 +3275,31 @@ fn build_describe_row(
         build_text_literal("NO"),
         build_text_literal(""),
     ])
+}
+
+/// The PPL type name `describe` reports for `field` of `entry`: `array` for an object field that reads
+/// a list column, the type a source reads it as (see [`PplType::from_data_type`]); otherwise the name
+/// of its field-model type ([`name_describe_type`]).
+///
+/// # Errors
+///
+/// The error the table failed to open with.
+fn name_field_describe_type(
+    session: &TenantSession,
+    entry: &IndexEntry,
+    field: &IndexField,
+) -> Result<&'static str, PplError> {
+    if field.field_type == FieldType::Object
+        && let Some(resolved_field) = session.resolve_field(entry, &field.name)
+        && let FieldValue::Column { column } = &resolved_field.value
+        && matches!(
+            session.column_data_type(entry, column)?,
+            Some(DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _))
+        )
+    {
+        return Ok(PplType::Array.name());
+    }
+    Ok(name_describe_type(field.field_type))
 }
 
 /// The PPL type name `describe` reports for a field-model type.
@@ -3728,7 +3874,6 @@ mod tests {
         drop_hidden_columns, hide_touched_sort_keys, lower_expression, plan_fillnull, plan_ppl, project_source_columns,
         select_fields, union_branches,
     };
-    use crate::opensearch::catalog::FieldType;
     use crate::opensearch::context::RequestContext;
     use crate::ppl::ast::{FillnullCommand, PplCommand, PplExpr, PplLiteral, SpanUnit};
     use crate::ppl::error::PplError;
@@ -4466,10 +4611,7 @@ mod tests {
         ];
         let expected: Vec<(&str, &DataType)> =
             expected_columns.iter().map(|(name, data_type)| (*name, data_type)).collect();
-        for fields in [
-            vec![],
-            vec![("body", FieldType::Text), ("log_attributes", FieldType::Object)],
-        ] {
+        for fields in [vec![], vec![("body", "string"), ("log_attributes", "struct")]] {
             let builder = build_describe_plan("icegate", "logs", fields.into_iter()).expect("describe plan");
             let columns: Vec<(&str, &DataType)> = builder
                 .schema()

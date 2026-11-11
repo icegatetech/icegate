@@ -8,7 +8,7 @@ use std::sync::Arc;
 use iceberg::Catalog;
 use icegate_common::schema::{
     COL_KIND, COL_LOG_ATTRIBUTES, COL_NAME, COL_PARENT_SPAN_ID, COL_RESOURCE_ATTRIBUTES, COL_SERVICE_NAME, COL_SPAN_ID,
-    COL_TRACE_ID, COL_VALUE_DOUBLE, COL_VALUE_INT,
+    COL_STATUS_CODE, COL_TRACE_ID, COL_VALUE_DOUBLE, COL_VALUE_INT,
 };
 use icegate_common::{LOGS_TABLE, METRICS_TABLE, SPANS_TABLE};
 use reqwest::StatusCode;
@@ -363,39 +363,37 @@ async fn other_profile_indices_stay_refused_as_ppl_sources() {
     server.shutdown().await;
 }
 
-/// A `traceId` filter reaches both scans as a predicate on the stored `trace_id` column, so the
-/// scan prunes by it as on `logs`.
-#[tokio::test]
-async fn a_trace_id_filter_over_ss4o_logs_reaches_the_scan_as_a_stored_column_predicate() {
-    let (server, catalog) = TestServer::start().await;
-    seed_trace_logs(&catalog).await;
-
-    let answer = post_ppl(
-        &server,
-        TENANT,
-        "/_plugins/_ppl/_explain",
-        &json!({"query": ASSOCIATED_LOGS_QUERY}),
-    )
-    .await;
-
-    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
-    let logical_plan = answer.body["calcite"]["logical"].as_str().expect("logical plan text");
+/// The predicate `_explain` shows on the Iceberg scan of `query`, run as [`TENANT`].
+async fn read_iceberg_scan_predicate(server: &TestServer, query: &str) -> String {
+    let answer = post_ppl(server, TENANT, "/_plugins/_ppl/_explain", &json!({ "query": query })).await;
+    assert_eq!(answer.status, StatusCode::OK, "{query}: {}", answer.body);
     let physical_plan = answer.body["calcite"]["physical"].as_str().expect("physical plan text");
-    let scan_line = logical_plan
-        .lines()
-        .find(|line| line.contains("TableScan"))
-        .expect("a table scan");
-    assert!(scan_line.contains("trace_id"), "{logical_plan}");
-    let iceberg_line = physical_plan
+    physical_plan
         .lines()
         .find(|line| line.contains("IcegateIcebergScan"))
-        .expect("an Iceberg scan");
-    assert!(
-        iceberg_line
-            .split_once("predicate:[")
-            .is_some_and(|(_, predicate)| predicate.contains("trace_id")),
-        "{physical_plan}"
-    );
+        .and_then(|line| line.split_once("predicate:["))
+        .map_or_else(
+            || panic!("no Iceberg scan predicate for {query}:\n{physical_plan}"),
+            |(_, predicate)| predicate.to_string(),
+        )
+}
+
+/// A `traceId` filter and an `@timestamp` range over the ss4o logs index reach the Iceberg scan as
+/// predicates on the stored `trace_id` and `timestamp` columns, so the scan prunes by them as on
+/// `logs`.
+#[tokio::test]
+async fn trace_id_and_time_filters_over_ss4o_logs_reach_the_scan_as_stored_column_predicates() {
+    let (server, catalog) = TestServer::start().await;
+    seed_trace_logs(&catalog).await;
+    let time_query = format!("source={SS4O_LOGS} | where @timestamp >= '2025-10-09 08:53:21' | fields body");
+
+    let trace_predicate = read_iceberg_scan_predicate(&server, ASSOCIATED_LOGS_QUERY).await;
+    let time_predicate = read_iceberg_scan_predicate(&server, &time_query).await;
+    let time_answer = run_query(&server, &time_query).await;
+
+    assert!(trace_predicate.contains("trace_id"), "{trace_predicate}");
+    assert!(time_predicate.contains("timestamp"), "{time_predicate}");
+    assert_eq!(read_rows(&time_answer), &json!([["payment declined"], ["cart ready"]]));
     server.shutdown().await;
 }
 
@@ -433,9 +431,10 @@ async fn describe_and_a_bare_source_agree_on_the_ss4o_logs_columns() {
 }
 
 /// Over the ss4o traces and metrics indices, a bare source's columns are the top-level fields
-/// `describe` lists, in its order, but for the fields PPL cannot read.
+/// `describe` lists, in its order and with its types, but for the fields PPL cannot read. A list
+/// column (`bucketCountsList`) is an `array` in both.
 #[tokio::test]
-async fn describe_and_a_bare_source_agree_on_the_ss4o_traces_and_metrics_column_names() {
+async fn describe_and_a_bare_source_agree_on_the_ss4o_traces_and_metrics_columns() {
     let (server, catalog) = TestServer::start().await;
     seed_spans(&catalog).await;
     commit_rows(
@@ -459,21 +458,32 @@ async fn describe_and_a_bare_source_agree_on_the_ss4o_traces_and_metrics_column_
     ];
 
     for (index, unreadable_fields) in cases {
-        let described_names: Vec<String> = describe_top_level_fields(&server, index)
+        let described_columns: Vec<(String, String)> = describe_top_level_fields(&server, index)
             .await
             .into_iter()
-            .map(|(name, _)| name)
-            .filter(|name| !unreadable_fields.contains(&name.as_str()))
+            .filter(|(name, _)| !unreadable_fields.contains(&name.as_str()))
             .collect();
         let source_answer = run_query(&server, &format!("source={index} | head 1")).await;
 
         assert_eq!(read_rows(&source_answer).as_array().map(Vec::len), Some(1), "{index}");
-        assert_eq!(read_column_names(&source_answer), described_names, "{index}");
+        assert_eq!(read_schema(&source_answer), described_columns, "{index}");
     }
+    let metrics_columns = describe_top_level_fields(&server, SS4O_METRICS).await;
+    assert!(
+        metrics_columns.contains(&("bucketCountsList".to_string(), "array".to_string())),
+        "{metrics_columns:?}"
+    );
     server.shutdown().await;
 }
 
-/// Spans of two `acme` traces and a `globex` span of the first one. The root's parent is NULL.
+/// Spans of two `acme` traces and a `globex` span of the first one, durations in microseconds:
+///
+/// | tenant | trace / span | parent | kind | service | duration | status code |
+/// |---|---|---|---|---|---|---|
+/// | acme | TRACE / 01… | NULL | 2 (server) | frontend | 90 ms | 2 |
+/// | acme | TRACE / 02… | 01… | 3 (client) | checkout | 50 ms | NULL |
+/// | acme | 0c… / 03… | NULL | 1 (internal) | cart | 20 ms | 0 |
+/// | globex | TRACE / 04… | NULL | 2 (server) | frontend | 90 ms | NULL |
 async fn seed_spans(catalog: &Arc<dyn Catalog>) {
     commit_rows(
         catalog,
@@ -488,6 +498,7 @@ async fn seed_spans(catalog: &Arc<dyn Catalog>) {
                     (COL_NAME, Cell::Text("GET /checkout")),
                     (COL_KIND, Cell::Int(2)),
                     (COL_SERVICE_NAME, Cell::Text("frontend")),
+                    (COL_STATUS_CODE, Cell::Int(2)),
                 ],
             ),
             build_span_row(
@@ -511,6 +522,7 @@ async fn seed_spans(catalog: &Arc<dyn Catalog>) {
                     (COL_NAME, Cell::Text("load cart")),
                     (COL_KIND, Cell::Int(1)),
                     (COL_SERVICE_NAME, Cell::Text("cart")),
+                    (COL_STATUS_CODE, Cell::Int(0)),
                 ],
             ),
             build_span_row(
@@ -680,5 +692,146 @@ async fn a_profile_field_some_source_indices_lack_is_refused_naming_it() {
         read_rows(&shared_answer),
         &json!([[2, "cart"], [3, "checkout"], [1, "frontend"]])
     );
+    server.shutdown().await;
+}
+
+/// Filters on the encoded and derived traces fields lower through the profile's inverses and keep
+/// the rows the fields' values select: the kind by name, the status code with NULL as 0, the
+/// duration in nanoseconds, the parent id with `""` as a root's. `!=` and `not` read the values
+/// themselves. The other tenant's server span never appears.
+#[tokio::test]
+async fn ss4o_traces_filters_on_encoded_and_derived_fields_select_the_rows_their_values_do() {
+    let (server, catalog) = TestServer::start().await;
+    seed_spans(&catalog).await;
+    let cases = [
+        ("kind = 'SPAN_KIND_SERVER'", json!([["0101010101010101"]])),
+        (
+            "kind in ('SPAN_KIND_CLIENT', 'SPAN_KIND_INTERNAL')",
+            json!([["0202020202020202"], ["0303030303030303"]]),
+        ),
+        ("'SPAN_KIND_SERVER' = kind", json!([["0101010101010101"]])),
+        (
+            "not kind = 'SPAN_KIND_SERVER'",
+            json!([["0202020202020202"], ["0303030303030303"]]),
+        ),
+        ("status.code = 0", json!([["0202020202020202"], ["0303030303030303"]])),
+        ("status.code > 0", json!([["0101010101010101"]])),
+        (
+            "durationInNanos >= 50000000",
+            json!([["0101010101010101"], ["0202020202020202"]]),
+        ),
+        (
+            "durationInNanos between 20000000 and 50000000",
+            json!([["0202020202020202"], ["0303030303030303"]]),
+        ),
+        ("parentSpanId = ''", json!([["0101010101010101"], ["0303030303030303"]])),
+        ("parentSpanId = '0101010101010101'", json!([["0202020202020202"]])),
+        ("parentSpanId != ''", json!([["0202020202020202"]])),
+        (
+            "kind = 'SPAN_KIND_SERVER' or durationInNanos < 30000000",
+            json!([["0101010101010101"], ["0303030303030303"]]),
+        ),
+        (
+            "traceState is not null",
+            json!([["0101010101010101"], ["0202020202020202"], ["0303030303030303"]]),
+        ),
+    ];
+
+    for (condition, expected_rows) in cases {
+        let query = format!("source={SS4O_TRACES} | where {condition} | fields spanId | sort spanId");
+        let answer = run_query(&server, &query).await;
+
+        assert_eq!(answer.status, StatusCode::OK, "{query}: {}", answer.body);
+        assert_eq!(read_rows(&answer), &expected_rows, "{query}");
+    }
+    server.shutdown().await;
+}
+
+/// Filters on the metrics `kind` and `value` lower through the profile's inverses and keep the
+/// rows the values select.
+#[tokio::test]
+async fn ss4o_metrics_filters_on_kind_and_value_select_the_rows_their_values_do() {
+    let (server, catalog) = TestServer::start().await;
+    commit_rows(
+        &catalog,
+        METRICS_TABLE,
+        &[
+            build_metric_row(
+                TENANT,
+                "cpu.usage",
+                "gauge",
+                vec![(COL_VALUE_DOUBLE, Cell::Double(0.5))],
+            ),
+            build_metric_row(TENANT, "requests", "sum", vec![(COL_VALUE_INT, Cell::Long(7))]),
+            build_metric_row(OTHER_TENANT, "requests", "sum", vec![(COL_VALUE_INT, Cell::Long(9))]),
+        ],
+    )
+    .await
+    .expect("commit metrics");
+    let cases = [
+        ("kind = 'SUM'", json!([["requests"]])),
+        ("kind > 'GAUGE'", json!([["requests"]])),
+        ("value >= 1", json!([["requests"]])),
+        ("value = 0.5", json!([["cpu.usage"]])),
+    ];
+
+    for (condition, expected_rows) in cases {
+        let query = format!("source={SS4O_METRICS} | where {condition} | fields name | sort name");
+        let answer = run_query(&server, &query).await;
+
+        assert_eq!(answer.status, StatusCode::OK, "{query}: {}", answer.body);
+        assert_eq!(read_rows(&answer), &expected_rows, "{query}");
+    }
+    server.shutdown().await;
+}
+
+/// A filter on the span kind and one on the parent id reach the Iceberg scan as predicates on the
+/// stored `kind` and `parent_span_id` columns.
+#[tokio::test]
+async fn ss4o_traces_kind_and_parent_filters_reach_the_scan_as_stored_column_predicates() {
+    let (server, catalog) = TestServer::start().await;
+    seed_spans(&catalog).await;
+
+    let kind_predicate = read_iceberg_scan_predicate(
+        &server,
+        &format!("source={SS4O_TRACES} | where kind = 'SPAN_KIND_SERVER'"),
+    )
+    .await;
+    let parent_predicate = read_iceberg_scan_predicate(
+        &server,
+        &format!("source={SS4O_TRACES} | where parentSpanId = '0101010101010101'"),
+    )
+    .await;
+
+    assert!(kind_predicate.contains("kind"), "{kind_predicate}");
+    assert!(parent_predicate.contains("parent_span_id"), "{parent_predicate}");
+    server.shutdown().await;
+}
+
+/// A parent id that is no hex id is the refusal a malformed id literal gets over the native `spans`
+/// index, never an empty answer.
+#[tokio::test]
+async fn a_malformed_parent_span_id_over_ss4o_traces_is_refused_like_over_spans() {
+    let (server, catalog) = TestServer::start().await;
+    seed_spans(&catalog).await;
+
+    let profile_answer = run_query(&server, &format!("source={SS4O_TRACES} | where parentSpanId='xyz'")).await;
+    let native_answer = run_query(&server, "source=spans | where parent_span_id='xyz'").await;
+
+    assert_semantic_refusal_naming(&profile_answer, "xyz");
+    assert_semantic_refusal_naming(&native_answer, "xyz");
+    server.shutdown().await;
+}
+
+/// A wildcard reaching `logs` through both its native index and the ss4o logs index is refused
+/// naming the source as written, like the two names written out.
+#[tokio::test]
+async fn a_wildcard_reaching_logs_through_two_profiles_is_refused_naming_it() {
+    let (server, catalog) = TestServer::start().await;
+    seed_trace_logs(&catalog).await;
+
+    let answer = run_query(&server, "source=*logs*").await;
+
+    assert_semantic_refusal_naming(&answer, "*logs*");
     server.shutdown().await;
 }
