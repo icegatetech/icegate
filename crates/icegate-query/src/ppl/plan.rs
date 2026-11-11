@@ -49,7 +49,8 @@ use super::functions::{
     match_string_literal, parse_timestamp_literal, plan_aggregate_call,
 };
 use super::profile_source::{
-    ProfileFilter, STORED_COLUMN_PREFIX, fold_id_literal, lower_profile_filter, resolve_stored_field, scan_ss4o_index,
+    ProfileFilter, STORED_COLUMN_PREFIX, fold_id_literal, is_top_level_field, lower_profile_filter,
+    resolve_stored_field, scan_ss4o_index,
 };
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::opensearch::catalog::{
@@ -2462,15 +2463,19 @@ const fn swap_comparison(operator: CompareOperator) -> CompareOperator {
 
 /// The value the field `name` resolves to in every source index, with the first index's name, when
 /// every source index is a profile index resolving it alike and the name still reads the source's
-/// field: not a lambda parameter, and not a column an earlier command wrote. `None` otherwise, so
-/// the test reads the field as [`resolve_field`] does.
+/// field: not a lambda parameter, not a column an earlier command wrote, and not a column of the
+/// relation an earlier command removed or renamed. `None` otherwise, so the test reads the field as
+/// [`resolve_field`] does.
 fn find_profile_filter_field<'a>(name: &str, scope: &ExpressionScope<'a>) -> Option<(FieldValue, &'a str)> {
     let source = scope.source?;
     if scope.lambda_variables.iter().any(|(parameter, _)| parameter == name) || source.replaced_columns.contains(name) {
         return None;
     }
     let mut values = source.entries.iter().map(|entry| {
-        find_profile_table(entry)?;
+        let table = find_profile_table(entry)?;
+        if is_top_level_field(table, name) && scope.schema.field_with_unqualified_name(name).is_err() {
+            return None;
+        }
         source
             .session
             .resolve_field(entry, name)
@@ -2839,14 +2844,17 @@ enum SourceRead {
     StoredValue(Expr),
 }
 
-/// The value the source indices read `name` from when it is no column: on a native index the
-/// column a resource attribute was promoted to (a resource attribute ingest moved into a column, so
-/// the name differs from the column's), on an ss4o index the field of its field model
-/// ([`resolve_stored_field`]). Indices that disagree on it are refused: one PPL field cannot read a
-/// value in some indices and a MAP key or nothing in others. A promoted column an earlier command
-/// removed, renamed or replaced is refused too: the MAP never holds the attribute (ingest moved
-/// it), and a name an earlier command reassigned holds another value. No command can name a stored
-/// column, so a profile field reads it whatever the commands before did to the visible columns.
+/// The value the source indices read `name` from when it is no column of the plan: on a native
+/// index the column a resource attribute was promoted to (a resource attribute ingest moved into a
+/// column, so the name differs from the column's), on an ss4o index the field of its field model
+/// that is no column of its relation ([`resolve_stored_field`]). Indices that disagree on it are
+/// refused: one PPL field cannot read a value in some indices and a MAP key or nothing in others. A
+/// promoted column an earlier command removed, renamed or replaced is refused too: the MAP never
+/// holds the attribute (ingest moved it), and a name an earlier command reassigned holds another
+/// value. No command can name a stored column, so a profile field that is no column of the relation
+/// reads it whatever the commands before did to the visible columns. A column of the relation
+/// reads nothing here: absent from the plan, an earlier command removed or renamed it, and like a
+/// native column it is then no field.
 fn find_source_field(name: &str, scope: &ExpressionScope<'_>) -> Result<Option<Expr>, PplError> {
     let Some(source) = scope.source else {
         return Ok(None);
@@ -2858,12 +2866,12 @@ fn find_source_field(name: &str, scope: &ExpressionScope<'_>) -> Result<Option<E
         .collect::<Result<Vec<_>, PplError>>()?;
     let Some(first_read) = source_reads.first().cloned().flatten() else {
         if source_reads.iter().any(Option::is_some) {
-            return Err(build_promoted_conflict_error(name));
+            return Err(build_source_read_conflict_error(name));
         }
         return Ok(None);
     };
     if source_reads.iter().any(|read| read.as_ref() != Some(&first_read)) {
-        return Err(build_promoted_conflict_error(name));
+        return Err(build_source_read_conflict_error(name));
     }
     let column = match first_read {
         SourceRead::StoredValue(value) => return check_stored_columns(name, value, scope.schema).map(Some),
@@ -2881,14 +2889,19 @@ fn find_source_field(name: &str, scope: &ExpressionScope<'_>) -> Result<Option<E
 }
 
 /// What `entry` reads `name` from beyond its columns (see [`find_source_field`]); `None` when it
-/// reads nothing else under that name.
+/// reads nothing else under that name, a column of an ss4o index's relation included.
 ///
 /// # Errors
 ///
-/// The refusals of [`resolve_stored_field`] on an ss4o index.
+/// The refusals of [`resolve_stored_field`] on an ss4o index, a top-level field the relation does
+/// not read included.
 fn find_entry_read(session: &TenantSession, entry: &IndexEntry, name: &str) -> Result<Option<SourceRead>, PplError> {
     if let Some(table) = find_profile_table(entry) {
-        return Ok(resolve_stored_field(session, entry, table, name)?.map(SourceRead::StoredValue));
+        let stored_value = resolve_stored_field(session, entry, table, name)?;
+        if is_top_level_field(table, name) {
+            return Ok(None);
+        }
+        return Ok(stored_value.map(SourceRead::StoredValue));
     }
     Ok(match session.resolve_field(entry, name).map(|field| field.value) {
         Some(FieldValue::Column { column }) if column != name => Some(SourceRead::PromotedColumn(column)),
@@ -2922,8 +2935,9 @@ fn check_stored_columns(name: &str, value: Expr, schema: &DFSchema) -> Result<Ex
     Ok(value)
 }
 
-/// The refusal of a promoted field the source indices disagree on.
-fn build_promoted_conflict_error(name: &str) -> PplError {
+/// The refusal of a field the source indices read from different places, or only some of them
+/// read past their columns.
+fn build_source_read_conflict_error(name: &str) -> PplError {
     PplError::semantic_naming(
         name,
         format!(

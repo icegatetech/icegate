@@ -4,9 +4,10 @@
 //!
 //! Every field whose parent is no declared object is a column, aliases included, and an object is
 //! a struct of its members (`README.md`, ss4o indices, states the contract and the tests that pin
-//! it). The table's stored columns travel beside them as hidden columns, so a dotted, aliased or
-//! promoted name resolves to its stored column, and a filter on an encoded or derived field lowers
-//! through the profile's inverse to a predicate on those columns.
+//! it). The table's stored columns travel beside them as hidden columns, so a name that is no
+//! column (a dotted member, an attribute key, a promoted resource attribute) resolves to its stored
+//! column, and a filter on an encoded or derived field lowers through the profile's inverse to a
+//! predicate on those columns.
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -80,7 +81,7 @@ pub(super) fn scan_ss4o_index(
     let relation = ProfileRelation { session, entry, table };
     let mut projection = Vec::new();
     for (name, source) in table.iter_fields() {
-        if relation.is_object_member(name) {
+        if is_object_member(table, name) {
             continue;
         }
         if let Some(value) = relation.build_field_value(name, *source)? {
@@ -179,6 +180,20 @@ const fn is_read_from_row(value: &FieldValue) -> bool {
     }
 }
 
+/// Whether `name` sits under a declared object of `table`, so the object's struct carries it
+/// rather than a column of its own.
+fn is_object_member(table: &ProfileTable, name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(parent, _)| table.iter_fields().any(|(field, _)| *field == parent))
+}
+
+/// Whether `name` is a field `table` declares outside any declared object: the name of a column of
+/// the relation of [`scan_ss4o_index`] when the relation reads the field, never a name that reads
+/// the hidden stored columns past the visible ones.
+pub(super) fn is_top_level_field(table: &ProfileTable, name: &str) -> bool {
+    table.iter_fields().any(|(field, _)| *field == name) && !is_object_member(table, name)
+}
+
 /// One ss4o index and its field table, while its relation is built.
 struct ProfileRelation<'a> {
     session: &'a TenantSession,
@@ -187,13 +202,6 @@ struct ProfileRelation<'a> {
 }
 
 impl ProfileRelation<'_> {
-    /// Whether the declared field `name` sits under a declared object, so the object's struct
-    /// carries it rather than a column of its own.
-    fn is_object_member(&self, name: &str) -> bool {
-        name.rsplit_once('.')
-            .is_some_and(|(parent, _)| self.table.iter_fields().any(|(field, _)| *field == parent))
-    }
-
     /// The value of the declared field `name`, which reads `source`; `None` for a field that is
     /// not a column of the relation and for an object with no such member.
     ///

@@ -298,6 +298,76 @@ async fn ss4o_logs_dotted_and_alias_fields_resolve_in_every_command() {
     server.shutdown().await;
 }
 
+/// A 400 `FIELD_NOT_FOUND` PPL envelope whose `context` names `field`.
+fn assert_field_not_found(answer: &PplAnswer, field: &str) {
+    assert_ppl_error(
+        answer,
+        StatusCode::BAD_REQUEST,
+        "SemanticCheckException",
+        "FIELD_NOT_FOUND",
+    );
+    assert_eq!(
+        answer.body["error"]["context"],
+        json!({ "field": field }),
+        "answer {}",
+        answer.body
+    );
+}
+
+/// A column of an ss4o relation that an earlier command removed, renamed away or replaced and then
+/// removed is no field, as a native column is in the same pipeline: the same 400, never a read of
+/// the stored value under the column's name. A filter the profile's inverse would lower (the
+/// traces `kind`) is no exception.
+#[tokio::test]
+async fn a_removed_ss4o_column_is_field_not_found_like_a_removed_native_column() {
+    let (server, catalog) = TestServer::start().await;
+    seed_trace_logs(&catalog).await;
+    seed_spans(&catalog).await;
+    let cases = [
+        (
+            format!("source={SS4O_LOGS} | fields - serviceName | where serviceName='cart'"),
+            "serviceName",
+            "source=logs | fields - service_name | where service_name='cart'",
+            "service_name",
+        ),
+        (
+            format!("source={SS4O_LOGS} | rename serviceName as svc | where serviceName='cart'"),
+            "serviceName",
+            "source=logs | rename service_name as svc | where service_name='cart'",
+            "service_name",
+        ),
+        (
+            format!(
+                "source={SS4O_LOGS} | eval serviceName = upper(serviceName) | fields - serviceName | where serviceName='cart'"
+            ),
+            "serviceName",
+            "source=logs | eval service_name = upper(service_name) | fields - service_name | where service_name='cart'",
+            "service_name",
+        ),
+        (
+            format!("source={SS4O_LOGS} | fields - body | fields body"),
+            "body",
+            "source=logs | fields - body | fields body",
+            "body",
+        ),
+        (
+            format!("source={SS4O_TRACES} | fields - kind | where kind='SPAN_KIND_SERVER'"),
+            "kind",
+            "source=spans | fields - kind | where kind=2",
+            "kind",
+        ),
+    ];
+
+    for (profile_query, profile_field, native_query, native_field) in cases {
+        let profile_answer = run_query(&server, &profile_query).await;
+        let native_answer = run_query(&server, native_query).await;
+
+        assert_field_not_found(&native_answer, native_field);
+        assert_field_not_found(&profile_answer, profile_field);
+    }
+    server.shutdown().await;
+}
+
 /// The Logs explorer's histogram counts the logs per minute of `@timestamp`.
 #[tokio::test]
 async fn ss4o_logs_time_series_answers_like_the_logs_explorer_histogram() {

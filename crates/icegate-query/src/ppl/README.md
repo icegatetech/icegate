@@ -119,7 +119,10 @@ the relation from that table and declares no field of its own.
   that takes a field, after the columns of that exact name; a `fields` that lists one keeps it as
   a column named by its path. Such a name reads the table's stored columns, which travel with the
   rows as hidden columns, so it holds the stored value whatever an earlier command did to the
-  visible columns (`fields - severity | where severity.text = 'ERROR'` filters). A string literal
+  visible columns (`fields - severity | where severity.text = 'ERROR'` filters). A column of the
+  relation is no such name: once a command removed it or renamed it away, it is no field, the
+  400 `FIELD_NOT_FOUND` of a native column in the same pipeline
+  (`a_removed_ss4o_column_is_field_not_found_like_a_removed_native_column`). A string literal
   compared with `traceId` or `spanId` is an id literal (see [Id literals](#id-literals)), a
   malformed one included.
 - **Filters.** A filter on a field that reads its column as stored (an id, a time, a plain value,
