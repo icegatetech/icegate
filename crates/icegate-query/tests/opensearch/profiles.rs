@@ -1303,7 +1303,7 @@ fn read_sorted_source_texts(answer: &Value, field: &str) -> Result<Vec<String>, 
 }
 
 /// A log row of `tenant` at `micros`, observed 5 µs and ingested 10 µs later, plus `cells`.
-fn build_log_row<'a>(
+pub(super) fn build_log_row<'a>(
     tenant: &'a str,
     micros: i64,
     body: &'a str,
@@ -1325,7 +1325,7 @@ fn build_log_row<'a>(
 }
 
 /// A metrics row at `T0`: the required columns plus `cells`.
-fn build_metric_row<'a>(
+pub(super) fn build_metric_row<'a>(
     tenant: &'a str,
     name: &'a str,
     metric_type: &'a str,

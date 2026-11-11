@@ -26,9 +26,9 @@ use super::harness::{PplReply, ServerOptions, TestServer};
 use super::search::NearlyFullMemory;
 use super::test_rows::TEMPERATURE;
 
-const TENANT: &str = "acme";
+pub(super) const TENANT: &str = "acme";
 
-const OTHER_TENANT: &str = "globex";
+pub(super) const OTHER_TENANT: &str = "globex";
 
 const PPL_PATH: &str = "/_plugins/_ppl";
 
@@ -112,10 +112,10 @@ const fn build_test_operation_row(tenant: &str, timestamp_micros: i64, temperatu
 
 /// A PPL answer: status, content type and body. Every PPL body is JSON, whatever its content
 /// type says.
-struct PplAnswer {
-    status: StatusCode,
-    content_type: String,
-    body: Value,
+pub(super) struct PplAnswer {
+    pub(super) status: StatusCode,
+    pub(super) content_type: String,
+    pub(super) body: Value,
 }
 
 /// `reply` with its body parsed.
@@ -127,22 +127,22 @@ fn read_answer(reply: PplReply) -> PplAnswer {
     }
 }
 
-async fn post_ppl(server: &TestServer, tenant: &str, path_and_query: &str, body: &Value) -> PplAnswer {
+pub(super) async fn post_ppl(server: &TestServer, tenant: &str, path_and_query: &str, body: &Value) -> PplAnswer {
     read_answer(server.post_ppl(tenant, path_and_query, body).await)
 }
 
-async fn run_query(server: &TestServer, query: &str) -> PplAnswer {
+pub(super) async fn run_query(server: &TestServer, query: &str) -> PplAnswer {
     post_ppl(server, TENANT, PPL_PATH, &json!({"query": query})).await
 }
 
 /// The datarows of an answer that must be a 200.
-fn read_rows(answer: &PplAnswer) -> &Value {
+pub(super) fn read_rows(answer: &PplAnswer) -> &Value {
     assert_eq!(answer.status, StatusCode::OK, "answer {}", answer.body);
     &answer.body["datarows"]
 }
 
 /// The column names of an answer's `schema`, in order.
-fn read_column_names(answer: &PplAnswer) -> Vec<String> {
+pub(super) fn read_column_names(answer: &PplAnswer) -> Vec<String> {
     answer.body["schema"]
         .as_array()
         .expect("schema")
@@ -153,7 +153,7 @@ fn read_column_names(answer: &PplAnswer) -> Vec<String> {
 
 /// A PPL error envelope with `status`, `type` and `code`, labelled as JSON, with a non-empty
 /// `reason` and `details`.
-fn assert_ppl_error(answer: &PplAnswer, status: StatusCode, error_type: &str, code: &str) {
+pub(super) fn assert_ppl_error(answer: &PplAnswer, status: StatusCode, error_type: &str, code: &str) {
     assert_eq!(answer.status, status, "answer {}", answer.body);
     assert_eq!(answer.content_type, PPL_ERROR_CONTENT_TYPE);
     assert_eq!(answer.body["status"], json!(status.as_u16()));
@@ -166,7 +166,7 @@ fn assert_ppl_error(answer: &PplAnswer, status: StatusCode, error_type: &str, co
 
 /// A 400 `SEMANTIC_ERROR` PPL envelope whose `context` names `name`, what the refusal is about.
 /// Its reason is IceGate's own wording and is not read.
-fn assert_semantic_refusal_naming(answer: &PplAnswer, name: &str) {
+pub(super) fn assert_semantic_refusal_naming(answer: &PplAnswer, name: &str) {
     assert_ppl_error(
         answer,
         StatusCode::BAD_REQUEST,

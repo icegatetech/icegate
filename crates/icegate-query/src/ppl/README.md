@@ -71,14 +71,67 @@ states the exact rules.
 `search source=<indices>`, `source=<indices>` and `index=<indices>` are the same source. The
 index list is an index expression: comma-separated names, `*` wildcards and `-` exclusions,
 resolved like the `_search` path with `ignore_unavailable=false`, `allow_no_indices=false` and
-open, non-hidden indices. A name that matches nothing is a 404 `INDEX_NOT_FOUND`; names are
-case-sensitive. A source on system indices is a 400, and so is a source on an index served under
-a non-native profile (the span index `otel-v1-apm-span-000001`, aliased `otel-v1-apm-span`): PPL
-reads stored columns, and such a profile renames, encodes and derives fields. A wildcard that
-reaches one table through two indices without naming each (`*` reaches `spans` and
-`otel-v1-apm-span-000001`) is a 400 as on `_search`, so no row is read twice. `describe <index>`
-lists an index's fields and reads no rows, so its rules differ: see [`describe`](#describe).
+open, non-hidden indices. A name that matches nothing is a 404 `INDEX_NOT_FOUND`. A wildcard part
+that matches nothing is skipped while another part matches, so only an expression that matches
+nothing as a whole is that 404: OSD's associated-logs source
+`ss4o_logs-*,opensearch_dashboards_sample_data_otel_logs*` reads the ss4o logs index. The
+OpenSearch SQL plugin (3.3.0.0) resolves a source the same way: it reads mappings and rows with
+the default index options (`allow_no_indices=true`, `ignore_unavailable=false`) and refuses an
+expression only when its mappings come back empty (`OpenSearchNodeClient.getIndexMappings`).
+Names are case-sensitive.
+
+A source on system indices is a 400, and so is a source on the Data Prepper span index
+(`otel-v1-apm-span-000001`, aliased `otel-v1-apm-span`): its cross-row fields read other rows,
+which no PPL projection of one row can. A wildcard that reaches one table through two indices
+without naming each (`*` reaches `spans` and `otel-v1-apm-span-000001`) is a 400 as on
+`_search`, so no row is read twice. A source that reaches one table through two profiles in any
+way, names written out included (`logs,ss4o_logs-icegate-default`), is a 400 `SEMANTIC_ERROR`
+naming the source as written: the two field models do not union (binary `trace_id` against hex
+`traceId`). `_search` reads such a named pair; PPL does not. `describe <index>` lists an index's
+fields and reads no rows, so its rules differ: see [`describe`](#describe).
 `source=[ <subsearch> ] [as t]` reads a subsearch's output: see [Subsearches](#subsearches).
+
+### ss4o indices
+
+The ss4o indices (`ss4o_logs-icegate-default`, `ss4o_traces-icegate-default`,
+`ss4o_metrics-icegate-default`) read as relations of their profile's field model: the field table
+in `opensearch/catalog/ss4o.rs` that `_search` and `describe` read. `profile_source.rs` builds
+the relation from that table and declares no field of its own.
+
+- **Columns.** Every field whose parent is no declared object is a column, in the profile's
+  declared order (the order `describe` lists), aliases included: `time`, `@message` and
+  `observerTime` read their targets. An object (`severity`, `resource`, `status`) is a `struct` of
+  its members, NULL when every member is; an attribute object is its MAP. This is the shape the
+  OpenSearch SQL plugin (3.3.0.0) gives a bare source over a mapping. Every mapped field, aliases
+  included, is a column of its row type (`OpenSearchIndex.getFieldTypes`; an alias from
+  `OpenSearchDataType.parseMapping`, read through its path by `CalciteEnumerableIndexScan`), and
+  the output drops a dotted field whose parent is also a field
+  (`CalciteRelNodeVisitor.tryToRemoveNestedFields`; `SymbolTable.lookupAllFields` in the v2 engine).
+- **Values** are those `_source` shows: ids as lowercase hex, times as timestamps, enumerations
+  by name (`kind`, `aggregationTemporality`), derived fields computed (`durationInNanos`, `value`,
+  the list lengths). An id whose stored column admits NULL (`parentSpanId`) reads as hex text, `""`
+  for NULL, as `_source` shows a root span's parent.
+- **Names.** A dotted member (`severity.text`, `status.code`), an object below another
+  (`resource.attributes`), an attribute key (`attributes.http.method`) or a promoted resource
+  attribute (`resource.attributes.service.name`, stored in `service_name`) resolves in every command
+  that takes a field, after the columns of that exact name, as the plugin's flattened fields do; a
+  `fields` that lists one keeps it as a column named by its path. Such a name reads the table's
+  stored columns, which travel with the rows as hidden columns, so it holds the stored value
+  whatever an earlier command did to the visible columns (`fields - severity | where
+  severity.text = 'ERROR'` filters). A filter on a profile field reaches the scan as a predicate
+  over its stored column, so one on a field that reads its column as stored (an id, a time, a
+  plain value, an attribute key) prunes the scan as on a native index. A string literal compared with
+  `traceId` or `spanId` is an id literal (see [Id literals](#id-literals)), a malformed one
+  included.
+- **Fields PPL cannot read.** A field `_source` reshapes from a whole list of the row (the span
+  `events` and `links`; the metrics `positiveBuckets`, `negativeBuckets`, `quantiles` and
+  `exemplar`) is no column, and naming it, or a path below it, is a 400 `SEMANTIC_ERROR` naming it.
+- **Several source indices.** A profile field that some source indices declare and others do not
+  (`severity.text` over `ss4o_logs-*,ss4o_traces-*`) is a 400 `SEMANTIC_ERROR` naming it: its
+  expression is the declaring profile's, and reading another index's rows through it could answer
+  a value that index never stored. The relations' columns union as any columns do.
+
+Every other contract of this README holds over these relations as over a native index.
 
 ## Commands
 
@@ -101,15 +154,17 @@ lists an index's fields and reads no rows, so its rules differ: see [`describe`]
 | `eventstats …`, `streamstats …` | See [Window commands](#window-commands). |
 | `append [ <search> \| <commands> ]` | See [`append`](#append). |
 
-The output columns of a source are the table's columns in table order. A field reference is
+The output columns of a source are the table's columns in table order, or for an ss4o index its
+profile's columns (see [ss4o indices](#ss4o-indices)). A field reference is
 resolved against the columns of the pipeline at that point, case-sensitively; a name that
 matches none is a 400 `FIELD_NOT_FOUND`, except for the promoted resource attributes below.
 
 ## Fields and types
 
 A field reference resolves, in this order, to a lambda parameter in scope, the column of that
-exact name, a resource attribute the source's profile promotes to a column, or a key of a MAP
-column written `<column>.<key>` (the key may itself contain dots; an absent key is NULL).
+exact name, a resource attribute the source's profile promotes to a column or a field of an ss4o
+source's field model (see [ss4o indices](#ss4o-indices)), or a key of a MAP column written
+`<column>.<key>` (the key may itself contain dots; an absent key is NULL).
 A field name that starts with `RESERVED_NAME_PREFIX` of `plan.rs`, the prefix of the plans' own
 columns, is a 400 `SEMANTIC_ERROR` naming it wherever the query writes it: a reference, a
 `fields` pattern, an `eval` or `rename` target, an alias, `timefield` or `countfield`.
@@ -312,8 +367,10 @@ it is typed `int`.
 One row per field of the index's field model, in the order `_mapping` lists them: schema column order,
 each MAP column followed by its keys in byte order. A key containing dots is one row
 (`log_attributes.http.method`). An index served under a non-native profile (`otel-v1-apm-span-000001`) lists
-the profile's fields in the profile's declared order. `describe` reads no rows, so it answers for such
-an index although the index cannot be a PPL source (see [Sources](#sources)). Per row: `TABLE_CAT` is `opensearch.cluster_name`; `TABLE_NAME` is the
+the profile's fields in the profile's declared order. `describe` reads no rows, so it answers for the Data
+Prepper span index although that index cannot be a PPL source (see [Sources](#sources)); over an ss4o index,
+its rows without a dot, but for the fields PPL cannot read, name the columns of a bare source, in the same
+order (see [ss4o indices](#ss4o-indices)). Per row: `TABLE_CAT` is `opensearch.cluster_name`; `TABLE_NAME` is the
 index as written; `COLUMN_NAME` the field name; `TYPE_NAME` is `string` for `text` and `keyword`,
 `timestamp` for `date`, `int`, `bigint`, `double`, `boolean`, and `struct` for objects; `NUM_PREC_RADIX`
 10; `NULLABLE` 2; `ORDINAL_POSITION` the 0-based row number; `IS_NULLABLE` and `IS_GENERATEDCOLUMN`

@@ -10,6 +10,7 @@ mod build;
 mod error;
 mod functions;
 mod plan;
+mod profile_source;
 
 pub(crate) use build::parse_ppl;
 pub(crate) use error::PplError;

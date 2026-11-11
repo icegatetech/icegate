@@ -171,8 +171,8 @@ impl From<OpenSearchError> for PplError {
             | OpenSearchErrorKind::SearchContextMissing
             | OpenSearchErrorKind::ResultWindowTooLarge
             | OpenSearchErrorKind::TooManyBuckets
-            // No PPL source reaches a cross-row field (a PPL source on a non-native profile is
-            // refused), so a PPL query never raises it.
+            // No PPL source reaches a cross-row field (a PPL source on the Data Prepper profile,
+            // the one that declares them, is refused), so a PPL query never raises it.
             | OpenSearchErrorKind::TooManyCrossRowTraces
             | OpenSearchErrorKind::StatusNotFound => Self::Internal {
                 reason: error.reason().to_string(),

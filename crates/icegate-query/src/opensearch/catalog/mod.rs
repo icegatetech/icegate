@@ -49,8 +49,9 @@ pub(crate) use self::cross_row::{
 use self::data_prepper::DATA_PREPPER_TABLE;
 pub(crate) use self::data_prepper::{DATA_PREPPER_SPAN_INDEX, SPAN_END_TIME_FIELD, TRACE_ID_FIELD};
 pub(crate) use self::encoding::{
-    EncodedField, ProfileTable, lower_derived_exists, lower_derived_range, lower_derived_term, lower_encoded_exists,
-    lower_encoded_range, lower_encoded_term, render_derived_value, render_profile_document, render_profile_field,
+    EncodedField, ProfileFieldSource, ProfileTable, lower_derived_exists, lower_derived_range, lower_derived_term,
+    lower_encoded_exists, lower_encoded_range, lower_encoded_term, render_derived_value, render_profile_document,
+    render_profile_field,
 };
 use self::encoding::{is_nullable_encoded_id, list_profile_fields, resolve_profile_field};
 use self::expression::ExpressionPart;

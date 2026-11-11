@@ -1498,7 +1498,7 @@ pub(crate) struct ProfileTable {
 
 impl ProfileTable {
     /// Every declared field, in order.
-    fn iter_fields(&self) -> impl Iterator<Item = &(&'static str, ProfileFieldSource)> {
+    pub(crate) fn iter_fields(&self) -> impl Iterator<Item = &(&'static str, ProfileFieldSource)> {
         self.fields.iter().flat_map(|segment| segment.iter())
     }
 

@@ -48,10 +48,11 @@ use super::functions::{
     FunctionContext, PlannedAggregate, is_higher_order_function, lower_arithmetic, lower_cast, lower_function_call,
     match_string_literal, parse_timestamp_literal, plan_aggregate_call,
 };
+use super::profile_source::{STORED_COLUMN_PREFIX, resolve_stored_field, scan_ss4o_index};
 use crate::engine::fixed_binary::decode_fixed_binary_literal;
 use crate::opensearch::catalog::{
     FieldListing, FieldType, FieldValue, IndexEntry, IndexExpression, IndexField, IndexOptions, IndexTarget, Profile,
-    TenantSession,
+    TenantSession, find_profile_table,
 };
 use crate::opensearch::context::RequestContext;
 use crate::opensearch::extract::ExpandWildcards;
@@ -216,8 +217,9 @@ struct Planning<'a> {
 ///
 /// The source resolves through the session's index catalog, case-sensitively, with the tenant
 /// scope of every scan; `tenant_id` is never a column of the output, and decimal columns read as
-/// doubles. Field references are case-sensitive. `where` follows SQL three-valued logic. A leaf
-/// `fields` keeps only the listed columns, so the scan reads only those. `now()` and the other
+/// doubles. An ss4o index reads as the relation of its profile's fields ([`scan_ss4o_index`]).
+/// Field references are case-sensitive. `where` follows SQL three-valued logic. A leaf `fields`
+/// keeps only the listed columns, so the scan reads only those. `now()` and the other
 /// request-time functions read `context.now`. `cluster_name` fills the `TABLE_CAT` column of
 /// `describe`.
 ///
@@ -226,10 +228,11 @@ struct Planning<'a> {
 /// Returns [`PplError::IndexNotFound`] for a source that names no index,
 /// [`PplError::FieldNotFound`] for a reference to no column, [`PplError::UnsupportedFunction`]
 /// for a function outside the library, and [`PplError::Semantic`] for a source on system
-/// indices, a field typed differently across the source indices, an expression whose types do
-/// not fit, a subsearch of `in` returning other than one column, an `in [ … ]` outside a
-/// top-level `and` conjunct of `where`, or a column both sides of an `append` have with different
-/// types.
+/// indices or on the Data Prepper span index, a source reaching one table through two profiles,
+/// a profile field PPL cannot read, a field typed differently across the source indices, an
+/// expression whose types do not fit, a subsearch of `in` returning other than one column, an
+/// `in [ … ]` outside a top-level `and` conjunct of `where`, or a column both sides of an
+/// `append` have with different types.
 pub(crate) async fn plan_ppl(
     query: &PplQuery,
     session: &TenantSession,
@@ -289,12 +292,14 @@ async fn plan_pipeline<'a>(query: &'a PplQuery, planning: Planning<'a>) -> Resul
 /// columns first appear; a column an index lacks is NULL in its rows. Column types are compared by
 /// structure: the names and metadata of nested fields are each table's own (every table numbers
 /// its Iceberg field ids independently), so they never make two types differ. A column typed
-/// differently across the indices is refused, because no single PPL type could describe it.
+/// differently across the indices is refused, because no single PPL type could describe it, and
+/// so is a table the indices reach through two profiles (see [`check_single_profile_per_table`]).
 async fn plan_index_source<'session>(
     expression: &str,
     session: &'session TenantSession,
 ) -> Result<Pipeline<'session>, PplError> {
     let entries = resolve_data_entries(expression, session).await?;
+    check_single_profile_per_table(expression, &entries)?;
     let mut branches = Vec::with_capacity(entries.len());
     for entry in &entries {
         branches.push((entry.name(), scan_entry(session, entry)?));
@@ -339,26 +344,59 @@ async fn resolve_data_entries<'session>(
     }
 }
 
-/// The columns of one index (see [`project_source_columns`]).
+/// Refuses `entries` when they reach one table through more than one profile (`logs` and
+/// `ss4o_logs-icegate-default`): the profiles' field models name and type the same values
+/// differently (binary `trace_id` against hex `traceId`), so their rows do not union.
 ///
 /// # Errors
 ///
-/// A semantic 400 naming the index and its profile for an index served under a non-native
-/// profile: PPL reads stored columns, and a profile that renames, encodes or derives fields has
-/// no PPL projection.
+/// A semantic 400 naming `expression` as written.
+fn check_single_profile_per_table(expression: &str, entries: &[&IndexEntry]) -> Result<(), PplError> {
+    let Some((first, second)) = entries.iter().enumerate().find_map(|(position, entry)| {
+        entries[..position]
+            .iter()
+            .find(|earlier| earlier.table() == entry.table() && earlier.profile() != entry.profile())
+            .map(|earlier| (*earlier, *entry))
+    }) else {
+        return Ok(());
+    };
+    Err(PplError::semantic_naming(
+        expression,
+        format!(
+            "[{}] and [{}] read the table [{}] under different field models, whose rows do not union; \
+             read one of them",
+            first.name(),
+            second.name(),
+            first.table()
+        ),
+    ))
+}
+
+/// The columns of one index: a native index's stored columns ([`project_source_columns`]), an
+/// ss4o index's profile fields ([`scan_ss4o_index`]).
+///
+/// # Errors
+///
+/// A semantic 400 naming the index and its profile for an index served under the Data Prepper
+/// profile: its cross-row fields read other rows, which no PPL projection of one row can. An
+/// internal error for an ss4o index over a table the ss4o profile declares no fields for.
 fn scan_entry(session: &TenantSession, entry: &IndexEntry) -> Result<LogicalPlanBuilder, PplError> {
     let profile = entry.profile();
-    if profile != Profile::Native {
-        return Err(PplError::Semantic {
+    match (profile, find_profile_table(entry)) {
+        (Profile::Native, _) => project_source_columns(session.scan_index(entry)?),
+        (Profile::Ss4o, Some(table)) => scan_ss4o_index(session, entry, table),
+        (Profile::Ss4o, None) => Err(PplError::Internal {
+            reason: format!("the ss4o index [{}] has no field table", entry.name()),
+        }),
+        (Profile::DataPrepper, _) => Err(PplError::Semantic {
             reason: format!(
-                "PPL reads native indices only; [{}] is served under the {} profile",
+                "PPL reads native and ss4o indices only; [{}] is served under the {} profile",
                 entry.name(),
                 profile.name()
             ),
             name: None,
-        });
+        }),
     }
-    project_source_columns(session.scan_index(entry)?)
 }
 
 /// The columns of a scan without `tenant_id`, in the table's schema order. Decimal columns are
@@ -719,7 +757,8 @@ const fn build_aggregated_pipeline<'session>(builder: LogicalPlanBuilder) -> Pip
 /// a name with one of them.
 pub(super) const RESERVED_NAME_PREFIX: &str = "__ppl_";
 
-/// The prefix of the hidden columns, within [`RESERVED_NAME_PREFIX`]. They carry the row order:
+/// The prefix of the order columns, the hidden columns ([`is_hidden_column`]) within
+/// [`RESERVED_NAME_PREFIX`] that carry the row order:
 /// the values of sort keys whose columns a later command removed or replaced, the row ordinal of a
 /// window command or an `append` ([`ROW_ORDINAL_COLUMN`]), and the side of an `append`
 /// ([`APPEND_BRANCH_COLUMN`]). They travel with the rows through every command up to an
@@ -745,10 +784,21 @@ const APPEND_BRANCH_COLUMN: &str = "__ppl_order_branch";
 /// [`ROW_ORDINAL_COLUMN`]: the window's input may still hold an earlier ordinal under that name.
 const ROW_NUMBER_COLUMN: &str = "__ppl_row_number";
 
-/// Whether `name` is a hidden column, which no client ever sees: a sort-key order column, the row
-/// ordinal or the side of an `append`. The name alone tells, because no field of a query
-/// starts with [`RESERVED_NAME_PREFIX`].
+/// Whether `name` is a hidden column, which no client ever sees: an order column
+/// ([`is_order_column`]) or a stored column of a profile source ([`STORED_COLUMN_PREFIX`]). The
+/// name alone tells, because no field of a query starts with [`RESERVED_NAME_PREFIX`].
+///
+/// A stored column carries a profile field's stored value, which a dotted, aliased or promoted
+/// name of that profile resolves to (see [`resolve_field`]). It travels with the rows like an order
+/// column, but no window command or `append` replaces it: it stays while the pipeline carries the
+/// source's rows, up to an aggregation, a `join`, an `append` or [`finish_plan`].
 fn is_hidden_column(name: &str) -> bool {
+    is_order_column(name) || name.starts_with(STORED_COLUMN_PREFIX)
+}
+
+/// Whether `name` is a hidden column that carries the row order: a sort-key order column, the row
+/// ordinal or the side of an `append`.
+fn is_order_column(name: &str) -> bool {
     name.starts_with(ORDER_COLUMN_PREFIX)
 }
 
@@ -770,8 +820,9 @@ fn list_visible_columns(schema: &DFSchema) -> Vec<Expr> {
 }
 
 /// Numbers the rows of `builder` into [`ROW_ORDINAL_COLUMN`] in their incoming `sort_keys` and drops every
-/// hidden column of `builder` (the order columns and an earlier ordinal) once the window has read them, so
-/// the output carries exactly one ordinal and no other hidden column.
+/// order column of `builder` (the hidden sort keys and an earlier ordinal) once the window has read them, so
+/// the output carries exactly one ordinal and no other order column; the stored columns of a profile source
+/// stay ([`is_hidden_column`]).
 ///
 /// The sort keys are written into the numbering window as its `ORDER BY`, so the numbers follow them however
 /// the rows below the window are partitioned or re-sorted; nothing relies on a sort beneath the window
@@ -784,7 +835,10 @@ fn number_incoming_rows(builder: LogicalPlanBuilder, sort_keys: &[SortExpr]) -> 
         .window_frame(WindowFrame::new(Some(true)))
         .build()?
         .alias(ROW_NUMBER_COLUMN);
-    let mut projection = list_visible_columns(builder.schema());
+    let mut projection: Vec<Expr> = list_columns(builder.schema())
+        .into_iter()
+        .filter(|column| !matches!(column, Expr::Column(column) if is_order_column(&column.name)))
+        .collect();
     projection.push(ident(ROW_NUMBER_COLUMN).alias(ROW_ORDINAL_COLUMN));
     Ok(builder.window(vec![ordinal])?.project(projection)?)
 }
@@ -2599,8 +2653,9 @@ fn lower_literal(literal: &PplLiteral) -> Expr {
 }
 
 /// The expression a field reference names, in this order: a lambda parameter in scope; the
-/// column of that exact name; a resource attribute the source indices promote to a column; a
-/// key of a MAP column, `<column>.<key>`, where the key may contain dots and an absent key is
+/// column of that exact name; a resource attribute the source indices promote to a column, or a
+/// field of a profile source's field model read from its stored columns ([`find_source_field`]);
+/// a key of a MAP column, `<column>.<key>`, where the key may contain dots and an absent key is
 /// NULL. Names are case-sensitive.
 fn resolve_field(name: &str, scope: &ExpressionScope<'_>) -> Result<Expr, PplError> {
     if let Some((parameter, field)) = scope.lambda_variables.iter().rev().find(|(parameter, _)| parameter == name) {
@@ -2612,8 +2667,8 @@ fn resolve_field(name: &str, scope: &ExpressionScope<'_>) -> Result<Expr, PplErr
     if scope.schema.field_with_unqualified_name(name).is_ok() {
         return Ok(ident(name));
     }
-    if let Some(column) = find_promoted_column(name, scope)? {
-        return Ok(ident(column));
+    if let Some(value) = find_source_field(name, scope)? {
+        return Ok(value);
     }
     for (separator, _) in name.match_indices('.') {
         let (column, key) = (&name[..separator], &name[separator + 1..]);
@@ -2630,63 +2685,105 @@ fn resolve_field(name: &str, scope: &ExpressionScope<'_>) -> Result<Expr, PplErr
     })
 }
 
-/// The column the source indices read `name` from when their profile promotes it (a resource
-/// attribute ingest moved into a column, so the name differs from the column's). Indices that
-/// disagree on it are refused: one PPL field cannot read a column in some indices and a MAP key
-/// in others. A promoted column an earlier command removed, renamed or replaced is refused too:
-/// the MAP never holds the attribute (ingest moved it), and a name an earlier command reassigned
-/// holds another value.
-fn find_promoted_column(name: &str, scope: &ExpressionScope<'_>) -> Result<Option<String>, PplError> {
+/// What one source index reads a field name from, beyond its columns of that exact name.
+#[derive(Debug, Clone, PartialEq)]
+enum SourceRead {
+    /// A native index's column a resource attribute was promoted to.
+    PromotedColumn(String),
+    /// A profile field, as an expression over the hidden stored columns of its source.
+    StoredValue(Expr),
+}
+
+/// The value the source indices read `name` from when it is no column: on a native index the
+/// column a resource attribute was promoted to (a resource attribute ingest moved into a column, so
+/// the name differs from the column's), on an ss4o index the field of its field model
+/// ([`resolve_stored_field`]). Indices that disagree on it are refused: one PPL field cannot read a
+/// value in some indices and a MAP key or nothing in others. A promoted column an earlier command
+/// removed, renamed or replaced is refused too: the MAP never holds the attribute (ingest moved
+/// it), and a name an earlier command reassigned holds another value. No command can name a stored
+/// column, so a profile field reads it whatever the commands before did to the visible columns.
+fn find_source_field(name: &str, scope: &ExpressionScope<'_>) -> Result<Option<Expr>, PplError> {
     let Some(source) = scope.source else {
         return Ok(None);
     };
-    let promoted_columns: Vec<Option<String>> = source
+    let source_reads = source
         .entries
         .iter()
-        .map(
-            |entry| match source.session.resolve_field(entry, name).map(|field| field.value) {
-                Some(FieldValue::Column { column }) if column != name => Some(column),
-                // A native index, the only one PPL reads, resolves no encoded or cross-row field,
-                // and its one derived field, the metrics `value`, is no promoted column.
-                Some(
-                    FieldValue::Column { .. }
-                    | FieldValue::MapKey { .. }
-                    | FieldValue::HexId { .. }
-                    | FieldValue::Encoded(_)
-                    | FieldValue::Derived(_)
-                    | FieldValue::CrossRow(_),
-                )
-                | None => None,
-            },
-        )
-        .collect();
-    let Some(first_column) = promoted_columns.first().cloned().flatten() else {
-        if promoted_columns.iter().any(Option::is_some) {
+        .map(|entry| find_entry_read(source.session, entry, name))
+        .collect::<Result<Vec<_>, PplError>>()?;
+    let Some(first_read) = source_reads.first().cloned().flatten() else {
+        if source_reads.iter().any(Option::is_some) {
             return Err(build_promoted_conflict_error(name));
         }
         return Ok(None);
     };
-    if promoted_columns.iter().any(|column| column.as_ref() != Some(&first_column)) {
+    if source_reads.iter().any(|read| read.as_ref() != Some(&first_read)) {
         return Err(build_promoted_conflict_error(name));
     }
-    if scope.schema.field_with_unqualified_name(&first_column).is_err()
-        || source.replaced_columns.contains(&first_column)
-    {
+    let column = match first_read {
+        SourceRead::StoredValue(value) => return check_stored_columns(name, value, scope.schema).map(Some),
+        SourceRead::PromotedColumn(column) => column,
+    };
+    if scope.schema.field_with_unqualified_name(&column).is_err() || source.replaced_columns.contains(&column) {
         return Err(PplError::semantic_naming(
             name,
             format!(
-                "field [{name}] reads the column [{first_column}], which an earlier command removed, renamed or replaced"
+                "field [{name}] reads the column [{column}], which an earlier command removed, renamed or replaced"
             ),
         ));
     }
-    Ok(Some(first_column))
+    Ok(Some(ident(column)))
+}
+
+/// What `entry` reads `name` from beyond its columns (see [`find_source_field`]); `None` when it
+/// reads nothing else under that name.
+///
+/// # Errors
+///
+/// The refusals of [`resolve_stored_field`] on an ss4o index.
+fn find_entry_read(session: &TenantSession, entry: &IndexEntry, name: &str) -> Result<Option<SourceRead>, PplError> {
+    if let Some(table) = find_profile_table(entry) {
+        return Ok(resolve_stored_field(session, entry, table, name)?.map(SourceRead::StoredValue));
+    }
+    Ok(match session.resolve_field(entry, name).map(|field| field.value) {
+        Some(FieldValue::Column { column }) if column != name => Some(SourceRead::PromotedColumn(column)),
+        // A native index resolves no encoded or cross-row field, and its one derived field, the
+        // metrics `value`, is no promoted column.
+        Some(
+            FieldValue::Column { .. }
+            | FieldValue::MapKey { .. }
+            | FieldValue::HexId { .. }
+            | FieldValue::Encoded(_)
+            | FieldValue::Derived(_)
+            | FieldValue::CrossRow(_),
+        )
+        | None => None,
+    })
+}
+
+/// `value` when every stored column it reads is still a column of `schema`. A command that ends
+/// the source binding drops the stored columns with it, so a missing one is a planner fault.
+fn check_stored_columns(name: &str, value: Expr, schema: &DFSchema) -> Result<Expr, PplError> {
+    let lost_column = value
+        .column_refs()
+        .into_iter()
+        .find(|column| schema.field_with_unqualified_name(&column.name).is_err())
+        .map(|column| column.name.clone());
+    if let Some(column) = lost_column {
+        return Err(PplError::Internal {
+            reason: format!("field [{name}] reads the stored column [{column}], which the plan lost"),
+        });
+    }
+    Ok(value)
 }
 
 /// The refusal of a promoted field the source indices disagree on.
 fn build_promoted_conflict_error(name: &str) -> PplError {
     PplError::semantic_naming(
         name,
-        format!("field [{name}] reads a column in some source indices and not in others"),
+        format!(
+            "field [{name}] reads a column or a profile field in some source indices and not in others, or reads it differently"
+        ),
     )
 }
 
@@ -2934,7 +3031,8 @@ const DESCRIBE_NULLABLE: i32 = 2;
 /// Plans `describe <index>`: one row per field of the index's field model, in field-model order
 /// (schema column order, each MAP column followed by its keys in byte order, keys never split).
 /// An index served under a non-native profile lists the profile's fields in the profile's
-/// declared order; it answers although it cannot be a PPL source, since `describe` reads no rows.
+/// declared order; the Data Prepper span index answers although it cannot be a PPL source, since
+/// `describe` reads no rows.
 ///
 /// The rows are no index's columns, so the pipeline carries no source binding and no order.
 ///

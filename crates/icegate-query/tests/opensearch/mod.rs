@@ -18,6 +18,7 @@ mod ppl;
 mod ppl_clients;
 mod ppl_endpoints;
 mod ppl_formats;
+mod ppl_ss4o;
 mod ppl_trust_delta;
 mod profiles;
 mod requests;
