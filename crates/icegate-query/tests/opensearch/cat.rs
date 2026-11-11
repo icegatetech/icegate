@@ -9,7 +9,7 @@ use icegate_common::{ICEGATE_NAMESPACE, schema};
 use reqwest::Method;
 use serde_json::{Value, json};
 
-use super::data::{LogRow, commit_log_rows};
+use super::data::{LogRow, PriceRow, RowWriteError, commit_log_rows, commit_price_rows};
 use super::harness::TestServer;
 
 /// The tenant every request names unless a test states its own.
@@ -375,6 +375,163 @@ async fn cat_indices_with_a_trailing_slash_lists_the_same_rows_in_the_default_co
             "store.size": "0b", "pri.store.size": "0b"
         })
     );
+    server.shutdown().await;
+}
+
+/// Ten of the tenant's log rows (counted by `logs` and `ss4o_logs-icegate-default`) and nine rows
+/// of the global `prices` table: two counts whose text order ("10" before "9") is the reverse of
+/// their numeric order, so a sort by rendered text cannot pass for a numeric one.
+async fn commit_ten_logs_and_nine_prices(catalog: &Arc<dyn Catalog>) -> Result<(), RowWriteError> {
+    commit_log_rows(catalog, &build_rows(TENANT, 10)).await?;
+    let models: Vec<String> = (0..9).map(|position| format!("model-{position}")).collect();
+    let price_rows: Vec<PriceRow<'_>> = models
+        .iter()
+        .map(|model| PriceRow {
+            model,
+            input_usd_per_1m: None,
+        })
+        .collect();
+    commit_price_rows(catalog, &price_rows).await?;
+    Ok(())
+}
+
+/// `s` orders rows by a figure numerically, either way, and a null figure (a view's count) sorts
+/// last in both directions.
+#[tokio::test]
+async fn cat_indices_sorts_by_a_figure_numerically_with_nulls_last() {
+    let (server, catalog) = TestServer::start().await;
+    commit_ten_logs_and_nine_prices(&catalog)
+        .await
+        .expect("ten log rows and nine prices");
+
+    let listing = "/_cat/indices/prices_effective,logs,prices?format=json&h=index,docs.count";
+    let (descending_status, descending_body) = get_cat_json(&server, TENANT, &format!("{listing}&s=docs.count:desc"))
+        .await
+        .expect("a JSON answer");
+    let (ascending_status, ascending_body) = get_cat_json(&server, TENANT, &format!("{listing}&s=docs.count"))
+        .await
+        .expect("a JSON answer");
+
+    assert_eq!((descending_status, ascending_status), (200, 200));
+    assert_eq!(
+        descending_body,
+        json!([
+            {"index": "logs", "docs.count": "10"},
+            {"index": "prices", "docs.count": "9"},
+            {"index": "prices_effective", "docs.count": null}
+        ])
+    );
+    assert_eq!(
+        ascending_body,
+        json!([
+            {"index": "prices", "docs.count": "9"},
+            {"index": "logs", "docs.count": "10"},
+            {"index": "prices_effective", "docs.count": null}
+        ])
+    );
+    server.shutdown().await;
+}
+
+/// Later `s` keys break the ties of earlier ones, and a key may name a column `h` does not
+/// render: the rows are ordered by it all the same.
+#[tokio::test]
+async fn cat_indices_breaks_ties_with_later_sort_keys_and_sorts_by_an_unrendered_column() {
+    let (server, catalog) = TestServer::start().await;
+    commit_ten_logs_and_nine_prices(&catalog)
+        .await
+        .expect("ten log rows and nine prices");
+
+    let listing = "/_cat/indices/prices,logs,ss4o_logs-icegate-default?format=json";
+    let (tie_status, tie_body) = get_cat_json(
+        &server,
+        TENANT,
+        &format!("{listing}&h=index,docs.count&s=docs.count:desc,index:desc"),
+    )
+    .await
+    .expect("a JSON answer");
+    let (unrendered_status, unrendered_body) =
+        get_cat_json(&server, TENANT, &format!("{listing}&h=index&s=docs.count,index"))
+            .await
+            .expect("a JSON answer");
+
+    assert_eq!((tie_status, unrendered_status), (200, 200));
+    assert_eq!(
+        tie_body,
+        json!([
+            {"index": "ss4o_logs-icegate-default", "docs.count": "10"},
+            {"index": "logs", "docs.count": "10"},
+            {"index": "prices", "docs.count": "9"}
+        ])
+    );
+    assert_eq!(
+        unrendered_body,
+        json!([
+            {"index": "prices"},
+            {"index": "logs"},
+            {"index": "ss4o_logs-icegate-default"}
+        ])
+    );
+    server.shutdown().await;
+}
+
+/// `s=index:desc` reverses the name order of the whole listing, and the text rendering carries
+/// the same order.
+#[tokio::test]
+async fn cat_indices_sorts_by_index_name_in_text_and_json() {
+    let (server, _catalog) = TestServer::start().await;
+
+    let (json_status, json_body) = get_cat_json(&server, TENANT, "/_cat/indices?format=json&h=index&s=index:desc")
+        .await
+        .expect("a JSON answer");
+    let (text_status, _, text) = get_cat_text(&server, "/_cat/indices/logs,events,spans?h=index&s=index:desc")
+        .await
+        .expect("a text answer");
+
+    assert_eq!((json_status, text_status), (200, 200));
+    let names: Vec<&str> = json_body
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["index"].as_str().expect("a string index"))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "ss4o_traces-icegate-default",
+            "ss4o_metrics-icegate-default",
+            "ss4o_logs-icegate-default",
+            "spans",
+            "prices_effective_by_time_of_day",
+            "prices_effective",
+            "prices",
+            "otel-v1-apm-span-000001",
+            "operations",
+            "metrics",
+            "logs",
+            "events"
+        ]
+    );
+    assert_eq!(text, "spans\nlogs\nevents\n");
+    server.shutdown().await;
+}
+
+/// An `s` key naming no column, a direction other than `asc` or `desc`, or an empty key is the
+/// caller's mistake. The same listing answers with a valid key, so each refusal is the key's own.
+#[tokio::test]
+async fn cat_indices_refuses_an_unknown_sort_column_or_direction() {
+    let (server, _catalog) = TestServer::start().await;
+
+    let (valid_status, _) = get_cat_json(&server, TENANT, "/_cat/indices?format=json&s=index:asc")
+        .await
+        .expect("a JSON answer");
+    assert_eq!(valid_status, 200);
+    for sort in ["nonsense", "index:sideways", "", "index,", "index:"] {
+        let path = format!("/_cat/indices?format=json&s={sort}");
+        let (status, body) = get_cat_json(&server, TENANT, &path).await.expect("a JSON answer");
+
+        assert_eq!(status, 400, "{path}");
+        assert_eq!(body["error"]["type"], "illegal_argument_exception", "{path}");
+    }
     server.shutdown().await;
 }
 

@@ -295,6 +295,8 @@ These hold for a search over data indices; a search over system indices is docum
   `docs.count`, `store.size` and `pri.store.size` are the requesting tenant's figures over
   committed rows: rows still in the WAL are not counted, a table every tenant shares
   (`GLOBAL_TABLES` in `icegate-common`) is counted whole, and a view's figures are null.
+  `s=` orders the rows by any of those columns, rendered or not, each `:asc` (the default) or
+  `:desc`; a figure sorts by its number and a null last (`list_cat_indices` states the order).
 - `_cat/plugins` answers a fixed list, `opensearch-observability` and `opensearch-sql`, each
   with the node name and the version `<opensearch.version>.0`.
 

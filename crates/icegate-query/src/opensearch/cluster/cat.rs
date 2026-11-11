@@ -3,9 +3,11 @@
 //! Values are strings or null, and `format` is matched case-insensitively. `docs.count` and the
 //! store sizes are the requesting tenant's committed figures, never table-wide ones; rows still
 //! in the WAL are not counted, and a view's figures are null. In text output a null value is an
-//! empty cell between its separators.
+//! empty cell between its separators. `_cat/indices` orders its rows by `s` when given; a figure
+//! sorts by its number, never by its rendering.
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::iter;
 
 use axum::Json;
@@ -21,6 +23,7 @@ use crate::opensearch::catalog::{IndexEntry, IndexExpression, IndexOptions};
 use crate::opensearch::error::OpenSearchError;
 use crate::opensearch::extract::{EndpointParameters, ExpandWildcards, Parameters, PathParameters, deserialize_flag};
 use crate::opensearch::node::derive_identifier;
+use crate::opensearch::search::request::SortOrder;
 use crate::opensearch::state::OpenSearchState;
 
 /// A `_cat/indices` column.
@@ -91,6 +94,56 @@ impl CatIndicesColumn {
             | Self::DocsDeleted => false,
         }
     }
+
+    /// Whether the column's figure is a byte size, which `bytes` decides how to write.
+    const fn is_byte_size_column(self) -> bool {
+        match self {
+            Self::StoreSize | Self::PrimaryStoreSize => true,
+            Self::Health
+            | Self::Status
+            | Self::Index
+            | Self::Uuid
+            | Self::PrimaryShards
+            | Self::ReplicaShards
+            | Self::DocsCount
+            | Self::DocsDeleted => false,
+        }
+    }
+}
+
+/// One `s` key: the column rows are ordered by and the direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatSortKey {
+    /// The column whose values order the rows; `h` need not render it.
+    column: CatIndicesColumn,
+    /// The direction.
+    order: SortOrder,
+}
+
+impl CatSortKey {
+    /// Read one `s` key, `<column>` (ascending) or `<column>:asc` / `<column>:desc`, the column
+    /// named as `h` names it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `illegal_argument_exception` for a name no column renders under or a direction
+    /// other than `asc` or `desc`.
+    fn parse(text: &str) -> Result<Self, OpenSearchError> {
+        let (column_name, order) = match text.split_once(':') {
+            None => (text, SortOrder::Asc),
+            Some((column_name, "asc")) => (column_name, SortOrder::Asc),
+            Some((column_name, "desc")) => (column_name, SortOrder::Desc),
+            Some((_, unknown_order)) => {
+                return Err(OpenSearchError::illegal_argument(format!(
+                    "unknown _cat/indices sort order [{unknown_order}]; pass [asc] or [desc]"
+                )));
+            }
+        };
+        Ok(Self {
+            column: CatIndicesColumn::parse(column_name)?,
+            order,
+        })
+    }
 }
 
 /// Columns rendered when `h` is absent, in IceGate's order; also every column `h` may name, so
@@ -125,6 +178,58 @@ struct CatFigures {
     document_count: Option<u64>,
     /// `store.size` and `pri.store.size`.
     store_bytes: Option<u64>,
+}
+
+/// One `_cat/indices` row before it is rendered: the index and its figures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatIndexRow<'a> {
+    /// The index name.
+    index: &'a str,
+    /// Its figures.
+    figures: CatFigures,
+}
+
+/// One `_cat/indices` value before it is rendered. A figure stays a number, so `s` orders it
+/// numerically and `bytes` decides only how it is written. A column always yields the same
+/// variant, so the derived order between the variants never decides a sort.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CatValue<'a> {
+    /// A count or a byte size.
+    Figure(u64),
+    /// Any other value: borrowed when fixed or held by the request, owned only when computed
+    /// for it. A constant column (`pri`, `rep`, `docs.deleted`) is text: every row holds the
+    /// same value, so its representation never orders two rows.
+    Text(Cow<'a, str>),
+}
+
+/// A row's value under one `s` key, ordered the way that key orders rows: a null value after
+/// every value in either direction.
+#[derive(Debug, PartialEq, Eq)]
+struct CatSortValue<'a> {
+    /// The value; `None` is null.
+    value: Option<CatValue<'a>>,
+    /// The key's direction.
+    order: SortOrder,
+}
+
+impl Ord for CatSortValue<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (&self.value, &other.value) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(value), Some(other_value)) => match self.order {
+                SortOrder::Asc => value.cmp(other_value),
+                SortOrder::Desc => other_value.cmp(value),
+            },
+        }
+    }
+}
+
+impl PartialOrd for CatSortValue<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// The rendering a `_cat` request asks for with `format`.
@@ -183,6 +288,10 @@ pub(crate) struct CatIndicesParameters {
     has_header: Option<bool>,
     /// What the listing expands to, with or without an expression; absent means open indices.
     expand_wildcards: Option<String>,
+    /// `s`: the comma list of `<column>[:asc|:desc]` keys the rows are ordered by; absent keeps
+    /// the listing's order.
+    #[serde(rename = "s")]
+    sort: Option<String>,
 }
 
 impl EndpointParameters for CatIndicesParameters {
@@ -225,6 +334,10 @@ impl EndpointParameters for CatTemplatesParameters {
 /// nothing is listed. A dot-prefixed system index is listed only when a part starts with `.` or
 /// `expand_wildcards` includes hidden; an alias lists the index it names. A system index's
 /// `docs.count` is its document count, and its sizes are null.
+///
+/// With `s`, each later key breaks the ties of the keys before it, rows equal under every key
+/// keep the listing's order, and a null value sorts last in either direction. A key may name a
+/// column `h` does not render.
 pub(crate) async fn list_cat_indices(
     State(state): State<OpenSearchState>,
     Extension(tenant): Extension<TenantId>,
@@ -238,6 +351,10 @@ pub(crate) async fn list_cat_indices(
             .map(CatIndicesColumn::parse)
             .collect::<Result<_, _>>()?,
         None => DEFAULT_COLUMNS.to_vec(),
+    };
+    let sort_keys: Vec<CatSortKey> = match parameters.sort.as_deref() {
+        Some(requested_keys) => requested_keys.split(',').map(CatSortKey::parse).collect::<Result<_, _>>()?,
+        None => Vec::new(),
     };
     let byte_rendering = match parameters.bytes.as_deref() {
         None => ByteRendering::Human,
@@ -287,25 +404,27 @@ pub(crate) async fn list_cat_indices(
         }
     };
     // A count loads the table from the catalog and reads its manifests, so it runs only when a
-    // requested column renders a figure. Uncounted entries pair with `None`, which no requested
-    // column reads.
-    let footprints = if columns.iter().any(|column| column.is_footprint_column()) {
+    // requested column renders a figure or a sort key orders by one. Uncounted entries pair with
+    // `None`, which no requested column or key reads.
+    let needs_footprints = columns
+        .iter()
+        .copied()
+        .chain(sort_keys.iter().map(|key| key.column))
+        .any(CatIndicesColumn::is_footprint_column);
+    let footprints = if needs_footprints {
         try_join_all(entries.iter().map(|entry| session.count_footprint(entry))).await?
     } else {
         Vec::new()
     };
-    let mut rows: Vec<Vec<CatCell<'_>>> = entries
+    let mut rows: Vec<CatIndexRow<'_>> = entries
         .iter()
         .zip(footprints.into_iter().chain(iter::repeat(None)))
-        .map(|(entry, footprint)| {
-            let figures = CatFigures {
+        .map(|(entry, footprint)| CatIndexRow {
+            index: entry.name(),
+            figures: CatFigures {
                 document_count: footprint.map(|footprint| footprint.record_count),
                 store_bytes: footprint.map(|footprint| footprint.file_size_bytes),
-            };
-            columns
-                .iter()
-                .map(|column| render_cell(*column, entry.name(), figures, &tenant, byte_rendering))
-                .collect()
+            },
         })
         .collect();
     // A system index has no storage of its own, so its sizes are null; its count is the number
@@ -317,22 +436,41 @@ pub(crate) async fn list_cat_indices(
             let system_index = snapshot
                 .find_index(index)
                 .ok_or_else(|| OpenSearchError::index_not_found(index))?;
-            let figures = CatFigures {
-                document_count: Some(system_index.document_count()),
-                store_bytes: None,
-            };
-            rows.push(
-                columns
-                    .iter()
-                    .map(|column| render_cell(*column, index, figures, &tenant, byte_rendering))
-                    .collect(),
-            );
+            rows.push(CatIndexRow {
+                index,
+                figures: CatFigures {
+                    document_count: Some(system_index.document_count()),
+                    store_bytes: None,
+                },
+            });
         }
     }
+    // The keys are derived once per row rather than once per comparison, since a `uuid` key
+    // hashes; `sort_by_cached_key` is stable, so ties keep the listing's order.
+    if !sort_keys.is_empty() {
+        rows.sort_by_cached_key(|row| {
+            sort_keys
+                .iter()
+                .map(|key| CatSortValue {
+                    value: derive_cell_value(key.column, row.index, row.figures, &tenant),
+                    order: key.order,
+                })
+                .collect::<Vec<_>>()
+        });
+    }
+    let cells: Vec<Vec<CatCell<'_>>> = rows
+        .iter()
+        .map(|row| {
+            columns
+                .iter()
+                .map(|column| render_cell(*column, row.index, row.figures, &tenant, byte_rendering))
+                .collect()
+        })
+        .collect();
     let column_names: Vec<&str> = columns.iter().copied().map(CatIndicesColumn::name).collect();
     Ok(render_rows(
         &column_names,
-        rows,
+        cells,
         format,
         parameters.has_header.unwrap_or(false),
     ))
@@ -379,9 +517,32 @@ pub(crate) async fn list_index_templates(
     ))
 }
 
-/// One `_cat/indices` cell of the index `index`; a figure column is null when its figure is
-/// `None`. The index `uuid` is derived from the tenant and the index name, so it is stable per
-/// tenant and shared by no two tenants.
+/// The `column` value of the index `index`, `None` when null: a figure column is null when its
+/// figure is `None`. The index `uuid` is derived from the tenant and the index name, so it is
+/// stable per tenant and shared by no two tenants.
+fn derive_cell_value<'a>(
+    column: CatIndicesColumn,
+    index: &'a str,
+    figures: CatFigures,
+    tenant: &TenantId,
+) -> Option<CatValue<'a>> {
+    match column {
+        CatIndicesColumn::Health => Some(CatValue::Text(Cow::Borrowed("green"))),
+        CatIndicesColumn::Status => Some(CatValue::Text(Cow::Borrowed("open"))),
+        CatIndicesColumn::Index => Some(CatValue::Text(Cow::Borrowed(index))),
+        CatIndicesColumn::Uuid => Some(CatValue::Text(Cow::Owned(derive_identifier(
+            "index",
+            &format!("{tenant}/{index}"),
+        )))),
+        CatIndicesColumn::PrimaryShards => Some(CatValue::Text(Cow::Borrowed("1"))),
+        CatIndicesColumn::ReplicaShards | CatIndicesColumn::DocsDeleted => Some(CatValue::Text(Cow::Borrowed("0"))),
+        CatIndicesColumn::DocsCount => figures.document_count.map(CatValue::Figure),
+        CatIndicesColumn::StoreSize | CatIndicesColumn::PrimaryStoreSize => figures.store_bytes.map(CatValue::Figure),
+    }
+}
+
+/// One `_cat/indices` cell of the index `index`: its [`derive_cell_value`] written out, a byte
+/// size as `byte_rendering` asks.
 fn render_cell<'a>(
     column: CatIndicesColumn,
     index: &'a str,
@@ -389,24 +550,13 @@ fn render_cell<'a>(
     tenant: &TenantId,
     byte_rendering: ByteRendering,
 ) -> CatCell<'a> {
-    let render_bytes = |bytes: u64| match byte_rendering {
-        ByteRendering::Human => format_byte_size(bytes),
-        ByteRendering::Bytes => bytes.to_string(),
-    };
-    match column {
-        CatIndicesColumn::Health => Some(Cow::Borrowed("green")),
-        CatIndicesColumn::Status => Some(Cow::Borrowed("open")),
-        CatIndicesColumn::Index => Some(Cow::Borrowed(index)),
-        CatIndicesColumn::Uuid => Some(Cow::Owned(derive_identifier("index", &format!("{tenant}/{index}")))),
-        CatIndicesColumn::PrimaryShards => Some(Cow::Borrowed("1")),
-        CatIndicesColumn::ReplicaShards | CatIndicesColumn::DocsDeleted => Some(Cow::Borrowed("0")),
-        CatIndicesColumn::DocsCount => figures
-            .document_count
-            .map(|document_count| Cow::Owned(document_count.to_string())),
-        CatIndicesColumn::StoreSize | CatIndicesColumn::PrimaryStoreSize => {
-            figures.store_bytes.map(|store_bytes| Cow::Owned(render_bytes(store_bytes)))
+    derive_cell_value(column, index, figures, tenant).map(|value| match value {
+        CatValue::Text(text) => text,
+        CatValue::Figure(figure) if column.is_byte_size_column() && byte_rendering == ByteRendering::Human => {
+            Cow::Owned(format_byte_size(figure))
         }
-    }
+        CatValue::Figure(figure) => Cow::Owned(figure.to_string()),
+    })
 }
 
 /// Render `_cat` rows in `format`. `has_header` (`v`) adds the column names as the first text
