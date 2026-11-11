@@ -225,9 +225,9 @@ async fn a_workbench_style_index_tree_lists_the_tenants_indices() {
             "prices_effective",
             "prices_effective_by_time_of_day",
             "spans",
-            "ss4o_logs-tenant-a",
-            "ss4o_metrics-tenant-a",
-            "ss4o_traces-tenant-a",
+            "ss4o_logs-icegate-default",
+            "ss4o_metrics-icegate-default",
+            "ss4o_traces-icegate-default",
         ]
     );
     server.shutdown().await;

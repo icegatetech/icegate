@@ -3099,7 +3099,7 @@ mod tests {
             )
             .await;
         let session = fixture.open_session(TENANT_A).await;
-        let entry = find_index_entry(&session, "ss4o_metrics-tenant-a");
+        let entry = find_index_entry(&session, "ss4o_metrics-icegate-default");
         let table = find_ss4o_table(METRICS_TABLE).expect("the ss4o metrics table");
         let plan = session.scan_index(entry).expect("scan").build().expect("plan");
 

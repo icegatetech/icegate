@@ -616,7 +616,6 @@ mod tests {
     };
     use crate::opensearch::catalog::IndexSet;
     use crate::opensearch::error::render_envelope;
-    use crate::test_support::build_tenant;
 
     /// A `MAP<string, string>` column with one row per entry of `rows`: the entries in this
     /// order, or NULL.
@@ -913,8 +912,7 @@ mod tests {
                 "{micros} {row_hash}"
             );
         }
-        let indices =
-            IndexSet::from_table_names(vec!["logs".to_string(), "spans".to_string()], &build_tenant("tenant-a"));
+        let indices = IndexSet::from_table_names(vec!["logs".to_string(), "spans".to_string()]);
         let logs = indices.entries().iter().find(|entry| entry.name() == "logs").expect("logs");
         let spans = indices.entries().iter().find(|entry| entry.name() == "spans").expect("spans");
         assert_eq!(
@@ -952,8 +950,7 @@ mod tests {
 
     #[test]
     fn a_malformed_id_decodes_to_nothing() {
-        let indices =
-            IndexSet::from_table_names(vec!["logs".to_string(), "spans".to_string()], &build_tenant("tenant-a"));
+        let indices = IndexSet::from_table_names(vec!["logs".to_string(), "spans".to_string()]);
         let logs = indices.entries().iter().find(|entry| entry.name() == "logs").expect("logs");
         let spans = indices.entries().iter().find(|entry| entry.name() == "spans").expect("spans");
         for id in [

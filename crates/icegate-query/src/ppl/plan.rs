@@ -356,8 +356,8 @@ async fn resolve_data_entries<'session>(
     }
 }
 
-/// Refuses `entries` when they reach one table through more than one profile (`logs` and its
-/// ss4o logs index): the profiles' field models name and type the same values
+/// Refuses `entries` when they reach one table through more than one profile (`logs` and
+/// `ss4o_logs-icegate-default`): the profiles' field models name and type the same values
 /// differently (binary `trace_id` against hex `traceId`), so their rows do not union.
 ///
 /// # Errors

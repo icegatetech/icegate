@@ -83,7 +83,7 @@ A source on system indices is a 400, and so is a source on the Data Prepper span
 which no PPL projection of one row can. A wildcard that reaches one table through two indices
 without naming each (`*` reaches `spans` and `otel-v1-apm-span-000001`) is a 400 as on
 `_search`, so no row is read twice. A source that reaches one table through two profiles in any
-way, through a wildcard (`*logs*`) or with the names written out (`logs,ss4o_logs-<tenant>`),
+way, through a wildcard (`*logs*`) or with the names written out (`logs,ss4o_logs-icegate-default`),
 is a 400 `SEMANTIC_ERROR` naming the source as written, as is every other refusal of index
 resolution (a source mixing data and system indices): the two field models do not union (binary `trace_id` against hex
 `traceId`). `_search` reads such a named pair; PPL does not. `describe <index>` lists an index's
@@ -92,8 +92,8 @@ fields and reads no rows, so its rules differ: see [`describe`](#describe).
 
 ### ss4o indices
 
-The ss4o indices (`ss4o_logs-<tenant>`, `ss4o_traces-<tenant>`, `ss4o_metrics-<tenant>`, named
-for the requesting tenant) read as relations of their profile's field model: the field table
+The ss4o indices (`ss4o_logs-icegate-default`, `ss4o_traces-icegate-default`,
+`ss4o_metrics-icegate-default`) read as relations of their profile's field model: the field table
 in `opensearch/catalog/ss4o.rs` that `_search` and `describe` read. `profile_source.rs` builds
 the relation from that table and declares no field of its own.
 
@@ -388,7 +388,7 @@ order (see [ss4o indices](#ss4o-indices)). Per row: `TABLE_CAT` is `opensearch.c
 index as written; `COLUMN_NAME` the field name; `TYPE_NAME` is `string` for `text` and `keyword`,
 `timestamp` for `date`, `int`, `bigint`, `double`, `boolean`, `array` for an object field that reads a
 list column (the type a source reads it as: `events` of `spans`, `bucketCountsList` of
-`ss4o_metrics-<tenant>`; `describe_types_a_native_list_column_array_as_a_bare_source_reads_it` in
+`ss4o_metrics-icegate-default`; `describe_types_a_native_list_column_array_as_a_bare_source_reads_it` in
 `tests/opensearch/ppl_ss4o.rs`), and `struct` for every other object; `NUM_PREC_RADIX`
 10; `NULLABLE` 2; `ORDINAL_POSITION` the 0-based row number; `IS_NULLABLE` and `IS_GENERATEDCOLUMN`
 empty strings; `IS_AUTOINCREMENT` `NO`; every other column null. MAP keys come from field discovery, so
